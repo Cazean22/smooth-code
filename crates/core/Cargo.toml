@@ -6,9 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 async-channel.workspace = true
 futures-util.workspace = true
 indexmap.workspace = true
+rig-core.workspace = true
 smooth-protocol = { path = "../protocol" }
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }

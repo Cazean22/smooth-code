@@ -39,6 +39,11 @@ impl App {
         thread_id: ThreadId,
         op: Op,
     ) -> Result<()> {
+        match op {
+            Op::UserInput(input) => {
+                let _response = app_server.turn_start(thread_id, input).await?;
+            }
+        }
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 mod context_manager;
 mod core;
 mod core_thread;
+mod provider;
 mod state;
 mod tasks;
 mod thread_manager;

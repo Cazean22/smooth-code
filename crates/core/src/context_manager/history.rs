@@ -1,7 +1,9 @@
+use rig::message::Message;
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
-    items: Vec<String>,
+    items: Vec<Message>,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
     token_info: Option<String>,
@@ -15,5 +17,16 @@ pub(crate) struct ContextManager {
     /// baseline and emits a full reinjection of context state. Rollback may
     /// also clear this when it trims a mixed initial-context developer bundle
     /// whose non-diff fragments no longer exist in the surviving history.
-    reference_context_item: Option<String>,
+    reference_context_item: Option<Message>,
+}
+
+impl ContextManager {
+    pub(crate) fn items(&self) -> &[Message] {
+        &self.items
+    }
+
+    pub(crate) fn push(&mut self, item: Message) {
+        self.items.push(item);
+        self.history_version = self.history_version.saturating_add(1);
+    }
 }

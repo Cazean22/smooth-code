@@ -1,13 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{Arc, atomic::AtomicBool},
 };
 
-use app_server_protocol::{ClientRequest, JSONRPCErrorError, RequestId, ServerRequest};
+use app_server_protocol::{ClientRequest, JSONRPCErrorError, ServerRequest};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::{
-    ClientRequestResult, OutboundConnectionState,
+    OutboundConnectionState,
     message_processor::{ConnectionSessionState, MessageProcessor},
     outgoing_message::{OutgoingEnvelope, OutgoingMessageSender, QueuedOutgoingMessage},
     route_outgoing_envelope,
@@ -25,7 +25,10 @@ pub enum InProcessClientMessage {
     },
 }
 enum ProcessorCommand {
-    Request(Box<ClientRequest>),
+    Request {
+        request: Box<ClientRequest>,
+        response_tx: oneshot::Sender<std::result::Result<serde_json::Value, JSONRPCErrorError>>,
+    },
 }
 
 /// Event emitted from the app-server to the in-process client.
@@ -52,7 +55,7 @@ impl InProcessClientHandle {
 pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
     let channel_capacity = args.channel_capacity.max(1);
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
-    let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
+    let (_event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
     let runtime_handle = tokio::spawn(async move {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
@@ -69,7 +72,7 @@ pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
             /*disconnect_sender*/ None,
         );
 
-        let mut outbound_handle = tokio::spawn(async move {
+        let outbound_handle = tokio::spawn(async move {
             while let Some(envelope) = outgoing_rx.recv().await {
                 route_outgoing_envelope(&outbound_connection_state, envelope).await;
             }
@@ -77,7 +80,7 @@ pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
 
         let processor_outgoing = Arc::clone(&outgoing_message_sender);
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
-        let mut processor_handle = tokio::spawn(async move {
+        let processor_handle = tokio::spawn(async move {
             let processor = Arc::new(MessageProcessor::new(Arc::clone(&processor_outgoing)));
             let session = Arc::new(ConnectionSessionState::default());
 
@@ -85,12 +88,13 @@ pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
                 tokio::select! {
                     command = processor_rx.recv() => {
                         match command {
-                            Some(ProcessorCommand::Request(request)) => {
+                            Some(ProcessorCommand::Request { request, response_tx }) => {
                                 processor
                                     .process_client_request(
                                         *request,
                                         Arc::clone(&session),
                                         &outbound_initialized,
+                                        response_tx,
                                     )
                                     .await;
                             }
@@ -102,22 +106,34 @@ pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
                 }
             }
         });
-        let mut pending_request_responses =
-            HashMap::<RequestId, oneshot::Sender<ClientRequestResult>>::new();
-
         loop {
             tokio::select! {
                 message = client_rx.recv() => {
-                    todo!()
+                    match message {
+                        Some(InProcessClientMessage::Request { request, response_tx }) => {
+                            if processor_tx
+                                .send(ProcessorCommand::Request { request, response_tx })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
                 }
                 queued_message = writer_rx.recv() => {
-                    todo!()
+                    if queued_message.is_none() {
+                        break;
+                    }
                 }
             }
         }
         drop(writer_rx);
         drop(processor_tx);
         drop(outgoing_message_sender);
+        let _ = outbound_handle.await;
+        let _ = processor_handle.await;
     });
     InProcessClientHandle {
         client_tx,

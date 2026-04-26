@@ -22,7 +22,6 @@ impl AppServerClient {
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
         let worker_handle = tokio::spawn(async move {
             let mut event_stream_enabled = true;
-            let mut skipped_events = 0usize;
             loop {
                 tokio::select! {
                     command = command_rx.recv() => {
@@ -33,15 +32,26 @@ impl AppServerClient {
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
                                 tokio::spawn(async move {
-                                    // let result = request_sender.send(*request).await;
-                                    // let _ = response_tx.send(result);
+                                    let _ = request_sender
+                                        .send(in_process::InProcessClientMessage::Request {
+                                            request,
+                                            response_tx,
+                                        })
+                                        .await;
                                 });
                             }
                             None => {}
                         }
                     }
                     event = handle.next_event(), if event_stream_enabled => {
-                        todo!()
+                        match event {
+                            Some(event) => {
+                                let _ = event_tx.send(event).await;
+                            }
+                            None => {
+                                event_stream_enabled = false;
+                            }
+                        }
                     }
                 }
             }
@@ -51,5 +61,29 @@ impl AppServerClient {
             event_rx,
             worker_handle,
         })
+    }
+
+    pub(crate) async fn request(
+        &self,
+        request: ClientRequest,
+    ) -> std::result::Result<serde_json::Value, JSONRPCErrorError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let command = ClientCommand::Request {
+            request: Box::new(request),
+            response_tx,
+        };
+        self.command_tx
+            .send(command)
+            .await
+            .map_err(|err| JSONRPCErrorError {
+                code: -32000,
+                data: None,
+                message: err.to_string(),
+            })?;
+        response_rx.await.map_err(|err| JSONRPCErrorError {
+            code: -32000,
+            data: None,
+            message: err.to_string(),
+        })?
     }
 }

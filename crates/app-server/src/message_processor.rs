@@ -3,8 +3,9 @@ use std::{
     sync::{Arc, OnceLock, atomic::AtomicBool},
 };
 
-use app_server_protocol::ClientRequest;
+use app_server_protocol::{ClientRequest, JSONRPCErrorError};
 use futures_util::FutureExt;
+use tokio::sync::oneshot;
 
 use crate::{
     core_message_processor::CoreMessageProcessor, outgoing_message::OutgoingMessageSender,
@@ -40,10 +41,14 @@ impl MessageProcessor {
         request: ClientRequest,
         session: Arc<ConnectionSessionState>,
         outbound_initialized: &AtomicBool,
+        response_tx: oneshot::Sender<std::result::Result<serde_json::Value, JSONRPCErrorError>>,
     ) {
-        self.core_message_processor
+        let _ = (session, outbound_initialized);
+        let result = self
+            .core_message_processor
             .process_request(request)
             .boxed()
-            .await
+            .await;
+        let _ = response_tx.send(result);
     }
 }

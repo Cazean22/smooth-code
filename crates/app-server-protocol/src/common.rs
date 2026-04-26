@@ -12,6 +12,13 @@ pub struct TurnStartParams {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct TurnStartResponse {
+    pub thread_id: String,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct DynamicToolCallParams {
     pub thread_id: String,
     pub turn_id: String,

@@ -1,0 +1,49 @@
+use std::{
+    collections::HashSet,
+    sync::{Arc, OnceLock, atomic::AtomicBool},
+};
+
+use app_server_protocol::ClientRequest;
+use futures_util::FutureExt;
+
+use crate::{
+    core_message_processor::CoreMessageProcessor, outgoing_message::OutgoingMessageSender,
+};
+
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionSessionState {
+    initialized: OnceLock<InitializedConnectionSessionState>,
+}
+
+#[derive(Debug)]
+struct InitializedConnectionSessionState {
+    opted_out_notification_methods: HashSet<String>,
+    app_server_client_name: String,
+    client_version: String,
+}
+
+pub(crate) struct MessageProcessor {
+    outgoing: Arc<OutgoingMessageSender>,
+    core_message_processor: CoreMessageProcessor,
+}
+
+impl MessageProcessor {
+    pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>) -> Self {
+        let core_message_processor = CoreMessageProcessor::new(outgoing.clone());
+        Self {
+            outgoing,
+            core_message_processor,
+        }
+    }
+    pub(crate) async fn process_client_request(
+        self: &Arc<Self>,
+        request: ClientRequest,
+        session: Arc<ConnectionSessionState>,
+        outbound_initialized: &AtomicBool,
+    ) {
+        self.core_message_processor
+            .process_request(request)
+            .boxed()
+            .await
+    }
+}

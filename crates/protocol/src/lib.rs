@@ -1,0 +1,101 @@
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadId(Uuid);
+
+impl ThreadId {
+    pub fn new() -> Self {
+        ThreadId(Uuid::now_v7())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
+pub enum Op {
+    UserInput(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct Submission {
+    /// Unique id for this Submission to correlate with Events
+    pub id: String,
+    /// Payload
+    pub op: Op,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Event {
+    /// Submission `id` that this event is correlated with.
+    pub id: String,
+    /// Payload
+    pub msg: EventMsg,
+}
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventMsg {
+    /// Error while executing a submission
+    Error(ErrorEvent),
+    /// Agent text output message
+    AgentMessage(String),
+
+    /// User/system input message (what was sent to the model)
+    UserMessage(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ErrorEvent {
+    pub message: String,
+    #[serde(default)]
+    pub codex_error_info: Option<CoreErrorInfo>,
+}
+
+/// runtime errors that we expose to clients.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreErrorInfo {
+    ContextWindowExceeded,
+    UsageLimitExceeded,
+    ServerOverloaded,
+    HttpConnectionFailed {
+        http_status_code: Option<u16>,
+    },
+    /// Failed to connect to the response SSE stream.
+    ResponseStreamConnectionFailed {
+        http_status_code: Option<u16>,
+    },
+    InternalServerError,
+    Unauthorized,
+    BadRequest,
+    SandboxError,
+    /// The response SSE stream disconnected in the middle of a turnbefore completion.
+    ResponseStreamDisconnected {
+        http_status_code: Option<u16>,
+    },
+    /// Reached the retry limit for responses.
+    ResponseTooManyFailedAttempts {
+        http_status_code: Option<u16>,
+    },
+    ThreadRollbackFailed,
+    Other,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    /// Agent is waiting for initialization.
+    #[default]
+    PendingInit,
+    /// Agent is currently running.
+    Running,
+    /// Agent's current turn was interrupted and it may receive more input.
+    Interrupted,
+    /// Agent is done. Contains the final assistant message.
+    Completed(Option<String>),
+    /// Agent encountered an error.
+    Errored(String),
+    /// Agent has been shutdown.
+    Shutdown,
+    /// Agent is not found.
+    NotFound,
+}

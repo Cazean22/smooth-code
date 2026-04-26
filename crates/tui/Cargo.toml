@@ -1,0 +1,19 @@
+[package]
+name = "smooth-tui"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+app-server = { path = "../app-server" }
+app-server-protocol = { path = "../app-server-protocol" }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+ratatui = "0.30.0"
+serde.workspace = true
+serde_json.workspace = true
+smooth-core = { path = "../core" }
+smooth-protocol = { path = "../protocol" }
+tokio = { workspace = true, features = ["full"] }
+uuid = {workspace = true, features = ["serde", "v7"]}

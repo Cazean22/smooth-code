@@ -135,6 +135,9 @@ impl SessionTask for RegularTask {
                     session.replace_history(history).await;
                     if !response.is_empty() {
                         last_assistant_message = response;
+                        session
+                            .persist_assistant_message(last_assistant_message.clone())
+                            .await;
                     }
                 }
             }

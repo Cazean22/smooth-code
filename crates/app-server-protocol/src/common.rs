@@ -11,6 +11,46 @@ pub struct ThreadStartParams {}
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartResponse {
     pub thread_id: String,
+    pub rollout_path: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadResumeParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadResumeResponse {
+    pub thread_id: String,
+    pub rollout_path: String,
+    pub initial_messages: Vec<smooth_protocol::EventMsg>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListParams {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListItem {
+    pub thread_id: String,
+    pub rollout_path: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_user_message: Option<String>,
+    pub last_assistant_message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListResponse {
+    pub data: Vec<ThreadListItem>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
@@ -50,6 +90,16 @@ pub enum ClientRequest {
         #[serde(rename = "id")]
         request_id: RequestId,
         params: TurnStartParams,
+    },
+    ThreadResume {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: ThreadResumeParams,
+    },
+    ThreadList {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: ThreadListParams,
     },
 }
 

@@ -16,5 +16,6 @@ serde.workspace = true
 serde_json.workspace = true
 smooth-protocol = { path = "../protocol" }
 thiserror = "2.0.18"
+time.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }

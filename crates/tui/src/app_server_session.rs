@@ -1,7 +1,8 @@
 use anyhow::Result;
 use app_server::in_process::InProcessServerEvent;
 use app_server_protocol::{
-    ClientRequest, RequestId, ThreadStartParams, ThreadStartResponse, TurnStartParams,
+    ClientRequest, RequestId, ThreadListParams, ThreadListResponse, ThreadResumeParams,
+    ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, TurnStartParams,
     TurnStartResponse,
 };
 use smooth_protocol::ThreadId;
@@ -46,6 +47,43 @@ impl AppServerSession {
                 thread_id: thread_id.to_string(),
                 input,
             },
+        };
+        self.next_request_id += 1;
+        let value = self
+            .client
+            .request(request)
+            .await
+            .map_err(|err| anyhow::anyhow!(err.message))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub(crate) async fn thread_resume(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<ThreadResumeResponse> {
+        let request = ClientRequest::ThreadResume {
+            request_id: RequestId(self.next_request_id as usize),
+            params: ThreadResumeParams {
+                thread_id: thread_id.to_string(),
+            },
+        };
+        self.next_request_id += 1;
+        let value = self
+            .client
+            .request(request)
+            .await
+            .map_err(|err| anyhow::anyhow!(err.message))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub(crate) async fn thread_list(
+        &mut self,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<ThreadListResponse> {
+        let request = ClientRequest::ThreadList {
+            request_id: RequestId(self.next_request_id as usize),
+            params: ThreadListParams { cursor, limit },
         };
         self.next_request_id += 1;
         let value = self

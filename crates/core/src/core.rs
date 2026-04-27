@@ -15,7 +15,9 @@ use smooth_protocol::{
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::{
+    context_manager::ContextManager,
     provider::SessionModel,
+    rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persist_event},
     state::{ActiveTurn, RunningTask, SessionState},
     tasks::{RegularTask, SessionTask},
 };
@@ -35,6 +37,7 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     next_internal_sub_id: AtomicU64,
     model: SessionModel,
+    rollout: RolloutRecorder,
 }
 
 /// The context needed for a single turn of the thread.
@@ -46,17 +49,26 @@ pub(crate) struct TurnContext {
 }
 
 impl Core {
-    pub(crate) fn new(id: ThreadId, model: SessionModel) -> Self {
+    pub(crate) fn new(
+        id: ThreadId,
+        model: SessionModel,
+        history: Vec<Message>,
+        next_internal_sub_id: u64,
+        rollout: RolloutRecorder,
+    ) -> Self {
         let (agent_status, _) = watch::channel(AgentStatus::PendingInit);
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let mut context_manager = ContextManager::default();
+        context_manager.replace(history);
         let session = Arc::new(Session {
             id,
             agent_status,
             event_tx,
-            state: Mutex::new(SessionState::new()),
+            state: Mutex::new(SessionState::new(context_manager)),
             active_turn: Mutex::new(None),
-            next_internal_sub_id: AtomicU64::new(0),
+            next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
             model,
+            rollout,
         });
         Self { session }
     }
@@ -214,19 +226,30 @@ impl Session {
     pub(crate) async fn record_user_message(&self, text: String) {
         let mut state = self.state.lock().await;
         state.history.push(Message::User {
-            content: OneOrMany::one(UserContent::Text(Text { text })),
+            content: OneOrMany::one(UserContent::Text(Text { text: text.clone() })),
         });
+        drop(state);
+        let _ = self
+            .rollout
+            .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
+                text,
+            }))
+            .await;
     }
 
-    pub(crate) async fn record_assistant_message(&self, text: String) {
-        let mut state = self.state.lock().await;
-        state.history.push(Message::Assistant {
-            id: None,
-            content: OneOrMany::one(rig::message::AssistantContent::text(text)),
-        });
+    pub(crate) async fn persist_assistant_message(&self, text: String) {
+        let _ = self
+            .rollout
+            .append(PersistedItem::HistoryMessage(HistoryMessage::AssistantText {
+                text,
+            }))
+            .await;
     }
 
     pub(crate) async fn emit_event(&self, ctx: &TurnContext, msg: EventMsg) {
+        if persist_event(&msg) {
+            let _ = self.rollout.append(PersistedItem::Event(msg.clone())).await;
+        }
         let _ = self.event_tx.send(Event {
             id: ctx.sub_id.clone(),
             msg,
@@ -234,6 +257,9 @@ impl Session {
     }
 
     pub(crate) async fn emit_session_event(&self, msg: EventMsg) {
+        if persist_event(&msg) {
+            let _ = self.rollout.append(PersistedItem::Event(msg.clone())).await;
+        }
         let _ = self.event_tx.send(Event {
             id: "session".to_string(),
             msg,

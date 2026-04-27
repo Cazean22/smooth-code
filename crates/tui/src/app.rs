@@ -27,6 +27,9 @@ pub(crate) struct App {
     transcript_cells: Vec<Box<dyn HistoryCell>>,
     active_cell: Option<AgentMessageCell>,
     stream_controller: Option<StreamController>,
+    current_turn_id: Option<String>,
+    committed_assistant_item_id: Option<String>,
+    committed_assistant_for_current_turn: bool,
     composer: String,
     status_line: String,
     scroll: u16,
@@ -42,6 +45,9 @@ impl App {
             transcript_cells: Vec::new(),
             active_cell: None,
             stream_controller: None,
+            current_turn_id: None,
+            committed_assistant_item_id: None,
+            committed_assistant_for_current_turn: false,
             composer: String::new(),
             status_line: String::from("Idle"),
             scroll: 0,
@@ -136,20 +142,25 @@ impl App {
             }
             EventMsg::TurnStarted(turn) => {
                 self.is_turn_running = true;
+                self.current_turn_id = Some(turn.turn_id.clone());
+                self.committed_assistant_item_id = None;
+                self.committed_assistant_for_current_turn = false;
                 self.status_line = format!("Running turn {}", turn.turn_id);
             }
             EventMsg::TurnCompleted(turn) => {
-                self.finalize_stream();
+                let committed_from_stream = self.finalize_stream(None);
                 self.is_turn_running = false;
                 self.status_line = format!("Completed turn {}", turn.turn_id);
                 if let Some(message) = turn.last_assistant_message
-                    && self.active_cell.is_none()
+                    && !committed_from_stream
+                    && !self.committed_assistant_for_current_turn
                 {
                     self.push_rendered_assistant_message(&message);
+                    self.committed_assistant_for_current_turn = true;
                 }
             }
             EventMsg::TurnInterrupted(turn) => {
-                self.finalize_stream();
+                self.finalize_stream(None);
                 self.is_turn_running = false;
                 self.push_history(Box::new(PlainHistoryCell::info(format!(
                     "Turn {} interrupted: {}",
@@ -167,13 +178,21 @@ impl App {
                 self.handle_streaming_delta(delta.delta);
             }
             EventMsg::AgentMessageCompleted(completed) => {
-                self.finalize_stream();
-                if self.active_cell.is_none() {
+                let committed_from_stream =
+                    self.finalize_stream(Some(completed.item_id.as_str()));
+                if !committed_from_stream
+                    && self
+                        .committed_assistant_item_id
+                        .as_deref()
+                        != Some(completed.item_id.as_str())
+                {
                     self.push_rendered_assistant_message(&completed.text);
+                    self.committed_assistant_item_id = Some(completed.item_id);
+                    self.committed_assistant_for_current_turn = true;
                 }
             }
             EventMsg::ToolCallStarted(tool) => {
-                self.finalize_stream();
+                self.finalize_stream(None);
                 self.push_history(Box::new(PlainHistoryCell::new(vec![Line::from(vec![
                     Span::styled("[tool:start] ", Style::default().fg(Color::Blue).bold()),
                     Span::raw(tool.tool_name),
@@ -182,7 +201,7 @@ impl App {
                 ])])));
             }
             EventMsg::ToolCallCompleted(tool) => {
-                self.finalize_stream();
+                self.finalize_stream(None);
                 let detail = tool
                     .output_preview
                     .or(tool.error)
@@ -195,7 +214,7 @@ impl App {
                 ])])));
             }
             EventMsg::Error(error) => {
-                self.finalize_stream();
+                self.finalize_stream(None);
                 self.push_history(Box::new(PlainHistoryCell::error(error.message)));
                 self.is_turn_running = false;
                 self.status_line = String::from("Error");
@@ -220,13 +239,18 @@ impl App {
         }
     }
 
-    fn finalize_stream(&mut self) {
+    fn finalize_stream(&mut self, item_id: Option<&str>) -> bool {
         if let Some(controller) = self.stream_controller.take()
             && let Some(cell) = controller.finalize()
         {
             self.push_history(Box::new(cell));
+            self.committed_assistant_item_id = item_id.map(ToOwned::to_owned);
+            self.committed_assistant_for_current_turn = true;
+            self.active_cell = None;
+            return true;
         }
         self.active_cell = None;
+        false
     }
 
     fn push_rendered_assistant_message(&mut self, message: &str) {
@@ -390,6 +414,160 @@ impl App {
             }
             _ => Ok(AppRunControl::Continue),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smooth_protocol::{
+        AgentMessageCompletedEvent, AgentMessageDeltaEvent, EventMsg, TurnCompletedEvent,
+        TurnStartedEvent,
+    };
+
+    fn event(id: &str, msg: EventMsg) -> Event {
+        Event {
+            id: id.to_owned(),
+            msg,
+        }
+    }
+
+    fn transcript_strings(app: &App) -> Vec<String> {
+        app.transcript_lines(80)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn assistant_message_delta_complete_and_turn_complete_render_once() {
+        let mut app = App::new();
+
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("assistant-1"),
+                    delta: String::from("Hi! What can I help with?\n"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("assistant-1"),
+                    text: String::from("Hi! What can I help with?"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::TurnCompleted(TurnCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    last_assistant_message: Some(String::from("Hi! What can I help with?")),
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert_eq!(joined.matches("Hi! What can I help with?").count(), 1);
+    }
+
+    #[test]
+    fn completed_message_without_stream_renders_once() {
+        let mut app = App::new();
+
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("assistant-1"),
+                    text: String::from("Hi! What can I help with?"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::TurnCompleted(TurnCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    last_assistant_message: Some(String::from("Hi! What can I help with?")),
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert_eq!(joined.matches("Hi! What can I help with?").count(), 1);
+    }
+
+    #[test]
+    fn turn_completed_fallback_renders_once_when_no_completed_message_exists() {
+        let mut app = App::new();
+
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::TurnCompleted(TurnCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    last_assistant_message: Some(String::from("Hi! What can I help with?")),
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert_eq!(joined.matches("Hi! What can I help with?").count(), 1);
     }
 }
 

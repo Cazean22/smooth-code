@@ -25,6 +25,11 @@ impl ContextManager {
         &self.items
     }
 
+    pub(crate) fn replace(&mut self, items: Vec<Message>) {
+        self.items = items;
+        self.history_version = self.history_version.saturating_add(1);
+    }
+
     pub(crate) fn push(&mut self, item: Message) {
         self.items.push(item);
         self.history_version = self.history_version.saturating_add(1);

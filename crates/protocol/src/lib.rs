@@ -50,11 +50,89 @@ pub struct Event {
 pub enum EventMsg {
     /// Error while executing a submission
     Error(ErrorEvent),
+    TurnStarted(TurnStartedEvent),
+    TurnCompleted(TurnCompletedEvent),
+    TurnInterrupted(TurnInterruptedEvent),
+    AgentStatusChanged(AgentStatusChangedEvent),
     /// Agent text output message
     AgentMessage(String),
+    AgentMessageDelta(AgentMessageDeltaEvent),
+    AgentMessageCompleted(AgentMessageCompletedEvent),
+    ToolCallStarted(ToolCallStartedEvent),
+    ToolCallCompleted(ToolCallCompletedEvent),
 
     /// User/system input message (what was sent to the model)
     UserMessage(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStartedEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnCompletedEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub last_assistant_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnInterruptedEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatusChangedEvent {
+    pub thread_id: String,
+    pub turn_id: Option<String>,
+    pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessageDeltaEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub delta: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessageCompletedEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallStartedEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub args_preview: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallCompletedEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    pub success: bool,
+    pub output_preview: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

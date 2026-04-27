@@ -1,14 +1,34 @@
-use std::{env, sync::Arc};
+use std::{env, path::PathBuf, pin::Pin, sync::Arc};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use futures_util::StreamExt;
 use rig::{
-    agent::Agent,
+    agent::{Agent, MultiTurnStreamItem},
     client::CompletionClient,
-    message::{AssistantContent, Message},
+    message::{Message, ToolCall, ToolResult},
     providers::{anthropic, gemini, openai, openrouter},
-    streaming::{StreamedAssistantContent, StreamingCompletion},
+    streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat},
 };
+
+use crate::tools::{ListDirTool, ReadFileTool, RunCommandTool};
+
+pub(crate) enum SessionStreamEvent {
+    TextDelta(String),
+    ToolCall {
+        tool_call: ToolCall,
+        internal_call_id: String,
+    },
+    ToolResult {
+        tool_result: ToolResult,
+        internal_call_id: String,
+    },
+    Final {
+        response: String,
+        history: Vec<Message>,
+    },
+}
+
+type SessionStream = Pin<Box<dyn futures_util::Stream<Item = Result<SessionStreamEvent>> + Send>>;
 
 pub(crate) enum SessionModel {
     OpenAi(Arc<Agent<openai::responses_api::ResponsesCompletionModel>>),
@@ -18,7 +38,7 @@ pub(crate) enum SessionModel {
 }
 
 impl SessionModel {
-    pub(crate) fn from_env() -> Result<Self> {
+    pub(crate) fn from_env(cwd: PathBuf) -> Result<Self> {
         let provider = env::var("SMOOTH_CODE_LLM_PROVIDER")
             .unwrap_or_else(|_| "openai".to_string())
             .to_ascii_lowercase();
@@ -33,97 +53,126 @@ impl SessionModel {
                     builder = builder.base_url(&base_url);
                 }
                 let client = builder.build()?;
-                Ok(Self::OpenAi(Arc::new(
-                    client.agent(&model).preamble(&preamble).build(),
-                )))
+                Ok(Self::OpenAi(Arc::new(build_agent(
+                    client.agent(&model).preamble(&preamble),
+                    cwd,
+                ))))
             }
             "openrouter" => {
                 let client = openrouter::Client::new(&env::var("OPENROUTER_API_KEY")?)?;
-                Ok(Self::OpenRouter(Arc::new(
-                    client.agent(&model).preamble(&preamble).build(),
-                )))
+                Ok(Self::OpenRouter(Arc::new(build_agent(
+                    client.agent(&model).preamble(&preamble),
+                    cwd,
+                ))))
             }
             "anthropic" => {
                 let client = anthropic::Client::new(env::var("ANTHROPIC_API_KEY")?)?;
-                Ok(Self::Anthropic(Arc::new(
-                    client.agent(&model).preamble(&preamble).build(),
-                )))
+                Ok(Self::Anthropic(Arc::new(build_agent(
+                    client.agent(&model).preamble(&preamble),
+                    cwd,
+                ))))
             }
             "gemini" => {
                 let client = gemini::Client::new(env::var("GEMINI_API_KEY")?)?;
-                Ok(Self::Gemini(Arc::new(
-                    client.agent(&model).preamble(&preamble).build(),
-                )))
+                Ok(Self::Gemini(Arc::new(build_agent(
+                    client.agent(&model).preamble(&preamble),
+                    cwd,
+                ))))
             }
             other => bail!("unsupported SMOOTH_CODE_LLM_PROVIDER `{other}`"),
         }
     }
 
-    pub(crate) async fn complete_turn(
+    pub(crate) async fn stream_turn(
         &self,
         prompt: Message,
         history: &[Message],
-        mut on_text: impl FnMut(String) + Send,
-    ) -> Result<String> {
+    ) -> Result<SessionStream> {
         match self {
-            Self::OpenAi(agent) => stream_agent(agent, prompt, history, &mut on_text).await,
-            Self::OpenRouter(agent) => stream_agent(agent, prompt, history, &mut on_text).await,
-            Self::Anthropic(agent) => stream_agent(agent, prompt, history, &mut on_text).await,
-            Self::Gemini(agent) => stream_agent(agent, prompt, history, &mut on_text).await,
+            Self::OpenAi(agent) => stream_agent(agent, prompt, history).await,
+            Self::OpenRouter(agent) => stream_agent(agent, prompt, history).await,
+            Self::Anthropic(agent) => stream_agent(agent, prompt, history).await,
+            Self::Gemini(agent) => stream_agent(agent, prompt, history).await,
         }
     }
+}
+
+fn build_agent<M>(
+    builder: rig::agent::AgentBuilder<M, (), rig::agent::NoToolConfig>,
+    cwd: PathBuf,
+) -> Agent<M>
+where
+    M: rig::completion::CompletionModel,
+{
+    builder
+        .tool(ListDirTool::new(cwd.clone()))
+        .tool(ReadFileTool::new(cwd.clone()))
+        .tool(RunCommandTool::new(cwd))
+        .build()
 }
 
 async fn stream_agent<M>(
     agent: &Arc<Agent<M>>,
     prompt: Message,
     history: &[Message],
-    on_text: &mut (impl FnMut(String) + Send),
-) -> Result<String>
+) -> Result<SessionStream>
 where
-    M: rig::completion::CompletionModel,
+    M: rig::completion::CompletionModel + 'static,
     M::StreamingResponse: Clone + Unpin + rig::completion::GetTokenUsage,
 {
-    let mut stream = agent
-        .stream_completion(prompt, history.iter().cloned())
-        .await?
-        .stream()
-        .await?;
-    let mut final_text = String::new();
+    let stream = agent
+        .stream_chat(prompt, history.iter().cloned())
+        .await;
+    Ok(Box::pin(stream_to_events(stream)))
+}
 
-    while let Some(chunk) = stream.next().await {
-        match chunk? {
-            StreamedAssistantContent::Text(text) => {
-                on_text(text.text.clone());
-                final_text.push_str(&text.text);
+fn stream_to_events<R>(
+    mut stream: Pin<
+        Box<
+            dyn futures_util::Stream<Item = Result<MultiTurnStreamItem<R>, rig::agent::StreamingError>>
+                + Send,
+        >,
+    >,
+) -> impl futures_util::Stream<Item = Result<SessionStreamEvent>> + Send
+where
+    R: Clone + Unpin + rig::completion::GetTokenUsage + Send,
+{
+    async_stream::try_stream! {
+        while let Some(item) = stream.next().await {
+            match item? {
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
+                    yield SessionStreamEvent::TextDelta(text.text);
+                }
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id,
+                }) => {
+                    yield SessionStreamEvent::ToolCall {
+                        tool_call,
+                        internal_call_id,
+                    };
+                }
+                MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+                    tool_result,
+                    internal_call_id,
+                }) => {
+                    yield SessionStreamEvent::ToolResult {
+                        tool_result,
+                        internal_call_id,
+                    };
+                }
+                MultiTurnStreamItem::FinalResponse(final_response) => {
+                    yield SessionStreamEvent::Final {
+                        response: final_response.response().to_string(),
+                        history: final_response.history().unwrap_or(&[]).to_vec(),
+                    };
+                }
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(_))
+                | MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta { .. })
+                | MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCallDelta { .. })
+                | MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Final(_)) => {}
+                _ => {}
             }
-            StreamedAssistantContent::Final(_) => {}
-            StreamedAssistantContent::Reasoning(_)
-            | StreamedAssistantContent::ReasoningDelta { .. } => {}
-            StreamedAssistantContent::ToolCall { tool_call, .. } => {
-                return Err(anyhow!(
-                    "tool call `{}` is not implemented in smooth-code yet",
-                    tool_call.function.name
-                ));
-            }
-            StreamedAssistantContent::ToolCallDelta { .. } => {}
         }
     }
-
-    if !final_text.is_empty() {
-        return Ok(final_text);
-    }
-
-    let fallback = stream
-        .choice
-        .clone()
-        .into_iter()
-        .filter_map(|content| match content {
-            AssistantContent::Text(text) => Some(text.text),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("");
-
-    Ok(fallback)
 }

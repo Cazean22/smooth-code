@@ -1,21 +1,24 @@
-use std::sync::Arc;
+use std::collections::HashSet;
 
 use app_server_protocol::{ClientRequest, TurnStartResponse};
 use smooth_core::ThreadManagerState;
 use smooth_protocol::ThreadId;
+use tokio::sync::{Mutex, mpsc};
 
-use crate::outgoing_message::OutgoingMessageSender;
+use crate::in_process::InProcessServerEvent;
 
 pub(crate) struct CoreMessageProcessor {
     threads: ThreadManagerState,
-    outgoing: Arc<OutgoingMessageSender>,
+    event_tx: mpsc::Sender<InProcessServerEvent>,
+    subscribed_threads: Mutex<HashSet<ThreadId>>,
 }
 
 impl CoreMessageProcessor {
-    pub fn new(outgoing: Arc<OutgoingMessageSender>) -> Self {
+    pub fn new(event_tx: mpsc::Sender<InProcessServerEvent>) -> Self {
         Self {
             threads: ThreadManagerState::new(),
-            outgoing,
+            event_tx,
+            subscribed_threads: Mutex::new(HashSet::new()),
         }
     }
 
@@ -32,9 +35,10 @@ impl CoreMessageProcessor {
                         message: format!("invalid thread id: {err}"),
                     }
                 })?;
-                let message = self
+                self.ensure_thread_subscription(thread_id).await;
+                let turn_id = self
                     .threads
-                    .run_user_input(thread_id, params.input)
+                    .start_user_input(thread_id, params.input)
                     .await
                     .map_err(|err| app_server_protocol::JSONRPCErrorError {
                         code: -32000,
@@ -43,7 +47,7 @@ impl CoreMessageProcessor {
                     })?;
                 serde_json::to_value(TurnStartResponse {
                     thread_id: thread_id.to_string(),
-                    message,
+                    turn_id,
                 })
                 .map_err(|err| app_server_protocol::JSONRPCErrorError {
                     code: -32603,
@@ -52,5 +56,36 @@ impl CoreMessageProcessor {
                 })
             }
         }
+    }
+
+    async fn ensure_thread_subscription(&self, thread_id: ThreadId) {
+        {
+            let mut subscribed = self.subscribed_threads.lock().await;
+            if !subscribed.insert(thread_id) {
+                return;
+            }
+        }
+
+        let Ok(mut rx) = self.threads.subscribe(thread_id).await else {
+            return;
+        };
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if event_tx
+                            .send(InProcessServerEvent::SessionEvent(event))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 }

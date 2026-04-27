@@ -14,7 +14,7 @@ pub struct TurnStartParams {
 #[serde(rename_all = "camelCase")]
 pub struct TurnStartResponse {
     pub thread_id: String,
-    pub message: String,
+    pub turn_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]

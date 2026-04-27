@@ -4,6 +4,7 @@ use std::{
 };
 
 use app_server_protocol::{ClientRequest, JSONRPCErrorError, ServerRequest};
+use smooth_protocol::Event;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::{
@@ -38,6 +39,7 @@ enum ProcessorCommand {
 pub enum InProcessServerEvent {
     /// Server request that requires client response/rejection.
     ServerRequest(ServerRequest),
+    SessionEvent(Event),
 }
 
 pub struct InProcessClientHandle {
@@ -55,7 +57,7 @@ impl InProcessClientHandle {
 pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
     let channel_capacity = args.channel_capacity.max(1);
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
-    let (_event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
+    let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
     let runtime_handle = tokio::spawn(async move {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
@@ -78,10 +80,9 @@ pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
             }
         });
 
-        let processor_outgoing = Arc::clone(&outgoing_message_sender);
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
         let processor_handle = tokio::spawn(async move {
-            let processor = Arc::new(MessageProcessor::new(Arc::clone(&processor_outgoing)));
+            let processor = Arc::new(MessageProcessor::new(event_tx));
             let session = Arc::new(ConnectionSessionState::default());
 
             loop {

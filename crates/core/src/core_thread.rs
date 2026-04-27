@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use smooth_protocol::Event;
+use tokio::sync::broadcast;
 
 use crate::core::Core;
 use crate::provider::SessionModel;
@@ -13,14 +15,19 @@ pub struct CoreThread {
 
 impl CoreThread {
     pub(crate) fn new(id: ThreadId) -> Result<Self> {
-        let model = SessionModel::from_env()?;
+        let cwd = std::env::current_dir()?;
+        let model = SessionModel::from_env(cwd)?;
         Ok(Self {
             core: Core::new(id, model),
             rollout_path: None,
         })
     }
 
-    pub(crate) async fn run_user_input(&self, input: String) -> Result<String> {
-        self.core.run_user_input(input).await
+    pub(crate) async fn start_user_input(&self, input: String) -> Result<String> {
+        self.core.start_user_input(input).await
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.core.subscribe()
     }
 }

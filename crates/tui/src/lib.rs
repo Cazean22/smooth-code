@@ -10,6 +10,7 @@ use crate::{
     app_server_session::AppServerSession,
 };
 use anyhow::Result;
+use app_server::in_process::InProcessServerEvent;
 use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
@@ -36,10 +37,21 @@ pub async fn run() -> Result<()> {
     });
 
     loop {
-        if let Some(event) = app_event_rx.recv().await {
-            let _ = app.handle_event(&mut app_server, event).await;
-        } else {
-            break;
+        tokio::select! {
+            event = app_event_rx.recv() => {
+                if let Some(event) = event {
+                    let _ = app.handle_event(&mut app_server, event).await;
+                } else {
+                    break;
+                }
+            }
+            event = app_server.next_event() => {
+                match event {
+                    Some(InProcessServerEvent::SessionEvent(event)) => app.handle_session_event(event),
+                    Some(InProcessServerEvent::ServerRequest(_)) => {}
+                    None => break,
+                }
+            }
         }
     }
 

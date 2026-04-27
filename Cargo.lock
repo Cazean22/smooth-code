@@ -2357,10 +2357,14 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-channel",
+ "async-stream",
  "futures-util",
  "indexmap",
  "rig-core",
+ "serde",
+ "serde_json",
  "smooth-protocol",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
 ]

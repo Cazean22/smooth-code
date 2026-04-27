@@ -3,19 +3,24 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use rig::{
     OneOrMany,
     message::{Message, Text, UserContent},
 };
-use smooth_protocol::{AgentStatus, Event, EventMsg, ThreadId};
-use tokio::sync::{Mutex, watch};
+use smooth_protocol::{
+    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, ThreadId, TurnCompletedEvent,
+    TurnInterruptedEvent, TurnStartedEvent,
+};
+use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::{
     provider::SessionModel,
     state::{ActiveTurn, RunningTask, SessionState},
     tasks::{RegularTask, SessionTask},
 };
+
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 pub struct Core {
     pub(crate) session: Arc<Session>,
@@ -25,6 +30,7 @@ pub struct Core {
 pub(crate) struct Session {
     pub(crate) id: ThreadId,
     agent_status: watch::Sender<AgentStatus>,
+    event_tx: broadcast::Sender<Event>,
     state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     next_internal_sub_id: AtomicU64,
@@ -35,15 +41,18 @@ pub(crate) struct Session {
 #[derive(Debug)]
 pub(crate) struct TurnContext {
     pub(crate) sub_id: String,
+    pub(crate) assistant_item_id: String,
     pub(crate) timezone: Option<String>,
 }
 
 impl Core {
     pub(crate) fn new(id: ThreadId, model: SessionModel) -> Self {
         let (agent_status, _) = watch::channel(AgentStatus::PendingInit);
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let session = Arc::new(Session {
             id,
             agent_status,
+            event_tx,
             state: Mutex::new(SessionState::new()),
             active_turn: Mutex::new(None),
             next_internal_sub_id: AtomicU64::new(0),
@@ -52,37 +61,53 @@ impl Core {
         Self { session }
     }
 
-    pub async fn run_user_input(&self, input: String) -> Result<String> {
+    pub async fn start_user_input(&self, input: String) -> Result<String> {
+        let sub_id = self.session.next_internal_sub_id();
         let turn_context = Arc::new(TurnContext {
-            sub_id: self.session.next_internal_sub_id(),
+            assistant_item_id: format!("{sub_id}-assistant"),
+            sub_id: sub_id.clone(),
             timezone: None,
         });
 
         self.session
-            .run_task(turn_context, vec![input], RegularTask::new())
-            .await?
-            .ok_or_else(|| anyhow!("regular task finished without an assistant message"))
+            .start_task(turn_context, vec![input], RegularTask::new())
+            .await;
+        Ok(sub_id)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.session.event_tx.subscribe()
     }
 }
 
 impl Session {
-    pub(crate) async fn run_task<T: SessionTask>(
+    pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<String>,
         task: T,
-    ) -> Result<Option<String>> {
-        self.abort_all_tasks().await;
+    ) {
+        self.abort_all_tasks("replaced").await;
 
         let task: Arc<dyn crate::tasks::AnySessionTask> = Arc::new(task);
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         let done = Arc::new(tokio::sync::Notify::new());
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let sess = Arc::clone(self);
         let task_for_runner = Arc::clone(&task);
         let ctx_for_runner = Arc::clone(&turn_context);
         let done_for_runner = Arc::clone(&done);
         let cancellation_for_runner = cancellation_token.clone();
+
+        self.emit_event(
+            &turn_context,
+            EventMsg::TurnStarted(TurnStartedEvent {
+                thread_id: self.id.to_string(),
+                turn_id: turn_context.sub_id.clone(),
+            }),
+        )
+        .await;
+        self.set_agent_status(AgentStatus::Running, Some(turn_context.as_ref()))
+            .await;
 
         let handle = tokio::spawn(async move {
             let result = task_for_runner
@@ -90,12 +115,46 @@ impl Session {
                     Arc::clone(&sess),
                     Arc::clone(&ctx_for_runner),
                     input,
-                    cancellation_for_runner,
+                    cancellation_for_runner.clone(),
                 )
                 .await;
-            sess.set_agent_status(AgentStatus::Completed(result.clone()))
+
+            if cancellation_for_runner.is_cancelled() {
+                sess.set_agent_status(AgentStatus::Interrupted, Some(ctx_for_runner.as_ref()))
+                    .await;
+                sess.emit_event(
+                    &ctx_for_runner,
+                    EventMsg::TurnInterrupted(TurnInterruptedEvent {
+                        thread_id: sess.id.to_string(),
+                        turn_id: ctx_for_runner.sub_id.clone(),
+                        reason: "cancelled".to_string(),
+                    }),
+                )
                 .await;
-            let _ = result_tx.send(result);
+            } else if let Some(last_assistant_message) = result {
+                sess.set_agent_status(
+                    AgentStatus::Completed(Some(last_assistant_message.clone())),
+                    Some(ctx_for_runner.as_ref()),
+                )
+                .await;
+                sess.emit_event(
+                    &ctx_for_runner,
+                    EventMsg::TurnCompleted(TurnCompletedEvent {
+                        thread_id: sess.id.to_string(),
+                        turn_id: ctx_for_runner.sub_id.clone(),
+                        last_assistant_message: Some(last_assistant_message),
+                    }),
+                )
+                .await;
+            }
+
+            let mut active_turn = sess.active_turn.lock().await;
+            if let Some(turn) = active_turn.as_mut()
+                && turn.remove_task(&ctx_for_runner.sub_id)
+            {
+                *active_turn = None;
+            }
+
             done_for_runner.notify_waiters();
         });
 
@@ -111,24 +170,9 @@ impl Session {
         let mut active_turn = self.active_turn.lock().await;
         let turn = active_turn.get_or_insert_with(ActiveTurn::default);
         turn.add_task(running_task);
-        drop(active_turn);
-
-        let result = result_rx
-            .await
-            .map_err(|_| anyhow!("task runner dropped"))?;
-
-        let mut active_turn = self.active_turn.lock().await;
-        if let Some(turn) = active_turn.as_mut()
-            && turn.remove_task(&turn_context.sub_id)
-        {
-            *active_turn = None;
-        }
-        drop(active_turn);
-
-        Ok(result)
     }
 
-    pub(crate) async fn abort_all_tasks(self: &Arc<Self>) {
+    pub(crate) async fn abort_all_tasks(self: &Arc<Self>, reason: &str) {
         let drained = {
             let mut active_turn = self.active_turn.lock().await;
             active_turn.take().map(|mut turn| turn.drain_tasks())
@@ -140,6 +184,15 @@ impl Session {
                 task.task
                     .abort(Arc::clone(self), Arc::clone(&task.turn_context))
                     .await;
+                self.emit_event(
+                    task.turn_context.as_ref(),
+                    EventMsg::TurnInterrupted(TurnInterruptedEvent {
+                        thread_id: self.id.to_string(),
+                        turn_id: task.turn_context.sub_id.clone(),
+                        reason: reason.to_string(),
+                    }),
+                )
+                .await;
             }
         }
     }
@@ -147,6 +200,11 @@ impl Session {
     pub(crate) async fn history(&self) -> Vec<Message> {
         let state = self.state.lock().await;
         state.history.items().to_vec()
+    }
+
+    pub(crate) async fn replace_history(&self, history: Vec<Message>) {
+        let mut state = self.state.lock().await;
+        state.history.replace(history);
     }
 
     pub(crate) async fn record_user_message(&self, text: String) {
@@ -165,14 +223,24 @@ impl Session {
     }
 
     pub(crate) async fn emit_event(&self, ctx: &TurnContext, msg: EventMsg) {
-        let _event = Event {
+        let _ = self.event_tx.send(Event {
             id: ctx.sub_id.clone(),
             msg,
-        };
+        });
     }
 
-    pub(crate) async fn set_agent_status(&self, status: AgentStatus) {
-        self.agent_status.send_replace(status);
+    pub(crate) async fn set_agent_status(&self, status: AgentStatus, ctx: Option<&TurnContext>) {
+        self.agent_status.send_replace(status.clone());
+        let _ = self.event_tx.send(Event {
+            id: ctx
+                .map(|ctx| ctx.sub_id.clone())
+                .unwrap_or_else(|| "status".to_string()),
+            msg: EventMsg::AgentStatusChanged(AgentStatusChangedEvent {
+                thread_id: self.id.to_string(),
+                turn_id: ctx.map(|ctx| ctx.sub_id.clone()),
+                status,
+            }),
+        });
     }
 
     pub(crate) fn model(&self) -> &SessionModel {

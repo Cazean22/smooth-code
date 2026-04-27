@@ -7,10 +7,14 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-stream.workspace = true
 async-channel.workspace = true
 futures-util.workspace = true
 indexmap.workspace = true
 rig-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 smooth-protocol = { path = "../protocol" }
+thiserror = "2.0.18"
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }

@@ -5,11 +5,9 @@ use std::{
 
 use app_server_protocol::{ClientRequest, JSONRPCErrorError};
 use futures_util::FutureExt;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::{
-    core_message_processor::CoreMessageProcessor, outgoing_message::OutgoingMessageSender,
-};
+use crate::{core_message_processor::CoreMessageProcessor, in_process::InProcessServerEvent};
 
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionSessionState {
@@ -24,17 +22,13 @@ struct InitializedConnectionSessionState {
 }
 
 pub(crate) struct MessageProcessor {
-    outgoing: Arc<OutgoingMessageSender>,
     core_message_processor: CoreMessageProcessor,
 }
 
 impl MessageProcessor {
-    pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>) -> Self {
-        let core_message_processor = CoreMessageProcessor::new(outgoing.clone());
-        Self {
-            outgoing,
-            core_message_processor,
-        }
+    pub(crate) fn new(event_tx: mpsc::Sender<InProcessServerEvent>) -> Self {
+        let core_message_processor = CoreMessageProcessor::new(event_tx);
+        Self { core_message_processor }
     }
     pub(crate) async fn process_client_request(
         self: &Arc<Self>,

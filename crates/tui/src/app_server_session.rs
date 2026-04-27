@@ -1,4 +1,5 @@
 use anyhow::Result;
+use app_server::in_process::InProcessServerEvent;
 use app_server_protocol::{ClientRequest, RequestId, TurnStartParams, TurnStartResponse};
 use smooth_protocol::ThreadId;
 
@@ -36,5 +37,9 @@ impl AppServerSession {
             .await
             .map_err(|err| anyhow::anyhow!(err.message))?;
         Ok(serde_json::from_value(value)?)
+    }
+
+    pub(crate) async fn next_event(&mut self) -> Option<InProcessServerEvent> {
+        self.client.next_event().await
     }
 }

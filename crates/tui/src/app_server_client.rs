@@ -86,4 +86,8 @@ impl AppServerClient {
             message: err.to_string(),
         })?
     }
+
+    pub(crate) async fn next_event(&mut self) -> Option<InProcessServerEvent> {
+        self.event_rx.recv().await
+    }
 }

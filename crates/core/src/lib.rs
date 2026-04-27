@@ -4,6 +4,7 @@ mod core_thread;
 mod provider;
 mod state;
 mod tasks;
+mod tools;
 mod thread_manager;
 
 pub use thread_manager::ThreadManagerState;

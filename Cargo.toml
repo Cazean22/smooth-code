@@ -14,6 +14,7 @@ default-members = [
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+async-stream = "0.3.6"
 async-channel = "2.5.0"
 futures-util = "0.3.32"
 indexmap = "2.14.0"

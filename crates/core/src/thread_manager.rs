@@ -2,7 +2,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use smooth_protocol::ThreadId;
-use tokio::sync::RwLock;
+use smooth_protocol::Event;
+use tokio::sync::{RwLock, broadcast};
 
 use crate::core_thread::CoreThread;
 
@@ -17,9 +18,14 @@ impl ThreadManagerState {
         }
     }
 
-    pub async fn run_user_input(&self, thread_id: ThreadId, input: String) -> Result<String> {
+    pub async fn start_user_input(&self, thread_id: ThreadId, input: String) -> Result<String> {
         let thread = self.get_or_create(thread_id).await?;
-        thread.run_user_input(input).await
+        thread.start_user_input(input).await
+    }
+
+    pub async fn subscribe(&self, thread_id: ThreadId) -> Result<broadcast::Receiver<Event>> {
+        let thread = self.get_or_create(thread_id).await?;
+        Ok(thread.subscribe())
     }
 
     async fn get_or_create(&self, thread_id: ThreadId) -> Result<Arc<CoreThread>> {

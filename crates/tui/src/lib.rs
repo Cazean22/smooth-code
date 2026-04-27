@@ -1,14 +1,15 @@
 mod app;
-mod app_event;
 mod app_server_client;
 mod app_server_session;
+mod history_cell;
+mod markdown;
+mod markdown_render;
+mod markdown_stream;
+mod streaming;
 
 use std::io::{IsTerminal, Stdout};
 
-use crate::{
-    app::App, app_event::AppEvent, app_server_client::AppServerClient,
-    app_server_session::AppServerSession,
-};
+use crate::{app::App, app_server_client::AppServerClient, app_server_session::AppServerSession};
 use anyhow::Result;
 use app_server::in_process::InProcessServerEvent;
 use crossterm::{
@@ -16,48 +17,53 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures_util::StreamExt;
 use ratatui::{Terminal, prelude::CrosstermBackend};
-use smooth_protocol::Op;
-use tokio::sync::mpsc::unbounded_channel;
 
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 pub async fn run() -> Result<()> {
-    let mut terminal = init()?;
-    let (app_event_tx, mut app_event_rx) = unbounded_channel();
+    let mut terminal = init()?.ok_or_else(|| anyhow::anyhow!("smooth-tui requires a TTY"))?;
     let mut app_server = AppServerSession::new(AppServerClient::start(512)?);
-    let mut app = App {
-        app_event_tx: app_event_tx.clone(),
-        current_thread_id: None,
-    };
+    let mut app = App::new();
     let started_thread = app_server.start_thread().await?;
     app.current_thread_id = Some(started_thread.thread_id.parse()?);
-    tokio::spawn(async move {
-        let _ = app_event_tx.send(AppEvent::SubmitThreadOp {
-            op: Op::UserInput("Hi".to_owned()),
-        });
-    });
+    let mut event_stream = crossterm::event::EventStream::new();
+    terminal.draw(|frame| app.render(frame))?;
 
     loop {
         tokio::select! {
-            event = app_event_rx.recv() => {
-                if let Some(event) = event {
-                    let _ = app.handle_event(&mut app_server, event).await;
-                } else {
-                    break;
-                }
-            }
             event = app_server.next_event() => {
                 match event {
-                    Some(InProcessServerEvent::SessionEvent(event)) => app.handle_session_event(event),
+                    Some(InProcessServerEvent::SessionEvent(event)) => {
+                        let viewport_height = app.viewport_height_for(&terminal)?;
+                        app.handle_session_event(event, viewport_height);
+                        terminal.draw(|frame| app.render(frame))?;
+                    }
                     Some(InProcessServerEvent::ServerRequest(_)) => {}
+                    None => break,
+                }
+            }
+            maybe_event = event_stream.next() => {
+                match maybe_event {
+                    Some(Ok(event)) => {
+                        let viewport_height = app.viewport_height_for(&terminal)?;
+                        if matches!(
+                            app.handle_terminal_event(&mut app_server, event, viewport_height).await?,
+                            crate::app::AppRunControl::Exit
+                        ) {
+                            break;
+                        }
+                        terminal.draw(|frame| app.render(frame))?;
+                    }
+                    Some(Err(err)) => return Err(err.into()),
                     None => break,
                 }
             }
         }
     }
 
-    restore(terminal.as_mut())
+    restore(Some(&mut terminal))
 }
 
 fn init() -> Result<Option<AppTerminal>> {

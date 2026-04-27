@@ -50,6 +50,7 @@ pub struct Event {
 pub enum EventMsg {
     /// Error while executing a submission
     Error(ErrorEvent),
+    SessionConfigured(SessionConfiguredEvent),
     TurnStarted(TurnStartedEvent),
     TurnCompleted(TurnCompletedEvent),
     TurnInterrupted(TurnInterruptedEvent),
@@ -63,6 +64,12 @@ pub enum EventMsg {
 
     /// User/system input message (what was sent to the model)
     UserMessage(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfiguredEvent {
+    pub thread_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

@@ -6,7 +6,14 @@ use rig::{
     agent::{Agent, MultiTurnStreamItem},
     client::CompletionClient,
     message::{Message, ToolCall, ToolResult},
-    providers::{anthropic, gemini, openai, openrouter},
+    providers::{
+        anthropic, gemini,
+        openai::{
+            self,
+            responses_api::{AdditionalParameters, Reasoning, ReasoningEffort},
+        },
+        openrouter,
+    },
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat},
 };
 
@@ -48,13 +55,18 @@ impl SessionModel {
 
         match provider.as_str() {
             "openai" => {
-                let mut builder = openai::Client::builder().api_key(&env::var("OPENAI_API_KEY")?);
-                if let Ok(base_url) = env::var("OPENAI_BASE_URL") {
-                    builder = builder.base_url(&base_url);
-                }
+                let mut builder = openai::Client::builder().api_key("cazean");
+                builder = builder.base_url("http://localhost:8317/v1");
                 let client = builder.build()?;
+                let additional_params = AdditionalParameters {
+                    reasoning: Some(Reasoning::new().with_effort(ReasoningEffort::High)),
+                    ..Default::default()
+                };
                 Ok(Self::OpenAi(Arc::new(build_agent(
-                    client.agent(&model).preamble(&preamble),
+                    client
+                        .agent(&model)
+                        .preamble(&preamble)
+                        .additional_params(additional_params.to_json()),
                     cwd,
                 ))))
             }
@@ -120,17 +132,16 @@ where
     M: rig::completion::CompletionModel + 'static,
     M::StreamingResponse: Clone + Unpin + rig::completion::GetTokenUsage,
 {
-    let stream = agent
-        .stream_chat(prompt, history.iter().cloned())
-        .await;
+    let stream = agent.stream_chat(prompt, history.iter().cloned()).await;
     Ok(Box::pin(stream_to_events(stream)))
 }
 
 fn stream_to_events<R>(
     mut stream: Pin<
         Box<
-            dyn futures_util::Stream<Item = Result<MultiTurnStreamItem<R>, rig::agent::StreamingError>>
-                + Send,
+            dyn futures_util::Stream<
+                    Item = Result<MultiTurnStreamItem<R>, rig::agent::StreamingError>,
+                > + Send,
         >,
     >,
 ) -> impl futures_util::Stream<Item = Result<SessionStreamEvent>> + Send

@@ -51,7 +51,9 @@ impl SessionTask for RegularTask {
 
         let prompt_text = input.join("\n");
         session.record_user_message(prompt_text.clone()).await;
-        session.emit_event(&ctx, EventMsg::UserMessage(prompt_text.clone())).await;
+        session
+            .emit_event(&ctx, EventMsg::UserMessage(prompt_text.clone()))
+            .await;
 
         let prompt = Message::User {
             content: OneOrMany::one(UserContent::Text(Text {
@@ -129,10 +131,7 @@ impl SessionTask for RegularTask {
                         )
                         .await;
                 }
-                SessionStreamEvent::Final {
-                    response,
-                    history,
-                } => {
+                SessionStreamEvent::Final { response, history } => {
                     session.replace_history(history).await;
                     if !response.is_empty() {
                         last_assistant_message = response;

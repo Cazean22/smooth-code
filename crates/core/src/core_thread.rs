@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use smooth_protocol::Event;
+use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent};
 use tokio::sync::broadcast;
 
 use crate::core::Core;
@@ -25,6 +25,14 @@ impl CoreThread {
 
     pub(crate) async fn start_user_input(&self, input: String) -> Result<String> {
         self.core.start_user_input(input).await
+    }
+
+    pub(crate) async fn emit_session_configured(&self) {
+        self.core
+            .emit_session_event(EventMsg::SessionConfigured(SessionConfiguredEvent {
+                thread_id: self.core.session.id.to_string(),
+            }))
+            .await;
     }
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<Event> {

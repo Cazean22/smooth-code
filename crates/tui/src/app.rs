@@ -18,6 +18,7 @@ pub enum ExitReason {
 
 pub(crate) struct App {
     pub(crate) app_event_tx: mpsc::UnboundedSender<AppEvent>,
+    pub(crate) current_thread_id: Option<ThreadId>,
 }
 
 impl App {
@@ -27,18 +28,16 @@ impl App {
         event: AppEvent,
     ) -> Result<AppRunControl> {
         match event {
-            AppEvent::SubmitThreadOp { thread_id, op } => {
-                self.submit_thread_op(app_server, thread_id, op).await?;
+            AppEvent::SubmitThreadOp { op } => {
+                self.submit_thread_op(app_server, op).await?;
             }
         }
         Ok(AppRunControl::Continue)
     }
-    async fn submit_thread_op(
-        &mut self,
-        app_server: &mut AppServerSession,
-        thread_id: ThreadId,
-        op: Op,
-    ) -> Result<()> {
+    async fn submit_thread_op(&mut self, app_server: &mut AppServerSession, op: Op) -> Result<()> {
+        let thread_id = self
+            .current_thread_id
+            .ok_or_else(|| anyhow::anyhow!("no started thread available for prompt submission"))?;
         match op {
             Op::UserInput(input) => {
                 let response = app_server.turn_start(thread_id, input).await?;
@@ -53,6 +52,16 @@ impl App {
 
     pub(crate) fn handle_session_event(&mut self, event: Event) {
         match event.msg {
+            EventMsg::SessionConfigured(configured) => {
+                match configured.thread_id.parse::<ThreadId>() {
+                    Ok(thread_id) => {
+                        self.current_thread_id = Some(thread_id);
+                    }
+                    Err(err) => {
+                        eprintln!("error: invalid configured thread id: {err}");
+                    }
+                }
+            }
             EventMsg::AgentMessageDelta(delta) => {
                 print!("{}", delta.delta);
             }

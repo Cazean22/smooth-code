@@ -17,7 +17,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, prelude::CrosstermBackend};
-use smooth_protocol::{Op, ThreadId};
+use smooth_protocol::Op;
 use tokio::sync::mpsc::unbounded_channel;
 
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -28,10 +28,12 @@ pub async fn run() -> Result<()> {
     let mut app_server = AppServerSession::new(AppServerClient::start(512)?);
     let mut app = App {
         app_event_tx: app_event_tx.clone(),
+        current_thread_id: None,
     };
+    let started_thread = app_server.start_thread().await?;
+    app.current_thread_id = Some(started_thread.thread_id.parse()?);
     tokio::spawn(async move {
         let _ = app_event_tx.send(AppEvent::SubmitThreadOp {
-            thread_id: ThreadId::new(),
             op: Op::UserInput("Hi".to_owned()),
         });
     });

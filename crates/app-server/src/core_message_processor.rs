@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use app_server_protocol::{ClientRequest, TurnStartResponse};
+use app_server_protocol::{ClientRequest, ThreadStartResponse, TurnStartResponse};
 use smooth_core::ThreadManagerState;
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
@@ -27,6 +27,32 @@ impl CoreMessageProcessor {
         request: ClientRequest,
     ) -> Result<serde_json::Value, app_server_protocol::JSONRPCErrorError> {
         match request {
+            ClientRequest::ThreadStart { .. } => {
+                let started = self.threads.start_thread().await.map_err(|err| {
+                    app_server_protocol::JSONRPCErrorError {
+                        code: -32000,
+                        data: None,
+                        message: err.to_string(),
+                    }
+                })?;
+                self.ensure_thread_subscription(started.thread_id).await;
+                self.threads
+                    .emit_session_configured(started.thread_id)
+                    .await
+                    .map_err(|err| app_server_protocol::JSONRPCErrorError {
+                        code: -32000,
+                        data: None,
+                        message: err.to_string(),
+                    })?;
+                serde_json::to_value(ThreadStartResponse {
+                    thread_id: started.thread_id.to_string(),
+                })
+                .map_err(|err| app_server_protocol::JSONRPCErrorError {
+                    code: -32603,
+                    data: None,
+                    message: err.to_string(),
+                })
+            }
             ClientRequest::TurnStart { params, .. } => {
                 let thread_id = params.thread_id.parse::<ThreadId>().map_err(|err| {
                     app_server_protocol::JSONRPCErrorError {

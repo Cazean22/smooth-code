@@ -1,6 +1,6 @@
-use smooth_protocol::{Op, ThreadId};
+use smooth_protocol::Op;
 
 #[derive(Debug)]
 pub(crate) enum AppEvent {
-    SubmitThreadOp { thread_id: ThreadId, op: Op },
+    SubmitThreadOp { op: Op },
 }

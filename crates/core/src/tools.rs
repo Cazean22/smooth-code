@@ -1,10 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use rig::{
-    completion::ToolDefinition,
-    tool::Tool,
-};
+use rig::{completion::ToolDefinition, tool::Tool};
 use serde::Deserialize;
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 16 * 1024;

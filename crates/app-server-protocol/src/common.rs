@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::RequestId;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStartParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStartResponse {
+    pub thread_id: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnStartParams {
@@ -31,6 +41,11 @@ pub struct DynamicToolCallParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(tag = "method", rename_all = "camelCase")]
 pub enum ClientRequest {
+    ThreadStart {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: ThreadStartParams,
+    },
     TurnStart {
         #[serde(rename = "id")]
         request_id: RequestId,

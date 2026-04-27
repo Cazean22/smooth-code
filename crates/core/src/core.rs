@@ -78,6 +78,10 @@ impl Core {
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.session.event_tx.subscribe()
     }
+
+    pub(crate) async fn emit_session_event(&self, msg: EventMsg) {
+        self.session.emit_session_event(msg).await;
+    }
 }
 
 impl Session {
@@ -225,6 +229,13 @@ impl Session {
     pub(crate) async fn emit_event(&self, ctx: &TurnContext, msg: EventMsg) {
         let _ = self.event_tx.send(Event {
             id: ctx.sub_id.clone(),
+            msg,
+        });
+    }
+
+    pub(crate) async fn emit_session_event(&self, msg: EventMsg) {
+        let _ = self.event_tx.send(Event {
+            id: "session".to_string(),
             msg,
         });
     }

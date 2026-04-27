@@ -28,7 +28,9 @@ pub(crate) struct MessageProcessor {
 impl MessageProcessor {
     pub(crate) fn new(event_tx: mpsc::Sender<InProcessServerEvent>) -> Self {
         let core_message_processor = CoreMessageProcessor::new(event_tx);
-        Self { core_message_processor }
+        Self {
+            core_message_processor,
+        }
     }
     pub(crate) async fn process_client_request(
         self: &Arc<Self>,

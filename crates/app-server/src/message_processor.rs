@@ -32,6 +32,8 @@ impl MessageProcessor {
             core_message_processor,
         }
     }
+
+    #[tracing::instrument(name = "app_server.process_client_request", skip(self, request, session, outbound_initialized, response_tx))]
     pub(crate) async fn process_client_request(
         self: &Arc<Self>,
         request: ClientRequest,

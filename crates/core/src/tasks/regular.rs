@@ -44,6 +44,12 @@ impl SessionTask for RegularTask {
         input: Vec<String>,
         cancellation_token: CancellationToken,
     ) -> Option<String> {
+        tracing::debug!(
+            thread_id = %session.id,
+            turn_id = %ctx.sub_id,
+            input_count = input.len(),
+            "running regular task"
+        );
         let _ = self;
         if cancellation_token.is_cancelled() {
             return None;

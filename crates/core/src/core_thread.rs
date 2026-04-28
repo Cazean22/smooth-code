@@ -17,6 +17,7 @@ pub struct CoreThread {
 }
 
 impl CoreThread {
+    #[tracing::instrument(name = "core.thread.new", fields(thread_id = %id))]
     pub(crate) async fn new(id: ThreadId) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let model = SessionModel::from_env(cwd.clone())?;
@@ -29,6 +30,7 @@ impl CoreThread {
         })
     }
 
+    #[tracing::instrument(name = "core.thread.resume", skip(path, state), fields(thread_id = %state.thread_id))]
     pub(crate) async fn resume(path: PathBuf, state: ResumeState) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let model = SessionModel::from_env(cwd)?;
@@ -45,10 +47,12 @@ impl CoreThread {
         })
     }
 
+    #[tracing::instrument(name = "core.thread.start_user_input", skip(self, input), fields(thread_id = %self.core.session.id, input_len = input.len()))]
     pub(crate) async fn start_user_input(&self, input: String) -> Result<String> {
         self.core.start_user_input(input).await
     }
 
+    #[tracing::instrument(name = "core.thread.emit_session_configured", skip(self), fields(thread_id = %self.core.session.id))]
     pub(crate) async fn emit_session_configured(&self) {
         self.core
             .emit_session_event(EventMsg::SessionConfigured(SessionConfiguredEvent {

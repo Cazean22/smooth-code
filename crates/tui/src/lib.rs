@@ -22,6 +22,7 @@ use ratatui::{Terminal, prelude::CrosstermBackend};
 
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
+#[tracing::instrument(name = "tui.run", skip_all)]
 pub async fn run() -> Result<()> {
     let mut terminal = init()?.ok_or_else(|| anyhow::anyhow!("smooth-tui requires a TTY"))?;
     let mut app_server = AppServerSession::new(AppServerClient::start(512)?);

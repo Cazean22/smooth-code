@@ -7,6 +7,7 @@ use app_server_protocol::{
 use smooth_core::{ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
+use tracing::Instrument;
 
 use crate::in_process::InProcessServerEvent;
 
@@ -31,6 +32,7 @@ impl CoreMessageProcessor {
     ) -> Result<serde_json::Value, app_server_protocol::JSONRPCErrorError> {
         match request {
             ClientRequest::ThreadStart { .. } => {
+                tracing::debug!("processing thread start request");
                 let started = self
                     .threads
                     .start_thread()
@@ -48,6 +50,11 @@ impl CoreMessageProcessor {
                 .map_err(internal_serde_error)
             }
             ClientRequest::TurnStart { params, .. } => {
+                tracing::debug!(
+                    thread_id = %params.thread_id,
+                    input_len = params.input.len(),
+                    "processing turn start request"
+                );
                 let thread_id = params.thread_id.parse::<ThreadId>().map_err(|err| {
                     app_server_protocol::JSONRPCErrorError {
                         code: -32602,
@@ -68,6 +75,10 @@ impl CoreMessageProcessor {
                 .map_err(internal_serde_error)
             }
             ClientRequest::ThreadResume { params, .. } => {
+                tracing::debug!(
+                    thread_id = %params.thread_id,
+                    "processing thread resume request"
+                );
                 let thread_id = params.thread_id.parse::<ThreadId>().map_err(|err| {
                     app_server_protocol::JSONRPCErrorError {
                         code: -32602,
@@ -89,6 +100,11 @@ impl CoreMessageProcessor {
                 .map_err(internal_serde_error)
             }
             ClientRequest::ThreadList { params, .. } => {
+                tracing::debug!(
+                    cursor = ?params.cursor,
+                    limit = params.limit,
+                    "processing thread list request"
+                );
                 let threads = self.threads.list_threads().await.map_err(internal_error)?;
                 let offset = params
                     .cursor
@@ -124,23 +140,36 @@ impl CoreMessageProcessor {
             return;
         };
         let event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if event_tx
-                            .send(InProcessServerEvent::SessionEvent(event))
-                            .await
-                            .is_err()
-                        {
-                            break;
+        let subscription_span = tracing::info_span!(
+            "app_server.session_event_subscription",
+            thread_id = %thread_id,
+        );
+        tokio::task::Builder::new()
+            .name("app_server.session_subscription")
+            .spawn(
+                async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(event) => {
+                                if event_tx
+                                    .send(InProcessServerEvent::SessionEvent(event))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "session event subscription lagged");
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-            }
-        });
+                .instrument(subscription_span),
+            )
+            .expect("failed to spawn session event subscription task");
     }
 }
 

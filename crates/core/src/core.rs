@@ -13,6 +13,7 @@ use smooth_protocol::{
     TurnInterruptedEvent, TurnStartedEvent,
 };
 use tokio::sync::{Mutex, broadcast, watch};
+use tracing::Instrument;
 
 use crate::{
     context_manager::ContextManager,
@@ -73,8 +74,11 @@ impl Core {
         Self { session }
     }
 
+    #[tracing::instrument(name = "core.start_user_input", skip(self, input), fields(thread_id = %self.session.id, input_len = input.len()))]
     pub async fn start_user_input(&self, input: String) -> Result<String> {
         let sub_id = self.session.next_internal_sub_id();
+        tracing::Span::current().record("thread_id", tracing::field::display(self.session.id));
+        tracing::debug!(turn_id = %sub_id, "starting turn");
         let turn_context = Arc::new(TurnContext {
             assistant_item_id: format!("{sub_id}-assistant"),
             sub_id: sub_id.clone(),
@@ -97,6 +101,17 @@ impl Core {
 }
 
 impl Session {
+    #[tracing::instrument(
+        name = "core.session.start_task",
+        skip(self, turn_context, input, task),
+        fields(
+            thread_id = %self.id,
+            turn_id = %turn_context.sub_id,
+            task_name = task.span_name(),
+            task_kind = ?task.kind(),
+            input_count = input.len(),
+        )
+    )]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -125,54 +140,67 @@ impl Session {
         self.set_agent_status(AgentStatus::Running, Some(turn_context.as_ref()))
             .await;
 
-        let handle = tokio::spawn(async move {
-            let result = task_for_runner
-                .run(
-                    Arc::clone(&sess),
-                    Arc::clone(&ctx_for_runner),
-                    input,
-                    cancellation_for_runner.clone(),
-                )
-                .await;
+        let task_span = tracing::info_span!(
+            "core.session_task",
+            thread_id = %self.id,
+            turn_id = %turn_context.sub_id,
+            task_name = task_for_runner.span_name(),
+            task_kind = ?task_for_runner.kind(),
+        );
+        let handle = tokio::task::Builder::new()
+            .name(task_for_runner.span_name())
+            .spawn(
+                async move {
+                    let result = task_for_runner
+                        .run(
+                            Arc::clone(&sess),
+                            Arc::clone(&ctx_for_runner),
+                            input,
+                            cancellation_for_runner.clone(),
+                        )
+                        .await;
 
-            if cancellation_for_runner.is_cancelled() {
-                sess.set_agent_status(AgentStatus::Interrupted, Some(ctx_for_runner.as_ref()))
-                    .await;
-                sess.emit_event(
-                    &ctx_for_runner,
-                    EventMsg::TurnInterrupted(TurnInterruptedEvent {
-                        thread_id: sess.id.to_string(),
-                        turn_id: ctx_for_runner.sub_id.clone(),
-                        reason: "cancelled".to_string(),
-                    }),
-                )
-                .await;
-            } else if let Some(last_assistant_message) = result {
-                sess.set_agent_status(
-                    AgentStatus::Completed(Some(last_assistant_message.clone())),
-                    Some(ctx_for_runner.as_ref()),
-                )
-                .await;
-                sess.emit_event(
-                    &ctx_for_runner,
-                    EventMsg::TurnCompleted(TurnCompletedEvent {
-                        thread_id: sess.id.to_string(),
-                        turn_id: ctx_for_runner.sub_id.clone(),
-                        last_assistant_message: Some(last_assistant_message),
-                    }),
-                )
-                .await;
-            }
+                    if cancellation_for_runner.is_cancelled() {
+                        sess.set_agent_status(AgentStatus::Interrupted, Some(ctx_for_runner.as_ref()))
+                            .await;
+                        sess.emit_event(
+                            &ctx_for_runner,
+                            EventMsg::TurnInterrupted(TurnInterruptedEvent {
+                                thread_id: sess.id.to_string(),
+                                turn_id: ctx_for_runner.sub_id.clone(),
+                                reason: "cancelled".to_string(),
+                            }),
+                        )
+                        .await;
+                    } else if let Some(last_assistant_message) = result {
+                        sess.set_agent_status(
+                            AgentStatus::Completed(Some(last_assistant_message.clone())),
+                            Some(ctx_for_runner.as_ref()),
+                        )
+                        .await;
+                        sess.emit_event(
+                            &ctx_for_runner,
+                            EventMsg::TurnCompleted(TurnCompletedEvent {
+                                thread_id: sess.id.to_string(),
+                                turn_id: ctx_for_runner.sub_id.clone(),
+                                last_assistant_message: Some(last_assistant_message),
+                            }),
+                        )
+                        .await;
+                    }
 
-            let mut active_turn = sess.active_turn.lock().await;
-            if let Some(turn) = active_turn.as_mut()
-                && turn.remove_task(&ctx_for_runner.sub_id)
-            {
-                *active_turn = None;
-            }
+                    let mut active_turn = sess.active_turn.lock().await;
+                    if let Some(turn) = active_turn.as_mut()
+                        && turn.remove_task(&ctx_for_runner.sub_id)
+                    {
+                        *active_turn = None;
+                    }
 
-            done_for_runner.notify_waiters();
-        });
+                    done_for_runner.notify_waiters();
+                }
+                .instrument(task_span),
+            )
+            .expect("failed to spawn session task");
 
         let running_task = RunningTask {
             done,
@@ -188,6 +216,7 @@ impl Session {
         turn.add_task(running_task);
     }
 
+    #[tracing::instrument(name = "core.session.abort_all_tasks", skip(self), fields(thread_id = %self.id, reason))]
     pub(crate) async fn abort_all_tasks(self: &Arc<Self>, reason: &str) {
         let drained = {
             let mut active_turn = self.active_turn.lock().await;

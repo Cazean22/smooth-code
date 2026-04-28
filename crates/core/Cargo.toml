@@ -19,3 +19,4 @@ thiserror = "2.0.18"
 time.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true

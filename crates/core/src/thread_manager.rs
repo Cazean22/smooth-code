@@ -33,6 +33,7 @@ impl ThreadManagerState {
         }
     }
 
+    #[tracing::instrument(name = "core.thread_manager.start_thread", skip(self))]
     pub async fn start_thread(&self) -> Result<StartedThread> {
         let thread_id = ThreadId::new();
         let thread = Arc::new(CoreThread::new(thread_id).await?);
@@ -46,6 +47,7 @@ impl ThreadManagerState {
         })
     }
 
+    #[tracing::instrument(name = "core.thread_manager.resume_thread", skip(self), fields(thread_id = %thread_id))]
     pub async fn resume_thread(&self, thread_id: ThreadId) -> Result<ResumedThread> {
         if let Some(thread) = self.threads.read().await.get(&thread_id).cloned() {
             return Ok(ResumedThread {
@@ -70,16 +72,19 @@ impl ThreadManagerState {
         })
     }
 
+    #[tracing::instrument(name = "core.thread_manager.list_threads", skip(self))]
     pub async fn list_threads(&self) -> Result<Vec<ThreadSummary>> {
         let workspace_root = workspace_root()?;
         list_threads(&workspace_root).await
     }
 
+    #[tracing::instrument(name = "core.thread_manager.emit_session_configured", skip(self), fields(thread_id = %thread_id))]
     pub async fn emit_session_configured(&self, thread_id: ThreadId) -> Result<()> {
         self.get(thread_id).await?.emit_session_configured().await;
         Ok(())
     }
 
+    #[tracing::instrument(name = "core.thread_manager.start_user_input", skip(self, input), fields(thread_id = %thread_id, input_len = input.len()))]
     pub async fn start_user_input(&self, thread_id: ThreadId, input: String) -> Result<String> {
         let thread = self.get(thread_id).await?;
         thread.start_user_input(input).await

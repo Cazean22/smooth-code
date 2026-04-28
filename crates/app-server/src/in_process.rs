@@ -6,6 +6,7 @@ use std::{
 use app_server_protocol::{ClientRequest, JSONRPCErrorError, ServerRequest};
 use smooth_protocol::Event;
 use tokio::sync::{RwLock, mpsc, oneshot};
+use tracing::Instrument;
 
 use crate::{
     OutboundConnectionState,
@@ -59,83 +60,100 @@ pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
-    let runtime_handle = tokio::spawn(async move {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
-        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(outgoing_tx));
+    let runtime_span = tracing::info_span!(
+        "app_server.in_process_runtime",
+        channel_capacity,
+    );
+    let runtime_handle = tokio::task::Builder::new()
+        .name("app_server.in_process.runtime")
+        .spawn(
+            async move {
+                let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
+                let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(outgoing_tx));
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(channel_capacity);
-        let outbound_initialized = Arc::new(AtomicBool::new(false));
-        let outbound_opted_out_notification_methods = Arc::new(RwLock::new(HashSet::new()));
+                let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(channel_capacity);
+                let outbound_initialized = Arc::new(AtomicBool::new(false));
+                let outbound_opted_out_notification_methods = Arc::new(RwLock::new(HashSet::new()));
 
-        let outbound_connection_state = OutboundConnectionState::new(
-            writer_tx,
-            Arc::clone(&outbound_initialized),
-            Arc::clone(&outbound_opted_out_notification_methods),
-            /*disconnect_sender*/ None,
-        );
+                let outbound_connection_state = OutboundConnectionState::new(
+                    writer_tx,
+                    Arc::clone(&outbound_initialized),
+                    Arc::clone(&outbound_opted_out_notification_methods),
+                    /*disconnect_sender*/ None,
+                );
 
-        let outbound_handle = tokio::spawn(async move {
-            while let Some(envelope) = outgoing_rx.recv().await {
-                route_outgoing_envelope(&outbound_connection_state, envelope).await;
-            }
-        });
+                let outbound_handle = tokio::task::Builder::new()
+                    .name("app_server.outbound_router")
+                    .spawn(async move {
+                        while let Some(envelope) = outgoing_rx.recv().await {
+                            route_outgoing_envelope(&outbound_connection_state, envelope).await;
+                        }
+                    })
+                    .expect("failed to spawn app-server outbound router");
 
-        let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
-        let processor_handle = tokio::spawn(async move {
-            let processor = Arc::new(MessageProcessor::new(event_tx));
-            let session = Arc::new(ConnectionSessionState::default());
+                let (processor_tx, mut processor_rx) =
+                    mpsc::channel::<ProcessorCommand>(channel_capacity);
+                let processor_handle = tokio::task::Builder::new()
+                    .name("app_server.message_processor")
+                    .spawn(async move {
+                        let processor = Arc::new(MessageProcessor::new(event_tx));
+                        let session = Arc::new(ConnectionSessionState::default());
 
-            loop {
-                tokio::select! {
-                    command = processor_rx.recv() => {
-                        match command {
-                            Some(ProcessorCommand::Request { request, response_tx }) => {
-                                processor
-                                    .process_client_request(
-                                        *request,
-                                        Arc::clone(&session),
-                                        &outbound_initialized,
-                                        response_tx,
-                                    )
-                                    .await;
+                        loop {
+                            tokio::select! {
+                                command = processor_rx.recv() => {
+                                    match command {
+                                        Some(ProcessorCommand::Request { request, response_tx }) => {
+                                            processor
+                                                .process_client_request(
+                                                    *request,
+                                                    Arc::clone(&session),
+                                                    &outbound_initialized,
+                                                    response_tx,
+                                                )
+                                                .await;
+                                        }
+                                        None => {
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                            None => {
+                        }
+                    })
+                    .expect("failed to spawn app-server message processor");
+                loop {
+                    tokio::select! {
+                        message = client_rx.recv() => {
+                            match message {
+                                Some(InProcessClientMessage::Request { request, response_tx }) => {
+                                    if processor_tx
+                                        .send(ProcessorCommand::Request { request, response_tx })
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        queued_message = writer_rx.recv() => {
+                            if queued_message.is_none() {
                                 break;
                             }
                         }
                     }
                 }
+                drop(writer_rx);
+                drop(processor_tx);
+                drop(outgoing_message_sender);
+                let _ = outbound_handle.await;
+                let _ = processor_handle.await;
             }
-        });
-        loop {
-            tokio::select! {
-                message = client_rx.recv() => {
-                    match message {
-                        Some(InProcessClientMessage::Request { request, response_tx }) => {
-                            if processor_tx
-                                .send(ProcessorCommand::Request { request, response_tx })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                queued_message = writer_rx.recv() => {
-                    if queued_message.is_none() {
-                        break;
-                    }
-                }
-            }
-        }
-        drop(writer_rx);
-        drop(processor_tx);
-        drop(outgoing_message_sender);
-        let _ = outbound_handle.await;
-        let _ = processor_handle.await;
-    });
+            .instrument(runtime_span),
+        )
+        .expect("failed to spawn app-server runtime");
     InProcessClientHandle {
         client_tx,
         event_rx,

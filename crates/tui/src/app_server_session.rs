@@ -22,6 +22,7 @@ impl AppServerSession {
         }
     }
 
+    #[tracing::instrument(name = "tui.thread_start", skip(self))]
     pub(crate) async fn start_thread(&mut self) -> Result<ThreadStartResponse> {
         let request = ClientRequest::ThreadStart {
             request_id: RequestId(self.next_request_id as usize),
@@ -36,6 +37,11 @@ impl AppServerSession {
         Ok(serde_json::from_value(value)?)
     }
 
+    #[tracing::instrument(
+        name = "tui.turn_start",
+        skip(self, input),
+        fields(thread_id = %thread_id, input_len = input.len())
+    )]
     pub(crate) async fn turn_start(
         &mut self,
         thread_id: ThreadId,
@@ -57,6 +63,7 @@ impl AppServerSession {
         Ok(serde_json::from_value(value)?)
     }
 
+    #[tracing::instrument(name = "tui.thread_resume", skip(self), fields(thread_id = %thread_id))]
     pub(crate) async fn thread_resume(
         &mut self,
         thread_id: ThreadId,
@@ -76,6 +83,7 @@ impl AppServerSession {
         Ok(serde_json::from_value(value)?)
     }
 
+    #[tracing::instrument(name = "tui.thread_list", skip(self))]
     pub(crate) async fn thread_list(
         &mut self,
         cursor: Option<String>,

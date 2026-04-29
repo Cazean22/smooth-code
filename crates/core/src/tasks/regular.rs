@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     core::{Session, TurnContext},
-    provider::SessionStreamEvent,
+    provider::{SessionAssistantContent, SessionStreamEvent},
     state::TaskKind,
 };
 
@@ -75,72 +75,85 @@ impl SessionTask for RegularTask {
             if cancellation_token.is_cancelled() {
                 return None;
             }
+            // tracing::debug!(?item, "received stream item");
 
             match item.ok()? {
-                SessionStreamEvent::TextDelta(delta) => {
-                    last_assistant_message.push_str(&delta);
+                SessionStreamEvent::StreamAssistantItem(assistant_item) => match assistant_item {
+                    SessionAssistantContent::Text(text) => {
+                        last_assistant_message.push_str(&text.text);
+                        session
+                            .emit_event(
+                                &ctx,
+                                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                                    thread_id: session.id.to_string(),
+                                    turn_id: ctx.sub_id.clone(),
+                                    item_id: ctx.assistant_item_id.clone(),
+                                    delta: text.text,
+                                }),
+                            )
+                            .await;
+                    }
+                    SessionAssistantContent::ToolCall {
+                        tool_call,
+                        internal_call_id,
+                    } => {
+                        saw_tool_loop = true;
+                        session
+                            .emit_event(
+                                &ctx,
+                                EventMsg::ToolCallStarted(ToolCallStartedEvent {
+                                    thread_id: session.id.to_string(),
+                                    turn_id: ctx.sub_id.clone(),
+                                    call_id: internal_call_id,
+                                    tool_name: tool_call.function.name,
+                                    args_preview: tool_call.function.arguments.to_string(),
+                                }),
+                            )
+                            .await;
+                    }
+                    SessionAssistantContent::ToolCallDelta { .. }
+                    | SessionAssistantContent::Reasoning(_)
+                    | SessionAssistantContent::ReasoningDelta { .. }
+                    | SessionAssistantContent::Final => {}
+                },
+                SessionStreamEvent::StreamUserItem(user_item) => match user_item {
+                    rig::streaming::StreamedUserContent::ToolResult {
+                        tool_result,
+                        internal_call_id,
+                    } => {
+                        saw_tool_loop = true;
+                        let output_preview = tool_result
+                            .content
+                            .iter()
+                            .filter_map(|content| match content {
+                                rig::message::ToolResultContent::Text(text) => {
+                                    Some(text.text.as_str())
+                                }
+                                rig::message::ToolResultContent::Image(_) => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        session
+                            .emit_event(
+                                &ctx,
+                                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                                    thread_id: session.id.to_string(),
+                                    turn_id: ctx.sub_id.clone(),
+                                    call_id: internal_call_id,
+                                    success: true,
+                                    output_preview: Some(output_preview),
+                                    error: None,
+                                }),
+                            )
+                            .await;
+                    }
+                },
+                SessionStreamEvent::FinalResponse(final_response) => {
                     session
-                        .emit_event(
-                            &ctx,
-                            EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
-                                thread_id: session.id.to_string(),
-                                turn_id: ctx.sub_id.clone(),
-                                item_id: ctx.assistant_item_id.clone(),
-                                delta,
-                            }),
-                        )
+                        .replace_history(final_response.history().unwrap_or(&[]).to_vec())
                         .await;
-                }
-                SessionStreamEvent::ToolCall {
-                    tool_call,
-                    internal_call_id,
-                } => {
-                    saw_tool_loop = true;
-                    session
-                        .emit_event(
-                            &ctx,
-                            EventMsg::ToolCallStarted(ToolCallStartedEvent {
-                                thread_id: session.id.to_string(),
-                                turn_id: ctx.sub_id.clone(),
-                                call_id: internal_call_id,
-                                tool_name: tool_call.function.name,
-                                args_preview: tool_call.function.arguments.to_string(),
-                            }),
-                        )
-                        .await;
-                }
-                SessionStreamEvent::ToolResult {
-                    tool_result,
-                    internal_call_id,
-                } => {
-                    saw_tool_loop = true;
-                    let output_preview = tool_result
-                        .content
-                        .iter()
-                        .filter_map(|content| match content {
-                            rig::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
-                            rig::message::ToolResultContent::Image(_) => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    session
-                        .emit_event(
-                            &ctx,
-                            EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
-                                thread_id: session.id.to_string(),
-                                turn_id: ctx.sub_id.clone(),
-                                call_id: internal_call_id,
-                                success: true,
-                                output_preview: Some(output_preview),
-                                error: None,
-                            }),
-                        )
-                        .await;
-                }
-                SessionStreamEvent::Final { response, history } => {
-                    session.replace_history(history).await;
-                    if !response.is_empty() {
-                        last_assistant_message = response;
+                    if !final_response.response().is_empty() {
+                        last_assistant_message = final_response.response().to_string();
                         session
                             .persist_assistant_message(last_assistant_message.clone())
                             .await;
@@ -148,6 +161,12 @@ impl SessionTask for RegularTask {
                 }
             }
         }
+        tracing::debug!(
+            thread_id = %session.id,
+            turn_id = %ctx.sub_id,
+            input_count = input.len(),
+            "finished regular task"
+        );
 
         if last_assistant_message.is_empty() && saw_tool_loop {
             return Some(String::new());

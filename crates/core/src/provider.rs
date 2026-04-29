@@ -3,36 +3,49 @@ use std::{env, path::PathBuf, pin::Pin, sync::Arc};
 use anyhow::{Result, bail};
 use futures_util::StreamExt;
 use rig::{
-    agent::{Agent, MultiTurnStreamItem},
+    agent::{Agent, FinalResponse, MultiTurnStreamItem},
     client::CompletionClient,
-    message::{Message, ToolCall, ToolResult},
+    message::{Message, Reasoning as MessageReasoning, Text, ToolCall},
     providers::{
         anthropic, gemini,
         openai::{
             self,
-            responses_api::{AdditionalParameters, Reasoning, ReasoningEffort},
+            responses_api::{AdditionalParameters, Reasoning as OpenAiReasoning, ReasoningEffort},
         },
         openrouter,
     },
-    streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat},
+    streaming::{
+        StreamedAssistantContent, StreamedUserContent, StreamingChat, ToolCallDeltaContent,
+    },
 };
 
 use crate::tools::{ListDirTool, ReadFileTool, RunCommandTool};
 
+#[derive(Debug)]
 pub(crate) enum SessionStreamEvent {
-    TextDelta(String),
+    StreamAssistantItem(SessionAssistantContent),
+    StreamUserItem(StreamedUserContent),
+    FinalResponse(FinalResponse),
+}
+
+#[derive(Debug)]
+pub(crate) enum SessionAssistantContent {
+    Text(Text),
     ToolCall {
         tool_call: ToolCall,
         internal_call_id: String,
     },
-    ToolResult {
-        tool_result: ToolResult,
+    ToolCallDelta {
+        id: String,
         internal_call_id: String,
+        content: ToolCallDeltaContent,
     },
-    Final {
-        response: String,
-        history: Vec<Message>,
+    Reasoning(MessageReasoning),
+    ReasoningDelta {
+        id: Option<String>,
+        reasoning: String,
     },
+    Final,
 }
 
 type SessionStream = Pin<Box<dyn futures_util::Stream<Item = Result<SessionStreamEvent>> + Send>>;
@@ -59,7 +72,7 @@ impl SessionModel {
                 builder = builder.base_url("http://localhost:8317/v1");
                 let client = builder.build()?;
                 let additional_params = AdditionalParameters {
-                    reasoning: Some(Reasoning::new().with_effort(ReasoningEffort::High)),
+                    reasoning: Some(OpenAiReasoning::new().with_effort(ReasoningEffort::High)),
                     ..Default::default()
                 };
                 Ok(Self::OpenAi(Arc::new(build_agent(
@@ -120,6 +133,7 @@ where
         .tool(ListDirTool::new(cwd.clone()))
         .tool(ReadFileTool::new(cwd.clone()))
         .tool(RunCommandTool::new(cwd))
+        .default_max_turns(99999)
         .build()
 }
 
@@ -151,37 +165,41 @@ where
     async_stream::try_stream! {
         while let Some(item) = stream.next().await {
             match item? {
-                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
-                    yield SessionStreamEvent::TextDelta(text.text);
-                }
-                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
-                    tool_call,
-                    internal_call_id,
-                }) => {
-                    yield SessionStreamEvent::ToolCall {
-                        tool_call,
-                        internal_call_id,
+                MultiTurnStreamItem::StreamAssistantItem(assistant_item) => {
+                    let assistant_item = match assistant_item {
+                        StreamedAssistantContent::Text(text) => SessionAssistantContent::Text(text),
+                        StreamedAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id,
+                        } => SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id,
+                        },
+                        StreamedAssistantContent::ToolCallDelta {
+                            id,
+                            internal_call_id,
+                            content,
+                        } => SessionAssistantContent::ToolCallDelta {
+                            id,
+                            internal_call_id,
+                            content,
+                        },
+                        StreamedAssistantContent::Reasoning(reasoning) => {
+                            SessionAssistantContent::Reasoning(reasoning)
+                        }
+                        StreamedAssistantContent::ReasoningDelta { id, reasoning } => {
+                            SessionAssistantContent::ReasoningDelta { id, reasoning }
+                        }
+                        StreamedAssistantContent::Final(_) => SessionAssistantContent::Final,
                     };
+                    yield SessionStreamEvent::StreamAssistantItem(assistant_item);
                 }
-                MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
-                    tool_result,
-                    internal_call_id,
-                }) => {
-                    yield SessionStreamEvent::ToolResult {
-                        tool_result,
-                        internal_call_id,
-                    };
+                MultiTurnStreamItem::StreamUserItem(user_item) => {
+                    yield SessionStreamEvent::StreamUserItem(user_item);
                 }
                 MultiTurnStreamItem::FinalResponse(final_response) => {
-                    yield SessionStreamEvent::Final {
-                        response: final_response.response().to_string(),
-                        history: final_response.history().unwrap_or(&[]).to_vec(),
-                    };
+                    yield SessionStreamEvent::FinalResponse(final_response);
                 }
-                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(_))
-                | MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta { .. })
-                | MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCallDelta { .. })
-                | MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Final(_)) => {}
                 _ => {}
             }
         }

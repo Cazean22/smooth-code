@@ -11,7 +11,7 @@ use rig::{
 use serde::Deserialize;
 use smooth_protocol::{
     AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
-    AgentReasoningDeltaEvent, AgentStatus, EventMsg, ThreadId, ToolCallCompletedEvent,
+    AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, EventMsg, ThreadId, ToolCallCompletedEvent,
     ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
@@ -40,6 +40,39 @@ fn reasoning_text(reasoning: &MessageReasoning) -> String {
             _ => None,
         })
         .collect::<String>()
+}
+
+/// Mark the current turn as failed: log, emit a protocol `Error` event so the
+/// rollout / inbox carries the underlying provider/stream error, and publish
+/// `AgentStatus::Errored` so any parent waiting on this thread (inline waiter,
+/// completion watcher) unblocks with a meaningful status instead of stalling
+/// on `Running` forever or being overwritten with a misleading `Completed`.
+async fn fail_turn(
+    session: &Arc<Session>,
+    ctx: &TurnContext,
+    site: &'static str,
+    err: anyhow::Error,
+) {
+    let message = err.to_string();
+    tracing::error!(
+        thread_id = %session.id,
+        turn_id = %ctx.sub_id,
+        site,
+        error = %message,
+        "session task failed; marking turn errored"
+    );
+    session
+        .emit_event(
+            ctx,
+            EventMsg::Error(ErrorEvent {
+                message: message.clone(),
+                codex_error_info: None,
+            }),
+        )
+        .await;
+    session
+        .set_agent_status(AgentStatus::Errored(message), Some(ctx))
+        .await;
 }
 
 #[derive(Default)]
@@ -215,11 +248,17 @@ async fn run_manual_turn(
             &history_before_turn,
             &new_messages[..new_messages.len().saturating_sub(1)],
         );
-        let mut stream = session
+        let mut stream = match session
             .model()
             .stream_completion_turn(current_prompt, &history_snapshot)
             .await
-            .ok()?;
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                fail_turn(&session, &ctx, "manual.stream_completion_turn.open", err).await;
+                return None;
+            }
+        };
         let mut tool_calls = Vec::new();
         let mut tool_result_messages = Vec::new();
         let mut inline_notices = Vec::new();
@@ -237,7 +276,14 @@ async fn run_manual_turn(
                 return None;
             }
 
-            match item.ok()? {
+            let event = match item {
+                Ok(event) => event,
+                Err(err) => {
+                    fail_turn(&session, &ctx, "manual.stream_completion_turn.item", err).await;
+                    return None;
+                }
+            };
+            match event {
                 SessionCompletionEvent::AssistantItem(assistant_item) => match assistant_item {
                     SessionAssistantContent::Text(text) => {
                         session
@@ -402,11 +448,17 @@ async fn run_opaque_turn(
     history_before_turn: Vec<Message>,
     cancellation_token: CancellationToken,
 ) -> Option<String> {
-    let mut stream = session
+    let mut stream = match session
         .model()
         .stream_turn(prompt, &history_before_turn)
         .await
-        .ok()?;
+    {
+        Ok(stream) => stream,
+        Err(err) => {
+            fail_turn(&session, &ctx, "opaque.stream_turn.open", err).await;
+            return None;
+        }
+    };
     let mut last_assistant_message = String::new();
     let mut saw_tool_loop = false;
 
@@ -415,7 +467,14 @@ async fn run_opaque_turn(
             return None;
         }
 
-        match item.ok()? {
+        let event = match item {
+            Ok(event) => event,
+            Err(err) => {
+                fail_turn(&session, &ctx, "opaque.stream_turn.item", err).await;
+                return None;
+            }
+        };
+        match event {
             SessionStreamEvent::StreamAssistantItem(assistant_item) => match assistant_item {
                 SessionAssistantContent::Text(text) => {
                     last_assistant_message.push_str(&text.text);

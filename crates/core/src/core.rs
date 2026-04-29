@@ -253,6 +253,46 @@ impl Session {
                                 }),
                             )
                             .await;
+                        } else {
+                            // The session task returned `None` without being
+                            // cancelled. The driver may have already published
+                            // a terminal status (e.g. `Errored` from a failed
+                            // provider stream); in that case leave it alone so
+                            // the cause survives. Only if the status is still
+                            // non-terminal do we publish `Completed(None)` so
+                            // any parent waiting on this thread's completion
+                            // (`InlineChildCompletionReceiver`, the per-child
+                            // status watcher in `AgentControl`) unblocks
+                            // instead of stalling on `Running` forever.
+                            let current_status = sess.agent_status.borrow().clone();
+                            if crate::agent::status::is_final(&current_status) {
+                                tracing::debug!(
+                                    thread_id = %sess.id,
+                                    turn_id = %ctx_for_runner.sub_id,
+                                    status = ?current_status,
+                                    "session task ended without a result; terminal status already set, leaving as-is"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    thread_id = %sess.id,
+                                    turn_id = %ctx_for_runner.sub_id,
+                                    "session task ended without a result; marking turn completed with no assistant message"
+                                );
+                                sess.set_agent_status(
+                                    AgentStatus::Completed(None),
+                                    Some(ctx_for_runner.as_ref()),
+                                )
+                                .await;
+                                sess.emit_event(
+                                    &ctx_for_runner,
+                                    EventMsg::TurnCompleted(TurnCompletedEvent {
+                                        thread_id: sess.id.to_string(),
+                                        turn_id: ctx_for_runner.sub_id.clone(),
+                                        last_assistant_message: None,
+                                    }),
+                                )
+                                .await;
+                            }
                         }
 
                         let mut active_turn = sess.active_turn.lock().await;

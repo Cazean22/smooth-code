@@ -44,6 +44,11 @@ pub struct ListDirArgs {
 #[error("{0}")]
 pub struct ToolFailure(String);
 
+#[derive(Deserialize)]
+pub struct DynamicToolArgs {
+    payload: String,
+}
+
 impl Tool for ListDirTool {
     const NAME: &'static str = "list_dir";
 
@@ -238,7 +243,7 @@ impl Tool for DynamicTool {
     const NAME: &'static str = "dynamic_tool";
 
     type Error = ToolFailure;
-    type Args = serde_json::Value;
+    type Args = DynamicToolArgs;
     type Output = String;
 
     fn name(&self) -> String {
@@ -248,10 +253,17 @@ impl Tool for DynamicTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: self.name.clone(),
-            description: "Dispatch a dynamic tool call to the in-process client.".to_string(),
+            description: "Dispatch a dynamic tool call to the in-process client. Provide arguments as a JSON-encoded string in the `payload` field.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
-                "additionalProperties": true
+                "additionalProperties": false,
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "description": "JSON-encoded arguments to forward to the in-process client."
+                    }
+                },
+                "required": ["payload"]
             }),
         }
     }
@@ -262,12 +274,14 @@ impl Tool for DynamicTool {
             .borrow()
             .clone()
             .ok_or_else(|| ToolFailure("no active turn id".to_string()))?;
+        let arguments = serde_json::from_str(&args.payload)
+            .map_err(|err| ToolFailure(format!("invalid payload JSON: {err}")))?;
         let params = DynamicToolCallParams {
             thread_id: self.thread_id.to_string(),
-            turn_id: turn_id.clone(),
+            turn_id,
             call_id: Uuid::new_v4().to_string(),
             tool: self.name.clone(),
-            arguments: args,
+            arguments,
         };
 
         let value = self
@@ -326,7 +340,9 @@ mod tests {
 
         let definition = tool.definition(String::new()).await;
         let output = tool
-            .call(serde_json::json!({ "message": "hello" }))
+            .call(DynamicToolArgs {
+                payload: "{\"message\":\"hello\"}".to_string(),
+            })
             .await
             .expect("tool call should succeed");
         let params = stub
@@ -358,11 +374,36 @@ mod tests {
         );
 
         let err = tool
-            .call(serde_json::json!({}))
+            .call(DynamicToolArgs {
+                payload: "{}".to_string(),
+            })
             .await
             .expect_err("tool call should fail without an active turn");
 
         assert_eq!(err.to_string(), "no active turn id");
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_fails_on_invalid_payload_json() {
+        let (current_turn_id, _) = watch::channel(Some("turn-42".to_string()));
+        let tool = DynamicTool::new(
+            "dynamic_echo",
+            smooth_protocol::ThreadId::new(),
+            Arc::new(StubDynamicToolClient {
+                last_params: Mutex::new(None),
+                result: serde_json::json!({ "ok": true }),
+            }),
+            Arc::new(current_turn_id),
+        );
+
+        let err = tool
+            .call(DynamicToolArgs {
+                payload: "{not-json}".to_string(),
+            })
+            .await
+            .expect_err("tool call should fail on invalid payload JSON");
+
+        assert!(err.to_string().starts_with("invalid payload JSON: "));
     }
 }
 

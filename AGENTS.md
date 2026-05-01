@@ -17,6 +17,7 @@
 - Prefer `anyhow::Result` plus `.context(...)`/`.with_context(...)` at app boundaries, and `thiserror` for narrow domain/tool errors.
 - This project integrates LLM providers through `rig-core`; when a suitable type already exists there, prefer using the `rig-core` type directly instead of introducing a parallel local type.
 - Use typed structs/enums plus serde rename attributes for wire formats; avoid ad hoc JSON construction when a protocol type already exists.
+- For LLM tool argument schemas, derive `schemars::JsonSchema` on the args struct and emit `schema_for!(Args).to_value()` instead of hand-rolling `serde_json::json!`; doc comments become field descriptions, `#[serde(deny_unknown_fields)]` produces `additionalProperties: false`, and `#[schemars(range(...))]` carries numeric bounds.
 - Shared async state is typically `Arc` plus Tokio `Mutex`/`RwLock`/`watch`/`broadcast`; keep new concurrency primitives aligned with that style.
 - Naming conventions are consistent: `*Event`, `*Params`, `*Response`, `*Task`, `*Tool`, `*Session`, `*Thread`; modules and functions stay `snake_case`.
 - Keep changes scoped to the relevant crate and preserve the existing TUI -> app-server -> core -> protocol layering instead of bypassing it.

@@ -19,7 +19,7 @@ use rig::{
     },
 };
 use tokio::sync::watch;
-use tools::{DynamicTool, DynamicToolClient, ListDirTool, ReadFileTool, RunCommandTool};
+use tools::{DynamicTool, DynamicToolClient, ListDirTool, ReadTool, RunCommandTool};
 
 #[derive(Debug)]
 pub(crate) enum SessionStreamEvent {
@@ -151,7 +151,7 @@ where
 {
     let builder = builder
         .tool(ListDirTool::new(cwd.clone()))
-        .tool(ReadFileTool::new(cwd.clone()))
+        .tool(ReadTool::new(cwd.clone()))
         .tool(RunCommandTool::new(cwd));
     let builder = if let Some(dynamic_tool_client) = dynamic_tool_client {
         builder.tool(DynamicTool::new(

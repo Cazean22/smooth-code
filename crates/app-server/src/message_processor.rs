@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    sync::{Arc, OnceLock, atomic::AtomicBool},
-};
+use std::sync::Arc;
 
 use app_server_protocol::{ClientRequest, JSONRPCErrorError};
 use futures_util::FutureExt;
@@ -11,18 +8,6 @@ use crate::{
     core_message_processor::CoreMessageProcessor, in_process::InProcessServerEvent,
     outgoing_message::OutgoingMessageSender,
 };
-
-#[derive(Debug, Default)]
-pub(crate) struct ConnectionSessionState {
-    initialized: OnceLock<InitializedConnectionSessionState>,
-}
-
-#[derive(Debug)]
-struct InitializedConnectionSessionState {
-    opted_out_notification_methods: HashSet<String>,
-    app_server_client_name: String,
-    client_version: String,
-}
 
 pub(crate) struct MessageProcessor {
     core_message_processor: CoreMessageProcessor,
@@ -41,16 +26,13 @@ impl MessageProcessor {
 
     #[tracing::instrument(
         name = "app_server.process_client_request",
-        skip(self, request, session, outbound_initialized, response_tx)
+        skip(self, request, response_tx)
     )]
     pub(crate) async fn process_client_request(
         self: &Arc<Self>,
         request: ClientRequest,
-        session: Arc<ConnectionSessionState>,
-        outbound_initialized: &AtomicBool,
         response_tx: oneshot::Sender<std::result::Result<serde_json::Value, JSONRPCErrorError>>,
     ) {
-        let _ = (session, outbound_initialized);
         let result = self
             .core_message_processor
             .process_request(request)

@@ -1,16 +1,14 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use app_server_protocol::{ClientCommand, JSONRPCErrorError};
 use smooth_protocol::Event;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use crate::{
     OutboundConnectionState,
-    message_processor::{ConnectionSessionState, MessageProcessor},
+    error_code::{OVERLOADED_ERROR_CODE, SERVER_ERROR_CODE},
+    message_processor::MessageProcessor,
     outgoing_message::{
         ConnectionId, OutgoingMessage, OutgoingMessageSender, QueuedOutgoingMessage,
     },
@@ -61,17 +59,10 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
             async move {
                 let (writer_tx, mut writer_rx) =
                     mpsc::channel::<QueuedOutgoingMessage>(channel_capacity);
-                let outbound_initialized = Arc::new(AtomicBool::new(true));
-                let outbound_opted_out_notification_methods = Arc::new(RwLock::new(HashSet::new()));
                 let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
                 outbound_connections.insert(
                     IN_PROCESS_CONNECTION_ID,
-                    OutboundConnectionState::new(
-                        writer_tx,
-                        Arc::clone(&outbound_initialized),
-                        Arc::clone(&outbound_opted_out_notification_methods),
-                        None,
-                    ),
+                    OutboundConnectionState::new(writer_tx, None),
                 );
 
                 let outbound_handle = tokio::task::Builder::new()
@@ -92,24 +83,22 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
                     .spawn(async move {
                         let processor =
                             Arc::new(MessageProcessor::new(processor_event_tx, processor_outgoing));
-                        let session = Arc::new(ConnectionSessionState::default());
 
                         loop {
                             match processor_rx.recv().await {
                                 Some(ClientCommand::Request { request, response_tx }) => {
                                     processor
-                                        .process_client_request(
-                                            *request,
-                                            Arc::clone(&session),
-                                            &outbound_initialized,
-                                            response_tx,
-                                        )
+                                        .process_client_request(*request, response_tx)
                                         .await;
                                 }
                                 Some(
                                     ClientCommand::ServerRequestResponse { .. }
                                     | ClientCommand::ServerRequestError { .. },
-                                ) => {}
+                                ) => {
+                                    tracing::warn!(
+                                        "received server request completion command on processor queue"
+                                    );
+                                }
                                 None => break,
                             }
                         }
@@ -151,11 +140,11 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
                                     ) {
                                         let (code, message) = match send_error {
                                             mpsc::error::TrySendError::Full(_) => (
-                                                -32001,
+                                                OVERLOADED_ERROR_CODE,
                                                 "in-process server request queue is full",
                                             ),
                                             mpsc::error::TrySendError::Closed(_) => (
-                                                -32000,
+                                                SERVER_ERROR_CODE,
                                                 "in-process server request consumer is closed",
                                             ),
                                         };
@@ -195,7 +184,7 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
                 drop(processor_tx);
                 runtime_outgoing
                     .cancel_all_requests(Some(JSONRPCErrorError {
-                        code: -32000,
+                        code: SERVER_ERROR_CODE,
                         data: None,
                         message: "in-process app-server runtime is shutting down".to_string(),
                     }))
@@ -220,7 +209,7 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
 
 #[cfg(test)]
 mod tests {
-    use app_server_protocol::{DynamicToolCallParams, RequestId, ServerRequestPayload};
+    use app_server_protocol::{DynamicToolCallParams, ServerRequestPayload};
     use serde_json::json;
     use smooth_protocol::ThreadId;
     use tokio::time::{Duration, timeout};
@@ -260,7 +249,7 @@ mod tests {
         handle
             .client_tx
             .send(ClientCommand::ServerRequestResponse {
-                request_id: RequestId(observed_request_id.0),
+                request_id: observed_request_id.clone(),
                 result: json!({ "ok": true }),
             })
             .await

@@ -13,9 +13,7 @@ use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 
-use crate::ClientRequestResult;
-
-const INTERNAL_ERROR_CODE: i64 = -32603;
+use crate::{ClientRequestResult, error_code::INTERNAL_ERROR_CODE};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ConnectionId(pub(crate) u64);
@@ -27,6 +25,7 @@ impl fmt::Display for ConnectionId {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)] // Kept for parity with codex's transport-facing API.
 pub(crate) struct ConnectionRequestId {
     pub(crate) connection_id: ConnectionId,
     pub(crate) request_id: RequestId,
@@ -51,6 +50,7 @@ pub(crate) struct QueuedOutgoingMessage {
 }
 
 impl QueuedOutgoingMessage {
+    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
     pub(crate) fn new(message: OutgoingMessage) -> Self {
         Self {
             message,
@@ -124,6 +124,7 @@ impl ThreadScopedOutgoingMessageSender {
             .await
     }
 
+    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
     pub(crate) async fn send_response<T: Serialize>(
         &self,
         request_id: ConnectionRequestId,
@@ -132,6 +133,7 @@ impl ThreadScopedOutgoingMessageSender {
         self.outgoing.send_response(request_id, response).await;
     }
 
+    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
     pub(crate) async fn send_error(
         &self,
         request_id: ConnectionRequestId,
@@ -164,6 +166,7 @@ impl OutgoingMessageSender {
         }
     }
 
+    #[allow(dead_code)] // Used by tests now; kept as public parity API for future transports.
     pub(crate) async fn send_request(
         &self,
         request: ServerRequestPayload,
@@ -240,6 +243,7 @@ impl OutgoingMessageSender {
         (id, callback_rx)
     }
 
+    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
     pub(crate) async fn send_response<T: Serialize>(
         &self,
         request_id: ConnectionRequestId,
@@ -271,6 +275,7 @@ impl OutgoingMessageSender {
         }
     }
 
+    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
     pub(crate) async fn send_error(
         &self,
         request_id: ConnectionRequestId,
@@ -314,6 +319,7 @@ impl OutgoingMessageSender {
         }
     }
 
+    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
     pub(crate) async fn cancel_request(&self, id: &RequestId) -> bool {
         self.take_request_callback(id).await.is_some()
     }
@@ -374,6 +380,7 @@ impl OutgoingMessageSender {
         }
     }
 
+    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
     pub(crate) async fn pending_requests_for_thread(
         &self,
         thread_id: ThreadId,
@@ -389,6 +396,7 @@ impl OutgoingMessageSender {
         requests
     }
 
+    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
     pub(crate) async fn replay_requests_to_connection_for_thread(
         &self,
         connection_id: ConnectionId,

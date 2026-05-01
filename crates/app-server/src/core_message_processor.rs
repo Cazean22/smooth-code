@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
 use crate::{
+    error_code::{INTERNAL_ERROR_CODE, INVALID_PARAMS_ERROR_CODE, SERVER_ERROR_CODE},
     in_process::InProcessServerEvent,
     outgoing_message::{OutgoingMessageSender, ThreadScopedOutgoingMessageSender},
 };
@@ -54,7 +55,7 @@ impl DynamicToolClient for InProcessDynamicToolClient {
             match response_rx.await {
                 Ok(result) => result,
                 Err(err) => Err(JSONRPCErrorError {
-                    code: -32000,
+                    code: SERVER_ERROR_CODE,
                     data: None,
                     message: err.to_string(),
                 }),
@@ -114,7 +115,7 @@ impl CoreMessageProcessor {
                         .thread_id
                         .parse::<ThreadId>()
                         .map_err(|err| JSONRPCErrorError {
-                            code: -32602,
+                            code: INVALID_PARAMS_ERROR_CODE,
                             data: None,
                             message: format!("invalid thread id: {err}"),
                         })?;
@@ -140,7 +141,7 @@ impl CoreMessageProcessor {
                         .thread_id
                         .parse::<ThreadId>()
                         .map_err(|err| JSONRPCErrorError {
-                            code: -32602,
+                            code: INVALID_PARAMS_ERROR_CODE,
                             data: None,
                             message: format!("invalid thread id: {err}"),
                         })?;
@@ -233,7 +234,7 @@ impl CoreMessageProcessor {
 
 fn internal_error(err: anyhow::Error) -> JSONRPCErrorError {
     JSONRPCErrorError {
-        code: -32000,
+        code: SERVER_ERROR_CODE,
         data: None,
         message: err.to_string(),
     }
@@ -241,7 +242,7 @@ fn internal_error(err: anyhow::Error) -> JSONRPCErrorError {
 
 fn internal_serde_error(err: serde_json::Error) -> JSONRPCErrorError {
     JSONRPCErrorError {
-        code: -32603,
+        code: INTERNAL_ERROR_CODE,
         data: None,
         message: err.to_string(),
     }

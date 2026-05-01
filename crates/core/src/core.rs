@@ -197,6 +197,8 @@ impl Session {
                     if let Some(turn) = active_turn.as_mut()
                         && turn.remove_task(&ctx_for_runner.sub_id)
                     {
+                        // smooth-code currently runs a single task per turn, so once that task
+                        // completes there is no longer a current turn to attribute dynamic tools to.
                         *active_turn = None;
                         sess.current_turn_id.send_replace(None);
                     }
@@ -321,6 +323,7 @@ impl Session {
 
     pub(crate) async fn abort_pending_dynamic_tool_requests(&self) {
         if let Some(dynamic_tool_client) = &self.dynamic_tool_client {
+            // The transport adapter currently tracks pending dynamic-tool requests by thread.
             dynamic_tool_client.abort_pending_server_requests().await;
         }
     }

@@ -1,19 +1,13 @@
 mod core_message_processor;
+mod error_code;
 pub mod in_process;
 mod message_processor;
 mod outgoing_message;
 
-use std::{
-    collections::HashMap,
-    collections::HashSet,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::collections::HashMap;
 
 use app_server_protocol::JSONRPCErrorError;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::outgoing_message::{
@@ -22,8 +16,6 @@ use crate::outgoing_message::{
 pub type ClientRequestResult = std::result::Result<serde_json::Value, JSONRPCErrorError>;
 
 pub(crate) struct OutboundConnectionState {
-    pub(crate) initialized: Arc<AtomicBool>,
-    pub(crate) opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     pub(crate) writer: mpsc::Sender<QueuedOutgoingMessage>,
     pub(crate) disconnect_sender: Option<CancellationToken>,
 }
@@ -31,13 +23,9 @@ pub(crate) struct OutboundConnectionState {
 impl OutboundConnectionState {
     pub(crate) fn new(
         writer: mpsc::Sender<QueuedOutgoingMessage>,
-        initialized: Arc<AtomicBool>,
-        opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
         disconnect_sender: Option<CancellationToken>,
     ) -> Self {
         Self {
-            initialized,
-            opted_out_notification_methods,
             writer,
             disconnect_sender,
         }
@@ -100,15 +88,7 @@ pub(crate) async fn route_outgoing_envelope(
                     .await;
         }
         OutgoingEnvelope::Broadcast { message } => {
-            let target_connections = connections
-                .iter()
-                .filter_map(|(connection_id, connection_state)| {
-                    connection_state
-                        .initialized
-                        .load(Ordering::Acquire)
-                        .then_some(*connection_id)
-                })
-                .collect::<Vec<_>>();
+            let target_connections = connections.keys().copied().collect::<Vec<_>>();
             for connection_id in target_connections {
                 let _ =
                     send_message_to_connection(connections, connection_id, message.clone(), None)

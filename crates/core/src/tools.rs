@@ -241,6 +241,10 @@ impl Tool for DynamicTool {
     type Args = serde_json::Value;
     type Output = String;
 
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: self.name.clone(),
@@ -272,6 +276,93 @@ impl Tool for DynamicTool {
             .await
             .map_err(|err| ToolFailure(err.message))?;
         Ok(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use tokio::sync::watch;
+
+    use super::*;
+
+    struct StubDynamicToolClient {
+        last_params: Mutex<Option<DynamicToolCallParams>>,
+        result: serde_json::Value,
+    }
+
+    impl DynamicToolClient for StubDynamicToolClient {
+        fn call(
+            &self,
+            params: DynamicToolCallParams,
+        ) -> BoxFuture<'static, Result<serde_json::Value, JSONRPCErrorError>> {
+            *self
+                .last_params
+                .lock()
+                .expect("stub params mutex should lock") = Some(params);
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+
+        fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_uses_runtime_tool_name_and_current_turn_id() {
+        let stub = Arc::new(StubDynamicToolClient {
+            last_params: Mutex::new(None),
+            result: serde_json::json!({ "ok": true }),
+        });
+        let (current_turn_id, _) = watch::channel(Some("turn-42".to_string()));
+        let tool = DynamicTool::new(
+            "dynamic_echo",
+            smooth_protocol::ThreadId::new(),
+            stub.clone(),
+            Arc::new(current_turn_id),
+        );
+
+        let definition = tool.definition(String::new()).await;
+        let output = tool
+            .call(serde_json::json!({ "message": "hello" }))
+            .await
+            .expect("tool call should succeed");
+        let params = stub
+            .last_params
+            .lock()
+            .expect("stub params mutex should lock")
+            .clone()
+            .expect("tool call should record params");
+
+        assert_eq!(tool.name(), "dynamic_echo");
+        assert_eq!(definition.name, "dynamic_echo");
+        assert_eq!(params.turn_id, "turn-42");
+        assert_eq!(params.tool, "dynamic_echo");
+        assert_eq!(params.arguments, serde_json::json!({ "message": "hello" }));
+        assert_eq!(output, "{\"ok\":true}");
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_fails_without_an_active_turn() {
+        let (current_turn_id, _) = watch::channel(None);
+        let tool = DynamicTool::new(
+            "dynamic_echo",
+            smooth_protocol::ThreadId::new(),
+            Arc::new(StubDynamicToolClient {
+                last_params: Mutex::new(None),
+                result: serde_json::json!({ "ok": true }),
+            }),
+            Arc::new(current_turn_id),
+        );
+
+        let err = tool
+            .call(serde_json::json!({}))
+            .await
+            .expect_err("tool call should fail without an active turn");
+
+        assert_eq!(err.to_string(), "no active turn id");
     }
 }
 

@@ -7,7 +7,10 @@ use app_server_protocol::{ClientRequest, JSONRPCErrorError};
 use futures_util::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{core_message_processor::CoreMessageProcessor, in_process::InProcessServerEvent};
+use crate::{
+    core_message_processor::CoreMessageProcessor, in_process::InProcessServerEvent,
+    outgoing_message::OutgoingMessageSender,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionSessionState {
@@ -26,8 +29,11 @@ pub(crate) struct MessageProcessor {
 }
 
 impl MessageProcessor {
-    pub(crate) fn new(event_tx: mpsc::Sender<InProcessServerEvent>) -> Self {
-        let core_message_processor = CoreMessageProcessor::new(event_tx);
+    pub(crate) fn new(
+        event_tx: mpsc::Sender<InProcessServerEvent>,
+        outgoing: Arc<OutgoingMessageSender>,
+    ) -> Self {
+        let core_message_processor = CoreMessageProcessor::new(event_tx, outgoing);
         Self {
             core_message_processor,
         }

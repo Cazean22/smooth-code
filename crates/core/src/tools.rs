@@ -1,10 +1,28 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 
+use app_server_protocol::{DynamicToolCallParams, JSONRPCErrorError};
+use futures_util::future::BoxFuture;
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::Deserialize;
+use tokio::sync::watch;
+use uuid::Uuid;
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
+
+pub trait DynamicToolClient: Send + Sync {
+    fn call(
+        &self,
+        params: DynamicToolCallParams,
+    ) -> BoxFuture<'static, Result<serde_json::Value, JSONRPCErrorError>>;
+
+    fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()>;
+}
+
+pub trait DynamicToolClientFactory: Send + Sync {
+    fn build(&self, thread_id: smooth_protocol::ThreadId) -> Arc<dyn DynamicToolClient>;
+}
 
 #[derive(Clone)]
 pub(crate) struct ListDirTool {
@@ -189,6 +207,71 @@ impl Tool for RunCommandTool {
         }
 
         Ok(truncate_output(text))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DynamicTool {
+    name: String,
+    thread_id: smooth_protocol::ThreadId,
+    client: Arc<dyn DynamicToolClient>,
+    current_turn_id: Arc<watch::Sender<Option<String>>>,
+}
+
+impl DynamicTool {
+    pub(crate) fn new(
+        name: impl Into<String>,
+        thread_id: smooth_protocol::ThreadId,
+        client: Arc<dyn DynamicToolClient>,
+        current_turn_id: Arc<watch::Sender<Option<String>>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            thread_id,
+            client,
+            current_turn_id,
+        }
+    }
+}
+
+impl Tool for DynamicTool {
+    const NAME: &'static str = "dynamic_tool";
+
+    type Error = ToolFailure;
+    type Args = serde_json::Value;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.clone(),
+            description: "Dispatch a dynamic tool call to the in-process client.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": true
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let turn_id = self
+            .current_turn_id
+            .borrow()
+            .clone()
+            .ok_or_else(|| ToolFailure("no active turn id".to_string()))?;
+        let params = DynamicToolCallParams {
+            thread_id: self.thread_id.to_string(),
+            turn_id: turn_id.clone(),
+            call_id: Uuid::new_v4().to_string(),
+            tool: self.name.clone(),
+            arguments: args,
+        };
+
+        let value = self
+            .client
+            .call(params)
+            .await
+            .map_err(|err| ToolFailure(err.message))?;
+        Ok(value.to_string())
     }
 }
 

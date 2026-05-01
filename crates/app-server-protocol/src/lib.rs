@@ -23,4 +23,12 @@ pub enum ClientCommand {
         request: Box<ClientRequest>,
         response_tx: oneshot::Sender<std::result::Result<serde_json::Value, JSONRPCErrorError>>,
     },
+    ServerRequestResponse {
+        request_id: RequestId,
+        result: serde_json::Value,
+    },
+    ServerRequestError {
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    },
 }

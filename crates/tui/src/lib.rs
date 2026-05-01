@@ -19,6 +19,7 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ratatui::{Terminal, prelude::CrosstermBackend};
+use serde_json::json;
 
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -41,7 +42,37 @@ pub async fn run() -> Result<()> {
                         app.handle_session_event(event, viewport_height);
                         terminal.draw(|frame| app.render(frame))?;
                     }
-                    Some(InProcessServerEvent::ServerRequest(_)) => {}
+                    Some(InProcessServerEvent::ServerRequest(request)) => {
+                        match request {
+                            app_server_protocol::ServerRequest::DynamicToolCall {
+                                request_id,
+                                params,
+                            } => {
+                                if params.tool == "dynamic_error" {
+                                    app_server
+                                        .fail_server_request(
+                                            request_id,
+                                            app_server_protocol::JSONRPCErrorError {
+                                                code: -32000,
+                                                data: None,
+                                                message: "stub dynamic tool failure".to_string(),
+                                            },
+                                        )
+                                        .await?;
+                                } else {
+                                    app_server
+                                        .respond_to_server_request(
+                                            request_id,
+                                            json!({
+                                                "stub": true,
+                                                "tool": params.tool,
+                                            }),
+                                        )
+                                        .await?;
+                                }
+                            }
+                        }
+                    }
                     None => break,
                 }
             }

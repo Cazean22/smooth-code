@@ -21,6 +21,7 @@ use crate::{
     rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persist_event},
     state::{ActiveTurn, RunningTask, SessionState},
     tasks::{RegularTask, SessionTask},
+    tools::DynamicToolClient,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -36,6 +37,8 @@ pub(crate) struct Session {
     event_tx: broadcast::Sender<Event>,
     state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    current_turn_id: Arc<watch::Sender<Option<String>>>,
+    dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     next_internal_sub_id: AtomicU64,
     model: SessionModel,
     rollout: RolloutRecorder,
@@ -56,6 +59,8 @@ impl Core {
         history: Vec<Message>,
         next_internal_sub_id: u64,
         rollout: RolloutRecorder,
+        current_turn_id: Arc<watch::Sender<Option<String>>>,
+        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     ) -> Self {
         let (agent_status, _) = watch::channel(AgentStatus::PendingInit);
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -67,6 +72,8 @@ impl Core {
             event_tx,
             state: Mutex::new(SessionState::new(context_manager)),
             active_turn: Mutex::new(None),
+            current_turn_id,
+            dynamic_tool_client,
             next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
             model,
             rollout,
@@ -129,6 +136,8 @@ impl Session {
             }),
         )
         .await;
+        self.current_turn_id
+            .send_replace(Some(turn_context.sub_id.clone()));
         self.set_agent_status(AgentStatus::Running, Some(turn_context.as_ref()))
             .await;
 
@@ -189,6 +198,7 @@ impl Session {
                         && turn.remove_task(&ctx_for_runner.sub_id)
                     {
                         *active_turn = None;
+                        sess.current_turn_id.send_replace(None);
                     }
 
                     done_for_runner.notify_waiters();
@@ -219,6 +229,7 @@ impl Session {
         };
 
         if let Some(tasks) = drained {
+            self.current_turn_id.send_replace(None);
             for task in tasks {
                 task.cancellation_token.cancel();
                 task.task
@@ -306,6 +317,12 @@ impl Session {
 
     pub(crate) fn model(&self) -> &SessionModel {
         &self.model
+    }
+
+    pub(crate) async fn abort_pending_dynamic_tool_requests(&self) {
+        if let Some(dynamic_tool_client) = &self.dynamic_tool_client {
+            dynamic_tool_client.abort_pending_server_requests().await;
+        }
     }
 
     fn next_internal_sub_id(&self) -> String {

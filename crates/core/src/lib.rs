@@ -10,3 +10,4 @@ mod tools;
 
 pub use rollout::ThreadSummary;
 pub use thread_manager::{ResumedThread, StartedThread, ThreadManagerState};
+pub use tools::{DynamicToolClient, DynamicToolClientFactory};

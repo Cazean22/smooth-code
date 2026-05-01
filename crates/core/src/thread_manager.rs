@@ -9,6 +9,7 @@ use crate::{
     ThreadSummary,
     core_thread::CoreThread,
     rollout::{find_thread_path, list_threads, load_resume_state, workspace_root},
+    tools::{DynamicToolClient, DynamicToolClientFactory},
 };
 
 pub struct StartedThread {
@@ -24,19 +25,22 @@ pub struct ResumedThread {
 
 pub struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
+    dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
 }
 
 impl ThreadManagerState {
-    pub fn new() -> Self {
+    pub fn new(dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>) -> Self {
         Self {
             threads: Arc::new(RwLock::new(HashMap::new())),
+            dynamic_tool_client_factory,
         }
     }
 
     #[tracing::instrument(name = "core.thread_manager.start_thread", skip(self))]
     pub async fn start_thread(&self) -> Result<StartedThread> {
         let thread_id = ThreadId::new();
-        let thread = Arc::new(CoreThread::new(thread_id).await?);
+        let thread =
+            Arc::new(CoreThread::new(thread_id, self.dynamic_tool_client(thread_id)).await?);
         let rollout_path = thread.rollout_path().clone();
 
         let mut threads = self.threads.write().await;
@@ -61,7 +65,14 @@ impl ThreadManagerState {
         let rollout_path = find_thread_path(&workspace_root, thread_id).await?;
         let resume_state = load_resume_state(&rollout_path).await?;
         let initial_messages = resume_state.initial_messages.clone();
-        let thread = Arc::new(CoreThread::resume(rollout_path.clone(), resume_state).await?);
+        let thread = Arc::new(
+            CoreThread::resume(
+                rollout_path.clone(),
+                resume_state,
+                self.dynamic_tool_client(thread_id),
+            )
+            .await?,
+        );
 
         let mut threads = self.threads.write().await;
         threads.insert(thread_id, thread);
@@ -101,5 +112,11 @@ impl ThreadManagerState {
             .get(&thread_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown thread id: {thread_id}"))
+    }
+
+    fn dynamic_tool_client(&self, thread_id: ThreadId) -> Option<Arc<dyn DynamicToolClient>> {
+        self.dynamic_tool_client_factory
+            .as_ref()
+            .map(|factory| factory.build(thread_id))
     }
 }

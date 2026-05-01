@@ -12,7 +12,7 @@ pub(crate) struct AppServerClient {
 impl AppServerClient {
     pub(crate) fn start(channel_capacity: usize) -> anyhow::Result<Self> {
         let mut handle = in_process::start(InProcessStartArgs { channel_capacity });
-        let request_sender = handle.client_tx.clone();
+        let client_tx = handle.client_tx.clone();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
         let worker_handle = tokio::task::Builder::new()
@@ -30,7 +30,7 @@ impl AppServerClient {
                                         ClientRequest::ThreadResume { .. } => "thread_resume",
                                         ClientRequest::ThreadList { .. } => "thread_list",
                                     };
-                                    let request_sender = request_sender.clone();
+                                    let client_tx = client_tx.clone();
                                     let request_span = tracing::info_span!(
                                         "tui.app_server.forward_request",
                                         request = request_name,
@@ -43,7 +43,7 @@ impl AppServerClient {
                                         .name("tui.app_server.forward_request")
                                         .spawn(
                                             async move {
-                                                let _ = request_sender
+                                                let _ = client_tx
                                                     .send(ClientCommand::Request {
                                                         request,
                                                         response_tx,
@@ -53,6 +53,12 @@ impl AppServerClient {
                                             .instrument(request_span),
                                         )
                                         .expect("failed to spawn app-server request forwarder");
+                                }
+                                Some(command @ ClientCommand::ServerRequestResponse { .. }) => {
+                                    let _ = client_tx.send(command).await;
+                                }
+                                Some(command @ ClientCommand::ServerRequestError { .. }) => {
+                                    let _ = client_tx.send(command).await;
                                 }
                                 None => {}
                             }
@@ -117,5 +123,27 @@ impl AppServerClient {
 
     pub(crate) async fn next_event(&mut self) -> Option<InProcessServerEvent> {
         self.event_rx.recv().await
+    }
+
+    pub(crate) async fn respond_to_server_request(
+        &self,
+        request_id: app_server_protocol::RequestId,
+        result: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.command_tx
+            .send(ClientCommand::ServerRequestResponse { request_id, result })
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn fail_server_request(
+        &self,
+        request_id: app_server_protocol::RequestId,
+        error: JSONRPCErrorError,
+    ) -> anyhow::Result<()> {
+        self.command_tx
+            .send(ClientCommand::ServerRequestError { request_id, error })
+            .await?;
+        Ok(())
     }
 }

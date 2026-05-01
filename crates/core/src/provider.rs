@@ -18,8 +18,9 @@ use rig::{
         StreamedAssistantContent, StreamedUserContent, StreamingChat, ToolCallDeltaContent,
     },
 };
+use tokio::sync::watch;
 
-use crate::tools::{ListDirTool, ReadFileTool, RunCommandTool};
+use crate::tools::{DynamicTool, DynamicToolClient, ListDirTool, ReadFileTool, RunCommandTool};
 
 #[derive(Debug)]
 pub(crate) enum SessionStreamEvent {
@@ -58,7 +59,12 @@ pub(crate) enum SessionModel {
 }
 
 impl SessionModel {
-    pub(crate) fn from_env(cwd: PathBuf) -> Result<Self> {
+    pub(crate) fn from_env(
+        cwd: PathBuf,
+        thread_id: smooth_protocol::ThreadId,
+        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        current_turn_id: Arc<watch::Sender<Option<String>>>,
+    ) -> Result<Self> {
         let provider = env::var("SMOOTH_CODE_LLM_PROVIDER")
             .unwrap_or_else(|_| "openai".to_string())
             .to_ascii_lowercase();
@@ -81,6 +87,9 @@ impl SessionModel {
                         .preamble(&preamble)
                         .additional_params(additional_params.to_json()),
                     cwd,
+                    thread_id,
+                    dynamic_tool_client.clone(),
+                    Arc::clone(&current_turn_id),
                 ))))
             }
             "openrouter" => {
@@ -88,6 +97,9 @@ impl SessionModel {
                 Ok(Self::OpenRouter(Arc::new(build_agent(
                     client.agent(&model).preamble(&preamble),
                     cwd,
+                    thread_id,
+                    dynamic_tool_client.clone(),
+                    Arc::clone(&current_turn_id),
                 ))))
             }
             "anthropic" => {
@@ -95,6 +107,9 @@ impl SessionModel {
                 Ok(Self::Anthropic(Arc::new(build_agent(
                     client.agent(&model).preamble(&preamble),
                     cwd,
+                    thread_id,
+                    dynamic_tool_client.clone(),
+                    Arc::clone(&current_turn_id),
                 ))))
             }
             "gemini" => {
@@ -102,6 +117,9 @@ impl SessionModel {
                 Ok(Self::Gemini(Arc::new(build_agent(
                     client.agent(&model).preamble(&preamble),
                     cwd,
+                    thread_id,
+                    dynamic_tool_client,
+                    current_turn_id,
                 ))))
             }
             other => bail!("unsupported SMOOTH_CODE_LLM_PROVIDER `{other}`"),
@@ -125,16 +143,28 @@ impl SessionModel {
 fn build_agent<M>(
     builder: rig::agent::AgentBuilder<M, (), rig::agent::NoToolConfig>,
     cwd: PathBuf,
+    thread_id: smooth_protocol::ThreadId,
+    dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+    current_turn_id: Arc<watch::Sender<Option<String>>>,
 ) -> Agent<M>
 where
     M: rig::completion::CompletionModel,
 {
-    builder
+    let builder = builder
         .tool(ListDirTool::new(cwd.clone()))
         .tool(ReadFileTool::new(cwd.clone()))
-        .tool(RunCommandTool::new(cwd))
-        .default_max_turns(99999)
-        .build()
+        .tool(RunCommandTool::new(cwd));
+    let builder = if let Some(dynamic_tool_client) = dynamic_tool_client {
+        builder.tool(DynamicTool::new(
+            "dynamic_echo",
+            thread_id,
+            dynamic_tool_client,
+            current_turn_id,
+        ))
+    } else {
+        builder
+    };
+    builder.default_max_turns(99999).build()
 }
 
 async fn stream_agent<M>(

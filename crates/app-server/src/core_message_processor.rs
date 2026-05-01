@@ -1,15 +1,19 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use app_server_protocol::{
-    ClientRequest, ThreadListItem, ThreadListResponse, ThreadResumeResponse, ThreadStartResponse,
-    TurnStartResponse,
+    ClientRequest, DynamicToolCallParams, JSONRPCErrorError, ServerRequestPayload, ThreadListItem,
+    ThreadListResponse, ThreadResumeResponse, ThreadStartResponse, TurnStartResponse,
 };
-use smooth_core::{ThreadManagerState, ThreadSummary};
+use futures_util::future::BoxFuture;
+use smooth_core::{DynamicToolClient, DynamicToolClientFactory, ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
-use crate::in_process::InProcessServerEvent;
+use crate::{
+    in_process::InProcessServerEvent,
+    outgoing_message::{OutgoingMessageSender, ThreadScopedOutgoingMessageSender},
+};
 
 pub(crate) struct CoreMessageProcessor {
     threads: ThreadManagerState,
@@ -17,10 +21,64 @@ pub(crate) struct CoreMessageProcessor {
     subscribed_threads: Mutex<HashSet<ThreadId>>,
 }
 
+struct InProcessDynamicToolClientFactory {
+    outgoing: Arc<OutgoingMessageSender>,
+}
+
+struct InProcessDynamicToolClient {
+    outgoing: ThreadScopedOutgoingMessageSender,
+}
+
+impl DynamicToolClientFactory for InProcessDynamicToolClientFactory {
+    fn build(&self, thread_id: ThreadId) -> Arc<dyn DynamicToolClient> {
+        Arc::new(InProcessDynamicToolClient {
+            outgoing: ThreadScopedOutgoingMessageSender::new(
+                Arc::clone(&self.outgoing),
+                vec![crate::in_process::IN_PROCESS_CONNECTION_ID],
+                thread_id,
+            ),
+        })
+    }
+}
+
+impl DynamicToolClient for InProcessDynamicToolClient {
+    fn call(
+        &self,
+        params: DynamicToolCallParams,
+    ) -> BoxFuture<'static, Result<serde_json::Value, JSONRPCErrorError>> {
+        let outgoing = self.outgoing.clone();
+        Box::pin(async move {
+            let (_, response_rx) = outgoing
+                .send_request(ServerRequestPayload::DynamicToolCall(params))
+                .await;
+            match response_rx.await {
+                Ok(result) => result,
+                Err(err) => Err(JSONRPCErrorError {
+                    code: -32000,
+                    data: None,
+                    message: err.to_string(),
+                }),
+            }
+        })
+    }
+
+    fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()> {
+        let outgoing = self.outgoing.clone();
+        Box::pin(async move {
+            outgoing.abort_pending_server_requests().await;
+        })
+    }
+}
+
 impl CoreMessageProcessor {
-    pub fn new(event_tx: mpsc::Sender<InProcessServerEvent>) -> Self {
+    pub fn new(
+        event_tx: mpsc::Sender<InProcessServerEvent>,
+        outgoing: Arc<OutgoingMessageSender>,
+    ) -> Self {
+        let dynamic_tool_client_factory: Arc<dyn DynamicToolClientFactory> =
+            Arc::new(InProcessDynamicToolClientFactory { outgoing });
         Self {
-            threads: ThreadManagerState::new(),
+            threads: ThreadManagerState::new(Some(dynamic_tool_client_factory)),
             event_tx,
             subscribed_threads: Mutex::new(HashSet::new()),
         }
@@ -29,7 +87,7 @@ impl CoreMessageProcessor {
     pub async fn process_request(
         &self,
         request: ClientRequest,
-    ) -> Result<serde_json::Value, app_server_protocol::JSONRPCErrorError> {
+    ) -> Result<serde_json::Value, JSONRPCErrorError> {
         match request {
             ClientRequest::ThreadStart { .. } => {
                 tracing::debug!("processing thread start request");
@@ -51,13 +109,15 @@ impl CoreMessageProcessor {
                     input_len = params.input.len(),
                     "processing turn start request"
                 );
-                let thread_id = params.thread_id.parse::<ThreadId>().map_err(|err| {
-                    app_server_protocol::JSONRPCErrorError {
-                        code: -32602,
-                        data: None,
-                        message: format!("invalid thread id: {err}"),
-                    }
-                })?;
+                let thread_id =
+                    params
+                        .thread_id
+                        .parse::<ThreadId>()
+                        .map_err(|err| JSONRPCErrorError {
+                            code: -32602,
+                            data: None,
+                            message: format!("invalid thread id: {err}"),
+                        })?;
                 self.ensure_thread_subscription(thread_id).await;
                 let turn_id = self
                     .threads
@@ -75,13 +135,15 @@ impl CoreMessageProcessor {
                     thread_id = %params.thread_id,
                     "processing thread resume request"
                 );
-                let thread_id = params.thread_id.parse::<ThreadId>().map_err(|err| {
-                    app_server_protocol::JSONRPCErrorError {
-                        code: -32602,
-                        data: None,
-                        message: format!("invalid thread id: {err}"),
-                    }
-                })?;
+                let thread_id =
+                    params
+                        .thread_id
+                        .parse::<ThreadId>()
+                        .map_err(|err| JSONRPCErrorError {
+                            code: -32602,
+                            data: None,
+                            message: format!("invalid thread id: {err}"),
+                        })?;
                 let resumed = self
                     .threads
                     .resume_thread(thread_id)
@@ -169,16 +231,16 @@ impl CoreMessageProcessor {
     }
 }
 
-fn internal_error(err: anyhow::Error) -> app_server_protocol::JSONRPCErrorError {
-    app_server_protocol::JSONRPCErrorError {
+fn internal_error(err: anyhow::Error) -> JSONRPCErrorError {
+    JSONRPCErrorError {
         code: -32000,
         data: None,
         message: err.to_string(),
     }
 }
 
-fn internal_serde_error(err: serde_json::Error) -> app_server_protocol::JSONRPCErrorError {
-    app_server_protocol::JSONRPCErrorError {
+fn internal_serde_error(err: serde_json::Error) -> JSONRPCErrorError {
+    JSONRPCErrorError {
         code: -32603,
         data: None,
         message: err.to_string(),

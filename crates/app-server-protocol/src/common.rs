@@ -77,6 +77,20 @@ pub struct DynamicToolCallParams {
     pub arguments: serde_json::Value,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[allow(clippy::large_enum_variant)]
+pub enum ServerRequestPayload {
+    DynamicToolCall(DynamicToolCallParams),
+}
+
+impl ServerRequestPayload {
+    pub fn request_with_id(self, request_id: RequestId) -> ServerRequest {
+        match self {
+            Self::DynamicToolCall(params) => ServerRequest::DynamicToolCall { request_id, params },
+        }
+    }
+}
+
 #[doc = r" Request from the client to the server."]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(tag = "method", rename_all = "camelCase")]
@@ -115,4 +129,12 @@ pub enum ServerRequest {
         request_id: RequestId,
         params: DynamicToolCallParams,
     },
+}
+
+impl ServerRequest {
+    pub fn id(&self) -> &RequestId {
+        match self {
+            Self::DynamicToolCall { request_id, .. } => request_id,
+        }
+    }
 }

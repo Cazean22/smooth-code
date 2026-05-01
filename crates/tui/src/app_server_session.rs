@@ -105,4 +105,26 @@ impl AppServerSession {
     pub(crate) async fn next_event(&mut self) -> Option<InProcessServerEvent> {
         self.client.next_event().await
     }
+
+    pub(crate) async fn respond_to_server_request(
+        &self,
+        request_id: RequestId,
+        result: serde_json::Value,
+    ) -> Result<()> {
+        self.client
+            .respond_to_server_request(request_id, result)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn fail_server_request(
+        &self,
+        request_id: RequestId,
+        error: app_server_protocol::JSONRPCErrorError,
+    ) -> Result<()> {
+        self.client
+            .fail_server_request(request_id, error)
+            .await
+            .map_err(Into::into)
+    }
 }

@@ -192,4 +192,9 @@ impl SessionTask for RegularTask {
             .await;
         Some(last_assistant_message)
     }
+
+    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
+        let _ = ctx;
+        session.abort_pending_dynamic_tool_requests().await;
+    }
 }

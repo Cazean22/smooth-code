@@ -4,15 +4,21 @@ mod message_processor;
 mod outgoing_message;
 
 use std::{
+    collections::HashMap,
     collections::HashSet,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use app_server_protocol::JSONRPCErrorError;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::outgoing_message::{OutgoingEnvelope, OutgoingMessage, QueuedOutgoingMessage};
+use crate::outgoing_message::{
+    ConnectionId, OutgoingEnvelope, OutgoingMessage, QueuedOutgoingMessage,
+};
 pub type ClientRequestResult = std::result::Result<serde_json::Value, JSONRPCErrorError>;
 
 pub(crate) struct OutboundConnectionState {
@@ -49,10 +55,15 @@ impl OutboundConnectionState {
 }
 
 async fn send_message_to_connection(
-    connection_state: &OutboundConnectionState,
+    connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
+    connection_id: ConnectionId,
     message: OutgoingMessage,
     write_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> bool {
+    let Some(connection_state) = connections.get(&connection_id) else {
+        tracing::warn!("dropping message for disconnected connection: {connection_id:?}");
+        return false;
+    };
     let writer = connection_state.writer.clone();
     let queued_message = QueuedOutgoingMessage {
         message,
@@ -75,18 +86,34 @@ async fn send_message_to_connection(
 }
 
 pub(crate) async fn route_outgoing_envelope(
-    connection_state: &OutboundConnectionState,
+    connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     envelope: OutgoingEnvelope,
 ) {
     match envelope {
         OutgoingEnvelope::ToConnection {
+            connection_id,
             message,
             write_complete_tx,
         } => {
-            let _ = send_message_to_connection(connection_state, message, write_complete_tx).await;
+            let _ =
+                send_message_to_connection(connections, connection_id, message, write_complete_tx)
+                    .await;
         }
         OutgoingEnvelope::Broadcast { message } => {
-            let _ = send_message_to_connection(connection_state, message, None).await;
+            let target_connections = connections
+                .iter()
+                .filter_map(|(connection_id, connection_state)| {
+                    connection_state
+                        .initialized
+                        .load(Ordering::Acquire)
+                        .then_some(*connection_id)
+                })
+                .collect::<Vec<_>>();
+            for connection_id in target_connections {
+                let _ =
+                    send_message_to_connection(connections, connection_id, message.clone(), None)
+                        .await;
+            }
         }
     }
 }

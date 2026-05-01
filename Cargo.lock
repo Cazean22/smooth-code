@@ -2641,6 +2641,7 @@ name = "smooth-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "app-server-protocol",
  "async-channel",
  "async-stream",
  "futures-util",
@@ -2654,6 +2655,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

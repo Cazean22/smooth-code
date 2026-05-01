@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -12,7 +14,10 @@ use smooth_protocol::{AgentStatus, Event, EventMsg, ThreadId};
 use crate::{
     AppTerminal,
     app_server_session::AppServerSession,
-    history_cell::{AgentMessageCell, HistoryCell, PlainHistoryCell, UserHistoryCell},
+    history_cell::{
+        AgentMessageCell, HistoryCell, PlainHistoryCell, ToolCallCell, ToolCallState,
+        UserHistoryCell,
+    },
     streaming::StreamController,
 };
 
@@ -27,6 +32,7 @@ pub(crate) struct App {
     transcript_cells: Vec<Box<dyn HistoryCell>>,
     active_cell: Option<AgentMessageCell>,
     stream_controller: Option<StreamController>,
+    tool_call_rows: HashMap<String, (usize, String, String)>,
     current_turn_id: Option<String>,
     committed_assistant_item_id: Option<String>,
     committed_assistant_for_current_turn: bool,
@@ -45,6 +51,7 @@ impl App {
             transcript_cells: Vec::new(),
             active_cell: None,
             stream_controller: None,
+            tool_call_rows: HashMap::new(),
             current_turn_id: None,
             committed_assistant_item_id: None,
             committed_assistant_for_current_turn: false,
@@ -142,6 +149,7 @@ impl App {
             }
             EventMsg::TurnStarted(turn) => {
                 self.is_turn_running = true;
+                self.tool_call_rows.clear();
                 self.current_turn_id = Some(turn.turn_id.clone());
                 self.committed_assistant_item_id = None;
                 self.committed_assistant_for_current_turn = false;
@@ -190,25 +198,33 @@ impl App {
             }
             EventMsg::ToolCallStarted(tool) => {
                 self.finalize_stream(None);
-                self.push_history(Box::new(PlainHistoryCell::new(vec![Line::from(vec![
-                    Span::styled("[tool:start] ", Style::default().fg(Color::Blue).bold()),
-                    Span::raw(tool.tool_name),
-                    Span::raw(" "),
-                    Span::styled(tool.args_preview, Style::default().dim()),
-                ])])));
+                let idx = self.transcript_cells.len();
+                self.tool_call_rows.insert(
+                    tool.call_id,
+                    (idx, tool.tool_name.clone(), tool.args_preview.clone()),
+                );
+                let cell = ToolCallCell::running(tool.tool_name, tool.args_preview);
+                self.push_history(Box::new(cell));
             }
             EventMsg::ToolCallCompleted(tool) => {
                 self.finalize_stream(None);
-                let detail = tool
-                    .output_preview
-                    .or(tool.error)
-                    .unwrap_or_else(|| String::from("done"));
-                self.push_history(Box::new(PlainHistoryCell::new(vec![Line::from(vec![
-                    Span::styled("[tool:end] ", Style::default().fg(Color::Blue).bold()),
-                    Span::raw(tool.call_id),
-                    Span::raw(" "),
-                    Span::styled(detail, Style::default().dim()),
-                ])])));
+                let new_state = if tool.success {
+                    ToolCallState::Success
+                } else {
+                    ToolCallState::Failure
+                };
+
+                if let Some((idx, tool_name, args_preview)) =
+                    self.tool_call_rows.remove(&tool.call_id)
+                {
+                    self.transcript_cells[idx] = Box::new(
+                        ToolCallCell::running(tool_name, args_preview).with_state(new_state),
+                    );
+                } else {
+                    self.push_history(Box::new(
+                        ToolCallCell::running(String::new(), String::new()).with_state(new_state),
+                    ));
+                }
             }
             EventMsg::Error(error) => {
                 self.finalize_stream(None);
@@ -418,8 +434,8 @@ impl App {
 mod tests {
     use super::*;
     use smooth_protocol::{
-        AgentMessageCompletedEvent, AgentMessageDeltaEvent, EventMsg, TurnCompletedEvent,
-        TurnStartedEvent,
+        AgentMessageCompletedEvent, AgentMessageDeltaEvent, EventMsg, ToolCallCompletedEvent,
+        ToolCallStartedEvent, TurnCompletedEvent, TurnStartedEvent,
     };
 
     fn event(id: &str, msg: EventMsg) -> Event {
@@ -565,6 +581,108 @@ mod tests {
 
         let joined = transcript_strings(&app).join("\n");
         assert_eq!(joined.matches("Hi! What can I help with?").count(), 1);
+    }
+
+    #[test]
+    fn tool_call_start_then_complete_renders_single_row() {
+        let mut app = App::new();
+
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "2",
+                EventMsg::ToolCallStarted(ToolCallStartedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    tool_name: String::from("read"),
+                    args_preview: String::from("foo.rs"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("BIG CONTENT")),
+                    error: None,
+                }),
+            ),
+            20,
+        );
+
+        let transcript = transcript_strings(&app);
+        let joined = transcript.join("\n");
+
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|line| line.contains("read foo.rs"))
+                .count(),
+            1
+        );
+        assert!(!joined.contains("BIG CONTENT"));
+    }
+
+    #[test]
+    fn tool_call_completed_changes_glyph_in_place() {
+        let mut app = App::new();
+
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "2",
+                EventMsg::ToolCallStarted(ToolCallStartedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    tool_name: String::from("read"),
+                    args_preview: String::from("foo.rs"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("BIG CONTENT")),
+                    error: None,
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("✓ read foo.rs"));
+        assert!(!joined.contains("⠋ read foo.rs"));
     }
 }
 

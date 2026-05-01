@@ -15,7 +15,7 @@ use crate::{
     AppTerminal,
     app_server_session::AppServerSession,
     history_cell::{
-        AgentMessageCell, HistoryCell, PlainHistoryCell, ToolCallCell, ToolCallState,
+        AgentMessageCell, HistoryCell, PlainHistoryCell, ToolCallGroupCell, ToolCallState,
         UserHistoryCell,
     },
     streaming::StreamController,
@@ -32,7 +32,8 @@ pub(crate) struct App {
     transcript_cells: Vec<Box<dyn HistoryCell>>,
     active_cell: Option<AgentMessageCell>,
     stream_controller: Option<StreamController>,
-    tool_call_rows: HashMap<String, (usize, String, String)>,
+    tool_call_rows: HashMap<String, (usize, usize)>,
+    pending_tool_group: Option<(usize, String)>,
     current_turn_id: Option<String>,
     committed_assistant_item_id: Option<String>,
     committed_assistant_for_current_turn: bool,
@@ -52,6 +53,7 @@ impl App {
             active_cell: None,
             stream_controller: None,
             tool_call_rows: HashMap::new(),
+            pending_tool_group: None,
             current_turn_id: None,
             committed_assistant_item_id: None,
             committed_assistant_for_current_turn: false,
@@ -150,6 +152,7 @@ impl App {
             EventMsg::TurnStarted(turn) => {
                 self.is_turn_running = true;
                 self.tool_call_rows.clear();
+                self.pending_tool_group = None;
                 self.current_turn_id = Some(turn.turn_id.clone());
                 self.committed_assistant_item_id = None;
                 self.committed_assistant_for_current_turn = false;
@@ -198,13 +201,25 @@ impl App {
             }
             EventMsg::ToolCallStarted(tool) => {
                 self.finalize_stream(None);
-                let idx = self.transcript_cells.len();
-                self.tool_call_rows.insert(
-                    tool.call_id,
-                    (idx, tool.tool_name.clone(), tool.args_preview.clone()),
-                );
-                let cell = ToolCallCell::running(tool.tool_name, tool.args_preview);
-                self.push_history(Box::new(cell));
+
+                let call_id = tool.call_id;
+                let tool_name = tool.tool_name;
+                let args_preview = tool.args_preview;
+
+                if let Some(cell_idx) = self
+                    .pending_tool_group
+                    .as_ref()
+                    .and_then(|(idx, name)| (name == &tool_name).then_some(*idx))
+                {
+                    let entry_idx = self.tool_group_mut(cell_idx).push_entry(args_preview);
+                    self.tool_call_rows.insert(call_id, (cell_idx, entry_idx));
+                } else {
+                    let cell_idx = self.push_tool_group_cell(ToolCallGroupCell::new(
+                        tool_name.clone(),
+                        args_preview,
+                    ));
+                    self.tool_call_rows.insert(call_id, (cell_idx, 0));
+                }
             }
             EventMsg::ToolCallCompleted(tool) => {
                 self.finalize_stream(None);
@@ -213,17 +228,25 @@ impl App {
                 } else {
                     ToolCallState::Failure
                 };
-
-                if let Some((idx, tool_name, args_preview)) =
-                    self.tool_call_rows.remove(&tool.call_id)
-                {
-                    self.transcript_cells[idx] = Box::new(
-                        ToolCallCell::running(tool_name, args_preview).with_state(new_state),
-                    );
+                let error = if tool.success {
+                    None
                 } else {
-                    self.push_history(Box::new(
-                        ToolCallCell::running(String::new(), String::new()).with_state(new_state),
-                    ));
+                    Some(tool.error.unwrap_or_else(|| String::from("tool failed")))
+                };
+
+                if let Some((cell_idx, entry_idx)) = self.tool_call_rows.remove(&tool.call_id) {
+                    self.tool_group_mut(cell_idx)
+                        .set_entry_outcome(entry_idx, new_state, error);
+                } else if let Some(error) = error {
+                    self.push_history(Box::new(PlainHistoryCell::error(format!(
+                        "tool {} failed: {}",
+                        tool.call_id, error
+                    ))));
+                } else {
+                    self.push_history(Box::new(PlainHistoryCell::info(format!(
+                        "tool {} completed",
+                        tool.call_id
+                    ))));
                 }
             }
             EventMsg::Error(error) => {
@@ -253,14 +276,15 @@ impl App {
     }
 
     fn finalize_stream(&mut self, item_id: Option<&str>) -> bool {
-        if let Some(controller) = self.stream_controller.take()
-            && let Some(cell) = controller.finalize()
-        {
-            self.push_history(Box::new(cell));
-            self.committed_assistant_item_id = item_id.map(ToOwned::to_owned);
-            self.committed_assistant_for_current_turn = true;
-            self.active_cell = None;
-            return true;
+        if let Some(controller) = self.stream_controller.take() {
+            self.pending_tool_group = None;
+            if let Some(cell) = controller.finalize() {
+                self.push_history(Box::new(cell));
+                self.committed_assistant_item_id = item_id.map(ToOwned::to_owned);
+                self.committed_assistant_for_current_turn = true;
+                self.active_cell = None;
+                return true;
+            }
         }
         self.active_cell = None;
         false
@@ -277,7 +301,23 @@ impl App {
     }
 
     fn push_history(&mut self, cell: Box<dyn HistoryCell>) {
+        self.pending_tool_group = None;
         self.transcript_cells.push(cell);
+    }
+
+    fn push_tool_group_cell(&mut self, cell: ToolCallGroupCell) -> usize {
+        let cell_idx = self.transcript_cells.len();
+        let tool_name = cell.tool_name().to_owned();
+        self.transcript_cells.push(Box::new(cell));
+        self.pending_tool_group = Some((cell_idx, tool_name));
+        cell_idx
+    }
+
+    fn tool_group_mut(&mut self, cell_idx: usize) -> &mut ToolCallGroupCell {
+        self.transcript_cells[cell_idx]
+            .as_any_mut()
+            .downcast_mut::<ToolCallGroupCell>()
+            .expect("tracked tool row should be a ToolCallGroupCell")
     }
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -433,6 +473,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::StreamController;
     use smooth_protocol::{
         AgentMessageCompletedEvent, AgentMessageDeltaEvent, EventMsg, ToolCallCompletedEvent,
         ToolCallStartedEvent, TurnCompletedEvent, TurnStartedEvent,
@@ -455,6 +496,73 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn start_turn(app: &mut App) {
+        app.handle_session_event(
+            event(
+                "turn-start",
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                }),
+            ),
+            20,
+        );
+    }
+
+    fn start_tool_call(app: &mut App, event_id: &str, call_id: &str, tool_name: &str, args: &str) {
+        app.handle_session_event(
+            event(
+                event_id,
+                EventMsg::ToolCallStarted(ToolCallStartedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: call_id.to_owned(),
+                    tool_name: tool_name.to_owned(),
+                    args_preview: args.to_owned(),
+                }),
+            ),
+            20,
+        );
+    }
+
+    fn complete_tool_call(
+        app: &mut App,
+        event_id: &str,
+        call_id: &str,
+        success: bool,
+        error: Option<&str>,
+    ) {
+        app.handle_session_event(
+            event(
+                event_id,
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: call_id.to_owned(),
+                    success,
+                    output_preview: Some(String::from("BIG CONTENT")),
+                    error: error.map(str::to_owned),
+                }),
+            ),
+            20,
+        );
+    }
+
+    fn complete_agent_message(app: &mut App, event_id: &str, item_id: &str, text: &str) {
+        app.handle_session_event(
+            event(
+                event_id,
+                EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: item_id.to_owned(),
+                    text: text.to_owned(),
+                }),
+            ),
+            20,
+        );
     }
 
     #[test]
@@ -683,6 +791,156 @@ mod tests {
         let joined = transcript_strings(&app).join("\n");
         assert!(joined.contains("✓ read foo.rs"));
         assert!(!joined.contains("⠋ read foo.rs"));
+    }
+
+    #[test]
+    fn consecutive_same_tool_calls_render_as_group() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "read", "foo.rs");
+        start_tool_call(&mut app, "3", "c2", "read", "bar.rs");
+        complete_tool_call(&mut app, "4", "c1", true, None);
+        complete_tool_call(&mut app, "5", "c2", true, None);
+
+        let transcript = transcript_strings(&app);
+        let joined = transcript.join("\n");
+
+        assert!(joined.contains("✓ read\n      ✓ foo.rs\n      ✓ bar.rs"));
+        assert!(!joined.contains("✓ read foo.rs"));
+    }
+
+    #[test]
+    fn different_tool_names_do_not_group() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "list", "dir1");
+        complete_tool_call(&mut app, "3", "c1", true, None);
+        start_tool_call(&mut app, "4", "c2", "read", "foo.rs");
+        complete_tool_call(&mut app, "5", "c2", true, None);
+        start_tool_call(&mut app, "6", "c3", "list", "dir2");
+        complete_tool_call(&mut app, "7", "c3", true, None);
+
+        assert_eq!(
+            transcript_strings(&app),
+            vec![
+                String::from("✓ list dir1"),
+                String::new(),
+                String::from("✓ read foo.rs"),
+                String::new(),
+                String::from("✓ list dir2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_tool_event_breaks_group() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "read", "foo.rs");
+        complete_tool_call(&mut app, "3", "c1", true, None);
+        complete_agent_message(&mut app, "4", "assistant-1", "Between calls");
+        start_tool_call(&mut app, "5", "c2", "read", "bar.rs");
+        complete_tool_call(&mut app, "6", "c2", true, None);
+
+        let transcript = transcript_strings(&app);
+        let joined = transcript.join("\n");
+
+        assert!(joined.contains("✓ read foo.rs"));
+        assert!(joined.contains("✓ read bar.rs"));
+        assert!(!transcript.iter().any(|line| line == "✓ read"));
+    }
+
+    #[test]
+    fn phantom_stream_breaks_group() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "read", "foo.rs");
+        complete_tool_call(&mut app, "3", "c1", true, None);
+
+        app.stream_controller = Some(StreamController::new(Some(20)));
+
+        start_tool_call(&mut app, "4", "c2", "read", "bar.rs");
+        complete_tool_call(&mut app, "5", "c2", true, None);
+
+        let transcript = transcript_strings(&app);
+        let joined = transcript.join("\n");
+
+        assert!(joined.contains("✓ read foo.rs"));
+        assert!(joined.contains("✓ read bar.rs"));
+        assert!(!transcript.iter().any(|line| line == "✓ read"));
+    }
+
+    #[test]
+    fn mixed_sequence_matches_user_example() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "list", "dir1");
+        complete_tool_call(&mut app, "3", "c1", true, None);
+        start_tool_call(&mut app, "4", "c2", "read", "file a");
+        start_tool_call(&mut app, "5", "c3", "read", "file b");
+        complete_tool_call(&mut app, "6", "c2", true, None);
+        complete_tool_call(&mut app, "7", "c3", true, None);
+        start_tool_call(&mut app, "8", "c4", "list", "dir2");
+        complete_tool_call(&mut app, "9", "c4", true, None);
+        start_tool_call(&mut app, "10", "c5", "read", "file c");
+
+        assert_eq!(
+            transcript_strings(&app),
+            vec![
+                String::from("✓ list dir1"),
+                String::new(),
+                String::from("✓ read"),
+                String::from("      ✓ file a"),
+                String::from("      ✓ file b"),
+                String::new(),
+                String::from("✓ list dir2"),
+                String::new(),
+                String::from("⠋ read file c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_tool_call_shows_error_reason() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "read", "missing.rs");
+        complete_tool_call(&mut app, "3", "c1", false, Some("file not found"));
+
+        assert_eq!(
+            transcript_strings(&app),
+            vec![
+                String::from("✗ read missing.rs"),
+                String::from("      ! file not found"),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_entry_inside_group_shows_error_reason() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "read", "foo.rs");
+        start_tool_call(&mut app, "3", "c2", "read", "bar.rs");
+        complete_tool_call(&mut app, "4", "c1", true, None);
+        complete_tool_call(&mut app, "5", "c2", false, Some("permission denied"));
+
+        assert_eq!(
+            transcript_strings(&app),
+            vec![
+                String::from("✗ read"),
+                String::from("      ✓ foo.rs"),
+                String::from("      ✗ bar.rs"),
+                String::from("        ! permission denied"),
+            ]
+        );
     }
 }
 

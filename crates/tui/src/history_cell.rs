@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
@@ -5,6 +7,7 @@ use ratatui::{
 
 pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +24,10 @@ impl UserHistoryCell {
 impl HistoryCell for UserHistoryCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         prefix_multiline_text(&self.message, "› ".cyan().bold(), "  ".cyan())
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -51,6 +58,10 @@ impl HistoryCell for AgentMessageCell {
             "  ".green()
         };
         prefix_lines(self.lines.clone(), first_prefix, "  ".green())
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -83,6 +94,10 @@ impl HistoryCell for PlainHistoryCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         self.lines.clone()
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,49 +108,156 @@ pub(crate) enum ToolCallState {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ToolCallCell {
-    tool_name: String,
+pub(crate) struct ToolCallEntry {
     args_preview: String,
     state: ToolCallState,
+    error: Option<String>,
 }
 
-impl ToolCallCell {
-    pub(crate) fn running(tool_name: String, args_preview: String) -> Self {
+#[derive(Debug, Clone)]
+pub(crate) struct ToolCallGroupCell {
+    tool_name: String,
+    entries: Vec<ToolCallEntry>,
+}
+
+impl ToolCallGroupCell {
+    pub(crate) fn new(tool_name: String, args_preview: String) -> Self {
         Self {
             tool_name,
-            args_preview,
-            state: ToolCallState::Running,
+            entries: vec![ToolCallEntry {
+                args_preview,
+                state: ToolCallState::Running,
+                error: None,
+            }],
         }
     }
 
-    pub(crate) fn with_state(mut self, state: ToolCallState) -> Self {
-        self.state = state;
+    pub(crate) fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    pub(crate) fn push_entry(&mut self, args_preview: String) -> usize {
+        let entry_idx = self.entries.len();
+        self.entries.push(ToolCallEntry {
+            args_preview,
+            state: ToolCallState::Running,
+            error: None,
+        });
+        entry_idx
+    }
+
+    pub(crate) fn set_entry_outcome(
+        &mut self,
+        entry_idx: usize,
+        state: ToolCallState,
+        error: Option<String>,
+    ) {
+        let entry = self
+            .entries
+            .get_mut(entry_idx)
+            .expect("tool call entry index should be valid");
+        entry.state = state;
+        entry.error = error;
+    }
+}
+
+impl HistoryCell for ToolCallGroupCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let header_state = if self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.state, ToolCallState::Failure))
+        {
+            ToolCallState::Failure
+        } else if self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.state, ToolCallState::Running))
+        {
+            ToolCallState::Running
+        } else {
+            ToolCallState::Success
+        };
+
+        if self.entries.len() == 1 {
+            let entry = &self.entries[0];
+            let mut lines = vec![tool_call_line(
+                "",
+                entry.state,
+                Some(self.tool_name()),
+                &entry.args_preview,
+            )];
+            if matches!(entry.state, ToolCallState::Failure)
+                && let Some(error) = entry.error.as_deref()
+            {
+                lines.push(tool_error_line("      ", error));
+            }
+            return lines;
+        }
+
+        let mut lines = vec![tool_call_line("", header_state, Some(self.tool_name()), "")];
+        for entry in &self.entries {
+            lines.push(tool_call_line(
+                "      ",
+                entry.state,
+                None,
+                &entry.args_preview,
+            ));
+            if matches!(entry.state, ToolCallState::Failure)
+                && let Some(error) = entry.error.as_deref()
+            {
+                lines.push(tool_error_line("        ", error));
+            }
+        }
+        lines
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
 
-impl HistoryCell for ToolCallCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let (glyph, glyph_style) = match self.state {
-            ToolCallState::Running => ("⠋ ", Style::default().fg(Color::Yellow).bold()),
-            ToolCallState::Success => ("✓ ", Style::default().fg(Color::Green).bold()),
-            ToolCallState::Failure => ("✗ ", Style::default().fg(Color::Red).bold()),
-        };
-
-        let mut spans = vec![
-            Span::styled(glyph, glyph_style),
-            Span::raw(self.tool_name.clone()),
-        ];
-        if !self.args_preview.is_empty() {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                self.args_preview.clone(),
-                Style::default().dim(),
-            ));
-        }
-
-        vec![Line::from(spans)]
+fn tool_call_line(
+    indent: &'static str,
+    state: ToolCallState,
+    label: Option<&str>,
+    args_preview: &str,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    if !indent.is_empty() {
+        spans.push(Span::raw(indent));
     }
+    spans.push(tool_call_glyph(state));
+    if let Some(label) = label {
+        spans.push(Span::raw(label.to_owned()));
+    }
+    if !args_preview.is_empty() {
+        if label.is_some() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            args_preview.to_owned(),
+            Style::default().dim(),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn tool_call_glyph(state: ToolCallState) -> Span<'static> {
+    let (glyph, glyph_style) = match state {
+        ToolCallState::Running => ("⠋ ", Style::default().fg(Color::Yellow).bold()),
+        ToolCallState::Success => ("✓ ", Style::default().fg(Color::Green).bold()),
+        ToolCallState::Failure => ("✗ ", Style::default().fg(Color::Red).bold()),
+    };
+    Span::styled(glyph, glyph_style)
+}
+
+fn tool_error_line(indent: &'static str, error: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled("! ", Style::default().fg(Color::Red).bold()),
+        Span::styled(error.to_owned(), Style::default().fg(Color::Red).dim()),
+    ])
 }
 
 pub(crate) fn prefix_lines(

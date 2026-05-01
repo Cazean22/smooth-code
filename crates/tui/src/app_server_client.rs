@@ -1,14 +1,8 @@
 use app_server::in_process::{self, InProcessServerEvent, InProcessStartArgs};
-use app_server_protocol::{ClientRequest, JSONRPCErrorError};
+use app_server_protocol::{ClientCommand, ClientRequest, JSONRPCErrorError};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 
-enum ClientCommand {
-    Request {
-        request: Box<ClientRequest>,
-        response_tx: oneshot::Sender<std::result::Result<serde_json::Value, JSONRPCErrorError>>,
-    },
-}
 pub(crate) struct AppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
@@ -50,7 +44,7 @@ impl AppServerClient {
                                         .spawn(
                                             async move {
                                                 let _ = request_sender
-                                                    .send(in_process::InProcessClientMessage::Request {
+                                                    .send(ClientCommand::Request {
                                                         request,
                                                         response_tx,
                                                     })

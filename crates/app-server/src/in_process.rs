@@ -3,9 +3,9 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use app_server_protocol::{ClientRequest, JSONRPCErrorError, ServerRequest};
+use app_server_protocol::{ClientCommand, ServerRequest};
 use smooth_protocol::Event;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc};
 use tracing::Instrument;
 
 use crate::{
@@ -20,18 +20,6 @@ pub struct InProcessStartArgs {
     /// Capacity used for all runtime queues (clamped to at least 1).
     pub channel_capacity: usize,
 }
-pub enum InProcessClientMessage {
-    Request {
-        request: Box<ClientRequest>,
-        response_tx: oneshot::Sender<std::result::Result<serde_json::Value, JSONRPCErrorError>>,
-    },
-}
-enum ProcessorCommand {
-    Request {
-        request: Box<ClientRequest>,
-        response_tx: oneshot::Sender<std::result::Result<serde_json::Value, JSONRPCErrorError>>,
-    },
-}
 
 /// Event emitted from the app-server to the in-process client.
 ///
@@ -44,7 +32,7 @@ pub enum InProcessServerEvent {
 }
 
 pub struct InProcessClientHandle {
-    pub client_tx: mpsc::Sender<InProcessClientMessage>,
+    pub client_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     runtime_handle: tokio::task::JoinHandle<()>,
 }
@@ -57,21 +45,20 @@ impl InProcessClientHandle {
 
 pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
     let channel_capacity = args.channel_capacity.max(1);
-    let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
+    let (client_tx, mut client_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
-    let runtime_span = tracing::info_span!(
-        "app_server.in_process_runtime",
-        channel_capacity,
-    );
+    let runtime_span = tracing::info_span!("app_server.in_process_runtime", channel_capacity,);
     let runtime_handle = tokio::task::Builder::new()
         .name("app_server.in_process.runtime")
         .spawn(
             async move {
-                let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
+                let (outgoing_tx, mut outgoing_rx) =
+                    mpsc::channel::<OutgoingEnvelope>(channel_capacity);
                 let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(outgoing_tx));
 
-                let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(channel_capacity);
+                let (writer_tx, mut writer_rx) =
+                    mpsc::channel::<QueuedOutgoingMessage>(channel_capacity);
                 let outbound_initialized = Arc::new(AtomicBool::new(false));
                 let outbound_opted_out_notification_methods = Arc::new(RwLock::new(HashSet::new()));
 
@@ -92,7 +79,7 @@ pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
                     .expect("failed to spawn app-server outbound router");
 
                 let (processor_tx, mut processor_rx) =
-                    mpsc::channel::<ProcessorCommand>(channel_capacity);
+                    mpsc::channel::<ClientCommand>(channel_capacity);
                 let processor_handle = tokio::task::Builder::new()
                     .name("app_server.message_processor")
                     .spawn(async move {
@@ -103,7 +90,7 @@ pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
                             tokio::select! {
                                 command = processor_rx.recv() => {
                                     match command {
-                                        Some(ProcessorCommand::Request { request, response_tx }) => {
+                                        Some(ClientCommand::Request { request, response_tx }) => {
                                             processor
                                                 .process_client_request(
                                                     *request,
@@ -126,9 +113,9 @@ pub fn start(args: InProcessStartArgs) -> InProcessClientHandle {
                     tokio::select! {
                         message = client_rx.recv() => {
                             match message {
-                                Some(InProcessClientMessage::Request { request, response_tx }) => {
+                                Some(command @ ClientCommand::Request { .. }) => {
                                     if processor_tx
-                                        .send(ProcessorCommand::Request { request, response_tx })
+                                        .send(command)
                                         .await
                                         .is_err()
                                     {

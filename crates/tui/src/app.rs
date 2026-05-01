@@ -178,12 +178,9 @@ impl App {
                 self.handle_streaming_delta(delta.delta);
             }
             EventMsg::AgentMessageCompleted(completed) => {
-                let committed_from_stream =
-                    self.finalize_stream(Some(completed.item_id.as_str()));
+                let committed_from_stream = self.finalize_stream(Some(completed.item_id.as_str()));
                 if !committed_from_stream
-                    && self
-                        .committed_assistant_item_id
-                        .as_deref()
+                    && self.committed_assistant_item_id.as_deref()
                         != Some(completed.item_id.as_str())
                 {
                     self.push_rendered_assistant_message(&completed.text);

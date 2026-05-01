@@ -9,9 +9,7 @@ use rig::{
 use serde::{Deserialize, Serialize};
 use smooth_protocol::{EventMsg, ThreadId, TurnInterruptedEvent};
 use time::{
-    OffsetDateTime,
-    format_description::FormatItem,
-    format_description::well_known::Rfc3339,
+    OffsetDateTime, format_description::FormatItem, format_description::well_known::Rfc3339,
     macros::format_description,
 };
 use tokio::{
@@ -75,7 +73,11 @@ struct RolloutEnvelope {
 }
 
 impl RolloutRecorder {
-    pub(crate) async fn create(workspace_root: &Path, thread_id: ThreadId, cwd: &Path) -> Result<Self> {
+    pub(crate) async fn create(
+        workspace_root: &Path,
+        thread_id: ThreadId,
+        cwd: &Path,
+    ) -> Result<Self> {
         let path = create_rollout_path(workspace_root, thread_id)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
@@ -180,7 +182,12 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
                 });
             }
             PersistedItem::Event(event) => {
-                update_turn_tracking(&event, &mut max_turn_index, &mut has_open_turn, &mut has_terminal_turn);
+                update_turn_tracking(
+                    &event,
+                    &mut max_turn_index,
+                    &mut has_open_turn,
+                    &mut has_terminal_turn,
+                );
                 initial_messages.push(event);
             }
         }
@@ -222,7 +229,10 @@ pub(crate) async fn list_threads(workspace_root: &Path) -> Result<Vec<ThreadSumm
     Ok(threads)
 }
 
-pub(crate) async fn find_thread_path(workspace_root: &Path, thread_id: ThreadId) -> Result<PathBuf> {
+pub(crate) async fn find_thread_path(
+    workspace_root: &Path,
+    thread_id: ThreadId,
+) -> Result<PathBuf> {
     let threads = list_threads(workspace_root).await?;
     threads
         .into_iter()
@@ -240,7 +250,8 @@ fn update_turn_tracking(
     match event {
         EventMsg::TurnStarted(turn) => {
             if let Ok(turn_index) = turn.turn_id.parse::<u64>() {
-                *max_turn_index = Some(max_turn_index.map_or(turn_index, |current| current.max(turn_index)));
+                *max_turn_index =
+                    Some(max_turn_index.map_or(turn_index, |current| current.max(turn_index)));
             }
             *has_open_turn = true;
             *has_terminal_turn = false;
@@ -402,10 +413,12 @@ mod tests {
                 .await
                 .expect("append user");
             recorder
-                .append(PersistedItem::Event(EventMsg::TurnStarted(TurnStartedEvent {
-                    thread_id: thread_id.to_string(),
-                    turn_id: "4".to_string(),
-                })))
+                .append(PersistedItem::Event(EventMsg::TurnStarted(
+                    TurnStartedEvent {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "4".to_string(),
+                    },
+                )))
                 .await
                 .expect("append turn started");
 

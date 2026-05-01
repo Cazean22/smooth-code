@@ -84,7 +84,6 @@ impl ThreadManagerState {
         Ok(())
     }
 
-    #[tracing::instrument(name = "core.thread_manager.start_user_input", skip(self, input), fields(thread_id = %thread_id, input_len = input.len()))]
     pub async fn start_user_input(&self, thread_id: ThreadId, input: String) -> Result<String> {
         let thread = self.get(thread_id).await?;
         thread.start_user_input(input).await

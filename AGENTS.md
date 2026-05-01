@@ -1,32 +1,22 @@
-# AGENTS.md
-
-## Workspace
-- Root is a Cargo workspace with five members: `app-server`, `app-server-protocol`, `smooth-core`, `smooth-protocol`, and `smooth-tui`.
-- `crates/tui` is the only `default-member`, and `smooth-tui` is the only binary target. `cargo run` at repo root launches the TUI.
-
-## Crate map
-- `crates/tui`: user-facing shell; starts the app server and submits thread ops.
-- `crates/app-server`: in-process request bridge; not a standalone daemon.
-- `crates/core`: session runtime, task orchestration, and model/provider integration.
-- `crates/protocol`: shared thread/op/event/status types.
-- `crates/app-server-protocol`: request/response schema between the TUI and app server.
-
-## Commands and verification
-- There are no checked-in repo wrappers or workflow configs (`README*`, `Justfile`, `Makefile`, `.github/workflows`, `nextest`, `pre-commit`, `.cargo/config*`, `rust-toolchain*` were not found). Use direct Cargo commands.
-- Prefer focused verification first: `cargo check -p smooth-core`, `cargo check -p smooth-tui`, etc. Widen to `cargo check --workspace` only for cross-crate changes.
-- `cargo metadata --no-deps --format-version 1` is the fastest source of truth for workspace members and targets.
-
-## Runtime gotchas
-- `smooth_tui::run()` auto-submits `Op::UserInput("Hi")` on startup. `cargo run` is not a passive smoke test.
-- The TUI starts the app server in-process via `AppServerClient::start(...)` -> `app_server::in_process::start(...)`; do not assume a separate server binary exists.
-- Non-TTY runs skip terminal setup, so headless runs exercise different behavior than an interactive TUI session.
-- Provider config comes from `crates/core/src/provider.rs`: `SMOOTH_CODE_LLM_PROVIDER`, `SMOOTH_CODE_LLM_MODEL`, `SMOOTH_CODE_LLM_PREAMBLE`, optional `OPENAI_BASE_URL`, plus the selected provider key (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`).
+# smooth-code agent notes
+- No additional `AGENTS.md`/`AGENT.md` files or Cursor/Claude/Windsurf/Cline/Goose/Copilot rule files were found in this repo.
+- Rust 2024 workspace; default member is `crates/tui`, so bare `cargo build/test/run` targets `smooth-tui` unless `--workspace` or `-p` is used.
+- Main crates: `smooth-tui` (`crates/tui`) is the terminal UI entrypoint; `app-server` is the in-process request/event bridge; `smooth-core` is the session/thread runtime; `smooth-protocol` and `app-server-protocol` hold shared wire types.
+- Runtime flow: TUI -> `AppServerSession` -> `app_server::in_process` -> `MessageProcessor` -> `ThreadManagerState`/`CoreThread`/`Core` -> Rig streaming model/tool loop -> protocol events back to the TUI.
+- Persistence: there is no SQL or embedded database; sessions are newline-delimited JSON rollout files under `.smooth-code/sessions/YYYY/MM/DD/*.jsonl`, and telemetry logs go to `.smooth-code/logs/smooth-tui.log`.
+- Internal APIs: shared event/status/thread types live in `crates/protocol`; typed request/response envelopes (`ClientRequest`, `ServerRequest`, `Thread*`, `TurnStart*`) live in `crates/app-server-protocol`.
+- LLM config comes from env vars: `SMOOTH_CODE_LLM_PROVIDER`, `SMOOTH_CODE_LLM_MODEL`, `SMOOTH_CODE_LLM_PREAMBLE`; non-OpenAI providers also need their provider API keys.
+- `.cargo/config.toml` enables `tokio_unstable`; do not remove it casually.
+- Build/check commands: `cargo check --workspace`, `cargo build --workspace`, `cargo run -p smooth-tui`.
+- Format/lint commands: `cargo fmt`, `cargo fmt -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`.
+- Test commands: `cargo test --workspace`; for one package use `cargo test -p smooth-tui` or `cargo test -p smooth-core`.
+- Single-test pattern: `cargo test -p <package> <module_path::test_name> -- --exact --nocapture`.
+- Example single test: `cargo test -p smooth-tui app::tests::completed_message_without_stream_renders_once -- --exact --nocapture`.
+- `cargo clippy --all-targets --all-features -- -D warnings` currently fails on a pre-existing `clippy::new_without_default` in `crates/protocol/src/lib.rs`; do not confuse that with your own change.
+- Follow `rustfmt`; keep imports grouped as `std`, external crates, then `crate`/local modules, matching the existing files.
+- Prefer `anyhow::Result` plus `.context(...)`/`.with_context(...)` at app boundaries, and `thiserror` for narrow domain/tool errors.
 - This project integrates LLM providers through `rig-core`; when a suitable type already exists there, prefer using the `rig-core` type directly instead of introducing a parallel local type.
-- Model tool calls currently fail explicitly in `crates/core/src/provider.rs`. The protocol already defines dynamic tool-call messages, but execution is not wired end-to-end yet.
-- Do not assume live server events work yet: `Session::emit_event()` constructs an event and drops it, and `app_server::in_process::start()` creates `_event_tx` without wiring it.
-- `ThreadId` values are client-generated (`Uuid::now_v7()`), and sessions are created lazily in `ThreadManagerState::get_or_create()`.
-
-## Tests and docs
-- No checked-in `tests/`, `benches/`, `examples/`, or Rust `#[test]` / `#[tokio::test]` modules were found. Do not claim an established test suite or CI workflow unless you add one.
-- `docs/codex-session-analysis.md` is useful design context for the session/task architecture, but executable behavior should be taken from the current source files.
-- `.gitignore` only ignores `/target` and `.codex`; never treat `target/` output as source of truth.
+- Use typed structs/enums plus serde rename attributes for wire formats; avoid ad hoc JSON construction when a protocol type already exists.
+- Shared async state is typically `Arc` plus Tokio `Mutex`/`RwLock`/`watch`/`broadcast`; keep new concurrency primitives aligned with that style.
+- Naming conventions are consistent: `*Event`, `*Params`, `*Response`, `*Task`, `*Tool`, `*Session`, `*Thread`; modules and functions stay `snake_case`.
+- Keep changes scoped to the relevant crate and preserve the existing TUI -> app-server -> core -> protocol layering instead of bypassing it.

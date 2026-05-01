@@ -74,11 +74,14 @@ impl Core {
         Self { session }
     }
 
-    #[tracing::instrument(name = "core.start_user_input", skip(self, input), fields(thread_id = %self.session.id, input_len = input.len()))]
     pub async fn start_user_input(&self, input: String) -> Result<String> {
         let sub_id = self.session.next_internal_sub_id();
-        tracing::Span::current().record("thread_id", tracing::field::display(self.session.id));
-        tracing::debug!(turn_id = %sub_id, "starting turn");
+        tracing::debug!(
+            thread_id = %self.session.id,
+            turn_id = %sub_id,
+            input_len = input.len(),
+            "starting turn"
+        );
         let turn_context = Arc::new(TurnContext {
             assistant_item_id: format!("{sub_id}-assistant"),
             sub_id: sub_id.clone(),
@@ -101,17 +104,6 @@ impl Core {
 }
 
 impl Session {
-    #[tracing::instrument(
-        name = "core.session.start_task",
-        skip(self, turn_context, input, task),
-        fields(
-            thread_id = %self.id,
-            turn_id = %turn_context.sub_id,
-            task_name = task.span_name(),
-            task_kind = ?task.kind(),
-            input_count = input.len(),
-        )
-    )]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -161,8 +153,11 @@ impl Session {
                         .await;
 
                     if cancellation_for_runner.is_cancelled() {
-                        sess.set_agent_status(AgentStatus::Interrupted, Some(ctx_for_runner.as_ref()))
-                            .await;
+                        sess.set_agent_status(
+                            AgentStatus::Interrupted,
+                            Some(ctx_for_runner.as_ref()),
+                        )
+                        .await;
                         sess.emit_event(
                             &ctx_for_runner,
                             EventMsg::TurnInterrupted(TurnInterruptedEvent {
@@ -269,9 +264,9 @@ impl Session {
     pub(crate) async fn persist_assistant_message(&self, text: String) {
         let _ = self
             .rollout
-            .append(PersistedItem::HistoryMessage(HistoryMessage::AssistantText {
-                text,
-            }))
+            .append(PersistedItem::HistoryMessage(
+                HistoryMessage::AssistantText { text },
+            ))
             .await;
     }
 

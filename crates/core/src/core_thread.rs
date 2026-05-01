@@ -4,11 +4,11 @@ use anyhow::Result;
 use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent};
 use tokio::sync::broadcast;
 
+use crate::provider::SessionModel;
 use crate::{
     core::Core,
     rollout::{ResumeState, RolloutRecorder, workspace_root},
 };
-use crate::provider::SessionModel;
 use smooth_protocol::ThreadId;
 
 pub struct CoreThread {
@@ -47,7 +47,6 @@ impl CoreThread {
         })
     }
 
-    #[tracing::instrument(name = "core.thread.start_user_input", skip(self, input), fields(thread_id = %self.core.session.id, input_len = input.len()))]
     pub(crate) async fn start_user_input(&self, input: String) -> Result<String> {
         self.core.start_user_input(input).await
     }

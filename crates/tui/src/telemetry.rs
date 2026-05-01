@@ -26,8 +26,12 @@ pub(crate) fn init() -> Result<TelemetryGuard> {
         let log_dir = log_path
             .parent()
             .context("telemetry log path is missing a parent directory")?;
-        std::fs::create_dir_all(log_dir)
-            .with_context(|| format!("failed to create telemetry log directory at {}", log_dir.display()))?;
+        std::fs::create_dir_all(log_dir).with_context(|| {
+            format!(
+                "failed to create telemetry log directory at {}",
+                log_dir.display()
+            )
+        })?;
 
         let file_name = log_path
             .file_name()
@@ -43,8 +47,9 @@ pub(crate) fn init() -> Result<TelemetryGuard> {
     let console_layer = console_subscriber::ConsoleLayer::builder()
         .with_default_env()
         .spawn();
-    let log_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info,smooth_tui=debug,app_server=debug,smooth_core=debug"))?;
+    let log_filter = EnvFilter::try_from_default_env().or_else(|_| {
+        EnvFilter::try_new("info,smooth_tui=debug,app_server=debug,smooth_core=debug")
+    })?;
     let log_layer = fmt::layer()
         .with_writer(writer)
         .with_ansi(false)
@@ -59,11 +64,7 @@ pub(crate) fn init() -> Result<TelemetryGuard> {
         .with(log_layer)
         .init();
 
-    tracing::info!(
-        interactive_tui,
-        force_terminal_logs,
-        "tracing initialized"
-    );
+    tracing::info!(interactive_tui, force_terminal_logs, "tracing initialized");
 
     Ok(TelemetryGuard {
         _log_writer_guard: log_writer_guard,
@@ -71,12 +72,15 @@ pub(crate) fn init() -> Result<TelemetryGuard> {
 }
 
 fn preferred_log_path() -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to determine current directory for telemetry")?;
+    let cwd =
+        std::env::current_dir().context("failed to determine current directory for telemetry")?;
     Ok(log_path_in(&cwd))
 }
 
 fn log_path_in(root: &Path) -> PathBuf {
-    root.join(".smooth-code").join("logs").join("smooth-tui.log")
+    root.join(".smooth-code")
+        .join("logs")
+        .join("smooth-tui.log")
 }
 
 fn is_truthy(value: &std::ffi::OsStr) -> bool {

@@ -33,11 +33,7 @@ impl CoreMessageProcessor {
         match request {
             ClientRequest::ThreadStart { .. } => {
                 tracing::debug!("processing thread start request");
-                let started = self
-                    .threads
-                    .start_thread()
-                    .await
-                    .map_err(internal_error)?;
+                let started = self.threads.start_thread().await.map_err(internal_error)?;
                 self.ensure_thread_subscription(started.thread_id).await;
                 self.threads
                     .emit_session_configured(started.thread_id)

@@ -1,5 +1,6 @@
 mod client;
 mod dynamic_tool;
+mod edit;
 mod error;
 mod list_dir;
 mod read;
@@ -9,6 +10,7 @@ mod write;
 
 pub use client::{DynamicToolClient, DynamicToolClientFactory};
 pub use dynamic_tool::{DynamicTool, DynamicToolArgs};
+pub use edit::{EditArgs, EditTool};
 pub use error::ToolFailure;
 pub use list_dir::{ListDirArgs, ListDirTool};
 pub use read::{ReadArgs, ReadTool};

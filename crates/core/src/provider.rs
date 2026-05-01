@@ -19,7 +19,9 @@ use rig::{
     },
 };
 use tokio::sync::watch;
-use tools::{DynamicTool, DynamicToolClient, ListDirTool, ReadTool, RunCommandTool, WriteTool};
+use tools::{
+    DynamicTool, DynamicToolClient, EditTool, ListDirTool, ReadTool, RunCommandTool, WriteTool,
+};
 
 #[derive(Debug)]
 pub(crate) enum SessionStreamEvent {
@@ -150,6 +152,7 @@ where
     M: rig::completion::CompletionModel,
 {
     let builder = builder
+        .tool(EditTool::new(cwd.clone()))
         .tool(ListDirTool::new(cwd.clone()))
         .tool(ReadTool::new(cwd.clone()))
         .tool(RunCommandTool::new(cwd.clone()))

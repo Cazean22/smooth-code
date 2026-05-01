@@ -4,12 +4,12 @@ use anyhow::Result;
 use smooth_protocol::Event;
 use smooth_protocol::ThreadId;
 use tokio::sync::{RwLock, broadcast};
+use tools::{DynamicToolClient, DynamicToolClientFactory};
 
 use crate::{
     ThreadSummary,
     core_thread::CoreThread,
     rollout::{find_thread_path, list_threads, load_resume_state, workspace_root},
-    tools::{DynamicToolClient, DynamicToolClientFactory},
 };
 
 pub struct StartedThread {

@@ -6,7 +6,7 @@ license = "MIT"
 
 [workspace]
 resolver = "3"
-members = ["crates/app-server","crates/app-server-protocol","crates/core", "crates/protocol", "crates/tui"]
+members = ["crates/app-server","crates/app-server-protocol","crates/core", "crates/protocol", "crates/tools", "crates/tui"]
 
 default-members = [
   "crates/tui"

@@ -1,24 +1,17 @@
 [package]
-name = "smooth-core"
+name = "tools"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 app-server-protocol = { path = "../app-server-protocol" }
-async-stream.workspace = true
-async-channel.workspace = true
 futures-util.workspace = true
-indexmap.workspace = true
 rig-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smooth-protocol = { path = "../protocol" }
-time.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
-tokio-util = { workspace = true, features = ["rt"] }
-tools = { path = "../tools" }
-tracing.workspace = true
+thiserror = "2.0.18"
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 uuid = { workspace = true, features = ["v4"] }

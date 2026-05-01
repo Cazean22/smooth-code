@@ -4,12 +4,13 @@ use std::sync::Arc;
 use anyhow::Result;
 use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent};
 use tokio::sync::{broadcast, watch};
+use tools::DynamicToolClient;
 
+use crate::provider::SessionModel;
 use crate::{
     core::Core,
     rollout::{ResumeState, RolloutRecorder, workspace_root},
 };
-use crate::{provider::SessionModel, tools::DynamicToolClient};
 use smooth_protocol::ThreadId;
 
 pub struct CoreThread {

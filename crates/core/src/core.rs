@@ -13,6 +13,7 @@ use smooth_protocol::{
     TurnInterruptedEvent, TurnStartedEvent,
 };
 use tokio::sync::{Mutex, broadcast, watch};
+use tools::DynamicToolClient;
 use tracing::Instrument;
 
 use crate::{
@@ -21,7 +22,6 @@ use crate::{
     rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persist_event},
     state::{ActiveTurn, RunningTask, SessionState},
     tasks::{RegularTask, SessionTask},
-    tools::DynamicToolClient,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;

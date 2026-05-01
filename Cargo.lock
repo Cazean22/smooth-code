@@ -2650,10 +2650,10 @@ dependencies = [
  "serde",
  "serde_json",
  "smooth-protocol",
- "thiserror 2.0.18",
  "time",
  "tokio",
  "tokio-util",
+ "tools",
  "tracing",
  "uuid",
 ]
@@ -3102,6 +3102,21 @@ dependencies = [
  "bytes",
  "prost",
  "tonic",
+]
+
+[[package]]
+name = "tools"
+version = "0.0.1"
+dependencies = [
+ "app-server-protocol",
+ "futures-util",
+ "rig-core",
+ "serde",
+ "serde_json",
+ "smooth-protocol",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

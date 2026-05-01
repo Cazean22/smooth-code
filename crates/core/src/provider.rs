@@ -19,8 +19,7 @@ use rig::{
     },
 };
 use tokio::sync::watch;
-
-use crate::tools::{DynamicTool, DynamicToolClient, ListDirTool, ReadFileTool, RunCommandTool};
+use tools::{DynamicTool, DynamicToolClient, ListDirTool, ReadFileTool, RunCommandTool};
 
 #[derive(Debug)]
 pub(crate) enum SessionStreamEvent {

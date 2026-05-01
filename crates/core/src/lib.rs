@@ -6,7 +6,6 @@ mod rollout;
 mod state;
 mod tasks;
 mod thread_manager;
-mod tools;
 
 pub use rollout::ThreadSummary;
 pub use thread_manager::{ResumedThread, StartedThread, ThreadManagerState};

@@ -66,6 +66,44 @@ impl HistoryCell for AgentMessageCell {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ReasoningCell {
+    lines: Vec<Line<'static>>,
+    is_first_line: bool,
+}
+
+impl ReasoningCell {
+    pub(crate) fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
+        Self {
+            lines,
+            is_first_line,
+        }
+    }
+}
+
+impl HistoryCell for ReasoningCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let first_prefix = if self.is_first_line {
+            Span::styled("… ", Style::default().fg(Color::Magenta).dim().bold())
+        } else {
+            Span::styled("  ", Style::default().fg(Color::Magenta).dim())
+        };
+        prefix_lines(
+            self.lines
+                .clone()
+                .into_iter()
+                .map(|line| line.style(Style::default().dim()))
+                .collect(),
+            first_prefix,
+            Span::styled("  ", Style::default().fg(Color::Magenta).dim()),
+        )
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct PlainHistoryCell {
     lines: Vec<Line<'static>>,
 }

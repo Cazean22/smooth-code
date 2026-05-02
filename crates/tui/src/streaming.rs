@@ -1,6 +1,6 @@
 use ratatui::text::Line;
 
-use crate::{history_cell::AgentMessageCell, markdown_stream::MarkdownStreamCollector};
+use crate::markdown_stream::MarkdownStreamCollector;
 
 pub(crate) struct StreamController {
     collector: MarkdownStreamCollector,
@@ -25,15 +25,13 @@ impl StreamController {
         true
     }
 
-    pub(crate) fn snapshot_cell(&self) -> Option<AgentMessageCell> {
-        (!self.committed_lines.is_empty())
-            .then(|| AgentMessageCell::new(self.committed_lines.clone(), true))
+    pub(crate) fn snapshot_lines(&self) -> Option<Vec<Line<'static>>> {
+        (!self.committed_lines.is_empty()).then(|| self.committed_lines.clone())
     }
 
-    pub(crate) fn finalize(mut self) -> Option<AgentMessageCell> {
+    pub(crate) fn finalize_lines(mut self) -> Option<Vec<Line<'static>>> {
         let remaining = self.collector.finalize_and_drain();
         self.committed_lines.extend(remaining);
-        (!self.committed_lines.is_empty())
-            .then(|| AgentMessageCell::new(self.committed_lines, true))
+        (!self.committed_lines.is_empty()).then_some(self.committed_lines)
     }
 }

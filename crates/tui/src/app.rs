@@ -15,8 +15,8 @@ use crate::{
     AppTerminal,
     app_server_session::AppServerSession,
     history_cell::{
-        AgentMessageCell, HistoryCell, PlainHistoryCell, ToolCallGroupCell, ToolCallState,
-        UserHistoryCell,
+        AgentMessageCell, HistoryCell, PlainHistoryCell, ReasoningCell, ToolCallGroupCell,
+        ToolCallState, UserHistoryCell,
     },
     streaming::StreamController,
 };
@@ -30,13 +30,17 @@ pub(crate) enum AppRunControl {
 pub(crate) struct App {
     pub(crate) current_thread_id: Option<ThreadId>,
     transcript_cells: Vec<Box<dyn HistoryCell>>,
-    active_cell: Option<AgentMessageCell>,
-    stream_controller: Option<StreamController>,
+    active_assistant_cell: Option<AgentMessageCell>,
+    active_reasoning_cell: Option<ReasoningCell>,
+    assistant_stream: Option<StreamController>,
+    reasoning_stream: Option<StreamController>,
     tool_call_rows: HashMap<String, (usize, usize)>,
     pending_tool_group: Option<(usize, String)>,
     current_turn_id: Option<String>,
     committed_assistant_item_id: Option<String>,
     committed_assistant_for_current_turn: bool,
+    committed_reasoning_item_id: Option<String>,
+    in_flight_reasoning_item_id: Option<String>,
     composer: String,
     status_line: String,
     scroll: u16,
@@ -50,13 +54,17 @@ impl App {
         Self {
             current_thread_id: None,
             transcript_cells: Vec::new(),
-            active_cell: None,
-            stream_controller: None,
+            active_assistant_cell: None,
+            active_reasoning_cell: None,
+            assistant_stream: None,
+            reasoning_stream: None,
             tool_call_rows: HashMap::new(),
             pending_tool_group: None,
             current_turn_id: None,
             committed_assistant_item_id: None,
             committed_assistant_for_current_turn: false,
+            committed_reasoning_item_id: None,
+            in_flight_reasoning_item_id: None,
             composer: String::new(),
             status_line: String::from("Idle"),
             scroll: 0,
@@ -134,6 +142,7 @@ impl App {
     pub(crate) fn handle_session_event(&mut self, event: Event, viewport_height: u16) {
         match event.msg {
             EventMsg::SessionConfigured(configured) => {
+                self.finalize_reasoning_stream();
                 match configured.thread_id.parse::<ThreadId>() {
                     Ok(thread_id) => {
                         self.current_thread_id = Some(thread_id);
@@ -156,10 +165,12 @@ impl App {
                 self.current_turn_id = Some(turn.turn_id.clone());
                 self.committed_assistant_item_id = None;
                 self.committed_assistant_for_current_turn = false;
+                self.committed_reasoning_item_id = None;
+                self.in_flight_reasoning_item_id = None;
                 self.status_line = format!("Running turn {}", turn.turn_id);
             }
             EventMsg::TurnCompleted(turn) => {
-                let committed_from_stream = self.finalize_stream(None);
+                let committed_from_stream = self.finalize_assistant_stream(None);
                 self.is_turn_running = false;
                 self.status_line = format!("Completed turn {}", turn.turn_id);
                 if let Some(message) = turn.last_assistant_message
@@ -171,7 +182,7 @@ impl App {
                 }
             }
             EventMsg::TurnInterrupted(turn) => {
-                self.finalize_stream(None);
+                self.finalize_assistant_stream(None);
                 self.is_turn_running = false;
                 self.push_history(Box::new(PlainHistoryCell::info(format!(
                     "Turn {} interrupted: {}",
@@ -183,13 +194,15 @@ impl App {
                 self.status_line = format!("Status: {}", agent_status_label(&status.status));
             }
             EventMsg::UserMessage(message) => {
+                self.finalize_reasoning_stream();
                 self.push_history(Box::new(UserHistoryCell::new(message)));
             }
             EventMsg::AgentMessageDelta(delta) => {
-                self.handle_streaming_delta(delta.delta);
+                self.handle_assistant_delta(delta.delta);
             }
             EventMsg::AgentMessageCompleted(completed) => {
-                let committed_from_stream = self.finalize_stream(Some(completed.item_id.as_str()));
+                let committed_from_stream =
+                    self.finalize_assistant_stream(Some(completed.item_id.as_str()));
                 if !committed_from_stream
                     && self.committed_assistant_item_id.as_deref()
                         != Some(completed.item_id.as_str())
@@ -199,8 +212,23 @@ impl App {
                     self.committed_assistant_for_current_turn = true;
                 }
             }
+            EventMsg::AgentReasoningDelta(delta) => {
+                self.handle_reasoning_delta(delta.item_id, delta.delta);
+            }
+            EventMsg::AgentReasoningCompleted(completed) => {
+                self.pending_tool_group = None;
+                if self.committed_reasoning_item_id.as_deref()
+                    != Some(completed.item_id.as_str())
+                {
+                    let committed_from_stream = self.finalize_reasoning_stream();
+                    if !committed_from_stream {
+                        self.push_rendered_reasoning_message(&completed.text);
+                        self.committed_reasoning_item_id = Some(completed.item_id);
+                    }
+                }
+            }
             EventMsg::ToolCallStarted(tool) => {
-                self.finalize_stream(None);
+                self.finalize_assistant_stream(None);
 
                 let call_id = tool.call_id;
                 let tool_name = tool.tool_name;
@@ -222,7 +250,7 @@ impl App {
                 }
             }
             EventMsg::ToolCallCompleted(tool) => {
-                self.finalize_stream(None);
+                self.finalize_assistant_stream(None);
                 let new_state = if tool.success {
                     ToolCallState::Success
                 } else {
@@ -250,7 +278,7 @@ impl App {
                 }
             }
             EventMsg::Error(error) => {
-                self.finalize_stream(None);
+                self.finalize_assistant_stream(None);
                 self.push_history(Box::new(PlainHistoryCell::error(error.message)));
                 self.is_turn_running = false;
                 self.status_line = String::from("Error");
@@ -263,41 +291,94 @@ impl App {
         }
     }
 
-    fn handle_streaming_delta(&mut self, delta: String) {
-        if self.stream_controller.is_none() {
-            self.stream_controller = Some(StreamController::new(Some(usize::from(
+    fn handle_assistant_delta(&mut self, delta: String) {
+        if self.assistant_stream.is_none() {
+            self.assistant_stream = Some(StreamController::new(Some(usize::from(
                 self.terminal_width.saturating_sub(6).max(20),
             ))));
         }
-        if let Some(controller) = self.stream_controller.as_mut() {
+        if let Some(controller) = self.assistant_stream.as_mut() {
             let _ = controller.push(&delta);
-            self.active_cell = controller.snapshot_cell();
+            self.active_assistant_cell = controller
+                .snapshot_lines()
+                .map(|lines| AgentMessageCell::new(lines, true));
         }
     }
 
-    fn finalize_stream(&mut self, item_id: Option<&str>) -> bool {
-        if let Some(controller) = self.stream_controller.take() {
+    fn handle_reasoning_delta(&mut self, item_id: String, delta: String) {
+        self.pending_tool_group = None;
+        self.in_flight_reasoning_item_id = Some(item_id);
+        if self.reasoning_stream.is_none() {
+            self.reasoning_stream = Some(StreamController::new(Some(usize::from(
+                self.terminal_width.saturating_sub(6).max(20),
+            ))));
+        }
+        if let Some(controller) = self.reasoning_stream.as_mut() {
+            let _ = controller.push(&delta);
+            self.active_reasoning_cell = controller
+                .snapshot_lines()
+                .map(|lines| ReasoningCell::new(lines, true));
+        }
+    }
+
+    fn finalize_assistant_stream(&mut self, item_id: Option<&str>) -> bool {
+        self.finalize_reasoning_stream();
+        self.commit_assistant_stream(item_id)
+    }
+
+    fn commit_assistant_stream(&mut self, item_id: Option<&str>) -> bool {
+        if let Some(controller) = self.assistant_stream.take() {
             self.pending_tool_group = None;
-            if let Some(cell) = controller.finalize() {
-                self.push_history(Box::new(cell));
+            if let Some(lines) = controller.finalize_lines() {
+                self.push_history(Box::new(AgentMessageCell::new(lines, true)));
                 self.committed_assistant_item_id = item_id.map(ToOwned::to_owned);
                 self.committed_assistant_for_current_turn = true;
-                self.active_cell = None;
+                self.active_assistant_cell = None;
                 return true;
             }
         }
-        self.active_cell = None;
+        self.active_assistant_cell = None;
+        false
+    }
+
+    fn finalize_reasoning_stream(&mut self) -> bool {
+        let had_reasoning = self.reasoning_stream.is_some() || self.active_reasoning_cell.is_some();
+        let in_flight_id = self.in_flight_reasoning_item_id.take();
+        if let Some(controller) = self.reasoning_stream.take()
+            && let Some(lines) = controller.finalize_lines()
+        {
+            self.push_history(Box::new(ReasoningCell::new(lines, true)));
+            self.active_reasoning_cell = None;
+            if in_flight_id.is_some() {
+                self.committed_reasoning_item_id = in_flight_id;
+            }
+            return true;
+        }
+        self.active_reasoning_cell = None;
+        if had_reasoning {
+            self.pending_tool_group = None;
+        }
         false
     }
 
     fn push_rendered_assistant_message(&mut self, message: &str) {
+        let lines = self.render_markdown_lines(message);
+        self.push_history(Box::new(AgentMessageCell::new(lines, true)));
+    }
+
+    fn push_rendered_reasoning_message(&mut self, message: &str) {
+        let lines = self.render_markdown_lines(message);
+        self.push_history(Box::new(ReasoningCell::new(lines, true)));
+    }
+
+    fn render_markdown_lines(&self, message: &str) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         crate::markdown::append_markdown(
             message,
             Some(usize::from(self.terminal_width.saturating_sub(6))),
             &mut lines,
         );
-        self.push_history(Box::new(AgentMessageCell::new(lines, true)));
+        lines
     }
 
     fn push_history(&mut self, cell: Box<dyn HistoryCell>) {
@@ -328,7 +409,13 @@ impl App {
             }
             lines.extend(cell.display_lines(width));
         }
-        if let Some(active_cell) = self.active_cell.as_ref() {
+        if let Some(active_cell) = self.active_reasoning_cell.as_ref() {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.extend(active_cell.display_lines(width));
+        }
+        if let Some(active_cell) = self.active_assistant_cell.as_ref() {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
@@ -475,8 +562,9 @@ mod tests {
     use super::*;
     use crate::streaming::StreamController;
     use smooth_protocol::{
-        AgentMessageCompletedEvent, AgentMessageDeltaEvent, EventMsg, ToolCallCompletedEvent,
-        ToolCallStartedEvent, TurnCompletedEvent, TurnStartedEvent,
+        AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
+        AgentReasoningDeltaEvent, EventMsg, ToolCallCompletedEvent, ToolCallStartedEvent,
+        TurnCompletedEvent, TurnStartedEvent,
     };
 
     fn event(id: &str, msg: EventMsg) -> Event {
@@ -565,6 +653,36 @@ mod tests {
         );
     }
 
+    fn reasoning_delta(app: &mut App, event_id: &str, item_id: &str, delta: &str) {
+        app.handle_session_event(
+            event(
+                event_id,
+                EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: item_id.to_owned(),
+                    delta: delta.to_owned(),
+                }),
+            ),
+            20,
+        );
+    }
+
+    fn complete_reasoning(app: &mut App, event_id: &str, item_id: &str, text: &str) {
+        app.handle_session_event(
+            event(
+                event_id,
+                EventMsg::AgentReasoningCompleted(AgentReasoningCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: item_id.to_owned(),
+                    text: text.to_owned(),
+                }),
+            ),
+            20,
+        );
+    }
+
     #[test]
     fn assistant_message_delta_complete_and_turn_complete_render_once() {
         let mut app = App::new();
@@ -617,6 +735,187 @@ mod tests {
 
         let joined = transcript_strings(&app).join("\n");
         assert_eq!(joined.matches("Hi! What can I help with?").count(), 1);
+    }
+
+    #[test]
+    fn reasoning_delta_then_completed_renders_once() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        reasoning_delta(&mut app, "2", "reasoning-1", "Thinking through this...\n");
+        complete_reasoning(&mut app, "3", "reasoning-1", "Thinking through this...");
+
+        let transcript = transcript_strings(&app);
+        let joined = transcript.join("\n");
+
+        assert_eq!(joined.matches("Thinking through this...").count(), 1);
+        assert!(
+            transcript
+                .iter()
+                .any(|line| line == "… Thinking through this...")
+        );
+    }
+
+    #[test]
+    fn reasoning_completed_without_deltas_renders_once() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        complete_reasoning(
+            &mut app,
+            "2",
+            "reasoning-1",
+            "Silent chain of thought summary",
+        );
+
+        let transcript = transcript_strings(&app);
+        let joined = transcript.join("\n");
+
+        assert_eq!(joined.matches("Silent chain of thought summary").count(), 1);
+        assert!(
+            transcript
+                .iter()
+                .any(|line| line == "… Silent chain of thought summary")
+        );
+    }
+
+    #[test]
+    fn reasoning_then_assistant_message_render_in_order() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        reasoning_delta(&mut app, "2", "reasoning-1", "Planning steps\n");
+        complete_reasoning(&mut app, "3", "reasoning-1", "Planning steps");
+        app.handle_session_event(
+            event(
+                "4",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("assistant-1"),
+                    delta: String::from("Done.\n"),
+                }),
+            ),
+            20,
+        );
+        complete_agent_message(&mut app, "5", "assistant-1", "Done.");
+        app.handle_session_event(
+            event(
+                "6",
+                EventMsg::TurnCompleted(TurnCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    last_assistant_message: Some(String::from("Done.")),
+                }),
+            ),
+            20,
+        );
+
+        assert_eq!(
+            transcript_strings(&app),
+            vec![
+                String::from("… Planning steps"),
+                String::new(),
+                String::from("• Done."),
+            ]
+        );
+    }
+
+    #[test]
+    fn interleaved_reasoning_completion_does_not_duplicate_assistant() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        reasoning_delta(&mut app, "2", "reasoning-1", "Planning\n");
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("assistant-1"),
+                    delta: String::from("Started answer\n"),
+                }),
+            ),
+            20,
+        );
+        complete_reasoning(&mut app, "4", "reasoning-1", "Planning");
+        assert_eq!(
+            transcript_strings(&app),
+            vec![
+                String::from("… Planning"),
+                String::new(),
+                String::from("• Started answer"),
+            ]
+        );
+        complete_agent_message(&mut app, "5", "assistant-1", "Started answer");
+
+        let joined = transcript_strings(&app).join("\n");
+        assert_eq!(joined.matches("Started answer").count(), 1);
+        assert!(joined.contains("… Planning\n\n• Started answer"));
+    }
+
+    #[test]
+    fn duplicate_reasoning_completion_does_not_duplicate_cell() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        complete_reasoning(&mut app, "2", "r-1", "Planning");
+        complete_reasoning(&mut app, "3", "r-1", "Planning");
+
+        let joined = transcript_strings(&app).join("\n");
+        assert_eq!(joined.matches("Planning").count(), 1);
+    }
+
+    #[test]
+    fn late_reasoning_completion_after_stream_finalized_via_assistant_does_not_duplicate() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        reasoning_delta(&mut app, "2", "r-1", "Planning\n");
+        // Reasoning stream gets flushed by an assistant-side finalization
+        // (e.g., AgentMessageCompleted) before the matching ReasoningCompleted event arrives.
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("a-1"),
+                    delta: String::from("Done.\n"),
+                }),
+            ),
+            20,
+        );
+        complete_agent_message(&mut app, "4", "a-1", "Done.");
+        // Late completion for the reasoning we already streamed.
+        complete_reasoning(&mut app, "5", "r-1", "Planning");
+
+        let joined = transcript_strings(&app).join("\n");
+        assert_eq!(joined.matches("Planning").count(), 1);
+    }
+
+    #[test]
+    fn reasoning_breaks_tool_group() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "read", "foo.rs");
+        complete_tool_call(&mut app, "3", "c1", true, None);
+        complete_reasoning(&mut app, "4", "reasoning-1", "Checking context");
+        start_tool_call(&mut app, "5", "c2", "read", "bar.rs");
+        complete_tool_call(&mut app, "6", "c2", true, None);
+
+        assert_eq!(
+            transcript_strings(&app),
+            vec![
+                String::from("✓ read foo.rs"),
+                String::new(),
+                String::from("… Checking context"),
+                String::new(),
+                String::from("✓ read bar.rs"),
+            ]
+        );
     }
 
     #[test]
@@ -861,7 +1160,7 @@ mod tests {
         start_tool_call(&mut app, "2", "c1", "read", "foo.rs");
         complete_tool_call(&mut app, "3", "c1", true, None);
 
-        app.stream_controller = Some(StreamController::new(Some(20)));
+        app.assistant_stream = Some(StreamController::new(Some(20)));
 
         start_tool_call(&mut app, "4", "c2", "read", "bar.rs");
         complete_tool_call(&mut app, "5", "c2", true, None);

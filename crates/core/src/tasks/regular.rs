@@ -3,11 +3,11 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use rig::{
     OneOrMany,
-    message::{Message, Text, UserContent},
+    message::{Message, Reasoning as MessageReasoning, ReasoningContent, Text, UserContent},
 };
 use smooth_protocol::{
-    AgentMessageCompletedEvent, AgentMessageDeltaEvent, EventMsg, ToolCallCompletedEvent,
-    ToolCallStartedEvent,
+    AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
+    AgentReasoningDeltaEvent, EventMsg, ToolCallCompletedEvent, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +18,20 @@ use crate::{
 };
 
 use super::SessionTask;
+
+fn reasoning_text(reasoning: &MessageReasoning) -> String {
+    reasoning
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            ReasoningContent::Text { text, .. } | ReasoningContent::Summary(text) => {
+                Some(text.as_str())
+            }
+            // `ReasoningContent` is non-exhaustive; only human-readable variants are surfaced.
+            _ => None,
+        })
+        .collect::<String>()
+}
 
 #[derive(Default)]
 pub(crate) struct RegularTask;
@@ -111,9 +125,42 @@ impl SessionTask for RegularTask {
                             )
                             .await;
                     }
+                    SessionAssistantContent::ReasoningDelta { id, reasoning } => {
+                        let item_id =
+                            id.unwrap_or_else(|| format!("{}-reasoning", ctx.assistant_item_id));
+                        session
+                            .emit_event(
+                                &ctx,
+                                EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
+                                    thread_id: session.id.to_string(),
+                                    turn_id: ctx.sub_id.clone(),
+                                    item_id,
+                                    delta: reasoning,
+                                }),
+                            )
+                            .await;
+                    }
+                    SessionAssistantContent::Reasoning(reasoning) => {
+                        let text = reasoning_text(&reasoning);
+                        if text.is_empty() {
+                            continue;
+                        }
+
+                        session
+                            .emit_event(
+                                &ctx,
+                                EventMsg::AgentReasoningCompleted(AgentReasoningCompletedEvent {
+                                    thread_id: session.id.to_string(),
+                                    turn_id: ctx.sub_id.clone(),
+                                    item_id: reasoning.id.unwrap_or_else(|| {
+                                        format!("{}-reasoning", ctx.assistant_item_id)
+                                    }),
+                                    text,
+                                }),
+                            )
+                            .await;
+                    }
                     SessionAssistantContent::ToolCallDelta { .. }
-                    | SessionAssistantContent::Reasoning(_)
-                    | SessionAssistantContent::ReasoningDelta { .. }
                     | SessionAssistantContent::Final => {}
                 },
                 SessionStreamEvent::StreamUserItem(user_item) => match user_item {

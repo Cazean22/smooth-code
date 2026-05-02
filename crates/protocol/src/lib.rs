@@ -59,6 +59,8 @@ pub enum EventMsg {
     AgentMessage(String),
     AgentMessageDelta(AgentMessageDeltaEvent),
     AgentMessageCompleted(AgentMessageCompletedEvent),
+    AgentReasoningDelta(AgentReasoningDeltaEvent),
+    AgentReasoningCompleted(AgentReasoningCompletedEvent),
     ToolCallStarted(ToolCallStartedEvent),
     ToolCallCompleted(ToolCallCompletedEvent),
 
@@ -116,6 +118,24 @@ pub struct AgentMessageDeltaEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMessageCompletedEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReasoningDeltaEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub delta: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReasoningCompletedEvent {
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,

@@ -18,7 +18,7 @@ use crate::{
         notify,
         registry::{AgentMetadata, AgentRegistry},
         role::resolve_role,
-        status::is_final,
+        status::{agent_status_from_event, is_final},
     },
     core_thread::CoreThread,
     provider::SessionModelFactory,
@@ -92,6 +92,31 @@ impl AgentControl {
             .entry(thread_id)
             .or_insert_with(|| watch::channel(AgentStatus::PendingInit).0);
         Ok(metadata)
+    }
+
+    pub(crate) fn register_existing_agent(
+        &self,
+        metadata: AgentMetadata,
+        initial_events: &[EventMsg],
+    ) -> Result<AgentMetadata> {
+        let registered = self
+            .state
+            .registry
+            .register_existing_thread(metadata.clone(), AGENT_MAX_THREADS)
+            .map_err(anyhow::Error::msg)?;
+        let status = initial_events
+            .iter()
+            .filter_map(agent_status_from_event)
+            .last()
+            .unwrap_or(AgentStatus::PendingInit);
+        self.ensure_status_sender(
+            registered
+                .agent_id
+                .ok_or_else(|| anyhow!("registered agent is missing thread id"))?,
+            status,
+        );
+        self.maybe_start_completion_watcher(registered.clone());
+        Ok(registered)
     }
 
     pub(crate) fn get_status(&self, thread_id: ThreadId) -> AgentStatus {

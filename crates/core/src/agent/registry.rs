@@ -114,6 +114,46 @@ impl AgentRegistry {
         })
     }
 
+    pub(crate) fn register_existing_thread(
+        &self,
+        metadata: AgentMetadata,
+        max_threads: usize,
+    ) -> Result<AgentMetadata, String> {
+        let Some(agent_id) = metadata.agent_id else {
+            return Err("agent metadata must include an agent_id".to_string());
+        };
+        let mut state = self.state.lock().expect("registry mutex should lock");
+        if let Some(existing) = state.agents_by_thread.get(&agent_id) {
+            return Ok(existing.clone());
+        }
+        if metadata.depth < 0 {
+            return Err("agent depth cannot be negative".to_string());
+        }
+        if metadata.depth > 0 {
+            let parent_thread_id = metadata.parent_thread_id.ok_or_else(|| {
+                "child agent metadata must include a parent thread id".to_string()
+            })?;
+            if !state.agents_by_thread.contains_key(&parent_thread_id) {
+                return Err(format!("parent thread not registered: {parent_thread_id}"));
+            }
+        }
+        if state.agents_by_thread.len() >= max_threads {
+            return Err(format!("agent thread limit exceeded: {max_threads}"));
+        }
+        if state.thread_by_path.contains_key(&metadata.agent_path) {
+            return Err(format!(
+                "agent path already registered: {}",
+                metadata.agent_path
+            ));
+        }
+
+        state
+            .thread_by_path
+            .insert(metadata.agent_path.clone(), agent_id);
+        state.agents_by_thread.insert(agent_id, metadata.clone());
+        Ok(metadata)
+    }
+
     pub(crate) fn agent_id_for_path(&self, path: &AgentPath) -> Option<ThreadId> {
         self.state
             .lock()

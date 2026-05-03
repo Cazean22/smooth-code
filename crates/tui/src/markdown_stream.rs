@@ -19,6 +19,11 @@ impl MarkdownStreamCollector {
         self.buffer.push_str(delta);
     }
 
+    pub(crate) fn pending_tail(&self) -> &str {
+        let start = self.buffer.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        &self.buffer[start..]
+    }
+
     pub(crate) fn commit_complete_lines(&mut self) -> Vec<Line<'static>> {
         let Some(last_newline_idx) = self.buffer.rfind('\n') else {
             return Vec::new();

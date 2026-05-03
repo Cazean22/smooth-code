@@ -806,6 +806,27 @@ mod tests {
     }
 
     #[test]
+    fn assistant_delta_without_newline_renders_while_streaming() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("assistant-1"),
+                    delta: String::from("hello"),
+                }),
+            ),
+            20,
+        );
+
+        assert_eq!(transcript_strings(&app), vec![String::from("• hello")]);
+    }
+
+    #[test]
     fn reasoning_delta_then_completed_renders_once() {
         let mut app = App::new();
 

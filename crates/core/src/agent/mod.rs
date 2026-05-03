@@ -2,6 +2,7 @@
 
 pub(crate) mod agent_resolver;
 pub(crate) mod control;
+pub(crate) mod fork;
 pub(crate) mod mailbox;
 pub(crate) mod multi_agent_client;
 pub(crate) mod notify;

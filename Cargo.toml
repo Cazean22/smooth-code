@@ -6,7 +6,7 @@ license = "MIT"
 
 [workspace]
 resolver = "3"
-members = ["crates/app-server","crates/app-server-protocol","crates/core", "crates/protocol", "crates/tools", "crates/tui"]
+members = ["crates/app-server","crates/app-server-protocol","crates/core", "crates/protocol", "crates/state-db", "crates/tools", "crates/tui"]
 
 default-members = [
   "crates/tui"
@@ -29,4 +29,6 @@ tokio-util = "0.7.18"
 tracing = "0.1.41"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite"] }
+thiserror = "2.0.17"
 uuid = "1.23.1"

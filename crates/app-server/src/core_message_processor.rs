@@ -72,17 +72,17 @@ impl DynamicToolClient for InProcessDynamicToolClient {
 }
 
 impl CoreMessageProcessor {
-    pub fn new(
+    pub async fn new(
         event_tx: mpsc::Sender<InProcessServerEvent>,
         outgoing: Arc<OutgoingMessageSender>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let dynamic_tool_client_factory: Arc<dyn DynamicToolClientFactory> =
             Arc::new(InProcessDynamicToolClientFactory { outgoing });
-        Self {
-            threads: ThreadManagerState::new(Some(dynamic_tool_client_factory), None),
+        Ok(Self {
+            threads: ThreadManagerState::new(Some(dynamic_tool_client_factory), None).await?,
             event_tx,
             subscribed_threads: Mutex::new(HashSet::new()),
-        }
+        })
     }
 
     pub async fn process_request(

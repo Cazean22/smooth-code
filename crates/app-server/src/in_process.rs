@@ -81,8 +81,18 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
                 let processor_handle = tokio::task::Builder::new()
                     .name("app_server.message_processor")
                     .spawn(async move {
-                        let processor =
-                            Arc::new(MessageProcessor::new(processor_event_tx, processor_outgoing));
+                        let processor = match MessageProcessor::new(
+                            processor_event_tx,
+                            processor_outgoing,
+                        )
+                        .await
+                        {
+                            Ok(processor) => Arc::new(processor),
+                            Err(err) => {
+                                tracing::error!(error = %err, "failed to initialize message processor");
+                                return;
+                            }
+                        };
 
                         loop {
                             match processor_rx.recv().await {

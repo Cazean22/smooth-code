@@ -14,14 +14,14 @@ pub(crate) struct MessageProcessor {
 }
 
 impl MessageProcessor {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         event_tx: mpsc::Sender<InProcessServerEvent>,
         outgoing: Arc<OutgoingMessageSender>,
-    ) -> Self {
-        let core_message_processor = CoreMessageProcessor::new(event_tx, outgoing);
-        Self {
+    ) -> anyhow::Result<Self> {
+        let core_message_processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        Ok(Self {
             core_message_processor,
-        }
+        })
     }
 
     #[tracing::instrument(

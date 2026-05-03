@@ -394,7 +394,9 @@ mod tests {
                     delay: Duration::ZERO,
                 })),
             })),
-        );
+        )
+        .await
+        .expect("thread manager");
         let started = manager.start_thread().await.expect("start root");
         let client = InProcessMultiAgentClient::new(started.thread_id, manager.agent_control());
 
@@ -440,7 +442,9 @@ mod tests {
                     delay: Duration::from_millis(20),
                 })),
             })),
-        );
+        )
+        .await
+        .expect("thread manager");
         let started = manager.start_thread().await.expect("start root");
         let client = InProcessMultiAgentClient::new(started.thread_id, manager.agent_control());
         let spawned = client

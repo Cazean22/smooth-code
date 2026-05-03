@@ -3,7 +3,7 @@
 - Rust 2024 workspace; default member is `crates/tui`, so bare `cargo build/test/run` targets `smooth-tui` unless `--workspace` or `-p` is used.
 - Main crates: `smooth-tui` (`crates/tui`) is the terminal UI entrypoint; `app-server` is the in-process request/event bridge; `smooth-core` is the session/thread runtime; `smooth-protocol` and `app-server-protocol` hold shared wire types.
 - Runtime flow: TUI -> `AppServerSession` -> `app_server::in_process` -> `MessageProcessor` -> `ThreadManagerState`/`CoreThread`/`Core` -> Rig streaming model/tool loop -> protocol events back to the TUI.
-- Persistence: there is no SQL or embedded database; sessions are newline-delimited JSON rollout files under `.smooth-code/sessions/YYYY/MM/DD/*.jsonl`, and telemetry logs go to `.smooth-code/logs/smooth-tui.log`.
+- Persistence: rollout sessions are newline-delimited JSON under `.smooth-code/sessions/YYYY/MM/DD/*.jsonl`, telemetry logs go to `.smooth-code/logs/smooth-tui.log`, and multi-agent thread metadata lives in SQLite at `.smooth-code/state.db`.
 - Internal APIs: shared event/status/thread types live in `crates/protocol`; typed request/response envelopes (`ClientRequest`, `ServerRequest`, `Thread*`, `TurnStart*`) live in `crates/app-server-protocol`.
 - LLM config comes from env vars: `SMOOTH_CODE_LLM_PROVIDER`, `SMOOTH_CODE_LLM_MODEL`, `SMOOTH_CODE_LLM_PREAMBLE`; non-OpenAI providers also need their provider API keys.
 - `.cargo/config.toml` enables `tokio_unstable`; do not remove it casually.

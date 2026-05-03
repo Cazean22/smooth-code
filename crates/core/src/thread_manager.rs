@@ -2,6 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use smooth_protocol::{Event, Op, SessionSource, ThreadId};
+use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, broadcast};
 use tools::{DynamicToolClient, DynamicToolClientFactory};
 
@@ -29,26 +30,32 @@ pub struct ThreadManagerState {
     dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
     model_factory: Option<Arc<dyn SessionModelFactory>>,
     agent_control: AgentControl,
+    state_db: StateDbHandle,
 }
 
 impl ThreadManagerState {
-    pub fn new(
+    pub async fn new(
         dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let threads = Arc::new(RwLock::new(HashMap::new()));
+        let workspace_root = workspace_root()?;
+        let state_db =
+            StateDbHandle::open(workspace_root.join(".smooth-code").join("state.db")).await?;
         let agent_control = AgentControl::new();
         agent_control.attach_runtime(
             Arc::clone(&threads),
             dynamic_tool_client_factory.clone(),
             model_factory.clone(),
+            state_db.clone(),
         );
-        Self {
+        Ok(Self {
             threads,
             dynamic_tool_client_factory,
             model_factory,
             agent_control,
-        }
+            state_db,
+        })
     }
 
     #[tracing::instrument(name = "core.thread_manager.start_thread", skip(self))]
@@ -69,6 +76,9 @@ impl ThreadManagerState {
         let mut threads = self.threads.write().await;
         threads.insert(thread_id, thread);
         let _ = self.agent_control.register_session_root(thread_id);
+        self.state_db
+            .upsert_thread(&thread_id.to_string(), None, None, None)
+            .await?;
         Ok(StartedThread {
             thread_id,
             rollout_path,
@@ -104,6 +114,9 @@ impl ThreadManagerState {
         let mut threads = self.threads.write().await;
         threads.insert(thread_id, thread);
         let _ = self.agent_control.register_session_root(thread_id);
+        self.state_db
+            .upsert_thread(&thread_id.to_string(), None, None, None)
+            .await?;
         Ok(ResumedThread {
             thread_id,
             rollout_path,

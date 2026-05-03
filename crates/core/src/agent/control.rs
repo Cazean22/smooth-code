@@ -7,18 +7,22 @@ use anyhow::{Result, anyhow};
 use smooth_protocol::{
     AgentStatus, EventMsg, InterAgentCommunication, Op, SessionSource, SubAgentSource, ThreadId,
 };
+use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, watch};
 use tools::DynamicToolClientFactory;
 
 use crate::{
     agent::{
-        agent_resolver, notify,
+        agent_resolver,
+        fork::{SpawnAgentForkMode, persisted_items_to_messages},
+        notify,
         registry::{AgentMetadata, AgentRegistry},
         role::resolve_role,
         status::is_final,
     },
     core_thread::CoreThread,
     provider::SessionModelFactory,
+    rollout::read_persisted_items,
 };
 
 const AGENT_MAX_DEPTH: i32 = 8;
@@ -41,6 +45,7 @@ struct AgentControlRuntime {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
     dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
     model_factory: Option<Arc<dyn SessionModelFactory>>,
+    state_db: StateDbHandle,
 }
 
 impl AgentControl {
@@ -59,6 +64,7 @@ impl AgentControl {
         threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
         dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
+        state_db: StateDbHandle,
     ) {
         *self
             .state
@@ -68,6 +74,7 @@ impl AgentControl {
             threads,
             dynamic_tool_client_factory,
             model_factory,
+            state_db,
         });
     }
 
@@ -171,9 +178,6 @@ impl AgentControl {
         if model.is_some() {
             return Err(anyhow!("spawn_agent model override is not implemented yet"));
         }
-        if fork_context {
-            return Err(anyhow!("spawn_agent fork_context is not implemented yet"));
-        }
 
         let runtime = self
             .state
@@ -200,13 +204,20 @@ impl AgentControl {
             .dynamic_tool_client_factory
             .as_ref()
             .map(|factory| factory.build(child_thread_id));
+        let initial_history = if fork_context {
+            self.load_fork_history(parent_thread_id, SpawnAgentForkMode::ParentHistory)
+                .await?
+        } else {
+            Vec::new()
+        };
         let child_thread = Arc::new(
-            CoreThread::new(
+            CoreThread::new_with_history(
                 child_thread_id,
                 dynamic_tool_client,
                 runtime.model_factory.clone(),
                 child_source,
                 self.clone(),
+                initial_history,
             )
             .await?,
         );
@@ -236,6 +247,19 @@ impl AgentControl {
                 depth,
             })
             .map_err(anyhow::Error::msg)?;
+        runtime
+            .state_db
+            .upsert_thread(
+                &child_thread_id.to_string(),
+                Some(metadata.agent_path.as_str()),
+                metadata.agent_nickname.as_deref(),
+                metadata.agent_role.as_deref(),
+            )
+            .await?;
+        runtime
+            .state_db
+            .upsert_open_edge(&parent_thread_id.to_string(), &child_thread_id.to_string())
+            .await?;
         self.maybe_start_completion_watcher(metadata.clone());
         Ok(metadata)
     }
@@ -324,6 +348,17 @@ impl AgentControl {
     ) -> Result<AgentStatus> {
         let target_thread_id = self.resolve_agent_reference(author_thread_id, target)?;
         let runtime = self.runtime()?;
+        if let Some(metadata) = self
+            .state
+            .registry
+            .agent_metadata_for_thread(target_thread_id)
+            && let Some(parent_thread_id) = metadata.parent_thread_id
+        {
+            runtime
+                .state_db
+                .close_edge(&parent_thread_id.to_string(), &target_thread_id.to_string())
+                .await?;
+        }
         let threads = runtime.threads.read().await;
         let thread = threads
             .get(&target_thread_id)
@@ -428,17 +463,41 @@ impl AgentControl {
         drop(threads);
         thread.core.emit_session_event(msg).await;
     }
+
+    async fn load_fork_history(
+        &self,
+        parent_thread_id: ThreadId,
+        _fork_mode: SpawnAgentForkMode,
+    ) -> Result<Vec<rig::message::Message>> {
+        let runtime = self.runtime()?;
+        let threads = runtime.threads.read().await;
+        let parent_thread = threads
+            .get(&parent_thread_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown parent thread id: {parent_thread_id}"))?;
+        drop(threads);
+
+        parent_thread.flush_rollout().await?;
+        let items = read_persisted_items(parent_thread.rollout_path()).await?;
+        Ok(persisted_items_to_messages(items))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use anyhow::Result;
+    use futures_util::stream;
     use rig::{
         agent::FinalResponse,
-        message::{Message, Text},
+        message::{Message, Text, UserContent},
     };
+    use smooth_state_db::StateDbHandle;
     use tempfile::TempDir;
     use tokio::sync::watch;
 
@@ -448,7 +507,6 @@ mod tests {
         agent::role::RoleOverride, provider::SessionStreamEvent,
         thread_manager::ThreadManagerState,
     };
-    use futures_util::stream;
     use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
     use tools::DynamicToolClient;
 
@@ -504,6 +562,60 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingState {
+        calls: Mutex<HashMap<ThreadId, Vec<Vec<Message>>>>,
+    }
+
+    struct RecordingDriver {
+        thread_id: ThreadId,
+        state: Arc<RecordingState>,
+        text: String,
+    }
+
+    impl SessionModelDriver for RecordingDriver {
+        fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+            self.state
+                .calls
+                .lock()
+                .expect("calls mutex should lock")
+                .entry(self.thread_id)
+                .or_default()
+                .push(history.clone());
+            let _ = prompt;
+            Ok(Box::pin(stream::iter(vec![
+                Ok(SessionStreamEvent::StreamAssistantItem(
+                    crate::SessionAssistantContent::Text(Text {
+                        text: self.text.clone(),
+                    }),
+                )),
+                Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty())),
+            ])))
+        }
+    }
+
+    struct RecordingFactory {
+        state: Arc<RecordingState>,
+    }
+
+    impl SessionModelFactory for RecordingFactory {
+        fn build(
+            &self,
+            _cwd: PathBuf,
+            thread_id: ThreadId,
+            _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+            _current_turn_id: Arc<watch::Sender<Option<String>>>,
+            _role_override: RoleOverride,
+            _agent_control: AgentControl,
+        ) -> Result<SessionModel> {
+            Ok(SessionModel::Stub(Arc::new(RecordingDriver {
+                thread_id,
+                state: Arc::clone(&self.state),
+                text: "recorded".to_string(),
+            })))
+        }
+    }
+
     #[tokio::test]
     async fn spawn_agent_creates_child_and_tracks_it_live() {
         let _cwd_guard = crate::test_support::cwd_test_lock()
@@ -520,7 +632,9 @@ mod tests {
                     text: "child".into(),
                 })),
             })),
-        );
+        )
+        .await
+        .expect("thread manager");
         let started = manager.start_thread().await.expect("start root");
         let root_id = started.thread_id;
 
@@ -532,6 +646,33 @@ mod tests {
 
         assert!(child.agent_path.as_str().starts_with("/root/"));
         assert_eq!(control.registry().live_agents().len(), 2);
+        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db"))
+            .await
+            .expect("open state db");
+        let root_row = state_db
+            .get_thread(&root_id.to_string())
+            .await
+            .expect("get root row")
+            .expect("root row");
+        assert_eq!(root_row.agent_path, None);
+        let child_id = child.agent_id.expect("child id");
+        let child_row = state_db
+            .get_thread(&child_id.to_string())
+            .await
+            .expect("get child row")
+            .expect("child row");
+        assert_eq!(
+            child_row.agent_path.as_deref(),
+            Some(child.agent_path.as_str())
+        );
+        assert_eq!(
+            state_db
+                .list_open_children(&root_id.to_string())
+                .await
+                .expect("list open children")
+                .len(),
+            1
+        );
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
     }
@@ -552,7 +693,9 @@ mod tests {
                     text: "response".into(),
                 })),
             })),
-        );
+        )
+        .await
+        .expect("thread manager");
         let started = manager.start_thread().await.expect("start root");
         let root_id = started.thread_id;
         let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
@@ -609,7 +752,9 @@ mod tests {
                     text: "response".into(),
                 })),
             })),
-        );
+        )
+        .await
+        .expect("thread manager");
         let started = manager.start_thread().await.expect("start root");
         let root_id = started.thread_id;
         let control = manager.agent_control();
@@ -624,6 +769,16 @@ mod tests {
             .expect("close child");
         assert_eq!(status, AgentStatus::Shutdown);
         assert_eq!(control.registry().live_agents().len(), 1);
+        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db"))
+            .await
+            .expect("open state db");
+        assert!(
+            state_db
+                .list_open_children(&root_id.to_string())
+                .await
+                .expect("list open children")
+                .is_empty()
+        );
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
     }
@@ -644,7 +799,9 @@ mod tests {
                     text: "response".into(),
                 })),
             })),
-        );
+        )
+        .await
+        .expect("thread manager");
         let started = manager.start_thread().await.expect("start root");
         let root_id = started.thread_id;
         let control = manager.agent_control();
@@ -666,6 +823,75 @@ mod tests {
                 .iter()
                 .any(|mail| mail.content.contains("reached terminal status"))
         );
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_with_fork_context_seeds_child_history() {
+        let _cwd_guard = crate::test_support::cwd_test_lock()
+            .lock()
+            .expect("cwd lock");
+        let workspace = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+        let recording_state = Arc::new(RecordingState::default());
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(RecordingFactory {
+                state: Arc::clone(&recording_state),
+            })),
+        )
+        .await
+        .expect("thread manager");
+        let started = manager.start_thread().await.expect("start root");
+        let root_id = started.thread_id;
+        manager
+            .start_user_input(root_id, "parent asks".to_string())
+            .await
+            .expect("parent turn");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent_with_role(
+                root_id,
+                "child task".to_string(),
+                Some("explorer".to_string()),
+                None,
+                true,
+            )
+            .await
+            .expect("spawn child");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let child_id = child.agent_id.expect("child id");
+        let calls = recording_state
+            .calls
+            .lock()
+            .expect("calls mutex should lock");
+        let child_history = calls
+            .get(&child_id)
+            .and_then(|calls| calls.first())
+            .expect("child first call history");
+        assert_eq!(child_history.len(), 2);
+        assert!(matches!(
+            &child_history[0],
+            Message::User { content }
+                if matches!(
+                    content.iter().next(),
+                    Some(UserContent::Text(Text { text })) if text == "parent asks"
+                )
+        ));
+        assert!(matches!(
+            &child_history[1],
+            Message::User { content }
+                if matches!(
+                    content.iter().next(),
+                    Some(UserContent::Text(Text { text })) if text == "child task"
+                )
+        ));
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
     }

@@ -11,12 +11,13 @@ use smooth_protocol::{
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, broadcast};
-use tools::{DynamicToolClient, DynamicToolClientFactory};
+use tools::{DynMultiAgentClient, DynamicToolClient, DynamicToolClientFactory};
 use uuid::Uuid;
 
 use crate::{
     ThreadSummary,
     agent::AgentControl,
+    agent::InProcessMultiAgentClient,
     core_thread::CoreThread,
     provider::SessionModelFactory,
     rollout::{find_thread_path, list_threads, load_resume_state, workspace_root},
@@ -167,6 +168,13 @@ impl ThreadManagerState {
 
     pub(crate) fn agent_control(&self) -> AgentControl {
         self.agent_control.clone()
+    }
+
+    pub fn multi_agent_client(&self, author_thread_id: ThreadId) -> DynMultiAgentClient {
+        Arc::new(InProcessMultiAgentClient::new(
+            author_thread_id,
+            self.agent_control.clone(),
+        ))
     }
 
     pub(crate) async fn remove_thread(&self, thread_id: ThreadId) -> Option<Arc<CoreThread>> {
@@ -328,7 +336,9 @@ impl ThreadManagerState {
         })?;
         let agent_path = AgentPath::try_from(agent_path)
             .map_err(anyhow::Error::msg)
-            .with_context(|| format!("invalid agent path `{agent_path}` for thread {child_thread_id}"))?;
+            .with_context(|| {
+                format!("invalid agent path `{agent_path}` for thread {child_thread_id}")
+            })?;
         let rollout_path = find_thread_path(workspace_root, child_thread_id).await?;
         let resume_state = load_resume_state(&rollout_path).await?;
         let initial_messages = resume_state.initial_messages.clone();

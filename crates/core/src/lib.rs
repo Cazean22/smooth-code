@@ -10,6 +10,7 @@ pub mod test_support;
 mod thread_manager;
 
 pub use agent::AgentControl;
+pub use agent::role::RoleOverride;
 pub use provider::{
     EnvSessionModelFactory, SessionAssistantContent, SessionModel, SessionModelDriver,
     SessionModelFactory, SessionStream, SessionStreamEvent,

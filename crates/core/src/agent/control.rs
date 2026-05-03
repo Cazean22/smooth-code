@@ -107,7 +107,7 @@ impl AgentControl {
         let status = initial_events
             .iter()
             .filter_map(agent_status_from_event)
-            .last()
+            .next_back()
             .unwrap_or(AgentStatus::PendingInit);
         self.ensure_status_sender(
             registered

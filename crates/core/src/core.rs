@@ -38,6 +38,7 @@ pub(crate) struct Session {
     event_tx: broadcast::Sender<Event>,
     state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    #[allow(dead_code)]
     pub(crate) session_source: SessionSource,
     pub(crate) agent_control: AgentControl,
     pub(crate) mailbox: Mailbox,
@@ -54,10 +55,12 @@ pub(crate) struct Session {
 pub(crate) struct TurnContext {
     pub(crate) sub_id: String,
     pub(crate) assistant_item_id: String,
+    #[allow(dead_code)]
     pub(crate) timezone: Option<String>,
 }
 
 impl Core {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: ThreadId,
         model: SessionModel,

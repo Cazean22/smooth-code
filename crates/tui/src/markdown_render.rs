@@ -9,6 +9,7 @@ struct ListState {
     next_ordered: Option<u64>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn render_markdown_text(input: &str) -> Text<'static> {
     render_markdown_text_with_width(input, None)
 }

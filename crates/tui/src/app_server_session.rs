@@ -64,6 +64,7 @@ impl AppServerSession {
     }
 
     #[tracing::instrument(name = "tui.thread_resume", skip(self), fields(thread_id = %thread_id))]
+    #[allow(dead_code)]
     pub(crate) async fn thread_resume(
         &mut self,
         thread_id: ThreadId,
@@ -84,6 +85,7 @@ impl AppServerSession {
     }
 
     #[tracing::instrument(name = "tui.thread_list", skip(self))]
+    #[allow(dead_code)]
     pub(crate) async fn thread_list(
         &mut self,
         cursor: Option<String>,
@@ -114,7 +116,6 @@ impl AppServerSession {
         self.client
             .respond_to_server_request(request_id, result)
             .await
-            .map_err(Into::into)
     }
 
     pub(crate) async fn fail_server_request(
@@ -122,9 +123,6 @@ impl AppServerSession {
         request_id: RequestId,
         error: app_server_protocol::JSONRPCErrorError,
     ) -> Result<()> {
-        self.client
-            .fail_server_request(request_id, error)
-            .await
-            .map_err(Into::into)
+        self.client.fail_server_request(request_id, error).await
     }
 }

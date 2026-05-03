@@ -45,6 +45,7 @@ impl AgentMessageCell {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn lines(&self) -> &[Line<'static>] {
         &self.lines
     }

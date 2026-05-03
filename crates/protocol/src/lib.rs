@@ -16,6 +16,12 @@ impl ThreadId {
     }
 }
 
+impl Default for ThreadId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Display for ThreadId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -89,17 +95,12 @@ pub enum EventMsg {
     UserMessage(String),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionSource {
+    #[default]
     Cli,
     SubAgent(SubAgentSource),
-}
-
-impl Default for SessionSource {
-    fn default() -> Self {
-        Self::Cli
-    }
 }
 
 impl SessionSource {

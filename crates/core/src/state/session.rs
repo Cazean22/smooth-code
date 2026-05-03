@@ -3,6 +3,7 @@ use crate::context_manager::ContextManager;
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) history: ContextManager,
+    #[allow(dead_code)]
     pub(crate) next_turn_is_first: bool,
 }
 

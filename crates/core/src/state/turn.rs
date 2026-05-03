@@ -9,6 +9,7 @@ use crate::{core::TurnContext, tasks::AnySessionTask};
 /// Metadata about the currently running turn.
 pub(crate) struct ActiveTurn {
     pub(crate) tasks: IndexMap<String, RunningTask>,
+    #[allow(dead_code)]
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
 }
 
@@ -24,6 +25,7 @@ pub(crate) struct ActiveTurn {
 ///   prompt or a tool call after an untagged preamble), we reopen `CurrentTurn`
 ///   so that pending child mail is drained into that follow-up request.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum MailboxDeliveryPhase {
     /// Incoming mailbox messages can still be consumed by the current turn.
     #[default]
@@ -43,6 +45,7 @@ impl Default for ActiveTurn {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum TaskKind {
     Regular,
     Review,
@@ -50,10 +53,13 @@ pub(crate) enum TaskKind {
 }
 
 pub(crate) struct RunningTask {
+    #[allow(dead_code)]
     pub(crate) done: Arc<Notify>,
+    #[allow(dead_code)]
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
+    #[allow(dead_code)]
     pub(crate) handle: Arc<AbortOnDropHandle<()>>,
     pub(crate) turn_context: Arc<TurnContext>,
 }
@@ -77,5 +83,6 @@ impl ActiveTurn {
 /// Mutable state for a single turn.
 #[derive(Default)]
 pub(crate) struct TurnState {
+    #[allow(dead_code)]
     pub(crate) tool_calls: u64,
 }

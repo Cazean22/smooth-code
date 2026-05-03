@@ -157,6 +157,7 @@ impl ThreadManagerState {
         thread.submit(op).await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn send_op(&self, thread_id: ThreadId, op: Op) -> Result<String> {
         self.submit(thread_id, op).await
     }
@@ -166,6 +167,7 @@ impl ThreadManagerState {
         Ok(thread.subscribe())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn agent_control(&self) -> AgentControl {
         self.agent_control.clone()
     }
@@ -177,16 +179,18 @@ impl ThreadManagerState {
         ))
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn remove_thread(&self, thread_id: ThreadId) -> Option<Arc<CoreThread>> {
         self.threads.write().await.remove(&thread_id)
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn shutdown_and_remove_thread(
         &self,
         thread_id: ThreadId,
         reason: &str,
     ) -> Result<()> {
-        if let Some(thread) = self.get(thread_id).await.ok() {
+        if let Ok(thread) = self.get(thread_id).await {
             let _ = thread.submit(Op::Shutdown).await;
             thread.core.session.abort_all_tasks(reason).await;
         }

@@ -31,6 +31,7 @@ pub enum InProcessServerEvent {
 pub struct InProcessClientHandle {
     pub client_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
+    #[allow(dead_code)]
     runtime_handle: tokio::task::JoinHandle<()>,
 }
 

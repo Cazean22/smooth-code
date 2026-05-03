@@ -6,6 +6,7 @@ use tracing::Instrument;
 pub(crate) struct AppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
+    #[allow(dead_code)]
     worker_handle: tokio::task::JoinHandle<()>,
 }
 

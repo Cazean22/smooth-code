@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, pin::Pin, sync::Arc};
+use std::{collections::HashMap, env, path::PathBuf, pin::Pin, sync::Arc};
 
 use anyhow::{Result, bail};
 use futures_util::StreamExt;
@@ -23,15 +23,46 @@ use tools::{
     DynamicTool, DynamicToolClient, EditTool, ListDirTool, ReadTool, RunCommandTool, WriteTool,
 };
 
+/// Injectable builder for session-scoped models.
+pub trait SessionModelFactory: Send + Sync {
+    fn build(
+        &self,
+        cwd: PathBuf,
+        thread_id: smooth_protocol::ThreadId,
+        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        current_turn_id: Arc<watch::Sender<Option<String>>>,
+    ) -> Result<SessionModel>;
+}
+
+/// Default environment-backed `SessionModelFactory`.
+pub struct EnvSessionModelFactory;
+
+impl SessionModelFactory for EnvSessionModelFactory {
+    fn build(
+        &self,
+        cwd: PathBuf,
+        thread_id: smooth_protocol::ThreadId,
+        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        current_turn_id: Arc<watch::Sender<Option<String>>>,
+    ) -> Result<SessionModel> {
+        SessionModel::from_env(cwd, thread_id, dynamic_tool_client, current_turn_id)
+    }
+}
+
+/// Test seam for custom streaming behavior.
+pub trait SessionModelDriver: Send + Sync {
+    fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream>;
+}
+
 #[derive(Debug)]
-pub(crate) enum SessionStreamEvent {
+pub enum SessionStreamEvent {
     StreamAssistantItem(SessionAssistantContent),
     StreamUserItem(StreamedUserContent),
     FinalResponse(FinalResponse),
 }
 
 #[derive(Debug)]
-pub(crate) enum SessionAssistantContent {
+pub enum SessionAssistantContent {
     Text(Text),
     ToolCall {
         tool_call: ToolCall,
@@ -50,17 +81,20 @@ pub(crate) enum SessionAssistantContent {
     Final,
 }
 
-type SessionStream = Pin<Box<dyn futures_util::Stream<Item = Result<SessionStreamEvent>> + Send>>;
+pub type SessionStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<SessionStreamEvent>> + Send>>;
 
-pub(crate) enum SessionModel {
+#[derive(Clone)]
+pub enum SessionModel {
     OpenAi(Arc<Agent<openai::responses_api::ResponsesCompletionModel>>),
     OpenRouter(Arc<Agent<openrouter::CompletionModel>>),
     Anthropic(Arc<Agent<anthropic::completion::CompletionModel>>),
     Gemini(Arc<Agent<gemini::completion::CompletionModel>>),
+    Stub(Arc<dyn SessionModelDriver>),
 }
 
 impl SessionModel {
-    pub(crate) fn from_env(
+    pub fn from_env(
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
@@ -137,7 +171,41 @@ impl SessionModel {
             Self::OpenRouter(agent) => stream_agent(agent, prompt, history).await,
             Self::Anthropic(agent) => stream_agent(agent, prompt, history).await,
             Self::Gemini(agent) => stream_agent(agent, prompt, history).await,
+            Self::Stub(driver) => driver.stream_turn(prompt, history.to_vec()),
         }
+    }
+}
+
+pub(crate) fn default_session_model_factory() -> Arc<dyn SessionModelFactory> {
+    Arc::new(EnvSessionModelFactory)
+}
+
+pub(crate) fn stub_session_model_factory(
+    models: HashMap<smooth_protocol::ThreadId, SessionModel>,
+) -> Arc<dyn SessionModelFactory> {
+    Arc::new(StubSessionModelFactory {
+        models: std::sync::Mutex::new(models),
+    })
+}
+
+struct StubSessionModelFactory {
+    models: std::sync::Mutex<HashMap<smooth_protocol::ThreadId, SessionModel>>,
+}
+
+impl SessionModelFactory for StubSessionModelFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        thread_id: smooth_protocol::ThreadId,
+        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        _current_turn_id: Arc<watch::Sender<Option<String>>>,
+    ) -> Result<SessionModel> {
+        self.models
+            .lock()
+            .expect("stub session model factory mutex should lock")
+            .get(&thread_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing stub session model for thread {thread_id}"))
     }
 }
 

@@ -1,0 +1,32 @@
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+use anyhow::Result;
+use tokio::sync::watch;
+use tools::DynamicToolClient;
+
+use crate::{SessionModel, SessionModelFactory, provider::stub_session_model_factory};
+
+pub struct StubSessionModelFactory {
+    inner: Arc<dyn SessionModelFactory>,
+}
+
+impl StubSessionModelFactory {
+    pub fn new(models: HashMap<smooth_protocol::ThreadId, SessionModel>) -> Self {
+        Self {
+            inner: stub_session_model_factory(models),
+        }
+    }
+}
+
+impl SessionModelFactory for StubSessionModelFactory {
+    fn build(
+        &self,
+        cwd: PathBuf,
+        thread_id: smooth_protocol::ThreadId,
+        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        current_turn_id: Arc<watch::Sender<Option<String>>>,
+    ) -> Result<SessionModel> {
+        self.inner
+            .build(cwd, thread_id, dynamic_tool_client, current_turn_id)
+    }
+}

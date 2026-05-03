@@ -8,7 +8,9 @@ use tools::{DynamicToolClient, DynamicToolClientFactory};
 
 use crate::{
     ThreadSummary,
+    agent::AgentControl,
     core_thread::CoreThread,
+    provider::SessionModelFactory,
     rollout::{find_thread_path, list_threads, load_resume_state, workspace_root},
 };
 
@@ -26,25 +28,39 @@ pub struct ResumedThread {
 pub struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
     dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
+    model_factory: Option<Arc<dyn SessionModelFactory>>,
+    agent_control: AgentControl,
 }
 
 impl ThreadManagerState {
-    pub fn new(dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>) -> Self {
+    pub fn new(
+        dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
+        model_factory: Option<Arc<dyn SessionModelFactory>>,
+    ) -> Self {
         Self {
             threads: Arc::new(RwLock::new(HashMap::new())),
             dynamic_tool_client_factory,
+            model_factory,
+            agent_control: AgentControl::new(),
         }
     }
 
     #[tracing::instrument(name = "core.thread_manager.start_thread", skip(self))]
     pub async fn start_thread(&self) -> Result<StartedThread> {
         let thread_id = ThreadId::new();
-        let thread =
-            Arc::new(CoreThread::new(thread_id, self.dynamic_tool_client(thread_id)).await?);
+        let thread = Arc::new(
+            CoreThread::new(
+                thread_id,
+                self.dynamic_tool_client(thread_id),
+                self.model_factory.clone(),
+            )
+            .await?,
+        );
         let rollout_path = thread.rollout_path().clone();
 
         let mut threads = self.threads.write().await;
         threads.insert(thread_id, thread);
+        let _ = self.agent_control.register_session_root(thread_id);
         Ok(StartedThread {
             thread_id,
             rollout_path,
@@ -70,12 +86,14 @@ impl ThreadManagerState {
                 rollout_path.clone(),
                 resume_state,
                 self.dynamic_tool_client(thread_id),
+                self.model_factory.clone(),
             )
             .await?,
         );
 
         let mut threads = self.threads.write().await;
         threads.insert(thread_id, thread);
+        let _ = self.agent_control.register_session_root(thread_id);
         Ok(ResumedThread {
             thread_id,
             rollout_path,
@@ -100,9 +118,18 @@ impl ThreadManagerState {
         thread.start_user_input(input).await
     }
 
+    pub async fn submit(&self, thread_id: ThreadId, op: smooth_protocol::Op) -> Result<String> {
+        let thread = self.get(thread_id).await?;
+        thread.submit(op).await
+    }
+
     pub async fn subscribe(&self, thread_id: ThreadId) -> Result<broadcast::Receiver<Event>> {
         let thread = self.get(thread_id).await?;
         Ok(thread.subscribe())
+    }
+
+    pub(crate) fn agent_control(&self) -> AgentControl {
+        self.agent_control.clone()
     }
 
     async fn get(&self, thread_id: ThreadId) -> Result<Arc<CoreThread>> {

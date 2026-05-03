@@ -6,12 +6,12 @@ use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent};
 use tokio::sync::{broadcast, watch};
 use tools::DynamicToolClient;
 
-use crate::provider::SessionModel;
+use crate::provider::{SessionModelFactory, default_session_model_factory};
 use crate::{
     core::Core,
     rollout::{ResumeState, RolloutRecorder, workspace_root},
 };
-use smooth_protocol::ThreadId;
+use smooth_protocol::{Op, ThreadId};
 
 pub struct CoreThread {
     pub(crate) core: Core,
@@ -21,22 +21,25 @@ pub struct CoreThread {
 impl CoreThread {
     #[tracing::instrument(
         name = "core.thread.new",
-        skip(dynamic_tool_client),
+        skip(dynamic_tool_client, model_factory),
         fields(thread_id = %id)
     )]
     pub(crate) async fn new(
         id: ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        model_factory: Option<Arc<dyn SessionModelFactory>>,
     ) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let (current_turn_id, _) = watch::channel(None);
         let current_turn_id = Arc::new(current_turn_id);
-        let model = SessionModel::from_env(
-            cwd.clone(),
-            id,
-            dynamic_tool_client.clone(),
-            Arc::clone(&current_turn_id),
-        )?;
+        let model = model_factory
+            .unwrap_or_else(default_session_model_factory)
+            .build(
+                cwd.clone(),
+                id,
+                dynamic_tool_client.clone(),
+                Arc::clone(&current_turn_id),
+            )?;
         let workspace_root = workspace_root()?;
         let rollout = RolloutRecorder::create(&workspace_root, id, &cwd).await?;
         let rollout_path = rollout.path().to_path_buf();
@@ -56,23 +59,26 @@ impl CoreThread {
 
     #[tracing::instrument(
         name = "core.thread.resume",
-        skip(path, state, dynamic_tool_client),
+        skip(path, state, dynamic_tool_client, model_factory),
         fields(thread_id = %state.thread_id)
     )]
     pub(crate) async fn resume(
         path: PathBuf,
         state: ResumeState,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        model_factory: Option<Arc<dyn SessionModelFactory>>,
     ) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let (current_turn_id, _) = watch::channel(None);
         let current_turn_id = Arc::new(current_turn_id);
-        let model = SessionModel::from_env(
-            cwd,
-            state.thread_id,
-            dynamic_tool_client.clone(),
-            Arc::clone(&current_turn_id),
-        )?;
+        let model = model_factory
+            .unwrap_or_else(default_session_model_factory)
+            .build(
+                cwd,
+                state.thread_id,
+                dynamic_tool_client.clone(),
+                Arc::clone(&current_turn_id),
+            )?;
         let rollout = RolloutRecorder::resume(path.clone()).await?;
         Ok(Self {
             core: Core::new(
@@ -90,6 +96,10 @@ impl CoreThread {
 
     pub(crate) async fn start_user_input(&self, input: String) -> Result<String> {
         self.core.start_user_input(input).await
+    }
+
+    pub(crate) async fn submit(&self, op: Op) -> Result<String> {
+        self.core.submit(op).await
     }
 
     #[tracing::instrument(name = "core.thread.emit_session_configured", skip(self), fields(thread_id = %self.core.session.id))]

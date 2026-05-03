@@ -79,7 +79,7 @@ impl CoreMessageProcessor {
         let dynamic_tool_client_factory: Arc<dyn DynamicToolClientFactory> =
             Arc::new(InProcessDynamicToolClientFactory { outgoing });
         Self {
-            threads: ThreadManagerState::new(Some(dynamic_tool_client_factory)),
+            threads: ThreadManagerState::new(Some(dynamic_tool_client_factory), None),
             event_tx,
             subscribed_threads: Mutex::new(HashSet::new()),
         }

@@ -9,7 +9,7 @@ use rig::{
     message::{Message, Text, UserContent},
 };
 use smooth_protocol::{
-    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, ThreadId, TurnCompletedEvent,
+    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, ThreadId, TurnCompletedEvent,
     TurnInterruptedEvent, TurnStartedEvent,
 };
 use tokio::sync::{Mutex, broadcast, watch};
@@ -82,23 +82,48 @@ impl Core {
     }
 
     pub async fn start_user_input(&self, input: String) -> Result<String> {
-        let sub_id = self.session.next_internal_sub_id();
-        tracing::debug!(
-            thread_id = %self.session.id,
-            turn_id = %sub_id,
-            input_len = input.len(),
-            "starting turn"
-        );
-        let turn_context = Arc::new(TurnContext {
-            assistant_item_id: format!("{sub_id}-assistant"),
-            sub_id: sub_id.clone(),
-            timezone: None,
-        });
+        self.submit(Op::UserInput(input)).await
+    }
 
-        self.session
-            .start_task(turn_context, vec![input], RegularTask::new())
-            .await;
-        Ok(sub_id)
+    pub async fn submit(&self, op: Op) -> Result<String> {
+        match op {
+            Op::UserInput(input) => {
+                let sub_id = self.session.next_internal_sub_id();
+                tracing::debug!(
+                    thread_id = %self.session.id,
+                    turn_id = %sub_id,
+                    input_len = input.len(),
+                    "starting turn"
+                );
+                let turn_context = Arc::new(TurnContext {
+                    assistant_item_id: format!("{sub_id}-assistant"),
+                    sub_id: sub_id.clone(),
+                    timezone: None,
+                });
+
+                self.session
+                    .start_task(turn_context, vec![input], RegularTask::new())
+                    .await;
+                Ok(sub_id)
+            }
+            Op::InterAgentCommunication { .. } => {
+                anyhow::bail!("inter-agent communication is not implemented yet")
+            }
+            Op::Interrupt => {
+                self.session.abort_all_tasks("interrupted").await;
+                self.session
+                    .set_agent_status(AgentStatus::Interrupted, None)
+                    .await;
+                Ok("interrupted".to_string())
+            }
+            Op::Shutdown => {
+                self.session.abort_all_tasks("shutdown").await;
+                self.session
+                    .set_agent_status(AgentStatus::Shutdown, None)
+                    .await;
+                Ok("shutdown".to_string())
+            }
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -332,5 +357,99 @@ impl Session {
         self.next_internal_sub_id
             .fetch_add(1, Ordering::Relaxed)
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc};
+
+    use anyhow::Result;
+    use futures_util::stream;
+    use rig::message::Message;
+    use tempfile::TempDir;
+    use tokio::sync::watch;
+
+    use crate::{SessionModel, SessionModelDriver, SessionStream, rollout::RolloutRecorder};
+
+    use super::Core;
+
+    struct EmptyDriver;
+
+    impl SessionModelDriver for EmptyDriver {
+        fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    async fn test_core() -> (
+        Core,
+        tokio::sync::broadcast::Receiver<smooth_protocol::Event>,
+    ) {
+        let workspace = TempDir::new().expect("tempdir");
+        let cwd = PathBuf::from(workspace.path());
+        let thread_id = smooth_protocol::ThreadId::new();
+        let (current_turn_id, _) = watch::channel(None);
+        let current_turn_id = Arc::new(current_turn_id);
+        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd)
+            .await
+            .expect("rollout");
+        let core = Core::new(
+            thread_id,
+            SessionModel::Stub(Arc::new(EmptyDriver)),
+            Vec::new(),
+            0,
+            rollout,
+            current_turn_id,
+            None,
+        );
+        let rx = core.subscribe();
+        (core, rx)
+    }
+
+    #[tokio::test]
+    async fn submit_interrupt_emits_interrupted_status() {
+        let (core, mut rx) = test_core().await;
+
+        let result = core
+            .submit(smooth_protocol::Op::Interrupt)
+            .await
+            .expect("interrupt submit");
+        assert_eq!(result, "interrupted");
+
+        let event = rx.recv().await.expect("status event");
+        assert_eq!(
+            event.msg,
+            smooth_protocol::EventMsg::AgentStatusChanged(
+                smooth_protocol::AgentStatusChangedEvent {
+                    thread_id: core.session.id.to_string(),
+                    turn_id: None,
+                    status: smooth_protocol::AgentStatus::Interrupted,
+                }
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_shutdown_emits_shutdown_status() {
+        let (core, mut rx) = test_core().await;
+
+        let result = core
+            .submit(smooth_protocol::Op::Shutdown)
+            .await
+            .expect("shutdown submit");
+        assert_eq!(result, "shutdown");
+
+        let event = rx.recv().await.expect("status event");
+        assert_eq!(
+            event.msg,
+            smooth_protocol::EventMsg::AgentStatusChanged(
+                smooth_protocol::AgentStatusChangedEvent {
+                    thread_id: core.session.id.to_string(),
+                    turn_id: None,
+                    status: smooth_protocol::AgentStatus::Shutdown,
+                }
+            )
+        );
     }
 }

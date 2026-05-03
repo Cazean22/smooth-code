@@ -1,8 +1,13 @@
+mod agent_path;
+
+pub use agent_path::AgentPath;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, JsonSchema)]
+#[schemars(with = "String")]
 pub struct ThreadId(Uuid);
 
 impl ThreadId {
@@ -28,6 +33,11 @@ impl std::str::FromStr for ThreadId {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
 pub enum Op {
     UserInput(String),
+    InterAgentCommunication {
+        communication: InterAgentCommunication,
+    },
+    Interrupt,
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -63,9 +73,105 @@ pub enum EventMsg {
     AgentReasoningCompleted(AgentReasoningCompletedEvent),
     ToolCallStarted(ToolCallStartedEvent),
     ToolCallCompleted(ToolCallCompletedEvent),
+    CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent),
+    CollabAgentSpawnEnd(CollabAgentSpawnEndEvent),
+    CollabSendMessageBegin(CollabSendMessageBeginEvent),
+    CollabSendMessageEnd(CollabSendMessageEndEvent),
+    CollabWaitingBegin(CollabWaitingBeginEvent),
+    CollabWaitingEnd(CollabWaitingEndEvent),
+    CollabCloseBegin(CollabCloseBeginEvent),
+    CollabCloseEnd(CollabCloseEndEvent),
+    CollabResumeBegin(CollabResumeBeginEvent),
+    CollabResumeEnd(CollabResumeEndEvent),
+    InterAgentMessage(InterAgentCommunicationEvent),
 
     /// User/system input message (what was sent to the model)
     UserMessage(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSource {
+    Cli,
+    SubAgent(SubAgentSource),
+}
+
+impl Default for SessionSource {
+    fn default() -> Self {
+        Self::Cli
+    }
+}
+
+impl SessionSource {
+    pub fn get_agent_path(&self) -> Option<AgentPath> {
+        match self {
+            SessionSource::Cli => None,
+            SessionSource::SubAgent(SubAgentSource::Review) => None,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_path, .. }) => {
+                agent_path.clone()
+            }
+        }
+    }
+
+    pub fn get_nickname(&self) -> Option<String> {
+        match self {
+            SessionSource::Cli | SessionSource::SubAgent(SubAgentSource::Review) => None,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_nickname, .. }) => {
+                agent_nickname.clone()
+            }
+        }
+    }
+
+    pub fn get_agent_role(&self) -> Option<String> {
+        match self {
+            SessionSource::Cli | SessionSource::SubAgent(SubAgentSource::Review) => None,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
+                agent_role.clone()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubAgentSource {
+    Review,
+    ThreadSpawn {
+        parent_thread_id: ThreadId,
+        depth: i32,
+        agent_path: Option<AgentPath>,
+        agent_nickname: Option<String>,
+        agent_role: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InterAgentCommunication {
+    pub author: AgentPath,
+    pub recipient: AgentPath,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    pub content: String,
+    pub trigger_turn: bool,
+}
+
+impl InterAgentCommunication {
+    pub fn new(
+        author: AgentPath,
+        recipient: AgentPath,
+        attachments: Vec<String>,
+        content: String,
+        trigger_turn: bool,
+    ) -> Self {
+        Self {
+            author,
+            recipient,
+            attachments,
+            content,
+            trigger_turn,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -163,6 +269,132 @@ pub struct ToolCallCompletedEvent {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabAgentRef {
+    pub thread_id: ThreadId,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabAgentStatusEntry {
+    pub thread_id: ThreadId,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+    pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabAgentSpawnBeginEvent {
+    pub call_id: String,
+    pub sender_thread_id: ThreadId,
+    pub prompt: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabAgentSpawnEndEvent {
+    pub call_id: String,
+    pub sender_thread_id: ThreadId,
+    pub new_thread_id: Option<ThreadId>,
+    pub new_agent_nickname: Option<String>,
+    pub new_agent_role: Option<String>,
+    pub prompt: String,
+    pub model: Option<String>,
+    pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabSendMessageBeginEvent {
+    pub call_id: String,
+    pub sender_thread_id: ThreadId,
+    pub receiver_thread_id: ThreadId,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabSendMessageEndEvent {
+    pub call_id: String,
+    pub sender_thread_id: ThreadId,
+    pub receiver_thread_id: ThreadId,
+    pub receiver_agent_nickname: Option<String>,
+    pub receiver_agent_role: Option<String>,
+    pub prompt: String,
+    pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabWaitingBeginEvent {
+    pub sender_thread_id: ThreadId,
+    pub receiver_thread_ids: Vec<ThreadId>,
+    #[serde(default)]
+    pub receiver_agents: Vec<CollabAgentRef>,
+    pub call_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabWaitingEndEvent {
+    pub sender_thread_id: ThreadId,
+    pub call_id: String,
+    #[serde(default)]
+    pub agent_statuses: Vec<CollabAgentStatusEntry>,
+    pub statuses: Vec<CollabAgentStatusEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabCloseBeginEvent {
+    pub call_id: String,
+    pub sender_thread_id: ThreadId,
+    pub receiver_thread_id: ThreadId,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabCloseEndEvent {
+    pub call_id: String,
+    pub sender_thread_id: ThreadId,
+    pub receiver_thread_id: ThreadId,
+    pub receiver_agent_nickname: Option<String>,
+    pub receiver_agent_role: Option<String>,
+    pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabResumeBeginEvent {
+    pub call_id: String,
+    pub sender_thread_id: ThreadId,
+    pub receiver_thread_id: ThreadId,
+    pub receiver_agent_nickname: Option<String>,
+    pub receiver_agent_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabResumeEndEvent {
+    pub call_id: String,
+    pub sender_thread_id: ThreadId,
+    pub receiver_thread_id: ThreadId,
+    pub receiver_agent_nickname: Option<String>,
+    pub receiver_agent_role: Option<String>,
+    pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InterAgentCommunicationEvent {
+    pub communication: InterAgentCommunication,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct ErrorEvent {
     pub message: String,
@@ -218,4 +450,74 @@ pub enum AgentStatus {
     Shutdown,
     /// Agent is not found.
     NotFound,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AgentPath, AgentStatus, CollabAgentStatusEntry, EventMsg, InterAgentCommunication, Op,
+        SessionSource, SubAgentSource, ThreadId,
+    };
+
+    #[test]
+    fn op_serde_round_trip_for_user_input() {
+        let op = Op::UserInput("hello".to_string());
+        let value = serde_json::to_value(&op).expect("serialize op");
+        let decoded: Op = serde_json::from_value(value).expect("deserialize op");
+        assert_eq!(decoded, op);
+    }
+
+    #[test]
+    fn op_serde_round_trip_for_inter_agent_communication() {
+        let op = Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("path"),
+                vec!["artifact.txt".to_string()],
+                "ping".to_string(),
+                true,
+            ),
+        };
+        let value = serde_json::to_value(&op).expect("serialize op");
+        let decoded: Op = serde_json::from_value(value).expect("deserialize op");
+        assert_eq!(decoded, op);
+    }
+
+    #[test]
+    fn session_source_accessors_return_thread_spawn_metadata() {
+        let thread_id = ThreadId::new();
+        let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: thread_id,
+            depth: 1,
+            agent_path: Some(AgentPath::try_from("/root/worker").expect("path")),
+            agent_nickname: Some("alpha".to_string()),
+            agent_role: Some("explorer".to_string()),
+        });
+
+        assert_eq!(
+            source.get_agent_path(),
+            Some(AgentPath::try_from("/root/worker").expect("path"))
+        );
+        assert_eq!(source.get_nickname(), Some("alpha".to_string()));
+        assert_eq!(source.get_agent_role(), Some("explorer".to_string()));
+    }
+
+    #[test]
+    fn collab_waiting_end_statuses_round_trip() {
+        let msg = EventMsg::CollabWaitingEnd(super::CollabWaitingEndEvent {
+            sender_thread_id: ThreadId::new(),
+            call_id: "call-1".to_string(),
+            agent_statuses: vec![CollabAgentStatusEntry {
+                thread_id: ThreadId::new(),
+                agent_nickname: Some("child".to_string()),
+                agent_role: Some("worker".to_string()),
+                status: AgentStatus::Completed(Some("done".to_string())),
+            }],
+            statuses: vec![],
+        });
+
+        let value = serde_json::to_value(&msg).expect("serialize event");
+        let decoded: EventMsg = serde_json::from_value(value).expect("deserialize event");
+        assert_eq!(decoded, msg);
+    }
 }

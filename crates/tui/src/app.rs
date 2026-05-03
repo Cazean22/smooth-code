@@ -217,9 +217,7 @@ impl App {
             }
             EventMsg::AgentReasoningCompleted(completed) => {
                 self.pending_tool_group = None;
-                if self.committed_reasoning_item_id.as_deref()
-                    != Some(completed.item_id.as_str())
-                {
+                if self.committed_reasoning_item_id.as_deref() != Some(completed.item_id.as_str()) {
                     let committed_from_stream = self.finalize_reasoning_stream();
                     if !committed_from_stream {
                         self.push_rendered_reasoning_message(&completed.text);

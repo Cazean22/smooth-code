@@ -8,7 +8,10 @@ use tools::DynamicToolClient;
 
 use crate::provider::{SessionModelFactory, default_session_model_factory};
 use crate::{
-    agent::AgentControl,
+    agent::{
+        AgentControl,
+        role::{RoleOverride, resolve_role},
+    },
     core::Core,
     rollout::{ResumeState, RolloutRecorder, workspace_root},
 };
@@ -35,6 +38,7 @@ impl CoreThread {
         let cwd = std::env::current_dir()?;
         let (current_turn_id, _) = watch::channel(None);
         let current_turn_id = Arc::new(current_turn_id);
+        let role_override = role_override_from_source(&session_source);
         let model = model_factory
             .unwrap_or_else(default_session_model_factory)
             .build(
@@ -42,6 +46,8 @@ impl CoreThread {
                 id,
                 dynamic_tool_client.clone(),
                 Arc::clone(&current_turn_id),
+                role_override,
+                agent_control.clone(),
             )?;
         let workspace_root = workspace_root()?;
         let rollout = RolloutRecorder::create(&workspace_root, id, &cwd).await?;
@@ -78,6 +84,7 @@ impl CoreThread {
         let cwd = std::env::current_dir()?;
         let (current_turn_id, _) = watch::channel(None);
         let current_turn_id = Arc::new(current_turn_id);
+        let role_override = role_override_from_source(&session_source);
         let model = model_factory
             .unwrap_or_else(default_session_model_factory)
             .build(
@@ -85,6 +92,8 @@ impl CoreThread {
                 state.thread_id,
                 dynamic_tool_client.clone(),
                 Arc::clone(&current_turn_id),
+                role_override,
+                agent_control.clone(),
             )?;
         let rollout = RolloutRecorder::resume(path.clone()).await?;
         Ok(Self {
@@ -128,4 +137,12 @@ impl CoreThread {
     pub(crate) fn rollout_path(&self) -> &PathBuf {
         &self.rollout_path
     }
+}
+
+fn role_override_from_source(source: &SessionSource) -> RoleOverride {
+    source
+        .get_agent_role()
+        .and_then(|role| resolve_role(&role))
+        .map(|config| config.override_config)
+        .unwrap_or_default()
 }

@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use smooth_protocol::{
-    AgentStatus, InterAgentCommunication, Op, SessionSource, SubAgentSource, ThreadId,
+    AgentStatus, EventMsg, InterAgentCommunication, Op, SessionSource, SubAgentSource, ThreadId,
 };
 use tokio::sync::{RwLock, watch};
 use tools::DynamicToolClientFactory;
@@ -14,6 +14,7 @@ use crate::{
     agent::{
         agent_resolver, notify,
         registry::{AgentMetadata, AgentRegistry},
+        role::resolve_role,
         status::is_final,
     },
     core_thread::CoreThread,
@@ -23,8 +24,9 @@ use crate::{
 const AGENT_MAX_DEPTH: i32 = 8;
 const AGENT_MAX_THREADS: usize = 16;
 
+/// Shared in-process handle for agent lifecycle and inter-agent coordination.
 #[derive(Clone)]
-pub(crate) struct AgentControl {
+pub struct AgentControl {
     state: Arc<AgentControlState>,
 }
 
@@ -149,6 +151,30 @@ impl AgentControl {
         parent_thread_id: ThreadId,
         message: String,
     ) -> Result<AgentMetadata> {
+        self.spawn_agent_with_role(parent_thread_id, message, None, None, false)
+            .await
+    }
+
+    pub(crate) async fn spawn_agent_with_role(
+        &self,
+        parent_thread_id: ThreadId,
+        message: String,
+        agent_role: Option<String>,
+        model: Option<String>,
+        fork_context: bool,
+    ) -> Result<AgentMetadata> {
+        if let Some(role) = agent_role.as_deref()
+            && resolve_role(role).is_none()
+        {
+            return Err(anyhow!("unknown agent role `{role}`"));
+        }
+        if model.is_some() {
+            return Err(anyhow!("spawn_agent model override is not implemented yet"));
+        }
+        if fork_context {
+            return Err(anyhow!("spawn_agent fork_context is not implemented yet"));
+        }
+
         let runtime = self
             .state
             .runtime
@@ -168,7 +194,7 @@ impl AgentControl {
             depth: reservation.depth(),
             agent_path: Some(reservation.agent_path().clone()),
             agent_nickname: Some(reservation.agent_path().name().to_string()),
-            agent_role: None,
+            agent_role: agent_role.clone(),
         });
         let dynamic_tool_client = runtime
             .dynamic_tool_client_factory
@@ -205,13 +231,51 @@ impl AgentControl {
                 agent_id: Some(child_thread_id),
                 agent_path,
                 agent_nickname: Some(agent_nickname),
-                agent_role: None,
+                agent_role,
                 parent_thread_id: Some(parent_thread_id),
                 depth,
             })
             .map_err(anyhow::Error::msg)?;
         self.maybe_start_completion_watcher(metadata.clone());
         Ok(metadata)
+    }
+
+    pub(crate) async fn wait_for_agent(
+        &self,
+        author_thread_id: ThreadId,
+        target: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentStatus> {
+        let target_thread_id = self.resolve_agent_reference(author_thread_id, target)?;
+        let mut status_rx = self.subscribe_status(target_thread_id);
+        let current = status_rx.borrow().clone();
+        if is_final(&current) {
+            return Ok(current);
+        }
+
+        let wait_for_final = async {
+            loop {
+                status_rx
+                    .changed()
+                    .await
+                    .map_err(|_| anyhow!("agent status stream closed"))?;
+                let status = status_rx.borrow().clone();
+                if is_final(&status) {
+                    return Ok(status);
+                }
+            }
+        };
+
+        if let Some(timeout_ms) = timeout_ms {
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), wait_for_final)
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(status_rx.borrow().clone()),
+            }
+        } else {
+            wait_for_final.await
+        }
     }
 
     pub(crate) async fn send_input(
@@ -352,6 +416,18 @@ impl AgentControl {
             }
         });
     }
+
+    pub(crate) async fn emit_collab_event(&self, author_thread_id: ThreadId, msg: EventMsg) {
+        let Ok(runtime) = self.runtime() else {
+            return;
+        };
+        let threads = runtime.threads.read().await;
+        let Some(thread) = threads.get(&author_thread_id).cloned() else {
+            return;
+        };
+        drop(threads);
+        thread.core.emit_session_event(msg).await;
+    }
 }
 
 #[cfg(test)]
@@ -369,7 +445,8 @@ mod tests {
     use super::AgentControl;
     use crate::{
         SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
-        provider::SessionStreamEvent, thread_manager::ThreadManagerState,
+        agent::role::RoleOverride, provider::SessionStreamEvent,
+        thread_manager::ThreadManagerState,
     };
     use futures_util::stream;
     use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
@@ -419,6 +496,8 @@ mod tests {
             thread_id: ThreadId,
             _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
             _current_turn_id: Arc<watch::Sender<Option<String>>>,
+            _role_override: RoleOverride,
+            _agent_control: AgentControl,
         ) -> Result<SessionModel> {
             let _ = thread_id;
             Ok(self.model.clone())
@@ -427,6 +506,9 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_agent_creates_child_and_tracks_it_live() {
+        let _cwd_guard = crate::test_support::cwd_test_lock()
+            .lock()
+            .expect("cwd lock");
         let workspace = TempDir::new().expect("tempdir");
         let original_cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(workspace.path()).expect("set cwd");
@@ -456,6 +538,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_input_resolves_relative_agent_target() {
+        let _cwd_guard = crate::test_support::cwd_test_lock()
+            .lock()
+            .expect("cwd lock");
         let workspace = TempDir::new().expect("tempdir");
         let original_cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(workspace.path()).expect("set cwd");
@@ -510,6 +595,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_agent_removes_live_child() {
+        let _cwd_guard = crate::test_support::cwd_test_lock()
+            .lock()
+            .expect("cwd lock");
         let workspace = TempDir::new().expect("tempdir");
         let original_cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(workspace.path()).expect("set cwd");
@@ -542,6 +630,9 @@ mod tests {
 
     #[tokio::test]
     async fn completion_watcher_queues_parent_notification() {
+        let _cwd_guard = crate::test_support::cwd_test_lock()
+            .lock()
+            .expect("cwd lock");
         let workspace = TempDir::new().expect("tempdir");
         let original_cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(workspace.path()).expect("set cwd");

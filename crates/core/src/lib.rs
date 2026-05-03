@@ -9,6 +9,7 @@ mod tasks;
 pub mod test_support;
 mod thread_manager;
 
+pub use agent::AgentControl;
 pub use provider::{
     EnvSessionModelFactory, SessionAssistantContent, SessionModel, SessionModelDriver,
     SessionModelFactory, SessionStream, SessionStreamEvent,

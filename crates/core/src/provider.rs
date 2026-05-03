@@ -20,7 +20,13 @@ use rig::{
 };
 use tokio::sync::watch;
 use tools::{
-    DynamicTool, DynamicToolClient, EditTool, ListDirTool, ReadTool, RunCommandTool, WriteTool,
+    CloseAgentTool, DynamicTool, DynamicToolClient, EditTool, ListAgentsTool, ListDirTool,
+    ReadTool, RunCommandTool, SendMessageTool, SpawnAgentTool, WaitAgentTool, WriteTool,
+};
+
+use crate::agent::{
+    AgentControl, InProcessMultiAgentClient,
+    role::{RoleOverride, render_spawn_agent_tool_description},
 };
 
 /// Injectable builder for session-scoped models.
@@ -31,6 +37,8 @@ pub trait SessionModelFactory: Send + Sync {
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         current_turn_id: Arc<watch::Sender<Option<String>>>,
+        role_override: RoleOverride,
+        agent_control: AgentControl,
     ) -> Result<SessionModel>;
 }
 
@@ -44,8 +52,17 @@ impl SessionModelFactory for EnvSessionModelFactory {
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         current_turn_id: Arc<watch::Sender<Option<String>>>,
+        role_override: RoleOverride,
+        agent_control: AgentControl,
     ) -> Result<SessionModel> {
-        SessionModel::from_env(cwd, thread_id, dynamic_tool_client, current_turn_id)
+        SessionModel::from_env(
+            cwd,
+            thread_id,
+            dynamic_tool_client,
+            current_turn_id,
+            role_override,
+            agent_control,
+        )
     }
 }
 
@@ -99,13 +116,22 @@ impl SessionModel {
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         current_turn_id: Arc<watch::Sender<Option<String>>>,
+        role_override: RoleOverride,
+        agent_control: AgentControl,
     ) -> Result<Self> {
         let provider = env::var("SMOOTH_CODE_LLM_PROVIDER")
             .unwrap_or_else(|_| "openai".to_string())
             .to_ascii_lowercase();
-        let model = env::var("SMOOTH_CODE_LLM_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
-        let preamble = env::var("SMOOTH_CODE_LLM_PREAMBLE")
-            .unwrap_or_else(|_| "You are smooth-code, a code agent.".to_string());
+        let model = role_override
+            .model
+            .clone()
+            .or_else(|| env::var("SMOOTH_CODE_LLM_MODEL").ok())
+            .unwrap_or_else(|| "gpt-5.4".to_string());
+        let preamble = role_override
+            .preamble
+            .clone()
+            .or_else(|| env::var("SMOOTH_CODE_LLM_PREAMBLE").ok())
+            .unwrap_or_else(|| "You are smooth-code, a code agent.".to_string());
 
         match provider.as_str() {
             "openai" => {
@@ -125,6 +151,7 @@ impl SessionModel {
                     thread_id,
                     dynamic_tool_client.clone(),
                     Arc::clone(&current_turn_id),
+                    agent_control.clone(),
                 ))))
             }
             "openrouter" => {
@@ -135,6 +162,7 @@ impl SessionModel {
                     thread_id,
                     dynamic_tool_client.clone(),
                     Arc::clone(&current_turn_id),
+                    agent_control.clone(),
                 ))))
             }
             "anthropic" => {
@@ -145,6 +173,7 @@ impl SessionModel {
                     thread_id,
                     dynamic_tool_client.clone(),
                     Arc::clone(&current_turn_id),
+                    agent_control.clone(),
                 ))))
             }
             "gemini" => {
@@ -155,6 +184,7 @@ impl SessionModel {
                     thread_id,
                     dynamic_tool_client,
                     current_turn_id,
+                    agent_control,
                 ))))
             }
             other => bail!("unsupported SMOOTH_CODE_LLM_PROVIDER `{other}`"),
@@ -199,6 +229,8 @@ impl SessionModelFactory for StubSessionModelFactory {
         thread_id: smooth_protocol::ThreadId,
         _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _current_turn_id: Arc<watch::Sender<Option<String>>>,
+        _role_override: RoleOverride,
+        _agent_control: AgentControl,
     ) -> Result<SessionModel> {
         self.models
             .lock()
@@ -215,6 +247,7 @@ fn build_agent<M>(
     thread_id: smooth_protocol::ThreadId,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     current_turn_id: Arc<watch::Sender<Option<String>>>,
+    agent_control: AgentControl,
 ) -> Agent<M>
 where
     M: rig::completion::CompletionModel,
@@ -235,6 +268,16 @@ where
     } else {
         builder
     };
+    let multi_agent_client = Arc::new(InProcessMultiAgentClient::new(thread_id, agent_control));
+    let builder = builder
+        .tool(SpawnAgentTool::new(
+            multi_agent_client.clone(),
+            render_spawn_agent_tool_description(),
+        ))
+        .tool(SendMessageTool::new(multi_agent_client.clone()))
+        .tool(WaitAgentTool::new(multi_agent_client.clone()))
+        .tool(ListAgentsTool::new(multi_agent_client.clone()))
+        .tool(CloseAgentTool::new(multi_agent_client));
     builder.default_max_turns(99999).build()
 }
 

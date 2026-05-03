@@ -7,3 +7,4 @@ pub(crate) mod registry;
 pub(crate) mod status;
 
 pub(crate) use control::AgentControl;
+pub(crate) use mailbox::{Mailbox, MailboxReceiver};

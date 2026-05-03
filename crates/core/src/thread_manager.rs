@@ -1,8 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use smooth_protocol::Event;
-use smooth_protocol::ThreadId;
+use smooth_protocol::{Event, Op, SessionSource, ThreadId};
 use tokio::sync::{RwLock, broadcast};
 use tools::{DynamicToolClient, DynamicToolClientFactory};
 
@@ -37,11 +36,18 @@ impl ThreadManagerState {
         dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
     ) -> Self {
+        let threads = Arc::new(RwLock::new(HashMap::new()));
+        let agent_control = AgentControl::new();
+        agent_control.attach_runtime(
+            Arc::clone(&threads),
+            dynamic_tool_client_factory.clone(),
+            model_factory.clone(),
+        );
         Self {
-            threads: Arc::new(RwLock::new(HashMap::new())),
+            threads,
             dynamic_tool_client_factory,
             model_factory,
-            agent_control: AgentControl::new(),
+            agent_control,
         }
     }
 
@@ -53,6 +59,8 @@ impl ThreadManagerState {
                 thread_id,
                 self.dynamic_tool_client(thread_id),
                 self.model_factory.clone(),
+                SessionSource::Cli,
+                self.agent_control.clone(),
             )
             .await?,
         );
@@ -87,6 +95,8 @@ impl ThreadManagerState {
                 resume_state,
                 self.dynamic_tool_client(thread_id),
                 self.model_factory.clone(),
+                SessionSource::Cli,
+                self.agent_control.clone(),
             )
             .await?,
         );
@@ -118,9 +128,13 @@ impl ThreadManagerState {
         thread.start_user_input(input).await
     }
 
-    pub async fn submit(&self, thread_id: ThreadId, op: smooth_protocol::Op) -> Result<String> {
+    pub async fn submit(&self, thread_id: ThreadId, op: Op) -> Result<String> {
         let thread = self.get(thread_id).await?;
         thread.submit(op).await
+    }
+
+    pub(crate) async fn send_op(&self, thread_id: ThreadId, op: Op) -> Result<String> {
+        self.submit(thread_id, op).await
     }
 
     pub async fn subscribe(&self, thread_id: ThreadId) -> Result<broadcast::Receiver<Event>> {
@@ -130,6 +144,23 @@ impl ThreadManagerState {
 
     pub(crate) fn agent_control(&self) -> AgentControl {
         self.agent_control.clone()
+    }
+
+    pub(crate) async fn remove_thread(&self, thread_id: ThreadId) -> Option<Arc<CoreThread>> {
+        self.threads.write().await.remove(&thread_id)
+    }
+
+    pub(crate) async fn shutdown_and_remove_thread(
+        &self,
+        thread_id: ThreadId,
+        reason: &str,
+    ) -> Result<()> {
+        if let Some(thread) = self.get(thread_id).await.ok() {
+            let _ = thread.submit(Op::Shutdown).await;
+            thread.core.session.abort_all_tasks(reason).await;
+        }
+        self.remove_thread(thread_id).await;
+        Ok(())
     }
 
     async fn get(&self, thread_id: ThreadId) -> Result<Arc<CoreThread>> {

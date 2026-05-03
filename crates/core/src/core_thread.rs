@@ -2,12 +2,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent};
+use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent, SessionSource};
 use tokio::sync::{broadcast, watch};
 use tools::DynamicToolClient;
 
 use crate::provider::{SessionModelFactory, default_session_model_factory};
 use crate::{
+    agent::AgentControl,
     core::Core,
     rollout::{ResumeState, RolloutRecorder, workspace_root},
 };
@@ -21,13 +22,15 @@ pub struct CoreThread {
 impl CoreThread {
     #[tracing::instrument(
         name = "core.thread.new",
-        skip(dynamic_tool_client, model_factory),
+        skip(dynamic_tool_client, model_factory, agent_control),
         fields(thread_id = %id)
     )]
     pub(crate) async fn new(
         id: ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
+        session_source: SessionSource,
+        agent_control: AgentControl,
     ) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let (current_turn_id, _) = watch::channel(None);
@@ -52,6 +55,8 @@ impl CoreThread {
                 rollout,
                 current_turn_id,
                 dynamic_tool_client,
+                session_source,
+                agent_control,
             ),
             rollout_path,
         })
@@ -59,7 +64,7 @@ impl CoreThread {
 
     #[tracing::instrument(
         name = "core.thread.resume",
-        skip(path, state, dynamic_tool_client, model_factory),
+        skip(path, state, dynamic_tool_client, model_factory, agent_control),
         fields(thread_id = %state.thread_id)
     )]
     pub(crate) async fn resume(
@@ -67,6 +72,8 @@ impl CoreThread {
         state: ResumeState,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
+        session_source: SessionSource,
+        agent_control: AgentControl,
     ) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let (current_turn_id, _) = watch::channel(None);
@@ -89,6 +96,8 @@ impl CoreThread {
                 rollout,
                 current_turn_id,
                 dynamic_tool_client,
+                session_source,
+                agent_control,
             ),
             rollout_path: path,
         })

@@ -69,11 +69,28 @@ impl SessionTask for RegularTask {
             return None;
         }
 
-        let prompt_text = input.join("\n");
+        let input_count = input.len();
+        let mailbox_messages = session.drain_mailbox().await;
+        let mut prompt_parts = mailbox_messages
+            .iter()
+            .map(render_mailbox_message)
+            .collect::<Vec<_>>();
+        prompt_parts.extend(input.into_iter().filter(|item| !item.is_empty()));
+        let prompt_text = prompt_parts.join("\n");
         session.record_user_message(prompt_text.clone()).await;
         session
             .emit_event(&ctx, EventMsg::UserMessage(prompt_text.clone()))
             .await;
+        for communication in mailbox_messages {
+            session
+                .emit_event(
+                    &ctx,
+                    EventMsg::InterAgentMessage(smooth_protocol::InterAgentCommunicationEvent {
+                        communication,
+                    }),
+                )
+                .await;
+        }
 
         let prompt = Message::User {
             content: OneOrMany::one(UserContent::Text(Text {
@@ -211,7 +228,7 @@ impl SessionTask for RegularTask {
         tracing::debug!(
             thread_id = %session.id,
             turn_id = %ctx.sub_id,
-            input_count = input.len(),
+            input_count,
             "finished regular task"
         );
 
@@ -244,4 +261,11 @@ impl SessionTask for RegularTask {
         let _ = ctx;
         session.abort_pending_dynamic_tool_requests().await;
     }
+}
+
+fn render_mailbox_message(communication: &smooth_protocol::InterAgentCommunication) -> String {
+    format!(
+        "<inter_agent_message from=\"{}\">{}</inter_agent_message>",
+        communication.author, communication.content
+    )
 }

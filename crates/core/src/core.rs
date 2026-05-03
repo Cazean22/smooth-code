@@ -9,14 +9,15 @@ use rig::{
     message::{Message, Text, UserContent},
 };
 use smooth_protocol::{
-    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, ThreadId, TurnCompletedEvent,
-    TurnInterruptedEvent, TurnStartedEvent,
+    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, SessionSource, ThreadId,
+    TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
 };
 use tokio::sync::{Mutex, broadcast, watch};
 use tools::DynamicToolClient;
 use tracing::Instrument;
 
 use crate::{
+    agent::{AgentControl, Mailbox, MailboxReceiver},
     context_manager::ContextManager,
     provider::SessionModel,
     rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persist_event},
@@ -37,6 +38,10 @@ pub(crate) struct Session {
     event_tx: broadcast::Sender<Event>,
     state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    pub(crate) session_source: SessionSource,
+    pub(crate) agent_control: AgentControl,
+    pub(crate) mailbox: Mailbox,
+    pub(crate) mailbox_rx: Mutex<MailboxReceiver>,
     current_turn_id: Arc<watch::Sender<Option<String>>>,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     next_internal_sub_id: AtomicU64,
@@ -61,9 +66,12 @@ impl Core {
         rollout: RolloutRecorder,
         current_turn_id: Arc<watch::Sender<Option<String>>>,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        session_source: SessionSource,
+        agent_control: AgentControl,
     ) -> Self {
         let (agent_status, _) = watch::channel(AgentStatus::PendingInit);
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (mailbox, mailbox_rx) = Mailbox::new();
         let mut context_manager = ContextManager::default();
         context_manager.replace(history);
         let session = Arc::new(Session {
@@ -72,6 +80,10 @@ impl Core {
             event_tx,
             state: Mutex::new(SessionState::new(context_manager)),
             active_turn: Mutex::new(None),
+            session_source,
+            agent_control,
+            mailbox,
+            mailbox_rx: Mutex::new(mailbox_rx),
             current_turn_id,
             dynamic_tool_client,
             next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
@@ -88,26 +100,36 @@ impl Core {
     pub async fn submit(&self, op: Op) -> Result<String> {
         match op {
             Op::UserInput(input) => {
-                let sub_id = self.session.next_internal_sub_id();
+                let turn_context = Arc::new(self.session.fresh_turn_context());
+                let sub_id = turn_context.sub_id.clone();
                 tracing::debug!(
                     thread_id = %self.session.id,
                     turn_id = %sub_id,
                     input_len = input.len(),
                     "starting turn"
                 );
-                let turn_context = Arc::new(TurnContext {
-                    assistant_item_id: format!("{sub_id}-assistant"),
-                    sub_id: sub_id.clone(),
-                    timezone: None,
-                });
 
                 self.session
                     .start_task(turn_context, vec![input], RegularTask::new())
                     .await;
                 Ok(sub_id)
             }
-            Op::InterAgentCommunication { .. } => {
-                anyhow::bail!("inter-agent communication is not implemented yet")
+            Op::InterAgentCommunication { communication } => {
+                self.session
+                    .mailbox
+                    .send(communication)
+                    .map_err(anyhow::Error::msg)?;
+
+                if self.session.mailbox.has_trigger_turn_pending() && self.session.is_idle().await {
+                    let turn_context = Arc::new(self.session.fresh_turn_context());
+                    let sub_id = turn_context.sub_id.clone();
+                    self.session
+                        .start_task(turn_context, vec![String::new()], RegularTask::new())
+                        .await;
+                    return Ok(sub_id);
+                }
+
+                Ok("queued".to_string())
             }
             Op::Interrupt => {
                 self.session.abort_all_tasks("interrupted").await;
@@ -222,8 +244,6 @@ impl Session {
                     if let Some(turn) = active_turn.as_mut()
                         && turn.remove_task(&ctx_for_runner.sub_id)
                     {
-                        // smooth-code currently runs a single task per turn, so once that task
-                        // completes there is no longer a current turn to attribute dynamic tools to.
                         *active_turn = None;
                         sess.current_turn_id.send_replace(None);
                     }
@@ -330,6 +350,7 @@ impl Session {
 
     pub(crate) async fn set_agent_status(&self, status: AgentStatus, ctx: Option<&TurnContext>) {
         self.agent_status.send_replace(status.clone());
+        self.agent_control.set_status(self.id, status.clone());
         let _ = self.event_tx.send(Event {
             id: ctx
                 .map(|ctx| ctx.sub_id.clone())
@@ -353,6 +374,23 @@ impl Session {
         }
     }
 
+    pub(crate) async fn drain_mailbox(&self) -> Vec<smooth_protocol::InterAgentCommunication> {
+        self.mailbox_rx.lock().await.try_drain_all()
+    }
+
+    pub(crate) async fn is_idle(&self) -> bool {
+        self.active_turn.lock().await.is_none()
+    }
+
+    pub(crate) fn fresh_turn_context(&self) -> TurnContext {
+        let sub_id = self.next_internal_sub_id();
+        TurnContext {
+            assistant_item_id: format!("{sub_id}-assistant"),
+            sub_id,
+            timezone: None,
+        }
+    }
+
     fn next_internal_sub_id(&self) -> String {
         self.next_internal_sub_id
             .fetch_add(1, Ordering::Relaxed)
@@ -370,9 +408,16 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::watch;
 
-    use crate::{SessionModel, SessionModelDriver, SessionStream, rollout::RolloutRecorder};
+    use crate::{
+        SessionModel, SessionModelDriver, SessionStream, agent::AgentControl,
+        rollout::RolloutRecorder,
+    };
 
     use super::Core;
+    use smooth_protocol::{
+        AgentPath, AgentStatusChangedEvent, EventMsg, InterAgentCommunicationEvent, Op,
+        SessionSource, TurnStartedEvent,
+    };
 
     struct EmptyDriver;
 
@@ -402,6 +447,8 @@ mod tests {
             rollout,
             current_turn_id,
             None,
+            SessionSource::Cli,
+            AgentControl::new(),
         );
         let rx = core.subscribe();
         (core, rx)
@@ -420,13 +467,11 @@ mod tests {
         let event = rx.recv().await.expect("status event");
         assert_eq!(
             event.msg,
-            smooth_protocol::EventMsg::AgentStatusChanged(
-                smooth_protocol::AgentStatusChangedEvent {
-                    thread_id: core.session.id.to_string(),
-                    turn_id: None,
-                    status: smooth_protocol::AgentStatus::Interrupted,
-                }
-            )
+            EventMsg::AgentStatusChanged(AgentStatusChangedEvent {
+                thread_id: core.session.id.to_string(),
+                turn_id: None,
+                status: smooth_protocol::AgentStatus::Interrupted,
+            })
         );
     }
 
@@ -443,13 +488,73 @@ mod tests {
         let event = rx.recv().await.expect("status event");
         assert_eq!(
             event.msg,
-            smooth_protocol::EventMsg::AgentStatusChanged(
-                smooth_protocol::AgentStatusChangedEvent {
-                    thread_id: core.session.id.to_string(),
-                    turn_id: None,
-                    status: smooth_protocol::AgentStatus::Shutdown,
-                }
-            )
+            EventMsg::AgentStatusChanged(AgentStatusChangedEvent {
+                thread_id: core.session.id.to_string(),
+                turn_id: None,
+                status: smooth_protocol::AgentStatus::Shutdown,
+            })
         );
+    }
+
+    #[tokio::test]
+    async fn submit_inter_agent_communication_queues_without_trigger() {
+        let (core, mut rx) = test_core().await;
+
+        let result = core
+            .submit(Op::InterAgentCommunication {
+                communication: smooth_protocol::InterAgentCommunication::new(
+                    AgentPath::try_from("/root/child").expect("path"),
+                    AgentPath::root(),
+                    vec![],
+                    "child says hi".to_string(),
+                    false,
+                ),
+            })
+            .await
+            .expect("queue mail");
+        assert_eq!(result, "queued");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_inter_agent_communication_with_trigger_starts_turn() {
+        let (core, mut rx) = test_core().await;
+
+        let turn_id = core
+            .submit(Op::InterAgentCommunication {
+                communication: smooth_protocol::InterAgentCommunication::new(
+                    AgentPath::try_from("/root/child").expect("path"),
+                    AgentPath::root(),
+                    vec![],
+                    "child says hi".to_string(),
+                    true,
+                ),
+            })
+            .await
+            .expect("trigger mail");
+
+        let event = rx.recv().await.expect("turn started");
+        assert_eq!(
+            event.msg,
+            EventMsg::TurnStarted(TurnStartedEvent {
+                thread_id: core.session.id.to_string(),
+                turn_id: turn_id.clone(),
+            })
+        );
+
+        loop {
+            let event = rx.recv().await.expect("event");
+            if let EventMsg::InterAgentMessage(InterAgentCommunicationEvent { communication }) =
+                event.msg
+            {
+                assert_eq!(communication.content, "child says hi");
+                break;
+            }
+        }
     }
 }

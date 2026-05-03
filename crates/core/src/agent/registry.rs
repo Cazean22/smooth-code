@@ -149,6 +149,13 @@ impl AgentRegistry {
         self.agent_metadata_for_thread(thread_id)
             .map(|metadata| metadata.depth + 1)
     }
+
+    pub(crate) fn unregister_thread(&self, thread_id: ThreadId) -> Option<AgentMetadata> {
+        let mut state = self.state.lock().expect("registry mutex should lock");
+        let metadata = state.agents_by_thread.remove(&thread_id)?;
+        state.thread_by_path.remove(&metadata.agent_path);
+        Some(metadata)
+    }
 }
 
 impl SpawnReservation {

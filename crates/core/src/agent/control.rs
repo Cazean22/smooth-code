@@ -4,12 +4,18 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use smooth_protocol::{AgentStatus, Op, SessionSource, SubAgentSource, ThreadId};
+use smooth_protocol::{
+    AgentStatus, InterAgentCommunication, Op, SessionSource, SubAgentSource, ThreadId,
+};
 use tokio::sync::{RwLock, watch};
 use tools::DynamicToolClientFactory;
 
 use crate::{
-    agent::registry::{AgentMetadata, AgentRegistry},
+    agent::{
+        agent_resolver, notify,
+        registry::{AgentMetadata, AgentRegistry},
+        status::is_final,
+    },
     core_thread::CoreThread,
     provider::SessionModelFactory,
 };
@@ -118,6 +124,26 @@ impl AgentControl {
         self.state.registry.clone()
     }
 
+    pub(crate) fn resolve_agent_reference(
+        &self,
+        author_thread_id: ThreadId,
+        target: &str,
+    ) -> Result<ThreadId> {
+        let session_source = self.session_source_for_thread(author_thread_id)?;
+        agent_resolver::resolve_agent_reference(&self.state.registry, &session_source, target)
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn list_agents(
+        &self,
+        author_thread_id: ThreadId,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<AgentMetadata>> {
+        let session_source = self.session_source_for_thread(author_thread_id)?;
+        agent_resolver::list_agents(&self.state.registry, &session_source, path_prefix)
+            .map_err(anyhow::Error::msg)
+    }
+
     pub(crate) async fn spawn_agent(
         &self,
         parent_thread_id: ThreadId,
@@ -174,8 +200,7 @@ impl AgentControl {
         let agent_path = reservation.agent_path().clone();
         let agent_nickname = reservation.agent_path().name().to_string();
         let depth = reservation.depth();
-
-        reservation
+        let metadata = reservation
             .commit(AgentMetadata {
                 agent_id: Some(child_thread_id),
                 agent_path,
@@ -184,7 +209,70 @@ impl AgentControl {
                 parent_thread_id: Some(parent_thread_id),
                 depth,
             })
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::msg)?;
+        self.maybe_start_completion_watcher(metadata.clone());
+        Ok(metadata)
+    }
+
+    pub(crate) async fn send_input(
+        &self,
+        author_thread_id: ThreadId,
+        target: &str,
+        content: String,
+        trigger_turn: bool,
+    ) -> Result<String> {
+        let recipient_thread_id = self.resolve_agent_reference(author_thread_id, target)?;
+        let author = self
+            .state
+            .registry
+            .agent_metadata_for_thread(author_thread_id)
+            .ok_or_else(|| anyhow!("unknown author thread id: {author_thread_id}"))?;
+        let recipient = self
+            .state
+            .registry
+            .agent_metadata_for_thread(recipient_thread_id)
+            .ok_or_else(|| anyhow!("unknown recipient thread id: {recipient_thread_id}"))?;
+        let runtime = self.runtime()?;
+        let threads = runtime.threads.read().await;
+        let thread = threads
+            .get(&recipient_thread_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown live recipient thread id: {recipient_thread_id}"))?;
+        drop(threads);
+
+        thread
+            .submit(Op::InterAgentCommunication {
+                communication: InterAgentCommunication::new(
+                    author.agent_path,
+                    recipient.agent_path,
+                    vec![],
+                    content,
+                    trigger_turn,
+                ),
+            })
+            .await
+    }
+
+    pub(crate) async fn close_agent(
+        &self,
+        author_thread_id: ThreadId,
+        target: &str,
+    ) -> Result<AgentStatus> {
+        let target_thread_id = self.resolve_agent_reference(author_thread_id, target)?;
+        let runtime = self.runtime()?;
+        let threads = runtime.threads.read().await;
+        let thread = threads
+            .get(&target_thread_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown live agent thread id: {target_thread_id}"))?;
+        drop(threads);
+
+        let _ = thread.submit(Op::Shutdown).await?;
+        thread.core.session.abort_all_tasks("closed").await;
+        runtime.threads.write().await.remove(&target_thread_id);
+        self.state.registry.unregister_thread(target_thread_id);
+        self.remove_status_sender(target_thread_id);
+        Ok(AgentStatus::Shutdown)
     }
 
     fn ensure_status_sender(&self, thread_id: ThreadId, status: AgentStatus) {
@@ -202,6 +290,67 @@ impl AgentControl {
             .lock()
             .expect("agent control status mutex should lock")
             .remove(&thread_id);
+    }
+
+    fn session_source_for_thread(&self, thread_id: ThreadId) -> Result<SessionSource> {
+        let Some(metadata) = self.state.registry.agent_metadata_for_thread(thread_id) else {
+            return Err(anyhow!("unknown thread id: {thread_id}"));
+        };
+        if metadata.parent_thread_id.is_none() || metadata.depth == 0 {
+            return Ok(SessionSource::Cli);
+        }
+        Ok(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: metadata
+                .parent_thread_id
+                .ok_or_else(|| anyhow!("missing parent thread id for {thread_id}"))?,
+            depth: metadata.depth,
+            agent_path: Some(metadata.agent_path),
+            agent_nickname: metadata.agent_nickname,
+            agent_role: metadata.agent_role,
+        }))
+    }
+
+    fn runtime(&self) -> Result<AgentControlRuntime> {
+        self.state
+            .runtime
+            .lock()
+            .expect("agent control runtime mutex should lock")
+            .clone()
+            .ok_or_else(|| anyhow!("agent control runtime is not attached"))
+    }
+
+    fn maybe_start_completion_watcher(&self, child: AgentMetadata) {
+        let Some(parent_thread_id) = child.parent_thread_id else {
+            return;
+        };
+        let mut status_rx = self.subscribe_status(child.agent_id.unwrap_or(parent_thread_id));
+        let control = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let status = status_rx.borrow().clone();
+                if is_final(&status) {
+                    let Some(parent) = control
+                        .state
+                        .registry
+                        .agent_metadata_for_thread(parent_thread_id)
+                    else {
+                        break;
+                    };
+                    let _ = control
+                        .send_input(
+                            child.agent_id.unwrap_or(parent_thread_id),
+                            parent.agent_path.as_str(),
+                            notify::render_completion_notification(&child, &status),
+                            false,
+                        )
+                        .await;
+                    break;
+                }
+                if status_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
     }
 }
 
@@ -223,7 +372,7 @@ mod tests {
         provider::SessionStreamEvent, thread_manager::ThreadManagerState,
     };
     use futures_util::stream;
-    use smooth_protocol::{AgentStatus, ThreadId};
+    use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
     use tools::DynamicToolClient;
 
     #[test]
@@ -301,6 +450,131 @@ mod tests {
 
         assert!(child.agent_path.as_str().starts_with("/root/"));
         assert_eq!(control.registry().live_agents().len(), 2);
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+    }
+
+    #[tokio::test]
+    async fn send_input_resolves_relative_agent_target() {
+        let workspace = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "response".into(),
+                })),
+            })),
+        );
+        let started = manager.start_thread().await.expect("start root");
+        let root_id = started.thread_id;
+        let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent(root_id, "hello child".to_string())
+            .await
+            .expect("spawn child");
+        let child_id = child.agent_id.expect("child id");
+        let child_name = child.agent_path.name().to_string();
+
+        let _turn_id = control
+            .send_input(child_id, "/root", "wake root".to_string(), true)
+            .await
+            .expect("send input");
+
+        let mut saw_mail = false;
+        for _ in 0..10 {
+            let event = root_events.recv().await.expect("root event");
+            if let EventMsg::InterAgentMessage(mail) = event.msg {
+                if mail.communication.content == "wake root" {
+                    saw_mail = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_mail);
+
+        let listed = control
+            .list_agents(child_id, Some(".."))
+            .expect_err("invalid relative");
+        assert!(listed.to_string().contains("`..` is reserved"));
+        let listed = control
+            .list_agents(root_id, Some(&child_name))
+            .expect("list child");
+        assert_eq!(listed.len(), 1);
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+    }
+
+    #[tokio::test]
+    async fn close_agent_removes_live_child() {
+        let workspace = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "response".into(),
+                })),
+            })),
+        );
+        let started = manager.start_thread().await.expect("start root");
+        let root_id = started.thread_id;
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent(root_id, "hello child".to_string())
+            .await
+            .expect("spawn child");
+
+        let status = control
+            .close_agent(root_id, child.agent_path.as_str())
+            .await
+            .expect("close child");
+        assert_eq!(status, AgentStatus::Shutdown);
+        assert_eq!(control.registry().live_agents().len(), 1);
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+    }
+
+    #[tokio::test]
+    async fn completion_watcher_queues_parent_notification() {
+        let workspace = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "response".into(),
+                })),
+            })),
+        );
+        let started = manager.start_thread().await.expect("start root");
+        let root_id = started.thread_id;
+        let control = manager.agent_control();
+        let _child = control
+            .spawn_agent(root_id, "hello child".to_string())
+            .await
+            .expect("spawn child");
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let runtime = control.runtime().expect("runtime");
+        let threads = runtime.threads.read().await;
+        let root_thread = threads.get(&root_id).cloned().expect("root thread");
+        drop(threads);
+        let drained = root_thread.core.session.drain_mailbox().await;
+
+        assert!(
+            drained
+                .iter()
+                .any(|mail| mail.content.contains("reached terminal status"))
+        );
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
     }

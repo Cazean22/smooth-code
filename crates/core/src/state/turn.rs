@@ -13,28 +13,6 @@ pub(crate) struct ActiveTurn {
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
 }
 
-/// Whether mailbox deliveries should still be folded into the current turn.
-///
-/// State machine:
-/// - A turn starts in `CurrentTurn`, so queued child mail can join the next
-///   model request for that turn.
-/// - After user-visible terminal output is recorded, we switch to `NextTurn`
-///   to leave late child mail queued instead of extending an already shown
-///   answer.
-/// - If the same task later gets explicit same-turn work again (a steered user
-///   prompt or a tool call after an untagged preamble), we reopen `CurrentTurn`
-///   so that pending child mail is drained into that follow-up request.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code)]
-pub(crate) enum MailboxDeliveryPhase {
-    /// Incoming mailbox messages can still be consumed by the current turn.
-    #[default]
-    CurrentTurn,
-    /// The current turn already emitted visible final answer text; mailbox
-    /// messages should remain queued for a later turn.
-    NextTurn,
-}
-
 impl Default for ActiveTurn {
     fn default() -> Self {
         Self {
@@ -83,6 +61,8 @@ impl ActiveTurn {
 /// Mutable state for a single turn.
 #[derive(Default)]
 pub(crate) struct TurnState {
+    // Mailbox delivery is v1 turn-start-only, so turn state does not track any
+    // per-turn mailbox delivery phase.
     #[allow(dead_code)]
     pub(crate) tool_calls: u64,
 }

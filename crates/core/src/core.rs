@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use anyhow::Result;
+use futures_util::future::BoxFuture;
 use rig::{
     OneOrMany,
     message::{Message, Text, UserContent},
@@ -22,7 +23,7 @@ use crate::{
     provider::SessionModel,
     rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persist_event},
     state::{ActiveTurn, RunningTask, SessionState},
-    tasks::{RegularTask, SessionTask},
+    tasks::{AnySessionTask, RegularTask},
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -103,18 +104,7 @@ impl Core {
     pub async fn submit(&self, op: Op) -> Result<String> {
         match op {
             Op::UserInput(input) => {
-                let turn_context = Arc::new(self.session.fresh_turn_context());
-                let sub_id = turn_context.sub_id.clone();
-                tracing::debug!(
-                    thread_id = %self.session.id,
-                    turn_id = %sub_id,
-                    input_len = input.len(),
-                    "starting turn"
-                );
-
-                self.session
-                    .start_task(turn_context, vec![input], RegularTask::new())
-                    .await;
+                let sub_id = self.session.start_regular_turn(vec![input]).await;
                 Ok(sub_id)
             }
             Op::InterAgentCommunication { communication } => {
@@ -124,11 +114,7 @@ impl Core {
                     .map_err(anyhow::Error::msg)?;
 
                 if self.session.mailbox.has_trigger_turn_pending() && self.session.is_idle().await {
-                    let turn_context = Arc::new(self.session.fresh_turn_context());
-                    let sub_id = turn_context.sub_id.clone();
-                    self.session
-                        .start_task(turn_context, vec![String::new()], RegularTask::new())
-                        .await;
+                    let sub_id = self.session.start_regular_turn(vec![String::new()]).await;
                     return Ok(sub_id);
                 }
 
@@ -165,114 +151,147 @@ impl Core {
 }
 
 impl Session {
-    pub(crate) async fn start_task<T: SessionTask>(
+    fn start_regular_turn(self: &Arc<Self>, input: Vec<String>) -> BoxFuture<'_, String> {
+        Box::pin(async move {
+            let turn_context = Arc::new(self.fresh_turn_context());
+            let sub_id = turn_context.sub_id.clone();
+            let input_len = input.iter().map(String::len).sum::<usize>();
+            tracing::debug!(
+                thread_id = %self.id,
+                turn_id = %sub_id,
+                input_len,
+                "starting turn"
+            );
+            self.start_task(
+                turn_context,
+                input,
+                Arc::new(RegularTask::new()),
+                crate::state::TaskKind::Regular,
+            )
+            .await;
+            sub_id
+        })
+    }
+
+    pub(crate) fn start_task(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<String>,
-        task: T,
-    ) {
-        self.abort_all_tasks("replaced").await;
+        task: Arc<dyn AnySessionTask>,
+        task_kind: crate::state::TaskKind,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.abort_all_tasks("replaced").await;
+            let cancellation_token = tokio_util::sync::CancellationToken::new();
+            let done = Arc::new(tokio::sync::Notify::new());
+            let sess = Arc::clone(self);
+            let task_for_runner = Arc::clone(&task);
+            let ctx_for_runner = Arc::clone(&turn_context);
+            let done_for_runner = Arc::clone(&done);
+            let cancellation_for_runner = cancellation_token.clone();
 
-        let task: Arc<dyn crate::tasks::AnySessionTask> = Arc::new(task);
-        let cancellation_token = tokio_util::sync::CancellationToken::new();
-        let done = Arc::new(tokio::sync::Notify::new());
-        let sess = Arc::clone(self);
-        let task_for_runner = Arc::clone(&task);
-        let ctx_for_runner = Arc::clone(&turn_context);
-        let done_for_runner = Arc::clone(&done);
-        let cancellation_for_runner = cancellation_token.clone();
-
-        self.emit_event(
-            &turn_context,
-            EventMsg::TurnStarted(TurnStartedEvent {
-                thread_id: self.id.to_string(),
-                turn_id: turn_context.sub_id.clone(),
-            }),
-        )
-        .await;
-        self.current_turn_id
-            .send_replace(Some(turn_context.sub_id.clone()));
-        self.set_agent_status(AgentStatus::Running, Some(turn_context.as_ref()))
-            .await;
-
-        let task_span = tracing::info_span!(
-            "core.session_task",
-            thread_id = %self.id,
-            turn_id = %turn_context.sub_id,
-            task_name = task_for_runner.span_name(),
-            task_kind = ?task_for_runner.kind(),
-        );
-        let handle = tokio::task::Builder::new()
-            .name(task_for_runner.span_name())
-            .spawn(
-                async move {
-                    let result = task_for_runner
-                        .run(
-                            Arc::clone(&sess),
-                            Arc::clone(&ctx_for_runner),
-                            input,
-                            cancellation_for_runner.clone(),
-                        )
-                        .await;
-
-                    if cancellation_for_runner.is_cancelled() {
-                        sess.set_agent_status(
-                            AgentStatus::Interrupted,
-                            Some(ctx_for_runner.as_ref()),
-                        )
-                        .await;
-                        sess.emit_event(
-                            &ctx_for_runner,
-                            EventMsg::TurnInterrupted(TurnInterruptedEvent {
-                                thread_id: sess.id.to_string(),
-                                turn_id: ctx_for_runner.sub_id.clone(),
-                                reason: "cancelled".to_string(),
-                            }),
-                        )
-                        .await;
-                    } else if let Some(last_assistant_message) = result {
-                        sess.set_agent_status(
-                            AgentStatus::Completed(Some(last_assistant_message.clone())),
-                            Some(ctx_for_runner.as_ref()),
-                        )
-                        .await;
-                        sess.emit_event(
-                            &ctx_for_runner,
-                            EventMsg::TurnCompleted(TurnCompletedEvent {
-                                thread_id: sess.id.to_string(),
-                                turn_id: ctx_for_runner.sub_id.clone(),
-                                last_assistant_message: Some(last_assistant_message),
-                            }),
-                        )
-                        .await;
-                    }
-
-                    let mut active_turn = sess.active_turn.lock().await;
-                    if let Some(turn) = active_turn.as_mut()
-                        && turn.remove_task(&ctx_for_runner.sub_id)
-                    {
-                        *active_turn = None;
-                        sess.current_turn_id.send_replace(None);
-                    }
-
-                    done_for_runner.notify_waiters();
-                }
-                .instrument(task_span),
+            self.emit_event(
+                &turn_context,
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    thread_id: self.id.to_string(),
+                    turn_id: turn_context.sub_id.clone(),
+                }),
             )
-            .expect("failed to spawn session task");
+            .await;
+            self.current_turn_id
+                .send_replace(Some(turn_context.sub_id.clone()));
+            self.set_agent_status(AgentStatus::Running, Some(turn_context.as_ref()))
+                .await;
 
-        let running_task = RunningTask {
-            done,
-            kind: task.kind(),
-            task,
-            cancellation_token,
-            handle: Arc::new(tokio_util::task::AbortOnDropHandle::new(handle)),
-            turn_context: Arc::clone(&turn_context),
-        };
+            let task_span = tracing::info_span!(
+                "core.session_task",
+                thread_id = %self.id,
+                turn_id = %turn_context.sub_id,
+                task_name = task_for_runner.span_name(),
+                task_kind = ?task_for_runner.kind(),
+            );
+            let handle = tokio::task::Builder::new()
+                .name(task_for_runner.span_name())
+                .spawn(
+                    async move {
+                        let result = task_for_runner
+                            .run(
+                                Arc::clone(&sess),
+                                Arc::clone(&ctx_for_runner),
+                                input,
+                                cancellation_for_runner.clone(),
+                            )
+                            .await;
 
-        let mut active_turn = self.active_turn.lock().await;
-        let turn = active_turn.get_or_insert_with(ActiveTurn::default);
-        turn.add_task(running_task);
+                        if cancellation_for_runner.is_cancelled() {
+                            sess.set_agent_status(
+                                AgentStatus::Interrupted,
+                                Some(ctx_for_runner.as_ref()),
+                            )
+                            .await;
+                            sess.emit_event(
+                                &ctx_for_runner,
+                                EventMsg::TurnInterrupted(TurnInterruptedEvent {
+                                    thread_id: sess.id.to_string(),
+                                    turn_id: ctx_for_runner.sub_id.clone(),
+                                    reason: "cancelled".to_string(),
+                                }),
+                            )
+                            .await;
+                        } else if let Some(last_assistant_message) = result {
+                            sess.set_agent_status(
+                                AgentStatus::Completed(Some(last_assistant_message.clone())),
+                                Some(ctx_for_runner.as_ref()),
+                            )
+                            .await;
+                            sess.emit_event(
+                                &ctx_for_runner,
+                                EventMsg::TurnCompleted(TurnCompletedEvent {
+                                    thread_id: sess.id.to_string(),
+                                    turn_id: ctx_for_runner.sub_id.clone(),
+                                    last_assistant_message: Some(last_assistant_message),
+                                }),
+                            )
+                            .await;
+                        }
+
+                        let mut active_turn = sess.active_turn.lock().await;
+                        if let Some(turn) = active_turn.as_mut()
+                            && turn.remove_task(&ctx_for_runner.sub_id)
+                        {
+                            *active_turn = None;
+                            sess.current_turn_id.send_replace(None);
+                        }
+                        drop(active_turn);
+
+                        if sess.mailbox.has_trigger_turn_pending() {
+                            let sess_for_follow_up = Arc::clone(&sess);
+                            tokio::spawn(async move {
+                                let _sub_id = sess_for_follow_up
+                                    .start_regular_turn(vec![String::new()])
+                                    .await;
+                            });
+                        }
+
+                        done_for_runner.notify_waiters();
+                    }
+                    .instrument(task_span),
+                )
+                .expect("failed to spawn session task");
+
+            let running_task = RunningTask {
+                done,
+                kind: task_kind,
+                task,
+                cancellation_token,
+                handle: Arc::new(tokio_util::task::AbortOnDropHandle::new(handle)),
+                turn_context: Arc::clone(&turn_context),
+            };
+
+            let mut active_turn = self.active_turn.lock().await;
+            let turn = active_turn.get_or_insert_with(ActiveTurn::default);
+            turn.add_task(running_task);
+        })
     }
 
     #[tracing::instrument(name = "core.session.abort_all_tasks", skip(self), fields(thread_id = %self.id, reason))]
@@ -407,16 +426,19 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{path::PathBuf, sync::Arc, time::Duration};
 
     use anyhow::Result;
-    use futures_util::stream;
-    use rig::message::Message;
+    use async_stream::stream;
+    use rig::{
+        agent::FinalResponse,
+        message::{Message, Text},
+    };
     use tempfile::TempDir;
-    use tokio::sync::watch;
+    use tokio::sync::{Notify, Semaphore, watch};
 
     use crate::{
-        SessionModel, SessionModelDriver, SessionStream, agent::AgentControl,
+        SessionModel, SessionModelDriver, SessionStream, SessionStreamEvent, agent::AgentControl,
         rollout::RolloutRecorder,
     };
 
@@ -430,7 +452,29 @@ mod tests {
 
     impl SessionModelDriver for EmptyDriver {
         fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-            Ok(Box::pin(stream::empty()))
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
+
+    struct BlockingDriver {
+        started: Arc<Notify>,
+        release: Arc<Semaphore>,
+        text: String,
+    }
+
+    impl SessionModelDriver for BlockingDriver {
+        fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+            let started = Arc::clone(&self.started);
+            let release = Arc::clone(&self.release);
+            let text = self.text.clone();
+            Ok(Box::pin(stream! {
+                started.notify_one();
+                let _permit = release.acquire().await.expect("release semaphore should stay open");
+                yield Ok(SessionStreamEvent::StreamAssistantItem(
+                    crate::SessionAssistantContent::Text(Text { text }),
+                ));
+                yield Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty()));
+            }))
         }
     }
 
@@ -563,5 +607,114 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn submit_inter_agent_communication_with_trigger_starts_follow_up_turn_when_busy() {
+        let workspace = TempDir::new().expect("tempdir");
+        let cwd = PathBuf::from(workspace.path());
+        let thread_id = smooth_protocol::ThreadId::new();
+        let (current_turn_id, _) = watch::channel(None);
+        let current_turn_id = Arc::new(current_turn_id);
+        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd)
+            .await
+            .expect("rollout");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let core = Core::new(
+            thread_id,
+            SessionModel::Stub(Arc::new(BlockingDriver {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                text: "done".to_string(),
+            })),
+            Vec::new(),
+            0,
+            rollout,
+            current_turn_id,
+            None,
+            SessionSource::Cli,
+            AgentControl::new(),
+        );
+        let mut rx = core.subscribe();
+
+        let initial_turn_id = core
+            .submit(Op::UserInput("first turn".to_string()))
+            .await
+            .expect("start user turn");
+        let initial_turn_id_for_assert = initial_turn_id.clone();
+
+        let event = rx.recv().await.expect("turn started");
+        assert_eq!(
+            event.msg,
+            EventMsg::TurnStarted(TurnStartedEvent {
+                thread_id: core.session.id.to_string(),
+                turn_id: initial_turn_id_for_assert,
+            })
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("driver should start");
+
+        let result = core
+            .submit(Op::InterAgentCommunication {
+                communication: smooth_protocol::InterAgentCommunication::new(
+                    AgentPath::try_from("/root/child").expect("path"),
+                    AgentPath::root(),
+                    vec![],
+                    "child follow-up".to_string(),
+                    true,
+                ),
+            })
+            .await
+            .expect("queue trigger mail");
+        assert_eq!(result, "queued");
+
+        release.add_permits(1);
+
+        let mut saw_follow_up_turn = false;
+        let mut saw_mail = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(event)) => event,
+                Ok(Err(err)) => panic!("event channel closed: {err}"),
+                Err(_) => break,
+            };
+
+            match event.msg {
+                EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) => {
+                    if turn_id != initial_turn_id {
+                        saw_follow_up_turn = true;
+                    }
+                }
+                EventMsg::InterAgentMessage(InterAgentCommunicationEvent { communication }) => {
+                    if communication.content == "child follow-up" {
+                        saw_mail = true;
+                    }
+                }
+                _ => {}
+            }
+
+            if saw_follow_up_turn && saw_mail {
+                break;
+            }
+        }
+
+        assert!(
+            saw_follow_up_turn,
+            "expected follow-up turn to start; idle={}, pending_trigger_turn={}",
+            core.session.is_idle().await,
+            core.session.mailbox.has_trigger_turn_pending()
+        );
+        assert!(
+            saw_mail,
+            "expected queued mail to drain in follow-up turn; idle={}, pending_trigger_turn={}",
+            core.session.is_idle().await,
+            core.session.mailbox.has_trigger_turn_pending()
+        );
     }
 }

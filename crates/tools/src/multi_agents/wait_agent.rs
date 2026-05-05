@@ -1,6 +1,6 @@
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{
     ToolFailure,
@@ -17,13 +17,6 @@ pub struct WaitAgentTool {
 pub struct WaitAgentArgs {
     pub target: String,
     pub timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct WaitAgentOutput {
-    pub target: String,
-    pub status: String,
 }
 
 impl WaitAgentTool {
@@ -55,10 +48,7 @@ impl Tool for WaitAgentTool {
                 timeout_ms: args.timeout_ms,
             })
             .await?;
-        serde_json::to_string(&WaitAgentOutput {
-            target: result.target,
-            status: result.status,
-        })
-        .map_err(|err| ToolFailure::new(format!("failed to encode wait_agent output: {err}")))
+        serde_json::to_string(&result)
+            .map_err(|err| ToolFailure::new(format!("failed to encode wait_agent output: {err}")))
     }
 }

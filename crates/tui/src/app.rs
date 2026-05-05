@@ -291,6 +291,17 @@ impl App {
                     agent_status_label(&event.status)
                 ))));
             }
+            EventMsg::CollabAgentCompleted(event) => {
+                let nickname = event
+                    .agent_nickname
+                    .as_deref()
+                    .unwrap_or_else(|| event.agent_path.name());
+                self.push_history(Box::new(PlainHistoryCell::info(format!(
+                    "Sub-agent {nickname} ({}) finished with {}",
+                    event.agent_path,
+                    agent_status_label(&event.status)
+                ))));
+            }
             EventMsg::CollabSendMessageBegin(event) => {
                 self.push_history(Box::new(PlainHistoryCell::info(format!(
                     "Sending message to {}",
@@ -1077,6 +1088,30 @@ mod tests {
 
         let joined = transcript_strings(&app).join("\n");
         assert_eq!(joined.matches("Hi! What can I help with?").count(), 1);
+    }
+
+    #[test]
+    fn collab_agent_completed_renders_transcript_entry() {
+        let mut app = App::new();
+
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::CollabAgentCompleted(smooth_protocol::CollabAgentCompletedEvent {
+                    parent_thread_id: ThreadId::new(),
+                    child_thread_id: ThreadId::new(),
+                    agent_path: smooth_protocol::AgentPath::try_from("/root/child").expect("path"),
+                    agent_nickname: Some("child".to_string()),
+                    agent_role: Some("worker".to_string()),
+                    status: AgentStatus::Completed(Some("Done".to_string())),
+                    last_assistant_message: Some("Done".to_string()),
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("Sub-agent child (/root/child) finished with completed (Done)"));
     }
 
     #[test]

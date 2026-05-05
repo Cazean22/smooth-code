@@ -3,6 +3,7 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use smooth_protocol::AgentStatus;
 
 use crate::ToolFailure;
 
@@ -31,6 +32,10 @@ pub struct AgentInfo {
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
     pub status: Option<String>,
+    #[serde(default)]
+    pub status_detail: Option<AgentStatus>,
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -38,6 +43,13 @@ pub struct AgentInfo {
 pub struct AgentWaitOutcome {
     pub target: String,
     pub status: String,
+    pub thread_id: String,
+    pub agent_path: String,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+    pub status_detail: AgentStatus,
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
 }
 
 pub trait MultiAgentClient: Send + Sync {

@@ -5,7 +5,6 @@ pub(crate) mod control;
 pub(crate) mod fork;
 pub(crate) mod mailbox;
 pub(crate) mod multi_agent_client;
-pub(crate) mod notify;
 pub(crate) mod registry;
 pub(crate) mod role;
 pub(crate) mod status;

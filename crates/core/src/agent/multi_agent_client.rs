@@ -10,7 +10,7 @@ use tools::{
 };
 use uuid::Uuid;
 
-use crate::agent::{AgentControl, registry::AgentMetadata};
+use crate::agent::{AgentControl, registry::AgentMetadata, status::last_assistant_message};
 
 #[derive(Clone)]
 pub(crate) struct InProcessMultiAgentClient {
@@ -197,24 +197,28 @@ impl MultiAgentClient for InProcessMultiAgentClient {
                     EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
                         sender_thread_id: author_thread_id,
                         call_id,
-                        agent_statuses: vec![CollabAgentStatusEntry {
-                            thread_id: target_thread_id,
-                            agent_nickname: target_metadata.agent_nickname.clone(),
-                            agent_role: target_metadata.agent_role.clone(),
-                            status: status.clone(),
-                        }],
-                        statuses: vec![CollabAgentStatusEntry {
-                            thread_id: target_thread_id,
-                            agent_nickname: target_metadata.agent_nickname,
-                            agent_role: target_metadata.agent_role,
-                            status: status.clone(),
-                        }],
+                        agent_statuses: vec![status_entry_from_metadata(
+                            &target_metadata,
+                            target_thread_id,
+                            status.clone(),
+                        )],
+                        statuses: vec![status_entry_from_metadata(
+                            &target_metadata,
+                            target_thread_id,
+                            status.clone(),
+                        )],
                     }),
                 )
                 .await;
             Ok(AgentWaitOutcome {
                 target: params.target,
                 status: agent_status_label(&status),
+                thread_id: target_thread_id.to_string(),
+                agent_path: target_metadata.agent_path.to_string(),
+                agent_nickname: target_metadata.agent_nickname,
+                agent_role: target_metadata.agent_role,
+                status_detail: status.clone(),
+                last_assistant_message: last_assistant_message(&status),
             })
         })
     }
@@ -302,6 +306,23 @@ fn agent_info_from_metadata(metadata: &AgentMetadata, status: AgentStatus) -> Ag
         agent_nickname: metadata.agent_nickname.clone(),
         agent_role: metadata.agent_role.clone(),
         status: Some(agent_status_label(&status)),
+        status_detail: Some(status.clone()),
+        last_assistant_message: last_assistant_message(&status),
+    }
+}
+
+fn status_entry_from_metadata(
+    metadata: &AgentMetadata,
+    thread_id: ThreadId,
+    status: AgentStatus,
+) -> CollabAgentStatusEntry {
+    CollabAgentStatusEntry {
+        thread_id,
+        agent_path: metadata.agent_path.clone(),
+        agent_nickname: metadata.agent_nickname.clone(),
+        agent_role: metadata.agent_role.clone(),
+        last_assistant_message: last_assistant_message(&status),
+        status,
     }
 }
 
@@ -326,7 +347,7 @@ mod tests {
         agent::FinalResponse,
         message::{Message, Text},
     };
-    use smooth_protocol::ThreadId;
+    use smooth_protocol::{AgentStatus, ThreadId};
     use tempfile::TempDir;
     use tokio::{sync::watch, time::sleep};
     use tools::{MultiAgentClient, SpawnAgentParams, WaitAgentParams};
@@ -465,6 +486,11 @@ mod tests {
             .await
             .expect("wait should succeed");
         assert_eq!(waited.status, "completed");
+        assert_eq!(
+            waited.status_detail,
+            AgentStatus::Completed(Some("child".to_string()))
+        );
+        assert_eq!(waited.last_assistant_message.as_deref(), Some("child"));
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
     }

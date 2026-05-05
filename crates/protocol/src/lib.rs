@@ -81,6 +81,7 @@ pub enum EventMsg {
     ToolCallCompleted(ToolCallCompletedEvent),
     CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent),
     CollabAgentSpawnEnd(CollabAgentSpawnEndEvent),
+    CollabAgentCompleted(CollabAgentCompletedEvent),
     CollabSendMessageBegin(CollabSendMessageBeginEvent),
     CollabSendMessageEnd(CollabSendMessageEndEvent),
     CollabWaitingBegin(CollabWaitingBeginEvent),
@@ -282,9 +283,12 @@ pub struct CollabAgentRef {
 #[serde(rename_all = "camelCase")]
 pub struct CollabAgentStatusEntry {
     pub thread_id: ThreadId,
+    pub agent_path: AgentPath,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
     pub status: AgentStatus,
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -307,6 +311,19 @@ pub struct CollabAgentSpawnEndEvent {
     pub prompt: String,
     pub model: Option<String>,
     pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabAgentCompletedEvent {
+    pub parent_thread_id: ThreadId,
+    pub child_thread_id: ThreadId,
+    pub agent_path: AgentPath,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+    pub status: AgentStatus,
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -510,11 +527,30 @@ mod tests {
             call_id: "call-1".to_string(),
             agent_statuses: vec![CollabAgentStatusEntry {
                 thread_id: ThreadId::new(),
+                agent_path: AgentPath::try_from("/root/child").expect("path"),
                 agent_nickname: Some("child".to_string()),
                 agent_role: Some("worker".to_string()),
                 status: AgentStatus::Completed(Some("done".to_string())),
+                last_assistant_message: Some("done".to_string()),
             }],
             statuses: vec![],
+        });
+
+        let value = serde_json::to_value(&msg).expect("serialize event");
+        let decoded: EventMsg = serde_json::from_value(value).expect("deserialize event");
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn collab_agent_completed_round_trip() {
+        let msg = EventMsg::CollabAgentCompleted(super::CollabAgentCompletedEvent {
+            parent_thread_id: ThreadId::new(),
+            child_thread_id: ThreadId::new(),
+            agent_path: AgentPath::try_from("/root/child").expect("path"),
+            agent_nickname: Some("child".to_string()),
+            agent_role: Some("worker".to_string()),
+            status: AgentStatus::Completed(Some("done".to_string())),
+            last_assistant_message: Some("done".to_string()),
         });
 
         let value = serde_json::to_value(&msg).expect("serialize event");

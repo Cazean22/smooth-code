@@ -21,6 +21,7 @@ mod tests {
 
     use futures_util::future::BoxFuture;
     use rig::tool::Tool;
+    use smooth_protocol::AgentStatus;
 
     use super::{
         AgentInfo, AgentWaitOutcome, CloseAgentTool, DynMultiAgentClient, ListAgentsTool,
@@ -57,6 +58,8 @@ mod tests {
                     agent_nickname: Some("child".to_string()),
                     agent_role: params.agent_type,
                     status: None,
+                    status_detail: None,
+                    last_assistant_message: None,
                 })
             })
         }
@@ -86,6 +89,12 @@ mod tests {
                 Ok(AgentWaitOutcome {
                     target: params.target,
                     status: "completed".to_string(),
+                    thread_id: "thread-1".to_string(),
+                    agent_path: "/root/child".to_string(),
+                    agent_nickname: Some("child".to_string()),
+                    agent_role: Some("worker".to_string()),
+                    status_detail: AgentStatus::Completed(Some("done".to_string())),
+                    last_assistant_message: Some("done".to_string()),
                 })
             })
         }
@@ -105,6 +114,8 @@ mod tests {
                     agent_nickname: Some("child".to_string()),
                     agent_role: Some("worker".to_string()),
                     status: Some("running".to_string()),
+                    status_detail: Some(AgentStatus::Running),
+                    last_assistant_message: None,
                 }])
             })
         }
@@ -164,6 +175,7 @@ mod tests {
             .await
             .expect("wait should succeed");
         assert!(waited.contains("\"status\":\"completed\""));
+        assert!(waited.contains("\"lastAssistantMessage\":\"done\""));
 
         let list = ListAgentsTool::new(client());
         let listed = list
@@ -173,6 +185,7 @@ mod tests {
             .await
             .expect("list should succeed");
         assert!(listed.contains("\"agentPath\":\"/root/child\""));
+        assert!(listed.contains("\"statusDetail\":\"running\""));
 
         let close = CloseAgentTool::new(client());
         assert_eq!(

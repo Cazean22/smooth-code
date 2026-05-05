@@ -13,7 +13,7 @@ use smooth_core::{
     AgentControl, RoleOverride, SessionAssistantContent, SessionModel, SessionModelDriver,
     SessionModelFactory, SessionStream, SessionStreamEvent, ThreadManagerState,
 };
-use smooth_protocol::ThreadId;
+use smooth_protocol::{AgentStatus, ThreadId};
 use tempfile::TempDir;
 use tokio::sync::watch;
 use tools::{DynamicToolClient, SpawnAgentParams, WaitAgentParams};
@@ -91,6 +91,14 @@ async fn multi_agent_client_round_trip_spawns_waits_lists_and_closes_agents() {
         .expect("wait should succeed");
     assert_eq!(waited.target, spawned.agent_path);
     assert_eq!(waited.status, "completed");
+    assert_eq!(
+        waited.status_detail,
+        AgentStatus::Completed(Some(format!("done:{}", waited.thread_id)))
+    );
+    assert_eq!(
+        waited.last_assistant_message,
+        Some(format!("done:{}", waited.thread_id))
+    );
 
     let listed = client
         .list_agents(Some("/root".to_string()))

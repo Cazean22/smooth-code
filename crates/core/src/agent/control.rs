@@ -5,7 +5,8 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use smooth_protocol::{
-    AgentStatus, EventMsg, InterAgentCommunication, Op, SessionSource, SubAgentSource, ThreadId,
+    AgentStatus, CollabAgentCompletedEvent, EventMsg, InterAgentCommunication, Op, SessionSource,
+    SubAgentSource, ThreadId,
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, watch};
@@ -15,10 +16,9 @@ use crate::{
     agent::{
         agent_resolver,
         fork::{SpawnAgentForkMode, persisted_items_to_messages},
-        notify,
         registry::{AgentMetadata, AgentRegistry},
         role::resolve_role,
-        status::{agent_status_from_event, is_final},
+        status::{agent_status_from_event, is_final, last_assistant_message},
     },
     core_thread::CoreThread,
     provider::SessionModelFactory,
@@ -447,25 +447,27 @@ impl AgentControl {
         let Some(parent_thread_id) = child.parent_thread_id else {
             return;
         };
-        let mut status_rx = self.subscribe_status(child.agent_id.unwrap_or(parent_thread_id));
+        let Some(child_thread_id) = child.agent_id else {
+            return;
+        };
+        let mut status_rx = self.subscribe_status(child_thread_id);
         let control = self.clone();
         tokio::spawn(async move {
             loop {
                 let status = status_rx.borrow().clone();
                 if is_final(&status) {
-                    let Some(parent) = control
-                        .state
-                        .registry
-                        .agent_metadata_for_thread(parent_thread_id)
-                    else {
-                        break;
-                    };
-                    let _ = control
-                        .send_input(
-                            child.agent_id.unwrap_or(parent_thread_id),
-                            parent.agent_path.as_str(),
-                            notify::render_completion_notification(&child, &status),
-                            false,
+                    control
+                        .emit_collab_event(
+                            parent_thread_id,
+                            EventMsg::CollabAgentCompleted(CollabAgentCompletedEvent {
+                                parent_thread_id,
+                                child_thread_id,
+                                agent_path: child.agent_path.clone(),
+                                agent_nickname: child.agent_nickname.clone(),
+                                agent_role: child.agent_role.clone(),
+                                last_assistant_message: last_assistant_message(&status),
+                                status,
+                            }),
                         )
                         .await;
                     break;
@@ -809,7 +811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_watcher_queues_parent_notification() {
+    async fn completion_watcher_emits_parent_completion_event() {
         let _cwd_guard = crate::test_support::cwd_test_lock()
             .lock()
             .expect("cwd lock");
@@ -829,24 +831,33 @@ mod tests {
         .expect("thread manager");
         let started = manager.start_thread().await.expect("start root");
         let root_id = started.thread_id;
+        let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
         let control = manager.agent_control();
-        let _child = control
+        let child = control
             .spawn_agent(root_id, "hello child".to_string())
             .await
             .expect("spawn child");
+        let child_id = child.agent_id.expect("child id");
 
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let completion = loop {
+            let event = root_events.recv().await.expect("root event");
+            if let EventMsg::CollabAgentCompleted(event) = event.msg {
+                break event;
+            }
+        };
 
-        let runtime = control.runtime().expect("runtime");
-        let threads = runtime.threads.read().await;
-        let root_thread = threads.get(&root_id).cloned().expect("root thread");
-        drop(threads);
-        let drained = root_thread.core.session.drain_mailbox().await;
-
-        assert!(
-            drained
-                .iter()
-                .any(|mail| mail.content.contains("reached terminal status"))
+        assert_eq!(completion.parent_thread_id, root_id);
+        assert_eq!(completion.child_thread_id, child_id);
+        assert_eq!(completion.agent_path, child.agent_path);
+        assert_eq!(completion.agent_nickname, child.agent_nickname);
+        assert_eq!(completion.agent_role, child.agent_role);
+        assert_eq!(
+            completion.status,
+            AgentStatus::Completed(Some("response".to_string()))
+        );
+        assert_eq!(
+            completion.last_assistant_message.as_deref(),
+            Some("response")
         );
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");

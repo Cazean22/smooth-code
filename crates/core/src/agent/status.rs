@@ -15,18 +15,26 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
 pub(crate) fn is_final(status: &AgentStatus) -> bool {
     matches!(
         status,
-        AgentStatus::Completed(_)
+        AgentStatus::Interrupted
+            | AgentStatus::Completed(_)
             | AgentStatus::Errored(_)
             | AgentStatus::Shutdown
             | AgentStatus::NotFound
     )
 }
 
+pub(crate) fn last_assistant_message(status: &AgentStatus) -> Option<String> {
+    match status {
+        AgentStatus::Completed(message) => message.clone(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use smooth_protocol::{ErrorEvent, EventMsg, TurnCompletedEvent, TurnInterruptedEvent};
 
-    use super::{agent_status_from_event, is_final};
+    use super::{agent_status_from_event, is_final, last_assistant_message};
 
     #[test]
     fn maps_turn_events_to_agent_status() {
@@ -63,11 +71,26 @@ mod tests {
 
     #[test]
     fn final_statuses_match_contract() {
+        assert!(is_final(&smooth_protocol::AgentStatus::Interrupted));
         assert!(is_final(&smooth_protocol::AgentStatus::Completed(None)));
         assert!(is_final(&smooth_protocol::AgentStatus::Errored(
             "x".to_string()
         )));
         assert!(is_final(&smooth_protocol::AgentStatus::Shutdown));
         assert!(!is_final(&smooth_protocol::AgentStatus::Running));
+    }
+
+    #[test]
+    fn completed_status_exposes_last_assistant_message() {
+        assert_eq!(
+            last_assistant_message(&smooth_protocol::AgentStatus::Completed(Some(
+                "done".to_string()
+            ))),
+            Some("done".to_string())
+        );
+        assert_eq!(
+            last_assistant_message(&smooth_protocol::AgentStatus::Errored("boom".to_string())),
+            None
+        );
     }
 }

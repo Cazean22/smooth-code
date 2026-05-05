@@ -15,9 +15,8 @@ pub use edit::{EditArgs, EditTool};
 pub use error::ToolFailure;
 pub use list_dir::{ListDirArgs, ListDirTool};
 pub use multi_agents::{
-    AgentInfo, AgentWaitOutcome, CloseAgentTool, DynMultiAgentClient, ListAgentsTool,
-    MultiAgentClient, SendMessageTool, SpawnAgentParams, SpawnAgentTool, WaitAgentParams,
-    WaitAgentTool,
+    AgentInfo, CloseAgentTool, DynMultiAgentClient, ListAgentsTool, MultiAgentClient,
+    SendMessageTool, SpawnAgentParams, SpawnAgentTool,
 };
 pub use read::{ReadArgs, ReadTool};
 pub use run_command::{RunCommandArgs, RunCommandTool};

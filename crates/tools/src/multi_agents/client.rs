@@ -19,13 +19,6 @@ pub struct SpawnAgentParams {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct WaitAgentParams {
-    pub target: String,
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct AgentInfo {
     pub thread_id: String,
     pub agent_path: String,
@@ -34,20 +27,6 @@ pub struct AgentInfo {
     pub status: Option<String>,
     #[serde(default)]
     pub status_detail: Option<AgentStatus>,
-    #[serde(default)]
-    pub last_assistant_message: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentWaitOutcome {
-    pub target: String,
-    pub status: String,
-    pub thread_id: String,
-    pub agent_path: String,
-    pub agent_nickname: Option<String>,
-    pub agent_role: Option<String>,
-    pub status_detail: AgentStatus,
     #[serde(default)]
     pub last_assistant_message: Option<String>,
 }
@@ -61,10 +40,6 @@ pub trait MultiAgentClient: Send + Sync {
         content: String,
         trigger_turn: bool,
     ) -> BoxFuture<'static, Result<String, ToolFailure>>;
-    fn wait_agent(
-        &self,
-        params: WaitAgentParams,
-    ) -> BoxFuture<'static, Result<AgentWaitOutcome, ToolFailure>>;
     fn list_agents(
         &self,
         path_prefix: Option<String>,

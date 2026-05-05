@@ -115,7 +115,7 @@ impl AgentControl {
                 .ok_or_else(|| anyhow!("registered agent is missing thread id"))?,
             status,
         );
-        self.maybe_start_completion_watcher(registered.clone());
+        self.maybe_start_completion_watcher(registered.clone(), false);
         Ok(registered)
     }
 
@@ -285,46 +285,8 @@ impl AgentControl {
             .state_db
             .upsert_open_edge(&parent_thread_id.to_string(), &child_thread_id.to_string())
             .await?;
-        self.maybe_start_completion_watcher(metadata.clone());
+        self.maybe_start_completion_watcher(metadata.clone(), true);
         Ok(metadata)
-    }
-
-    pub(crate) async fn wait_for_agent(
-        &self,
-        author_thread_id: ThreadId,
-        target: &str,
-        timeout_ms: Option<u64>,
-    ) -> Result<AgentStatus> {
-        let target_thread_id = self.resolve_agent_reference(author_thread_id, target)?;
-        let mut status_rx = self.subscribe_status(target_thread_id);
-        let current = status_rx.borrow().clone();
-        if is_final(&current) {
-            return Ok(current);
-        }
-
-        let wait_for_final = async {
-            loop {
-                status_rx
-                    .changed()
-                    .await
-                    .map_err(|_| anyhow!("agent status stream closed"))?;
-                let status = status_rx.borrow().clone();
-                if is_final(&status) {
-                    return Ok(status);
-                }
-            }
-        };
-
-        if let Some(timeout_ms) = timeout_ms {
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), wait_for_final)
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => Ok(status_rx.borrow().clone()),
-            }
-        } else {
-            wait_for_final.await
-        }
     }
 
     pub(crate) async fn send_input(
@@ -345,24 +307,7 @@ impl AgentControl {
             .registry
             .agent_metadata_for_thread(recipient_thread_id)
             .ok_or_else(|| anyhow!("unknown recipient thread id: {recipient_thread_id}"))?;
-        let runtime = self.runtime()?;
-        let threads = runtime.threads.read().await;
-        let thread = threads
-            .get(&recipient_thread_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown live recipient thread id: {recipient_thread_id}"))?;
-        drop(threads);
-
-        thread
-            .submit(Op::InterAgentCommunication {
-                communication: InterAgentCommunication::new(
-                    author.agent_path,
-                    recipient.agent_path,
-                    vec![],
-                    content,
-                    trigger_turn,
-                ),
-            })
+        self.send_input_to_recipient(&author, &recipient, content, trigger_turn)
             .await
     }
 
@@ -443,7 +388,7 @@ impl AgentControl {
             .ok_or_else(|| anyhow!("agent control runtime is not attached"))
     }
 
-    fn maybe_start_completion_watcher(&self, child: AgentMetadata) {
+    fn maybe_start_completion_watcher(&self, child: AgentMetadata, notify_if_already_final: bool) {
         let Some(parent_thread_id) = child.parent_thread_id else {
             return;
         };
@@ -453,25 +398,23 @@ impl AgentControl {
         let mut status_rx = self.subscribe_status(child_thread_id);
         let control = self.clone();
         tokio::spawn(async move {
+            let mut first_poll = true;
             loop {
                 let status = status_rx.borrow().clone();
                 if is_final(&status) {
-                    control
-                        .emit_collab_event(
-                            parent_thread_id,
-                            EventMsg::CollabAgentCompleted(CollabAgentCompletedEvent {
+                    if !first_poll || notify_if_already_final {
+                        control
+                            .handle_child_completion(
                                 parent_thread_id,
                                 child_thread_id,
-                                agent_path: child.agent_path.clone(),
-                                agent_nickname: child.agent_nickname.clone(),
-                                agent_role: child.agent_role.clone(),
-                                last_assistant_message: last_assistant_message(&status),
+                                &child,
                                 status,
-                            }),
-                        )
-                        .await;
+                            )
+                            .await;
+                    }
                     break;
                 }
+                first_poll = false;
                 if status_rx.changed().await.is_err() {
                     break;
                 }
@@ -508,6 +451,141 @@ impl AgentControl {
         let items = read_persisted_items(parent_thread.rollout_path()).await?;
         Ok(persisted_items_to_messages(items))
     }
+
+    async fn send_input_to_recipient(
+        &self,
+        author: &AgentMetadata,
+        recipient: &AgentMetadata,
+        content: String,
+        trigger_turn: bool,
+    ) -> Result<String> {
+        let recipient_thread_id = recipient
+            .agent_id
+            .ok_or_else(|| anyhow!("recipient agent metadata is missing thread id"))?;
+        let runtime = self.runtime()?;
+        let threads = runtime.threads.read().await;
+        let thread = threads
+            .get(&recipient_thread_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown live recipient thread id: {recipient_thread_id}"))?;
+        drop(threads);
+
+        thread
+            .submit(Op::InterAgentCommunication {
+                communication: InterAgentCommunication::new(
+                    author.agent_path.clone(),
+                    recipient.agent_path.clone(),
+                    vec![],
+                    content,
+                    trigger_turn,
+                ),
+            })
+            .await
+    }
+
+    async fn handle_child_completion(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+        child: &AgentMetadata,
+        status: AgentStatus,
+    ) {
+        if !should_notify_parent_on_completion(&status) {
+            return;
+        }
+
+        self.emit_collab_event(
+            parent_thread_id,
+            EventMsg::CollabAgentCompleted(CollabAgentCompletedEvent {
+                parent_thread_id,
+                child_thread_id,
+                agent_path: child.agent_path.clone(),
+                agent_nickname: child.agent_nickname.clone(),
+                agent_role: child.agent_role.clone(),
+                last_assistant_message: last_assistant_message(&status),
+                status: status.clone(),
+            }),
+        )
+        .await;
+
+        let Some(parent) = self
+            .state
+            .registry
+            .agent_metadata_for_thread(parent_thread_id)
+        else {
+            return;
+        };
+        let notice = render_completion_notice(child, &status);
+        if let Err(err) = self
+            .send_input_to_recipient(child, &parent, notice, true)
+            .await
+        {
+            tracing::warn!(
+                parent_thread_id = %parent_thread_id,
+                child_thread_id = %child_thread_id,
+                error = %err,
+                "failed to deliver child completion notice to parent mailbox"
+            );
+        }
+    }
+}
+
+fn should_notify_parent_on_completion(status: &AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Completed(_) | AgentStatus::Interrupted | AgentStatus::Errored(_)
+    )
+}
+
+fn render_completion_notice(child: &AgentMetadata, status: &AgentStatus) -> String {
+    let mut lines = vec![
+        "[agent_completed]".to_string(),
+        format!("agent_path={}", child.agent_path),
+        format!("status={}", agent_status_label(status)),
+    ];
+    if let Some(agent_nickname) = child.agent_nickname.as_deref() {
+        lines.push(format!(
+            "agent_nickname={}",
+            escape_notice_value(agent_nickname)
+        ));
+    }
+    if let Some(agent_role) = child.agent_role.as_deref() {
+        lines.push(format!("agent_role={}", escape_notice_value(agent_role)));
+    }
+    if let Some(last_message) = last_assistant_message(status) {
+        lines.push(format!(
+            "last_assistant_message={}",
+            escape_notice_value(&last_message)
+        ));
+    }
+    lines.push("[/agent_completed]".to_string());
+    lines.join("\n")
+}
+
+fn agent_status_label(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::PendingInit => "pending_init",
+        AgentStatus::Running => "running",
+        AgentStatus::Completed(_) => "completed",
+        AgentStatus::Interrupted => "interrupted",
+        AgentStatus::Errored(_) => "errored",
+        AgentStatus::Shutdown => "shutdown",
+        AgentStatus::NotFound => "not_found",
+    }
+}
+
+fn escape_notice_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -811,7 +889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_watcher_emits_parent_completion_event() {
+    async fn completion_watcher_emits_parent_completion_event_and_mailbox_notice() {
         let _cwd_guard = crate::test_support::cwd_test_lock()
             .lock()
             .expect("cwd lock");
@@ -838,26 +916,67 @@ mod tests {
             .await
             .expect("spawn child");
         let child_id = child.agent_id.expect("child id");
+        let mut saw_completion = false;
+        let mut saw_notice = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+                Ok(Ok(event)) => event,
+                Ok(Err(err)) => panic!("root event channel closed: {err}"),
+                Err(_) => break,
+            };
 
-        let completion = loop {
-            let event = root_events.recv().await.expect("root event");
-            if let EventMsg::CollabAgentCompleted(event) = event.msg {
-                break event;
+            match event.msg {
+                EventMsg::CollabAgentCompleted(completion) => {
+                    assert_eq!(completion.parent_thread_id, root_id);
+                    assert_eq!(completion.child_thread_id, child_id);
+                    assert_eq!(completion.agent_path, child.agent_path);
+                    assert_eq!(completion.agent_nickname, child.agent_nickname);
+                    assert_eq!(completion.agent_role, child.agent_role);
+                    assert_eq!(
+                        completion.status,
+                        AgentStatus::Completed(Some("response".to_string()))
+                    );
+                    assert_eq!(
+                        completion.last_assistant_message.as_deref(),
+                        Some("response")
+                    );
+                    saw_completion = true;
+                }
+                EventMsg::InterAgentMessage(mail) => {
+                    if mail.communication.author == child.agent_path {
+                        assert!(mail.communication.trigger_turn);
+                        assert!(mail.communication.content.contains("[agent_completed]"));
+                        assert!(
+                            mail.communication
+                                .content
+                                .contains(&format!("agent_path={}", child.agent_path))
+                        );
+                        assert!(mail.communication.content.contains("status=completed"));
+                        assert!(
+                            mail.communication
+                                .content
+                                .contains("last_assistant_message=response")
+                        );
+                        saw_notice = true;
+                    }
+                }
+                _ => {}
             }
-        };
 
-        assert_eq!(completion.parent_thread_id, root_id);
-        assert_eq!(completion.child_thread_id, child_id);
-        assert_eq!(completion.agent_path, child.agent_path);
-        assert_eq!(completion.agent_nickname, child.agent_nickname);
-        assert_eq!(completion.agent_role, child.agent_role);
-        assert_eq!(
-            completion.status,
-            AgentStatus::Completed(Some("response".to_string()))
+            if saw_completion && saw_notice {
+                break;
+            }
+        }
+
+        assert!(
+            saw_completion,
+            "expected completion watcher to emit collab event"
         );
-        assert_eq!(
-            completion.last_assistant_message.as_deref(),
-            Some("response")
+        assert!(
+            saw_notice,
+            "expected completion watcher to queue parent mailbox notice"
         );
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");

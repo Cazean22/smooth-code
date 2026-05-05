@@ -1,13 +1,10 @@
 use futures_util::future::BoxFuture;
 use smooth_protocol::{
-    AgentStatus, CollabAgentRef, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
-    CollabAgentStatusEntry, CollabCloseBeginEvent, CollabCloseEndEvent,
-    CollabSendMessageBeginEvent, CollabSendMessageEndEvent, CollabWaitingBeginEvent,
-    CollabWaitingEndEvent, EventMsg, ThreadId,
+    AgentStatus, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent, CollabCloseBeginEvent,
+    CollabCloseEndEvent, CollabSendMessageBeginEvent, CollabSendMessageEndEvent, EventMsg,
+    ThreadId,
 };
-use tools::{
-    AgentInfo, AgentWaitOutcome, MultiAgentClient, SpawnAgentParams, ToolFailure, WaitAgentParams,
-};
+use tools::{AgentInfo, MultiAgentClient, SpawnAgentParams, ToolFailure};
 use uuid::Uuid;
 
 use crate::agent::{AgentControl, registry::AgentMetadata, status::last_assistant_message};
@@ -155,74 +152,6 @@ impl MultiAgentClient for InProcessMultiAgentClient {
         })
     }
 
-    fn wait_agent(
-        &self,
-        params: WaitAgentParams,
-    ) -> BoxFuture<'static, Result<AgentWaitOutcome, ToolFailure>> {
-        let control = self.control.clone();
-        let author_thread_id = self.author_thread_id;
-        Box::pin(async move {
-            let call_id = Uuid::now_v7().to_string();
-            let target_thread_id = control
-                .resolve_agent_reference(author_thread_id, &params.target)
-                .map_err(|err| ToolFailure::new(err.to_string()))?;
-            let target_metadata = control
-                .registry()
-                .agent_metadata_for_thread(target_thread_id)
-                .ok_or_else(|| {
-                    ToolFailure::new(format!("unknown live agent thread id: {target_thread_id}"))
-                })?;
-            control
-                .emit_collab_event(
-                    author_thread_id,
-                    EventMsg::CollabWaitingBegin(CollabWaitingBeginEvent {
-                        sender_thread_id: author_thread_id,
-                        receiver_thread_ids: vec![target_thread_id],
-                        receiver_agents: vec![CollabAgentRef {
-                            thread_id: target_thread_id,
-                            agent_nickname: target_metadata.agent_nickname.clone(),
-                            agent_role: target_metadata.agent_role.clone(),
-                        }],
-                        call_id: call_id.clone(),
-                    }),
-                )
-                .await;
-            let status = control
-                .wait_for_agent(author_thread_id, &params.target, params.timeout_ms)
-                .await
-                .map_err(|err| ToolFailure::new(err.to_string()))?;
-            control
-                .emit_collab_event(
-                    author_thread_id,
-                    EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
-                        sender_thread_id: author_thread_id,
-                        call_id,
-                        agent_statuses: vec![status_entry_from_metadata(
-                            &target_metadata,
-                            target_thread_id,
-                            status.clone(),
-                        )],
-                        statuses: vec![status_entry_from_metadata(
-                            &target_metadata,
-                            target_thread_id,
-                            status.clone(),
-                        )],
-                    }),
-                )
-                .await;
-            Ok(AgentWaitOutcome {
-                target: params.target,
-                status: agent_status_label(&status),
-                thread_id: target_thread_id.to_string(),
-                agent_path: target_metadata.agent_path.to_string(),
-                agent_nickname: target_metadata.agent_nickname,
-                agent_role: target_metadata.agent_role,
-                status_detail: status.clone(),
-                last_assistant_message: last_assistant_message(&status),
-            })
-        })
-    }
-
     fn list_agents(
         &self,
         path_prefix: Option<String>,
@@ -311,21 +240,6 @@ fn agent_info_from_metadata(metadata: &AgentMetadata, status: AgentStatus) -> Ag
     }
 }
 
-fn status_entry_from_metadata(
-    metadata: &AgentMetadata,
-    thread_id: ThreadId,
-    status: AgentStatus,
-) -> CollabAgentStatusEntry {
-    CollabAgentStatusEntry {
-        thread_id,
-        agent_path: metadata.agent_path.clone(),
-        agent_nickname: metadata.agent_nickname.clone(),
-        agent_role: metadata.agent_role.clone(),
-        last_assistant_message: last_assistant_message(&status),
-        status,
-    }
-}
-
 fn agent_status_label(status: &AgentStatus) -> String {
     match status {
         AgentStatus::PendingInit => "pending_init".to_string(),
@@ -347,10 +261,10 @@ mod tests {
         agent::FinalResponse,
         message::{Message, Text},
     };
-    use smooth_protocol::{AgentStatus, ThreadId};
+    use smooth_protocol::ThreadId;
     use tempfile::TempDir;
     use tokio::{sync::watch, time::sleep};
-    use tools::{MultiAgentClient, SpawnAgentParams, WaitAgentParams};
+    use tools::{MultiAgentClient, SpawnAgentParams};
 
     use crate::{
         SessionAssistantContent, SessionModel, SessionModelDriver, SessionModelFactory,
@@ -442,55 +356,6 @@ mod tests {
                 .iter()
                 .any(|agent| agent.agent_path == spawned.agent_path)
         );
-
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
-    }
-
-    #[tokio::test]
-    async fn adapter_wait_agent_returns_terminal_status() {
-        let _cwd_guard = crate::test_support::cwd_test_lock()
-            .lock()
-            .expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
-
-        let manager = ThreadManagerState::new(
-            None,
-            Some(Arc::new(StubFactory {
-                model: SessionModel::Stub(Arc::new(StubDriver {
-                    text: "child".to_string(),
-                    delay: Duration::from_millis(20),
-                })),
-            })),
-        )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
-        let client = InProcessMultiAgentClient::new(started.thread_id, manager.agent_control());
-        let spawned = client
-            .spawn(SpawnAgentParams {
-                message: "inspect".to_string(),
-                agent_type: Some("worker".to_string()),
-                model: None,
-                fork_context: false,
-            })
-            .await
-            .expect("spawn should succeed");
-
-        let waited = client
-            .wait_agent(WaitAgentParams {
-                target: spawned.agent_path,
-                timeout_ms: Some(250),
-            })
-            .await
-            .expect("wait should succeed");
-        assert_eq!(waited.status, "completed");
-        assert_eq!(
-            waited.status_detail,
-            AgentStatus::Completed(Some("child".to_string()))
-        );
-        assert_eq!(waited.last_assistant_message.as_deref(), Some("child"));
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
     }

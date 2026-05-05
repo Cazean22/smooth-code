@@ -21,7 +21,7 @@ use rig::{
 use tokio::sync::watch;
 use tools::{
     CloseAgentTool, DynamicTool, DynamicToolClient, EditTool, ListAgentsTool, ListDirTool,
-    ReadTool, RunCommandTool, SendMessageTool, SpawnAgentTool, WaitAgentTool, WriteTool,
+    ReadTool, RunCommandTool, SendMessageTool, SpawnAgentTool, WriteTool,
 };
 
 use crate::agent::{
@@ -275,7 +275,6 @@ where
             render_spawn_agent_tool_description(),
         ))
         .tool(SendMessageTool::new(multi_agent_client.clone()))
-        .tool(WaitAgentTool::new(multi_agent_client.clone()))
         .tool(ListAgentsTool::new(multi_agent_client.clone()))
         .tool(CloseAgentTool::new(multi_agent_client));
     builder.default_max_turns(99999).build()

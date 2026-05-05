@@ -3,17 +3,12 @@ mod close_agent;
 mod list_agents;
 mod send_message;
 mod spawn_agent;
-mod wait_agent;
 
-pub use client::{
-    AgentInfo, AgentWaitOutcome, DynMultiAgentClient, MultiAgentClient, SpawnAgentParams,
-    WaitAgentParams,
-};
+pub use client::{AgentInfo, DynMultiAgentClient, MultiAgentClient, SpawnAgentParams};
 pub use close_agent::CloseAgentTool;
 pub use list_agents::ListAgentsTool;
 pub use send_message::SendMessageTool;
 pub use spawn_agent::SpawnAgentTool;
-pub use wait_agent::WaitAgentTool;
 
 #[cfg(test)]
 mod tests {
@@ -24,9 +19,8 @@ mod tests {
     use smooth_protocol::AgentStatus;
 
     use super::{
-        AgentInfo, AgentWaitOutcome, CloseAgentTool, DynMultiAgentClient, ListAgentsTool,
-        MultiAgentClient, SendMessageTool, SpawnAgentParams, SpawnAgentTool, WaitAgentParams,
-        WaitAgentTool,
+        AgentInfo, CloseAgentTool, DynMultiAgentClient, ListAgentsTool, MultiAgentClient,
+        SendMessageTool, SpawnAgentParams, SpawnAgentTool,
     };
     use crate::ToolFailure;
 
@@ -75,28 +69,6 @@ mod tests {
                 .expect("calls mutex should lock")
                 .push(format!("send:{target}:{content}:{trigger_turn}"));
             Box::pin(async move { Ok("queued".to_string()) })
-        }
-
-        fn wait_agent(
-            &self,
-            params: WaitAgentParams,
-        ) -> BoxFuture<'static, Result<AgentWaitOutcome, ToolFailure>> {
-            self.calls
-                .lock()
-                .expect("calls mutex should lock")
-                .push(format!("wait:{}", params.target));
-            Box::pin(async move {
-                Ok(AgentWaitOutcome {
-                    target: params.target,
-                    status: "completed".to_string(),
-                    thread_id: "thread-1".to_string(),
-                    agent_path: "/root/child".to_string(),
-                    agent_nickname: Some("child".to_string()),
-                    agent_role: Some("worker".to_string()),
-                    status_detail: AgentStatus::Completed(Some("done".to_string())),
-                    last_assistant_message: Some("done".to_string()),
-                })
-            })
         }
 
         fn list_agents(
@@ -165,17 +137,6 @@ mod tests {
             .expect("send should succeed"),
             "queued"
         );
-
-        let wait = WaitAgentTool::new(client());
-        let waited = wait
-            .call(super::wait_agent::WaitAgentArgs {
-                target: "/root/child".to_string(),
-                timeout_ms: Some(10),
-            })
-            .await
-            .expect("wait should succeed");
-        assert!(waited.contains("\"status\":\"completed\""));
-        assert!(waited.contains("\"lastAssistantMessage\":\"done\""));
 
         let list = ListAgentsTool::new(client());
         let listed = list

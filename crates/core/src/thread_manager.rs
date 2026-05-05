@@ -646,4 +646,60 @@ mod tests {
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
     }
+
+    #[tokio::test]
+    async fn resume_thread_does_not_replay_terminal_child_completion_notifications() {
+        let _cwd_guard = cwd_test_lock().lock().expect("cwd lock");
+        let workspace = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "done".to_string(),
+                })),
+            })),
+        )
+        .await
+        .expect("thread manager");
+        let started = manager.start_thread().await.expect("start root");
+        let root_id = started.thread_id;
+        let control = manager.agent_control();
+        let _child = control
+            .spawn_agent(root_id, "child task".to_string())
+            .await
+            .expect("spawn child");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(manager);
+
+        let resumed_manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "done".to_string(),
+                })),
+            })),
+        )
+        .await
+        .expect("thread manager");
+        let _resumed = resumed_manager
+            .resume_thread(root_id)
+            .await
+            .expect("resume root");
+        let mut root_events = resumed_manager
+            .subscribe(root_id)
+            .await
+            .expect("subscribe root");
+
+        let replay =
+            tokio::time::timeout(std::time::Duration::from_millis(150), root_events.recv()).await;
+        assert!(
+            replay.is_err(),
+            "resuming a terminal child should not synthesize a fresh completion notification"
+        );
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+    }
 }

@@ -1,10 +1,11 @@
 use std::{collections::HashMap, env, path::PathBuf, pin::Pin, sync::Arc};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use futures_util::StreamExt;
 use rig::{
     agent::{Agent, FinalResponse, MultiTurnStreamItem},
     client::CompletionClient,
+    completion::Completion,
     message::{Message, Reasoning as MessageReasoning, Text, ToolCall},
     providers::{
         anthropic, gemini,
@@ -69,6 +70,22 @@ impl SessionModelFactory for EnvSessionModelFactory {
 /// Test seam for custom streaming behavior.
 pub trait SessionModelDriver: Send + Sync {
     fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream>;
+
+    fn supports_manual_tool_loop(&self) -> bool {
+        false
+    }
+
+    fn stream_completion_turn(
+        &self,
+        _prompt: Message,
+        _history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        Err(anyhow!("manual completion streaming is not supported"))
+    }
+
+    fn call_tool(&self, _tool_name: &str, _args: &str) -> Result<String> {
+        Err(anyhow!("manual tool execution is not supported"))
+    }
 }
 
 #[derive(Debug)]
@@ -76,6 +93,18 @@ pub enum SessionStreamEvent {
     StreamAssistantItem(SessionAssistantContent),
     StreamUserItem(StreamedUserContent),
     FinalResponse(FinalResponse),
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionTurnSummary {
+    pub assistant_message_id: Option<String>,
+    pub response: String,
+}
+
+#[derive(Debug)]
+pub enum SessionCompletionEvent {
+    AssistantItem(SessionAssistantContent),
+    Completed(SessionTurnSummary),
 }
 
 #[derive(Debug)]
@@ -100,6 +129,9 @@ pub enum SessionAssistantContent {
 
 pub type SessionStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<SessionStreamEvent>> + Send>>;
+
+pub type SessionCompletionStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<SessionCompletionEvent>> + Send>>;
 
 #[derive(Clone)]
 pub enum SessionModel {
@@ -204,6 +236,37 @@ impl SessionModel {
             Self::Stub(driver) => driver.stream_turn(prompt, history.to_vec()),
         }
     }
+
+    pub(crate) fn supports_manual_tool_loop(&self) -> bool {
+        match self {
+            Self::Stub(driver) => driver.supports_manual_tool_loop(),
+            _ => true,
+        }
+    }
+
+    pub(crate) async fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: &[Message],
+    ) -> Result<SessionCompletionStream> {
+        match self {
+            Self::OpenAi(agent) => stream_agent_completion(agent, prompt, history).await,
+            Self::OpenRouter(agent) => stream_agent_completion(agent, prompt, history).await,
+            Self::Anthropic(agent) => stream_agent_completion(agent, prompt, history).await,
+            Self::Gemini(agent) => stream_agent_completion(agent, prompt, history).await,
+            Self::Stub(driver) => driver.stream_completion_turn(prompt, history.to_vec()),
+        }
+    }
+
+    pub(crate) async fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+        match self {
+            Self::OpenAi(agent) => call_agent_tool(agent, tool_name, args).await,
+            Self::OpenRouter(agent) => call_agent_tool(agent, tool_name, args).await,
+            Self::Anthropic(agent) => call_agent_tool(agent, tool_name, args).await,
+            Self::Gemini(agent) => call_agent_tool(agent, tool_name, args).await,
+            Self::Stub(driver) => driver.call_tool(tool_name, args),
+        }
+    }
 }
 
 pub(crate) fn default_session_model_factory() -> Arc<dyn SessionModelFactory> {
@@ -291,6 +354,73 @@ where
 {
     let stream = agent.stream_chat(prompt, history.iter().cloned()).await;
     Ok(Box::pin(stream_to_events(stream)))
+}
+
+async fn stream_agent_completion<M>(
+    agent: &Arc<Agent<M>>,
+    prompt: Message,
+    history: &[Message],
+) -> Result<SessionCompletionStream>
+where
+    M: rig::completion::CompletionModel + 'static,
+    M::StreamingResponse: Clone + Unpin + rig::completion::GetTokenUsage + Send,
+{
+    let mut stream = agent
+        .completion(prompt, history.iter().cloned())
+        .await?
+        .stream()
+        .await?;
+    Ok(Box::pin(async_stream::try_stream! {
+        while let Some(item) = stream.next().await {
+            let assistant_item = match item? {
+                StreamedAssistantContent::Text(text) => SessionAssistantContent::Text(text),
+                StreamedAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id,
+                } => SessionAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id,
+                },
+                StreamedAssistantContent::ToolCallDelta {
+                    id,
+                    internal_call_id,
+                    content,
+                } => SessionAssistantContent::ToolCallDelta {
+                    id,
+                    internal_call_id,
+                    content,
+                },
+                StreamedAssistantContent::Reasoning(reasoning) => {
+                    SessionAssistantContent::Reasoning(reasoning)
+                }
+                StreamedAssistantContent::ReasoningDelta { id, reasoning } => {
+                    SessionAssistantContent::ReasoningDelta { id, reasoning }
+                }
+                StreamedAssistantContent::Final(_) => SessionAssistantContent::Final,
+            };
+            yield SessionCompletionEvent::AssistantItem(assistant_item);
+        }
+
+        let response = stream
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                rig::message::AssistantContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        yield SessionCompletionEvent::Completed(SessionTurnSummary {
+            assistant_message_id: stream.message_id.clone(),
+            response,
+        });
+    }))
+}
+
+async fn call_agent_tool<M>(agent: &Arc<Agent<M>>, tool_name: &str, args: &str) -> Result<String>
+where
+    M: rig::completion::CompletionModel,
+{
+    Ok(agent.tool_server_handle.call_tool(tool_name, args).await?)
 }
 
 fn stream_to_events<R>(

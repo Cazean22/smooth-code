@@ -10,5 +10,6 @@ pub(crate) mod role;
 pub(crate) mod status;
 
 pub use control::AgentControl;
+pub(crate) use control::InlineChildCompletionReceiver;
 pub(crate) use mailbox::{Mailbox, MailboxReceiver};
 pub(crate) use multi_agent_client::InProcessMultiAgentClient;

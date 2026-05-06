@@ -3,17 +3,26 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use rig::{
     OneOrMany,
-    message::{Message, Reasoning as MessageReasoning, ReasoningContent, Text, UserContent},
+    message::{
+        AssistantContent, Message, Reasoning as MessageReasoning, ReasoningContent, Text,
+        ToolResult, ToolResultContent, UserContent,
+    },
 };
+use serde::Deserialize;
 use smooth_protocol::{
     AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
-    AgentReasoningDeltaEvent, EventMsg, ToolCallCompletedEvent, ToolCallStartedEvent,
+    AgentReasoningDeltaEvent, AgentStatus, EventMsg, ThreadId, ToolCallCompletedEvent,
+    ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
+use tools::SpawnAgentParams;
 
 use crate::{
+    agent::InProcessMultiAgentClient,
     core::{Session, TurnContext},
-    provider::{SessionAssistantContent, SessionStreamEvent},
+    provider::{
+        SessionAssistantContent, SessionCompletionEvent, SessionStreamEvent, SessionTurnSummary,
+    },
     state::TaskKind,
 };
 
@@ -39,6 +48,50 @@ pub(crate) struct RegularTask;
 impl RegularTask {
     pub(crate) fn new() -> Self {
         Self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ManualSpawnAgentArgs {
+    message: String,
+    agent_type: Option<String>,
+    model: Option<String>,
+    #[serde(default)]
+    fork_context: bool,
+}
+
+struct ExecutedToolCall {
+    assistant_tool_call: AssistantContent,
+    tool_result_message: Message,
+    inline_notices: Vec<smooth_protocol::InterAgentCommunication>,
+}
+
+struct InlineWaitGuard {
+    control: crate::agent::AgentControl,
+    child_thread_id: ThreadId,
+    armed: bool,
+}
+
+impl InlineWaitGuard {
+    fn new(control: crate::agent::AgentControl, child_thread_id: ThreadId) -> Self {
+        Self {
+            control,
+            child_thread_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InlineWaitGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control
+                .unregister_inline_child_completion_waiter(self.child_thread_id);
+        }
     }
 }
 
@@ -70,6 +123,7 @@ impl SessionTask for RegularTask {
         }
 
         let input_count = input.len();
+        let history_before_turn = session.history().await;
         let mailbox_messages = session.drain_mailbox().await;
         let mut prompt_parts = mailbox_messages
             .iter()
@@ -97,21 +151,95 @@ impl SessionTask for RegularTask {
                 text: prompt_text.clone(),
             })),
         };
-        let history = session.history().await;
-        let mut stream = session.model().stream_turn(prompt, &history).await.ok()?;
-        let mut last_assistant_message = String::new();
-        let mut saw_tool_loop = false;
+        let result = if session.model().supports_manual_tool_loop() {
+            run_manual_turn(
+                Arc::clone(&session),
+                Arc::clone(&ctx),
+                prompt,
+                history_before_turn,
+                cancellation_token.clone(),
+            )
+            .await
+        } else {
+            run_opaque_turn(
+                Arc::clone(&session),
+                Arc::clone(&ctx),
+                prompt,
+                history_before_turn,
+                cancellation_token.clone(),
+            )
+            .await
+        };
+        tracing::debug!(
+            thread_id = %session.id,
+            turn_id = %ctx.sub_id,
+            input_count,
+            "finished regular task"
+        );
+        result
+    }
+
+    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
+        let _ = ctx;
+        session.abort_pending_dynamic_tool_requests().await;
+    }
+}
+
+fn render_mailbox_message(communication: &smooth_protocol::InterAgentCommunication) -> String {
+    format!(
+        "<inter_agent_message from=\"{}\">{}</inter_agent_message>",
+        communication.author, communication.content
+    )
+}
+
+async fn run_manual_turn(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    initial_prompt: Message,
+    history_before_turn: Vec<Message>,
+    cancellation_token: CancellationToken,
+) -> Option<String> {
+    let mut new_messages = vec![initial_prompt];
+    let mut saw_tool_loop = false;
+
+    loop {
+        if cancellation_token.is_cancelled() {
+            return None;
+        }
+
+        let current_prompt = new_messages
+            .last()
+            .cloned()
+            .expect("manual turn loop should keep a pending prompt");
+        let history_snapshot = build_history_for_request(
+            &history_before_turn,
+            &new_messages[..new_messages.len().saturating_sub(1)],
+        );
+        let mut stream = session
+            .model()
+            .stream_completion_turn(current_prompt, &history_snapshot)
+            .await
+            .ok()?;
+        let mut tool_calls = Vec::new();
+        let mut tool_result_messages = Vec::new();
+        let mut inline_notices = Vec::new();
+        let mut accumulated_reasoning = Vec::new();
+        let mut pending_reasoning_delta_text = String::new();
+        let mut pending_reasoning_delta_id = None;
+        let mut saw_tool_call_this_turn = false;
+        let mut turn_summary = SessionTurnSummary {
+            assistant_message_id: None,
+            response: String::new(),
+        };
 
         while let Some(item) = stream.next().await {
             if cancellation_token.is_cancelled() {
                 return None;
             }
-            // tracing::debug!(?item, "received stream item");
 
             match item.ok()? {
-                SessionStreamEvent::StreamAssistantItem(assistant_item) => match assistant_item {
+                SessionCompletionEvent::AssistantItem(assistant_item) => match assistant_item {
                     SessionAssistantContent::Text(text) => {
-                        last_assistant_message.push_str(&text.text);
                         session
                             .emit_event(
                                 &ctx,
@@ -129,22 +257,27 @@ impl SessionTask for RegularTask {
                         internal_call_id,
                     } => {
                         saw_tool_loop = true;
-                        session
-                            .emit_event(
-                                &ctx,
-                                EventMsg::ToolCallStarted(ToolCallStartedEvent {
-                                    thread_id: session.id.to_string(),
-                                    turn_id: ctx.sub_id.clone(),
-                                    call_id: internal_call_id,
-                                    tool_name: tool_call.function.name,
-                                    args_preview: tool_call.function.arguments.to_string(),
-                                }),
-                            )
-                            .await;
+                        saw_tool_call_this_turn = true;
+                        let executed = execute_tool_call(
+                            Arc::clone(&session),
+                            Arc::clone(&ctx),
+                            tool_call,
+                            internal_call_id,
+                            cancellation_token.clone(),
+                        )
+                        .await?;
+                        tool_calls.push(executed.assistant_tool_call);
+                        tool_result_messages.push(executed.tool_result_message);
+                        inline_notices.extend(executed.inline_notices);
                     }
                     SessionAssistantContent::ReasoningDelta { id, reasoning } => {
-                        let item_id =
-                            id.unwrap_or_else(|| format!("{}-reasoning", ctx.assistant_item_id));
+                        let item_id = id
+                            .clone()
+                            .unwrap_or_else(|| format!("{}-reasoning", ctx.assistant_item_id));
+                        pending_reasoning_delta_text.push_str(&reasoning);
+                        if pending_reasoning_delta_id.is_none() {
+                            pending_reasoning_delta_id = id;
+                        }
                         session
                             .emit_event(
                                 &ctx,
@@ -162,7 +295,7 @@ impl SessionTask for RegularTask {
                         if text.is_empty() {
                             continue;
                         }
-
+                        merge_reasoning_blocks(&mut accumulated_reasoning, &reasoning);
                         session
                             .emit_event(
                                 &ctx,
@@ -180,92 +313,466 @@ impl SessionTask for RegularTask {
                     SessionAssistantContent::ToolCallDelta { .. }
                     | SessionAssistantContent::Final => {}
                 },
-                SessionStreamEvent::StreamUserItem(user_item) => match user_item {
-                    rig::streaming::StreamedUserContent::ToolResult {
-                        tool_result,
-                        internal_call_id,
-                    } => {
-                        saw_tool_loop = true;
-                        let output_preview = tool_result
-                            .content
-                            .iter()
-                            .filter_map(|content| match content {
-                                rig::message::ToolResultContent::Text(text) => {
-                                    Some(text.text.as_str())
-                                }
-                                rig::message::ToolResultContent::Image(_) => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        session
-                            .emit_event(
-                                &ctx,
-                                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
-                                    thread_id: session.id.to_string(),
-                                    turn_id: ctx.sub_id.clone(),
-                                    call_id: internal_call_id,
-                                    success: true,
-                                    output_preview: Some(output_preview),
-                                    error: None,
-                                }),
-                            )
-                            .await;
-                    }
-                },
-                SessionStreamEvent::FinalResponse(final_response) => {
-                    session
-                        .replace_history(final_response.history().unwrap_or(&[]).to_vec())
-                        .await;
-                    if !final_response.response().is_empty() {
-                        last_assistant_message = final_response.response().to_string();
-                        session
-                            .persist_assistant_message(last_assistant_message.clone())
-                            .await;
-                    }
+                SessionCompletionEvent::Completed(summary) => {
+                    turn_summary = summary;
                 }
             }
         }
-        tracing::debug!(
-            thread_id = %session.id,
-            turn_id = %ctx.sub_id,
-            input_count,
-            "finished regular task"
-        );
 
-        if last_assistant_message.is_empty() && saw_tool_loop {
+        if accumulated_reasoning.is_empty() && !pending_reasoning_delta_text.is_empty() {
+            let mut reasoning = MessageReasoning::new(&pending_reasoning_delta_text);
+            if let Some(id) = pending_reasoning_delta_id.take() {
+                reasoning = reasoning.with_id(id);
+            }
+            accumulated_reasoning.push(reasoning);
+        }
+
+        if saw_tool_call_this_turn {
+            let mut content_items = Vec::new();
+            if !turn_summary.response.is_empty() {
+                content_items.push(AssistantContent::text(&turn_summary.response));
+            }
+            for reasoning in accumulated_reasoning.drain(..) {
+                content_items.push(AssistantContent::Reasoning(reasoning));
+            }
+            content_items.extend(tool_calls);
+
+            if !content_items.is_empty() {
+                new_messages.push(Message::Assistant {
+                    id: turn_summary.assistant_message_id.clone(),
+                    content: OneOrMany::many(content_items)
+                        .expect("tool phase assistant content should not be empty"),
+                });
+            }
+            new_messages.extend(tool_result_messages);
+
+            for communication in inline_notices {
+                session
+                    .emit_event(
+                        &ctx,
+                        EventMsg::InterAgentMessage(
+                            smooth_protocol::InterAgentCommunicationEvent {
+                                communication: communication.clone(),
+                            },
+                        ),
+                    )
+                    .await;
+                new_messages.push(Message::user(render_mailbox_message(&communication)));
+            }
+            continue;
+        }
+
+        let last_assistant_message = turn_summary.response.clone();
+        let final_history =
+            build_full_history(&history_before_turn, new_messages.clone(), &turn_summary);
+        session.replace_history(final_history).await;
+        if !last_assistant_message.is_empty() {
+            session
+                .persist_assistant_message(last_assistant_message.clone())
+                .await;
+            session
+                .emit_event(
+                    &ctx,
+                    EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
+                        thread_id: session.id.to_string(),
+                        turn_id: ctx.sub_id.clone(),
+                        item_id: ctx.assistant_item_id.clone(),
+                        text: last_assistant_message.clone(),
+                    }),
+                )
+                .await;
+            session
+                .emit_event(&ctx, EventMsg::AgentMessage(last_assistant_message.clone()))
+                .await;
+            return Some(last_assistant_message);
+        }
+
+        if saw_tool_loop {
             return Some(String::new());
         }
 
-        if last_assistant_message.is_empty() {
-            return None;
-        }
-
-        session
-            .emit_event(
-                &ctx,
-                EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
-                    thread_id: session.id.to_string(),
-                    turn_id: ctx.sub_id.clone(),
-                    item_id: ctx.assistant_item_id.clone(),
-                    text: last_assistant_message.clone(),
-                }),
-            )
-            .await;
-        session
-            .emit_event(&ctx, EventMsg::AgentMessage(last_assistant_message.clone()))
-            .await;
-        Some(last_assistant_message)
-    }
-
-    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
-        let _ = ctx;
-        session.abort_pending_dynamic_tool_requests().await;
+        return None;
     }
 }
 
-fn render_mailbox_message(communication: &smooth_protocol::InterAgentCommunication) -> String {
-    format!(
-        "<inter_agent_message from=\"{}\">{}</inter_agent_message>",
-        communication.author, communication.content
-    )
+async fn run_opaque_turn(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    prompt: Message,
+    history_before_turn: Vec<Message>,
+    cancellation_token: CancellationToken,
+) -> Option<String> {
+    let mut stream = session
+        .model()
+        .stream_turn(prompt, &history_before_turn)
+        .await
+        .ok()?;
+    let mut last_assistant_message = String::new();
+    let mut saw_tool_loop = false;
+
+    while let Some(item) = stream.next().await {
+        if cancellation_token.is_cancelled() {
+            return None;
+        }
+
+        match item.ok()? {
+            SessionStreamEvent::StreamAssistantItem(assistant_item) => match assistant_item {
+                SessionAssistantContent::Text(text) => {
+                    last_assistant_message.push_str(&text.text);
+                    session
+                        .emit_event(
+                            &ctx,
+                            EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                                thread_id: session.id.to_string(),
+                                turn_id: ctx.sub_id.clone(),
+                                item_id: ctx.assistant_item_id.clone(),
+                                delta: text.text,
+                            }),
+                        )
+                        .await;
+                }
+                SessionAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id,
+                } => {
+                    saw_tool_loop = true;
+                    session
+                        .emit_event(
+                            &ctx,
+                            EventMsg::ToolCallStarted(ToolCallStartedEvent {
+                                thread_id: session.id.to_string(),
+                                turn_id: ctx.sub_id.clone(),
+                                call_id: internal_call_id,
+                                tool_name: tool_call.function.name,
+                                args_preview: tool_call.function.arguments.to_string(),
+                            }),
+                        )
+                        .await;
+                }
+                SessionAssistantContent::ReasoningDelta { id, reasoning } => {
+                    let item_id =
+                        id.unwrap_or_else(|| format!("{}-reasoning", ctx.assistant_item_id));
+                    session
+                        .emit_event(
+                            &ctx,
+                            EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
+                                thread_id: session.id.to_string(),
+                                turn_id: ctx.sub_id.clone(),
+                                item_id,
+                                delta: reasoning,
+                            }),
+                        )
+                        .await;
+                }
+                SessionAssistantContent::Reasoning(reasoning) => {
+                    let text = reasoning_text(&reasoning);
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    session
+                        .emit_event(
+                            &ctx,
+                            EventMsg::AgentReasoningCompleted(AgentReasoningCompletedEvent {
+                                thread_id: session.id.to_string(),
+                                turn_id: ctx.sub_id.clone(),
+                                item_id: reasoning.id.unwrap_or_else(|| {
+                                    format!("{}-reasoning", ctx.assistant_item_id)
+                                }),
+                                text,
+                            }),
+                        )
+                        .await;
+                }
+                SessionAssistantContent::ToolCallDelta { .. } | SessionAssistantContent::Final => {}
+            },
+            SessionStreamEvent::StreamUserItem(user_item) => match user_item {
+                rig::streaming::StreamedUserContent::ToolResult {
+                    tool_result,
+                    internal_call_id,
+                } => {
+                    saw_tool_loop = true;
+                    let output_preview = tool_result
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            rig::message::ToolResultContent::Text(text) => Some(text.text.as_str()),
+                            rig::message::ToolResultContent::Image(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    session
+                        .emit_event(
+                            &ctx,
+                            EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                                thread_id: session.id.to_string(),
+                                turn_id: ctx.sub_id.clone(),
+                                call_id: internal_call_id,
+                                success: true,
+                                output_preview: Some(output_preview),
+                                error: None,
+                            }),
+                        )
+                        .await;
+                }
+            },
+            SessionStreamEvent::FinalResponse(final_response) => {
+                session
+                    .replace_history(final_response.history().unwrap_or(&[]).to_vec())
+                    .await;
+                if !final_response.response().is_empty() {
+                    last_assistant_message = final_response.response().to_string();
+                    session
+                        .persist_assistant_message(last_assistant_message.clone())
+                        .await;
+                }
+            }
+        }
+    }
+
+    if last_assistant_message.is_empty() && saw_tool_loop {
+        return Some(String::new());
+    }
+
+    if last_assistant_message.is_empty() {
+        return None;
+    }
+
+    session
+        .emit_event(
+            &ctx,
+            EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
+                thread_id: session.id.to_string(),
+                turn_id: ctx.sub_id.clone(),
+                item_id: ctx.assistant_item_id.clone(),
+                text: last_assistant_message.clone(),
+            }),
+        )
+        .await;
+    session
+        .emit_event(&ctx, EventMsg::AgentMessage(last_assistant_message.clone()))
+        .await;
+    Some(last_assistant_message)
+}
+
+async fn execute_tool_call(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    tool_call: rig::message::ToolCall,
+    internal_call_id: String,
+    cancellation_token: CancellationToken,
+) -> Option<ExecutedToolCall> {
+    session
+        .emit_event(
+            &ctx,
+            EventMsg::ToolCallStarted(ToolCallStartedEvent {
+                thread_id: session.id.to_string(),
+                turn_id: ctx.sub_id.clone(),
+                call_id: internal_call_id.clone(),
+                tool_name: tool_call.function.name.clone(),
+                args_preview: tool_call.function.arguments.to_string(),
+            }),
+        )
+        .await;
+
+    let mut inline_notices = Vec::new();
+    let (tool_output, success, error) = if tool_call.function.name == "spawn_agent" {
+        let args = match serde_json::from_value::<ManualSpawnAgentArgs>(
+            tool_call.function.arguments.clone(),
+        ) {
+            Ok(args) => args,
+            Err(err) => {
+                let message = format!("invalid spawn_agent args: {err}");
+                session
+                    .emit_event(
+                        &ctx,
+                        EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                            thread_id: session.id.to_string(),
+                            turn_id: ctx.sub_id.clone(),
+                            call_id: internal_call_id,
+                            success: false,
+                            output_preview: Some(message.clone()),
+                            error: Some(message.clone()),
+                        }),
+                    )
+                    .await;
+                return Some(ExecutedToolCall {
+                    assistant_tool_call: AssistantContent::ToolCall(tool_call.clone()),
+                    tool_result_message: tool_result_to_user_message(
+                        tool_call.id,
+                        tool_call.call_id,
+                        message,
+                    ),
+                    inline_notices,
+                });
+            }
+        };
+        let client = InProcessMultiAgentClient::new(session.id, session.agent_control.clone());
+        match client
+            .spawn_with_inline_wait(SpawnAgentParams {
+                message: args.message,
+                agent_type: args.agent_type,
+                model: args.model,
+                fork_context: args.fork_context,
+            })
+            .await
+        {
+            Ok((mut agent_info, waiter)) => {
+                let child_thread_id = match agent_info.thread_id.parse::<ThreadId>() {
+                    Ok(thread_id) => thread_id,
+                    Err(err) => {
+                        let message = format!("invalid spawned thread id: {err}");
+                        return Some(ExecutedToolCall {
+                            assistant_tool_call: AssistantContent::ToolCall(tool_call.clone()),
+                            tool_result_message: tool_result_to_user_message(
+                                tool_call.id,
+                                tool_call.call_id,
+                                message.clone(),
+                            ),
+                            inline_notices,
+                        });
+                    }
+                };
+                let mut guard =
+                    InlineWaitGuard::new(session.agent_control.clone(), child_thread_id);
+                let waited = tokio::select! {
+                    _ = cancellation_token.cancelled() => return None,
+                    completion = waiter => completion,
+                };
+                guard.disarm();
+
+                match waited {
+                    Ok(completion) => {
+                        agent_info.status =
+                            Some(agent_status_label(&completion.status).to_string());
+                        agent_info.status_detail = Some(completion.status.clone());
+                        agent_info.last_assistant_message =
+                            completion.last_assistant_message.clone();
+                        inline_notices.push(completion.communication);
+                        match serde_json::to_string(&agent_info) {
+                            Ok(output) => (output, true, None),
+                            Err(err) => {
+                                let message = format!("failed to encode spawn_agent output: {err}");
+                                (message.clone(), false, Some(message))
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("spawn_agent inline wait failed to resolve: {err}");
+                        (message.clone(), false, Some(message))
+                    }
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                (message.clone(), false, Some(message))
+            }
+        }
+    } else {
+        match session
+            .model()
+            .call_tool(
+                &tool_call.function.name,
+                &tool_call.function.arguments.to_string(),
+            )
+            .await
+        {
+            Ok(output) => (output, true, None),
+            Err(err) => {
+                let message = err.to_string();
+                (message.clone(), false, Some(message))
+            }
+        }
+    };
+
+    session
+        .emit_event(
+            &ctx,
+            EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                thread_id: session.id.to_string(),
+                turn_id: ctx.sub_id.clone(),
+                call_id: internal_call_id,
+                success,
+                output_preview: Some(tool_output.clone()),
+                error,
+            }),
+        )
+        .await;
+
+    Some(ExecutedToolCall {
+        assistant_tool_call: AssistantContent::ToolCall(tool_call.clone()),
+        tool_result_message: tool_result_to_user_message(
+            tool_call.id,
+            tool_call.call_id,
+            tool_output,
+        ),
+        inline_notices,
+    })
+}
+
+fn build_history_for_request(history: &[Message], new_messages: &[Message]) -> Vec<Message> {
+    history.iter().chain(new_messages.iter()).cloned().collect()
+}
+
+fn build_full_history(
+    history_before_turn: &[Message],
+    mut new_messages: Vec<Message>,
+    summary: &SessionTurnSummary,
+) -> Vec<Message> {
+    if !summary.response.is_empty() {
+        new_messages.push(Message::assistant(&summary.response));
+    }
+    history_before_turn
+        .iter()
+        .cloned()
+        .chain(new_messages)
+        .collect()
+}
+
+fn merge_reasoning_blocks(
+    accumulated_reasoning: &mut Vec<MessageReasoning>,
+    incoming: &MessageReasoning,
+) {
+    let ids_match = |existing: &MessageReasoning| {
+        matches!(
+            (&existing.id, &incoming.id),
+            (Some(existing_id), Some(incoming_id)) if existing_id == incoming_id
+        )
+    };
+
+    if let Some(existing) = accumulated_reasoning
+        .iter_mut()
+        .rev()
+        .find(|existing| ids_match(existing))
+    {
+        existing.content.extend(incoming.content.clone());
+    } else {
+        accumulated_reasoning.push(incoming.clone());
+    }
+}
+
+fn tool_result_to_user_message(
+    id: String,
+    call_id: Option<String>,
+    tool_result: String,
+) -> Message {
+    Message::User {
+        content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+            id,
+            call_id,
+            content: ToolResultContent::from_tool_output(tool_result),
+        })),
+    }
+}
+
+fn agent_status_label(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::PendingInit => "pending_init",
+        AgentStatus::Running => "running",
+        AgentStatus::Interrupted => "interrupted",
+        AgentStatus::Completed(_) => "completed",
+        AgentStatus::Errored(_) => "errored",
+        AgentStatus::Shutdown => "shutdown",
+        AgentStatus::NotFound => "not_found",
+    }
 }

@@ -51,9 +51,9 @@ mod tests {
                     agent_path: "/root/child".to_string(),
                     agent_nickname: Some("child".to_string()),
                     agent_role: params.agent_type,
-                    status: None,
-                    status_detail: None,
-                    last_assistant_message: None,
+                    status: Some("completed".to_string()),
+                    status_detail: Some(AgentStatus::Completed(Some("done".to_string()))),
+                    last_assistant_message: Some("done".to_string()),
                 })
             })
         }
@@ -122,6 +122,8 @@ mod tests {
             .await
             .expect("spawn call should succeed");
         assert!(output.contains("\"threadId\":\"thread-1\""));
+        assert!(output.contains("\"status\":\"completed\""));
+        assert!(output.contains("\"lastAssistantMessage\":\"done\""));
     }
 
     #[tokio::test]

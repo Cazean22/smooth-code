@@ -1,10 +1,10 @@
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{
     ToolFailure,
-    multi_agents::client::{AgentInfo, DynMultiAgentClient, SpawnAgentParams},
+    multi_agents::client::{DynMultiAgentClient, SpawnAgentParams},
 };
 
 #[derive(Clone)]
@@ -21,15 +21,6 @@ pub struct SpawnAgentArgs {
     pub model: Option<String>,
     #[serde(default)]
     pub fork_context: bool,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SpawnAgentOutput {
-    pub thread_id: String,
-    pub agent_path: String,
-    pub agent_nickname: Option<String>,
-    pub agent_role: Option<String>,
 }
 
 impl SpawnAgentTool {
@@ -57,13 +48,7 @@ impl Tool for SpawnAgentTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let AgentInfo {
-            thread_id,
-            agent_path,
-            agent_nickname,
-            agent_role,
-            ..
-        } = self
+        let output = self
             .client
             .spawn(SpawnAgentParams {
                 message: args.message,
@@ -72,12 +57,7 @@ impl Tool for SpawnAgentTool {
                 fork_context: args.fork_context,
             })
             .await?;
-        serde_json::to_string(&SpawnAgentOutput {
-            thread_id,
-            agent_path,
-            agent_nickname,
-            agent_role,
-        })
-        .map_err(|err| ToolFailure::new(format!("failed to encode spawn_agent output: {err}")))
+        serde_json::to_string(&output)
+            .map_err(|err| ToolFailure::new(format!("failed to encode spawn_agent output: {err}")))
     }
 }

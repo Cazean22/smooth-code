@@ -8,16 +8,17 @@ use anyhow::Result;
 use futures_util::stream;
 use rig::{
     agent::FinalResponse,
-    message::{Message, Text},
+    message::{Message, Text, ToolCall, ToolFunction, UserContent},
 };
 use smooth_core::{
-    AgentControl, RoleOverride, SessionAssistantContent, SessionModel, SessionModelDriver,
-    SessionModelFactory, SessionStream, SessionStreamEvent, ThreadManagerState,
+    AgentControl, RoleOverride, SessionAssistantContent, SessionCompletionEvent,
+    SessionCompletionStream, SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
+    SessionStreamEvent, SessionTurnSummary, ThreadManagerState,
 };
-use smooth_protocol::{AgentStatus, EventMsg, ThreadId, TurnInterruptedEvent, TurnStartedEvent};
+use smooth_protocol::{AgentStatus, EventMsg, ThreadId, TurnCompletedEvent, TurnStartedEvent};
 use tempfile::TempDir;
-use tokio::sync::{Notify, Semaphore, watch};
-use tools::{DynamicToolClient, SpawnAgentParams};
+use tokio::sync::watch;
+use tools::{AgentInfo, DynamicToolClient, SpawnAgentParams};
 
 static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -161,36 +162,119 @@ async fn multi_agent_client_round_trip_spawns_lists_closes_and_passively_notifie
     std::env::set_current_dir(original_cwd).expect("restore cwd");
 }
 
-struct BlockingDriver {
-    started: Arc<Notify>,
-    release: Arc<Semaphore>,
-    text: String,
+struct SameTurnSpawnDriver {
+    calls: Mutex<usize>,
 }
 
-impl SessionModelDriver for BlockingDriver {
-    fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
-        let _ = (prompt, history);
-        let started = Arc::clone(&self.started);
-        let release = Arc::clone(&self.release);
-        let text = self.text.clone();
-        Ok(Box::pin(async_stream::stream! {
-            started.notify_one();
-            let _permit = release.acquire().await.expect("release semaphore should stay open");
-            yield Ok(SessionStreamEvent::StreamAssistantItem(
-                SessionAssistantContent::Text(Text { text }),
-            ));
-            yield Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty()));
-        }))
+impl SessionModelDriver for SameTurnSpawnDriver {
+    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+        unreachable!("manual completion stream should be used for same-turn spawn test");
+    }
+
+    fn supports_manual_tool_loop(&self) -> bool {
+        true
+    }
+
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self.calls.lock().expect("calls mutex");
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(first_user_text(&prompt), Some("delegate child".to_string()));
+                assert!(history.is_empty());
+                let tool_call = ToolCall::new(
+                    "spawn-1".to_string(),
+                    ToolFunction::new(
+                        "spawn_agent".to_string(),
+                        serde_json::json!({
+                            "message": "finish quickly",
+                            "agent_type": "worker",
+                            "fork_context": false
+                        }),
+                    ),
+                )
+                .with_call_id("call-1".to_string());
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-call-1".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-tool-call".to_string()),
+                        response: String::new(),
+                    })),
+                ])))
+            }
+            1 => {
+                assert_eq!(history.len(), 3);
+                assert_eq!(
+                    first_user_text(&history[0]),
+                    Some("delegate child".to_string())
+                );
+                let tool_result = match &history[2] {
+                    Message::User { content } => content
+                        .iter()
+                        .find_map(|item| match item {
+                            UserContent::ToolResult(tool_result) => Some(tool_result),
+                            _ => None,
+                        })
+                        .expect("tool result content"),
+                    other => panic!("expected tool result message, got {other:?}"),
+                };
+                let tool_result_text = tool_result
+                    .content
+                    .iter()
+                    .find_map(|item| match item {
+                        rig::message::ToolResultContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .expect("tool result text");
+                let parsed: AgentInfo =
+                    serde_json::from_str(&tool_result_text).expect("spawn_agent output json");
+                assert_eq!(parsed.status.as_deref(), Some("completed"));
+                assert_eq!(
+                    parsed.status_detail,
+                    Some(AgentStatus::Completed(
+                        parsed.last_assistant_message.clone()
+                    ))
+                );
+                assert!(
+                    first_user_text(&prompt)
+                        .expect("inline prompt text")
+                        .contains("[agent_completed]")
+                );
+
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "parent finished".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-final".to_string()),
+                        response: "parent finished".to_string(),
+                    })),
+                ])))
+            }
+            other => panic!("unexpected completion turn {other}"),
+        }
     }
 }
 
-struct SequencedFactory {
-    started: Arc<Notify>,
-    release: Arc<Semaphore>,
+struct SameTurnSpawnFactory {
     build_count: Mutex<usize>,
 }
 
-impl SessionModelFactory for SequencedFactory {
+impl SessionModelFactory for SameTurnSpawnFactory {
     fn build(
         &self,
         _cwd: PathBuf,
@@ -202,10 +286,8 @@ impl SessionModelFactory for SequencedFactory {
     ) -> Result<SessionModel> {
         let mut build_count = self.build_count.lock().expect("build count mutex");
         let model = if *build_count == 0 {
-            SessionModel::Stub(Arc::new(BlockingDriver {
-                started: Arc::clone(&self.started),
-                release: Arc::clone(&self.release),
-                text: format!("root:{thread_id}"),
+            SessionModel::Stub(Arc::new(SameTurnSpawnDriver {
+                calls: Mutex::new(0),
             }))
         } else {
             SessionModel::Stub(Arc::new(StubDriver {
@@ -218,19 +300,15 @@ impl SessionModelFactory for SequencedFactory {
 }
 
 #[tokio::test]
-async fn child_completion_notice_waits_for_parent_turn_to_finish() {
+async fn spawn_agent_waits_inline_and_finishes_in_same_parent_turn() {
     let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
     let workspace = TempDir::new().expect("tempdir");
     let original_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(workspace.path()).expect("set cwd");
 
-    let started_signal = Arc::new(Notify::new());
-    let release = Arc::new(Semaphore::new(0));
     let manager = ThreadManagerState::new(
         None,
-        Some(Arc::new(SequencedFactory {
-            started: Arc::clone(&started_signal),
-            release: Arc::clone(&release),
+        Some(Arc::new(SameTurnSpawnFactory {
             build_count: Mutex::new(0),
         })),
     )
@@ -240,63 +318,17 @@ async fn child_completion_notice_waits_for_parent_turn_to_finish() {
     let root_id = started.thread_id;
     let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
     let initial_turn_id = manager
-        .start_user_input(root_id, "parent still working".to_string())
+        .start_user_input(root_id, "delegate child".to_string())
         .await
         .expect("start root turn");
 
-    let first_event = root_events.recv().await.expect("turn started");
-    assert_eq!(
-        first_event.msg,
-        EventMsg::TurnStarted(TurnStartedEvent {
-            thread_id: root_id.to_string(),
-            turn_id: initial_turn_id.clone(),
-        })
-    );
-    tokio::time::timeout(Duration::from_secs(1), started_signal.notified())
-        .await
-        .expect("root driver should start");
-
-    let client = manager.multi_agent_client(root_id);
-    let spawned = client
-        .spawn(SpawnAgentParams {
-            message: "finish quickly".to_string(),
-            agent_type: Some("worker".to_string()),
-            model: None,
-            fork_context: false,
-        })
-        .await
-        .expect("spawn should succeed");
-
-    let quiet_until_release = tokio::time::Instant::now() + Duration::from_millis(150);
-    while tokio::time::Instant::now() < quiet_until_release {
-        let remaining = quiet_until_release.saturating_duration_since(tokio::time::Instant::now());
-        let event = match tokio::time::timeout(remaining, root_events.recv()).await {
-            Ok(Ok(event)) => event,
-            Ok(Err(err)) => panic!("root event channel closed: {err}"),
-            Err(_) => break,
-        };
-
-        match event.msg {
-            EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) => {
-                assert_eq!(
-                    turn_id, initial_turn_id,
-                    "completion notice should not start a follow-up turn while parent is busy"
-                );
-            }
-            EventMsg::TurnInterrupted(TurnInterruptedEvent { turn_id, .. }) => {
-                panic!("parent turn should not be interrupted by child completion: {turn_id}");
-            }
-            EventMsg::InterAgentMessage(_) => {
-                panic!("completion notice should stay queued until the parent becomes idle");
-            }
-            _ => {}
-        }
-    }
-
-    release.add_permits(1);
-
-    let mut saw_follow_up_turn = false;
-    let mut saw_notice = false;
+    let mut turn_started = 0;
+    let mut turn_completed = 0;
+    let mut inter_agent_index = None;
+    let mut turn_completed_index = None;
+    let mut collab_completion_index = None;
+    let mut tool_completed_index = None;
+    let mut event_index = 0usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -308,35 +340,85 @@ async fn child_completion_notice_waits_for_parent_turn_to_finish() {
 
         match event.msg {
             EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) => {
-                if turn_id != initial_turn_id {
-                    saw_follow_up_turn = true;
-                }
+                turn_started += 1;
+                assert_eq!(turn_id, initial_turn_id);
             }
-            EventMsg::TurnInterrupted(TurnInterruptedEvent { turn_id, .. }) => {
-                panic!("parent turn should not be interrupted by child completion: {turn_id}");
+            EventMsg::CollabAgentCompleted(event) => {
+                collab_completion_index = Some(event_index);
+                assert_eq!(event.parent_thread_id, root_id);
+                assert_eq!(
+                    event.status,
+                    AgentStatus::Completed(event.last_assistant_message.clone())
+                );
+            }
+            EventMsg::ToolCallCompleted(event) => {
+                if event.call_id == "internal-call-1" {
+                    tool_completed_index = Some(event_index);
+                    let parsed: AgentInfo = serde_json::from_str(
+                        event
+                            .output_preview
+                            .as_deref()
+                            .expect("spawn_agent output preview"),
+                    )
+                    .expect("spawn_agent result json");
+                    assert_eq!(parsed.status.as_deref(), Some("completed"));
+                    assert_eq!(
+                        parsed.status_detail,
+                        Some(AgentStatus::Completed(
+                            parsed.last_assistant_message.clone()
+                        ))
+                    );
+                }
             }
             EventMsg::InterAgentMessage(event) => {
-                if event.communication.author.as_str() == spawned.agent_path {
-                    assert!(event.communication.content.contains("[agent_completed]"));
-                    saw_notice = true;
-                }
+                inter_agent_index = Some(event_index);
+                assert!(event.communication.content.contains("[agent_completed]"));
+            }
+            EventMsg::TurnCompleted(TurnCompletedEvent {
+                turn_id,
+                last_assistant_message,
+                ..
+            }) => {
+                turn_completed += 1;
+                turn_completed_index = Some(event_index);
+                assert_eq!(turn_id, initial_turn_id);
+                assert_eq!(last_assistant_message.as_deref(), Some("parent finished"));
+                break;
             }
             _ => {}
         }
-
-        if saw_follow_up_turn && saw_notice {
-            break;
-        }
+        event_index += 1;
     }
 
-    assert!(
-        saw_follow_up_turn,
-        "expected queued completion notice to start a follow-up turn after parent completion"
+    assert_eq!(turn_started, 1, "expected exactly one parent turn start");
+    assert_eq!(
+        turn_completed, 1,
+        "expected exactly one parent turn completion"
     );
     assert!(
-        saw_notice,
-        "expected queued completion notice to reach the parent mailbox after parent completion"
+        matches!(
+            (inter_agent_index, turn_completed_index),
+            (Some(inter_agent_index), Some(turn_completed_index)) if inter_agent_index < turn_completed_index
+        ),
+        "expected inline child completion notice before parent turn completion"
+    );
+    assert!(
+        matches!(
+            (collab_completion_index, tool_completed_index),
+            (Some(collab_completion_index), Some(tool_completed_index)) if collab_completion_index < tool_completed_index
+        ),
+        "expected spawn_agent tool result after child terminal status"
     );
 
     std::env::set_current_dir(original_cwd).expect("restore cwd");
+}
+
+fn first_user_text(message: &Message) -> Option<String> {
+    match message {
+        Message::User { content } => content.iter().find_map(|item| match item {
+            UserContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
 }

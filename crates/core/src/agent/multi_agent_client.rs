@@ -7,7 +7,10 @@ use smooth_protocol::{
 use tools::{AgentInfo, MultiAgentClient, SpawnAgentParams, ToolFailure};
 use uuid::Uuid;
 
-use crate::agent::{AgentControl, registry::AgentMetadata, status::last_assistant_message};
+use crate::agent::{
+    AgentControl, InlineChildCompletionReceiver, registry::AgentMetadata,
+    status::last_assistant_message,
+};
 
 #[derive(Clone)]
 pub(crate) struct InProcessMultiAgentClient {
@@ -22,6 +25,76 @@ impl InProcessMultiAgentClient {
             control,
         }
     }
+
+    pub(crate) async fn spawn_with_inline_wait(
+        &self,
+        params: SpawnAgentParams,
+    ) -> Result<(AgentInfo, InlineChildCompletionReceiver), ToolFailure> {
+        let call_id = Uuid::now_v7().to_string();
+        self.control
+            .emit_collab_event(
+                self.author_thread_id,
+                EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+                    call_id: call_id.clone(),
+                    sender_thread_id: self.author_thread_id,
+                    prompt: params.message.clone(),
+                    model: params.model.clone(),
+                }),
+            )
+            .await;
+        match self
+            .control
+            .spawn_agent_with_role_inline_wait(
+                self.author_thread_id,
+                params.message.clone(),
+                params.agent_type.clone(),
+                params.model.clone(),
+                params.fork_context,
+            )
+            .await
+        {
+            Ok((metadata, waiter)) => {
+                let thread_id = metadata
+                    .agent_id
+                    .expect("spawned agent should have a thread id");
+                let status = self.control.get_status(thread_id);
+                self.control
+                    .emit_collab_event(
+                        self.author_thread_id,
+                        EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                            call_id,
+                            sender_thread_id: self.author_thread_id,
+                            new_thread_id: Some(thread_id),
+                            new_agent_nickname: metadata.agent_nickname.clone(),
+                            new_agent_role: metadata.agent_role.clone(),
+                            prompt: params.message,
+                            model: params.model,
+                            status: status.clone(),
+                        }),
+                    )
+                    .await;
+                Ok((agent_info_from_metadata(&metadata, status), waiter))
+            }
+            Err(err) => {
+                self.control
+                    .emit_collab_event(
+                        self.author_thread_id,
+                        EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                            call_id,
+                            sender_thread_id: self.author_thread_id,
+                            new_thread_id: None,
+                            new_agent_nickname: None,
+                            new_agent_role: params.agent_type,
+                            prompt: params.message,
+                            model: params.model,
+                            status: AgentStatus::Errored(err.to_string()),
+                        }),
+                    )
+                    .await;
+                Err(ToolFailure::new(err.to_string()))
+            }
+        }
+    }
 }
 
 impl MultiAgentClient for InProcessMultiAgentClient {
@@ -29,73 +102,8 @@ impl MultiAgentClient for InProcessMultiAgentClient {
         &self,
         params: SpawnAgentParams,
     ) -> BoxFuture<'static, Result<AgentInfo, ToolFailure>> {
-        let control = self.control.clone();
-        let author_thread_id = self.author_thread_id;
-        Box::pin(async move {
-            let call_id = Uuid::now_v7().to_string();
-            control
-                .emit_collab_event(
-                    author_thread_id,
-                    EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
-                        call_id: call_id.clone(),
-                        sender_thread_id: author_thread_id,
-                        prompt: params.message.clone(),
-                        model: params.model.clone(),
-                    }),
-                )
-                .await;
-            let result = control
-                .spawn_agent_with_role(
-                    author_thread_id,
-                    params.message.clone(),
-                    params.agent_type.clone(),
-                    params.model.clone(),
-                    params.fork_context,
-                )
-                .await;
-            match result {
-                Ok(metadata) => {
-                    let thread_id = metadata
-                        .agent_id
-                        .expect("spawned agent should have a thread id");
-                    let status = control.get_status(thread_id);
-                    control
-                        .emit_collab_event(
-                            author_thread_id,
-                            EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                                call_id,
-                                sender_thread_id: author_thread_id,
-                                new_thread_id: Some(thread_id),
-                                new_agent_nickname: metadata.agent_nickname.clone(),
-                                new_agent_role: metadata.agent_role.clone(),
-                                prompt: params.message,
-                                model: params.model,
-                                status: status.clone(),
-                            }),
-                        )
-                        .await;
-                    Ok(agent_info_from_metadata(&metadata, status))
-                }
-                Err(err) => {
-                    control
-                        .emit_collab_event(
-                            author_thread_id,
-                            EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                                call_id,
-                                sender_thread_id: author_thread_id,
-                                new_thread_id: None,
-                                new_agent_nickname: None,
-                                new_agent_role: params.agent_type,
-                                prompt: params.message,
-                                model: params.model,
-                                status: AgentStatus::Errored(err.to_string()),
-                            }),
-                        )
-                        .await;
-                    Err(ToolFailure::new(err.to_string()))
-                }
-            }
-        })
+        let this = self.clone();
+        Box::pin(async move { this.spawn_with_inline_wait_disabled(params).await })
     }
 
     fn send_message(
@@ -222,6 +230,78 @@ impl MultiAgentClient for InProcessMultiAgentClient {
                 .await;
             Ok(agent_status_label(&status))
         })
+    }
+}
+
+impl InProcessMultiAgentClient {
+    async fn spawn_with_inline_wait_disabled(
+        &self,
+        params: SpawnAgentParams,
+    ) -> Result<AgentInfo, ToolFailure> {
+        let call_id = Uuid::now_v7().to_string();
+        self.control
+            .emit_collab_event(
+                self.author_thread_id,
+                EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+                    call_id: call_id.clone(),
+                    sender_thread_id: self.author_thread_id,
+                    prompt: params.message.clone(),
+                    model: params.model.clone(),
+                }),
+            )
+            .await;
+        match self
+            .control
+            .spawn_agent_with_role(
+                self.author_thread_id,
+                params.message.clone(),
+                params.agent_type.clone(),
+                params.model.clone(),
+                params.fork_context,
+            )
+            .await
+        {
+            Ok(metadata) => {
+                let thread_id = metadata
+                    .agent_id
+                    .expect("spawned agent should have a thread id");
+                let status = self.control.get_status(thread_id);
+                self.control
+                    .emit_collab_event(
+                        self.author_thread_id,
+                        EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                            call_id,
+                            sender_thread_id: self.author_thread_id,
+                            new_thread_id: Some(thread_id),
+                            new_agent_nickname: metadata.agent_nickname.clone(),
+                            new_agent_role: metadata.agent_role.clone(),
+                            prompt: params.message,
+                            model: params.model,
+                            status: status.clone(),
+                        }),
+                    )
+                    .await;
+                Ok(agent_info_from_metadata(&metadata, status))
+            }
+            Err(err) => {
+                self.control
+                    .emit_collab_event(
+                        self.author_thread_id,
+                        EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                            call_id,
+                            sender_thread_id: self.author_thread_id,
+                            new_thread_id: None,
+                            new_agent_nickname: None,
+                            new_agent_role: params.agent_type,
+                            prompt: params.message,
+                            model: params.model,
+                            status: AgentStatus::Errored(err.to_string()),
+                        }),
+                    )
+                    .await;
+                Err(ToolFailure::new(err.to_string()))
+            }
+        }
     }
 }
 

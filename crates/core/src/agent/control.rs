@@ -9,7 +9,7 @@ use smooth_protocol::{
     SubAgentSource, ThreadId,
 };
 use smooth_state_db::StateDbHandle;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{RwLock, oneshot, watch};
 use tools::DynamicToolClientFactory;
 
 use crate::{
@@ -37,8 +37,17 @@ pub struct AgentControl {
 struct AgentControlState {
     registry: AgentRegistry,
     statuses: Mutex<HashMap<ThreadId, watch::Sender<AgentStatus>>>,
+    inline_waiters: Mutex<HashMap<ThreadId, oneshot::Sender<InlineChildCompletion>>>,
     runtime: Mutex<Option<AgentControlRuntime>>,
 }
+
+pub(crate) struct InlineChildCompletion {
+    pub(crate) communication: InterAgentCommunication,
+    pub(crate) status: AgentStatus,
+    pub(crate) last_assistant_message: Option<String>,
+}
+
+pub(crate) type InlineChildCompletionReceiver = oneshot::Receiver<InlineChildCompletion>;
 
 #[derive(Clone)]
 struct AgentControlRuntime {
@@ -54,6 +63,7 @@ impl AgentControl {
             state: Arc::new(AgentControlState {
                 registry: AgentRegistry::new(),
                 statuses: Mutex::new(HashMap::new()),
+                inline_waiters: Mutex::new(HashMap::new()),
                 runtime: Mutex::new(None),
             }),
         }
@@ -195,6 +205,53 @@ impl AgentControl {
         model: Option<String>,
         fork_context: bool,
     ) -> Result<AgentMetadata> {
+        self.spawn_agent_with_role_internal(
+            parent_thread_id,
+            message,
+            agent_role,
+            model,
+            fork_context,
+            false,
+        )
+        .await
+        .map(|(metadata, _, _)| metadata)
+    }
+
+    pub(crate) async fn spawn_agent_with_role_inline_wait(
+        &self,
+        parent_thread_id: ThreadId,
+        message: String,
+        agent_role: Option<String>,
+        model: Option<String>,
+        fork_context: bool,
+    ) -> Result<(AgentMetadata, InlineChildCompletionReceiver)> {
+        let (metadata, _child_thread_id, waiter) = self
+            .spawn_agent_with_role_internal(
+                parent_thread_id,
+                message,
+                agent_role,
+                model,
+                fork_context,
+                true,
+            )
+            .await?;
+        let waiter = waiter.expect("inline waiter should be registered");
+        Ok((metadata, waiter))
+    }
+
+    async fn spawn_agent_with_role_internal(
+        &self,
+        parent_thread_id: ThreadId,
+        message: String,
+        agent_role: Option<String>,
+        model: Option<String>,
+        fork_context: bool,
+        inline_wait: bool,
+    ) -> Result<(
+        AgentMetadata,
+        ThreadId,
+        Option<InlineChildCompletionReceiver>,
+    )> {
         if let Some(role) = agent_role.as_deref()
             && resolve_role(role).is_none()
         {
@@ -252,10 +309,15 @@ impl AgentControl {
             threads.insert(child_thread_id, Arc::clone(&child_thread));
         }
         self.ensure_status_sender(child_thread_id, AgentStatus::PendingInit);
+        let inline_waiter =
+            inline_wait.then(|| self.register_inline_child_completion_waiter(child_thread_id));
 
         if let Err(err) = child_thread.submit(Op::UserInput(message)).await {
             runtime.threads.write().await.remove(&child_thread_id);
             self.remove_status_sender(child_thread_id);
+            if inline_wait {
+                self.unregister_inline_child_completion_waiter(child_thread_id);
+            }
             return Err(err);
         }
 
@@ -286,7 +348,7 @@ impl AgentControl {
             .upsert_open_edge(&parent_thread_id.to_string(), &child_thread_id.to_string())
             .await?;
         self.maybe_start_completion_watcher(metadata.clone(), true);
-        Ok(metadata)
+        Ok((metadata, child_thread_id, inline_waiter))
     }
 
     pub(crate) async fn send_input(
@@ -359,6 +421,27 @@ impl AgentControl {
             .lock()
             .expect("agent control status mutex should lock")
             .remove(&thread_id);
+    }
+
+    pub(crate) fn register_inline_child_completion_waiter(
+        &self,
+        child_thread_id: ThreadId,
+    ) -> InlineChildCompletionReceiver {
+        let (tx, rx) = oneshot::channel();
+        self.state
+            .inline_waiters
+            .lock()
+            .expect("agent control inline waiter mutex should lock")
+            .insert(child_thread_id, tx);
+        rx
+    }
+
+    pub(crate) fn unregister_inline_child_completion_waiter(&self, child_thread_id: ThreadId) {
+        self.state
+            .inline_waiters
+            .lock()
+            .expect("agent control inline waiter mutex should lock")
+            .remove(&child_thread_id);
     }
 
     fn session_source_for_thread(&self, thread_id: ThreadId) -> Result<SessionSource> {
@@ -516,8 +599,36 @@ impl AgentControl {
             return;
         };
         let notice = render_completion_notice(child, &status);
+        let communication = InterAgentCommunication::new(
+            child.agent_path.clone(),
+            parent.agent_path.clone(),
+            vec![],
+            notice,
+            true,
+        );
+
+        let last_assistant_message = last_assistant_message(&status);
+        if let Some(waiter) = self
+            .state
+            .inline_waiters
+            .lock()
+            .expect("agent control inline waiter mutex should lock")
+            .remove(&child_thread_id)
+        {
+            if waiter
+                .send(InlineChildCompletion {
+                    communication: communication.clone(),
+                    status,
+                    last_assistant_message,
+                })
+                .is_ok()
+            {
+                return;
+            }
+        }
+
         if let Err(err) = self
-            .send_input_to_recipient(child, &parent, notice, true)
+            .send_input_to_recipient(child, &parent, communication.content.clone(), true)
             .await
         {
             tracing::warn!(
@@ -983,6 +1094,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_watcher_resolves_inline_waiter_without_mailbox_notice() {
+        let _cwd_guard = crate::test_support::cwd_test_lock()
+            .lock()
+            .expect("cwd lock");
+        let workspace = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "response".into(),
+                })),
+            })),
+        )
+        .await
+        .expect("thread manager");
+        let started = manager.start_thread().await.expect("start root");
+        let root_id = started.thread_id;
+        let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+        let control = manager.agent_control();
+        let (child, waiter) = control
+            .spawn_agent_with_role_inline_wait(
+                root_id,
+                "hello child".to_string(),
+                Some("worker".to_string()),
+                None,
+                false,
+            )
+            .await
+            .expect("spawn child");
+        let child_id = child.agent_id.expect("child id");
+        let completion = waiter.await.expect("inline waiter result");
+
+        assert_eq!(
+            completion.status,
+            AgentStatus::Completed(Some("response".to_string()))
+        );
+        assert_eq!(
+            completion.last_assistant_message.as_deref(),
+            Some("response")
+        );
+        assert_eq!(completion.communication.author, child.agent_path);
+        assert!(
+            completion
+                .communication
+                .content
+                .contains("[agent_completed]")
+        );
+
+        let mut saw_collab_completion = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+                Ok(Ok(event)) => event,
+                Ok(Err(err)) => panic!("root event channel closed: {err}"),
+                Err(_) => break,
+            };
+
+            match event.msg {
+                EventMsg::CollabAgentCompleted(completion) => {
+                    assert_eq!(completion.child_thread_id, child_id);
+                    saw_collab_completion = true;
+                }
+                EventMsg::InterAgentMessage(mail) => {
+                    if mail.communication.author == child.agent_path {
+                        panic!("inline waiter should suppress mailbox notice");
+                    }
+                }
+                _ => {}
+            }
+
+            if saw_collab_completion {
+                break;
+            }
+        }
+
+        assert!(
+            saw_collab_completion,
+            "expected child completion event on parent thread"
+        );
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+    }
+
+    #[tokio::test]
+    async fn completion_watcher_falls_back_to_mailbox_after_inline_waiter_unregisters() {
+        let _cwd_guard = crate::test_support::cwd_test_lock()
+            .lock()
+            .expect("cwd lock");
+        let workspace = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "response".into(),
+                })),
+            })),
+        )
+        .await
+        .expect("thread manager");
+        let started = manager.start_thread().await.expect("start root");
+        let root_id = started.thread_id;
+        let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+        let control = manager.agent_control();
+        let (child, waiter) = control
+            .spawn_agent_with_role_inline_wait(
+                root_id,
+                "hello child".to_string(),
+                Some("worker".to_string()),
+                None,
+                false,
+            )
+            .await
+            .expect("spawn child");
+        let child_id = child.agent_id.expect("child id");
+        control.unregister_inline_child_completion_waiter(child_id);
+        drop(waiter);
+
+        let mut saw_completion = false;
+        let mut saw_notice = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+                Ok(Ok(event)) => event,
+                Ok(Err(err)) => panic!("root event channel closed: {err}"),
+                Err(_) => break,
+            };
+
+            match event.msg {
+                EventMsg::CollabAgentCompleted(completion) => {
+                    assert_eq!(completion.child_thread_id, child_id);
+                    saw_completion = true;
+                }
+                EventMsg::InterAgentMessage(mail) => {
+                    if mail.communication.author == child.agent_path {
+                        saw_notice = true;
+                    }
+                }
+                _ => {}
+            }
+
+            if saw_completion && saw_notice {
+                break;
+            }
+        }
+
+        assert!(saw_completion, "expected child completion event");
+        assert!(
+            saw_notice,
+            "expected mailbox fallback notice after unregister"
+        );
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+    }
+
+    #[tokio::test]
     async fn spawn_agent_with_fork_context_seeds_child_history() {
         let _cwd_guard = crate::test_support::cwd_test_lock()
             .lock()
@@ -1030,21 +1304,13 @@ mod tests {
             .get(&child_id)
             .and_then(|calls| calls.first())
             .expect("child first call history");
-        assert_eq!(child_history.len(), 2);
+        assert_eq!(child_history.len(), 1);
         assert!(matches!(
             &child_history[0],
             Message::User { content }
                 if matches!(
                     content.iter().next(),
                     Some(UserContent::Text(Text { text })) if text == "parent asks"
-                )
-        ));
-        assert!(matches!(
-            &child_history[1],
-            Message::User { content }
-                if matches!(
-                    content.iter().next(),
-                    Some(UserContent::Text(Text { text })) if text == "child task"
                 )
         ));
 

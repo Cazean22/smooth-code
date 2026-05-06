@@ -527,12 +527,16 @@ impl App {
     fn render_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let inner_width = area.width.saturating_sub(2).max(1);
         let lines = self.transcript_lines(inner_width);
-        let paragraph = Paragraph::new(Text::from(lines.clone()))
+        let paragraph = Paragraph::new(Text::from(lines))
             .block(Block::default().title("Transcript").borders(Borders::ALL))
             .wrap(Wrap { trim: false });
 
         if self.auto_scroll {
-            let total_rows = lines.len();
+            // `lines.len()` counts logical lines; `Paragraph` with `Wrap` lays
+            // out wrapped rows. Using the logical count here makes the bottom
+            // unreachable on narrow terminals because `scroll((y, _))` is in
+            // post-wrap rows, so we'd cap `self.scroll` below the true bottom.
+            let total_rows = paragraph.line_count(inner_width);
             let max_scroll = total_rows.saturating_sub(usize::from(area.height.saturating_sub(2)));
             self.scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
         }
@@ -608,9 +612,17 @@ impl App {
     }
 
     fn max_scroll(&self, viewport_height: u16) -> u16 {
-        let width = self.terminal_width.saturating_sub(4).max(1);
-        let lines = self.transcript_lines(width);
-        let total_rows = lines.len();
+        // Mirror `render_transcript`: `inner_width = area.width - 2` for the
+        // block's borders. Use `Paragraph::line_count(inner_width)` so the
+        // scroll cap reflects post-wrap rows, not logical line count — without
+        // this, narrow terminals leave the last `wrapped - logical` rows
+        // unreachable even with PageDown/End.
+        let inner_width = self.terminal_width.saturating_sub(2).max(1);
+        let lines = self.transcript_lines(inner_width);
+        let paragraph = Paragraph::new(Text::from(lines))
+            .block(Block::default().title("Transcript").borders(Borders::ALL))
+            .wrap(Wrap { trim: false });
+        let total_rows = paragraph.line_count(inner_width);
         let max_scroll = total_rows.saturating_sub(usize::from(viewport_height));
         u16::try_from(max_scroll).unwrap_or(u16::MAX)
     }

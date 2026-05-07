@@ -51,7 +51,12 @@ pub(crate) fn render_spawn_agent_tool_description() -> String {
         .map(|role| format!("`{}`: {}", role.name, role.description))
         .collect::<Vec<_>>()
         .join("\n");
-    format!("Built-in agent roles:\n{roles}")
+    format!(
+        "Spawn a sub-agent. In a parent tool-loop turn, spawned children run concurrently and the \
+turn waits for all spawned children to reach a terminal state before their final tool results are \
+returned. Completion notices are surfaced as `[agent_completed]` inter-agent messages.\n\
+Built-in agent roles:\n{roles}"
+    )
 }
 
 #[cfg(test)]
@@ -69,6 +74,9 @@ mod tests {
     #[test]
     fn renders_role_description() {
         let rendered = render_spawn_agent_tool_description();
+        assert!(rendered.contains("run concurrently"));
+        assert!(rendered.contains("waits for all spawned children"));
+        assert!(rendered.contains("[agent_completed]"));
         assert!(rendered.contains("`default`"));
         assert!(rendered.contains("`explorer`"));
         assert!(rendered.contains("`worker`"));

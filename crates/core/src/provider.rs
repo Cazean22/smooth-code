@@ -143,6 +143,10 @@ pub enum SessionModel {
 }
 
 impl SessionModel {
+    pub(crate) fn requires_provider_reasoning_ids(&self) -> bool {
+        matches!(self, Self::OpenAi(_))
+    }
+
     pub fn from_env(
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tools::SpawnAgentParams;
 
 use crate::{
-    agent::{InProcessMultiAgentClient, InlineChildCompletionReceiver},
+    agent::InProcessMultiAgentClient,
     core::{Session, TurnContext},
     provider::{
         SessionAssistantContent, SessionCompletionEvent, SessionStreamEvent, SessionTurnSummary,
@@ -94,31 +94,16 @@ struct ManualSpawnAgentArgs {
 }
 
 struct ExecutedToolCall {
+    index: usize,
+    tool_result_message: Message,
+    inline_notices: Vec<smooth_protocol::InterAgentCommunication>,
+}
+
+struct PendingToolCall {
+    index: usize,
     assistant_tool_call: AssistantContent,
-    tool_result_message: Message,
-    inline_notices: Vec<smooth_protocol::InterAgentCommunication>,
-}
-
-struct ResolvedPendingSpawnToolCall {
-    tool_result_message: Message,
-    inline_notices: Vec<smooth_protocol::InterAgentCommunication>,
-}
-
-enum ToolCallExecution {
-    Ready(ExecutedToolCall),
-    PendingSpawn {
-        assistant_tool_call: AssistantContent,
-        pending: PendingSpawnToolCall,
-    },
-}
-
-struct PendingSpawnToolCall {
-    tool_call_id: String,
-    tool_call_call_id: Option<String>,
+    tool_call: rig::message::ToolCall,
     internal_call_id: String,
-    agent_info: tools::AgentInfo,
-    waiter: InlineChildCompletionReceiver,
-    guard: InlineWaitGuard,
 }
 
 struct InlineWaitGuard {
@@ -281,10 +266,9 @@ async fn run_manual_turn(
                 return None;
             }
         };
-        let mut tool_calls = Vec::new();
+        let mut pending_tool_calls = Vec::new();
         let mut tool_result_messages = Vec::new();
         let mut inline_notices = Vec::new();
-        let mut pending_spawn_tool_calls = Vec::new();
         let mut accumulated_reasoning = Vec::new();
         let mut pending_reasoning_delta_text = String::new();
         let mut pending_reasoning_delta_id = None;
@@ -327,27 +311,24 @@ async fn run_manual_turn(
                     } => {
                         saw_tool_loop = true;
                         saw_tool_call_this_turn = true;
-                        let executed = execute_tool_call(
-                            Arc::clone(&session),
-                            Arc::clone(&ctx),
+                        session
+                            .emit_event(
+                                &ctx,
+                                EventMsg::ToolCallStarted(ToolCallStartedEvent {
+                                    thread_id: session.id.to_string(),
+                                    turn_id: ctx.sub_id.clone(),
+                                    call_id: internal_call_id.clone(),
+                                    tool_name: tool_call.function.name.clone(),
+                                    args_preview: tool_call.function.arguments.to_string(),
+                                }),
+                            )
+                            .await;
+                        pending_tool_calls.push(PendingToolCall {
+                            index: pending_tool_calls.len(),
+                            assistant_tool_call: AssistantContent::ToolCall(tool_call.clone()),
                             tool_call,
                             internal_call_id,
-                        )
-                        .await?;
-                        match executed {
-                            ToolCallExecution::Ready(executed) => {
-                                tool_calls.push(executed.assistant_tool_call);
-                                tool_result_messages.push(executed.tool_result_message);
-                                inline_notices.extend(executed.inline_notices);
-                            }
-                            ToolCallExecution::PendingSpawn {
-                                assistant_tool_call,
-                                pending,
-                            } => {
-                                tool_calls.push(assistant_tool_call);
-                                pending_spawn_tool_calls.push(pending);
-                            }
-                        }
+                        });
                     }
                     SessionAssistantContent::ReasoningDelta { id, reasoning } => {
                         let item_id = id
@@ -407,28 +388,22 @@ async fn run_manual_turn(
         }
 
         if saw_tool_call_this_turn {
-            if !pending_spawn_tool_calls.is_empty() {
-                let resolved_pending = wait_for_pending_spawn_tool_calls(
-                    Arc::clone(&session),
-                    Arc::clone(&ctx),
-                    pending_spawn_tool_calls,
-                    cancellation_token.clone(),
-                )
-                .await?;
-                for executed in resolved_pending {
-                    tool_result_messages.push(executed.tool_result_message);
-                    inline_notices.extend(executed.inline_notices);
-                }
-            }
-
             let mut content_items = Vec::new();
             if !turn_summary.response.is_empty() {
                 content_items.push(AssistantContent::text(&turn_summary.response));
             }
+            let requires_provider_reasoning_ids =
+                session.model().requires_provider_reasoning_ids();
             for reasoning in accumulated_reasoning.drain(..) {
-                content_items.push(AssistantContent::Reasoning(reasoning));
+                if should_roundtrip_reasoning(requires_provider_reasoning_ids, &reasoning) {
+                    content_items.push(AssistantContent::Reasoning(reasoning));
+                }
             }
-            content_items.extend(tool_calls);
+            content_items.extend(
+                pending_tool_calls
+                    .iter()
+                    .map(|pending| pending.assistant_tool_call.clone()),
+            );
 
             if !content_items.is_empty() {
                 new_messages.push(Message::Assistant {
@@ -436,6 +411,18 @@ async fn run_manual_turn(
                     content: OneOrMany::many(content_items)
                         .expect("tool phase assistant content should not be empty"),
                 });
+            }
+
+            let executed_tool_calls = execute_tool_calls_concurrently(
+                    Arc::clone(&session),
+                    Arc::clone(&ctx),
+                    pending_tool_calls,
+                    cancellation_token.clone(),
+                )
+                .await?;
+            for executed in executed_tool_calls {
+                tool_result_messages.push(executed.tool_result_message);
+                inline_notices.extend(executed.inline_notices);
             }
             new_messages.extend(tool_result_messages);
 
@@ -664,146 +651,33 @@ async fn run_opaque_turn(
 async fn execute_tool_call(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
-    tool_call: rig::message::ToolCall,
-    internal_call_id: String,
-) -> Option<ToolCallExecution> {
-    session
-        .emit_event(
-            &ctx,
-            EventMsg::ToolCallStarted(ToolCallStartedEvent {
-                thread_id: session.id.to_string(),
-                turn_id: ctx.sub_id.clone(),
-                call_id: internal_call_id.clone(),
-                tool_name: tool_call.function.name.clone(),
-                args_preview: tool_call.function.arguments.to_string(),
-            }),
-        )
-        .await;
+    pending: PendingToolCall,
+) -> ExecutedToolCall {
+    let PendingToolCall {
+        index,
+        assistant_tool_call: _,
+        tool_call,
+        internal_call_id,
+    } = pending;
 
-    if tool_call.function.name == "spawn_agent" {
-        let args = match serde_json::from_value::<ManualSpawnAgentArgs>(
-            tool_call.function.arguments.clone(),
-        ) {
-            Ok(args) => args,
-            Err(err) => {
-                let message = format!("invalid spawn_agent args: {err}");
-                session
-                    .emit_event(
-                        &ctx,
-                        EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
-                            thread_id: session.id.to_string(),
-                            turn_id: ctx.sub_id.clone(),
-                            call_id: internal_call_id,
-                            success: false,
-                            output_preview: Some(message.clone()),
-                            error: Some(message.clone()),
-                        }),
-                    )
-                    .await;
-                return Some(ToolCallExecution::Ready(ExecutedToolCall {
-                    assistant_tool_call: AssistantContent::ToolCall(tool_call.clone()),
-                    tool_result_message: tool_result_to_user_message(
-                        tool_call.id,
-                        tool_call.call_id,
-                        message,
-                    ),
-                    inline_notices: Vec::new(),
-                }));
-            }
-        };
-        let client = InProcessMultiAgentClient::new(session.id, session.agent_control.clone());
-        match client
-            .spawn_with_inline_wait(SpawnAgentParams {
-                message: args.message,
-                agent_type: args.agent_type,
-                model: args.model,
-                fork_context: args.fork_context,
-            })
+    let (tool_output, success, error, inline_notices) = if tool_call.function.name == "spawn_agent" {
+        resolve_spawn_tool_call(Arc::clone(&session), tool_call.function.arguments.clone()).await
+    } else {
+        let (tool_output, success, error) = match session
+            .model()
+            .call_tool(
+                &tool_call.function.name,
+                &tool_call.function.arguments.to_string(),
+            )
             .await
         {
-            Ok((agent_info, waiter)) => {
-                let child_thread_id = match agent_info.thread_id.parse::<ThreadId>() {
-                    Ok(thread_id) => thread_id,
-                    Err(err) => {
-                        let message = format!("invalid spawned thread id: {err}");
-                        session
-                            .emit_event(
-                                &ctx,
-                                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
-                                    thread_id: session.id.to_string(),
-                                    turn_id: ctx.sub_id.clone(),
-                                    call_id: internal_call_id,
-                                    success: false,
-                                    output_preview: Some(message.clone()),
-                                    error: Some(message.clone()),
-                                }),
-                            )
-                            .await;
-                        return Some(ToolCallExecution::Ready(ExecutedToolCall {
-                            assistant_tool_call: AssistantContent::ToolCall(tool_call.clone()),
-                            tool_result_message: tool_result_to_user_message(
-                                tool_call.id,
-                                tool_call.call_id,
-                                message,
-                            ),
-                            inline_notices: Vec::new(),
-                        }));
-                    }
-                };
-                return Some(ToolCallExecution::PendingSpawn {
-                    assistant_tool_call: AssistantContent::ToolCall(tool_call.clone()),
-                    pending: PendingSpawnToolCall {
-                        tool_call_id: tool_call.id,
-                        tool_call_call_id: tool_call.call_id,
-                        internal_call_id,
-                        agent_info,
-                        waiter,
-                        guard: InlineWaitGuard::new(session.agent_control.clone(), child_thread_id),
-                    },
-                });
-            }
+            Ok(output) => (output, true, None),
             Err(err) => {
                 let message = err.to_string();
-                session
-                    .emit_event(
-                        &ctx,
-                        EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
-                            thread_id: session.id.to_string(),
-                            turn_id: ctx.sub_id.clone(),
-                            call_id: internal_call_id,
-                            success: false,
-                            output_preview: Some(message.clone()),
-                            error: Some(message.clone()),
-                        }),
-                    )
-                    .await;
-                return Some(ToolCallExecution::Ready(ExecutedToolCall {
-                    assistant_tool_call: AssistantContent::ToolCall(tool_call.clone()),
-                    tool_result_message: tool_result_to_user_message(
-                        tool_call.id,
-                        tool_call.call_id,
-                        message,
-                    ),
-                    inline_notices: Vec::new(),
-                }));
+                (message.clone(), false, Some(message))
             }
-        }
-    }
-
-    let inline_notices = Vec::new();
-    let (tool_output, success, error) = match session
-        .model()
-        .call_tool(
-            &tool_call.function.name,
-            &tool_call.function.arguments.to_string(),
-        )
-        .await
-    {
-        Ok(output) => (output, true, None),
-        Err(err) => {
-            let message = err.to_string();
-            (message.clone(), false, Some(message))
-        }
+        };
+        (tool_output, success, error, Vec::new())
     };
 
     session
@@ -820,29 +694,26 @@ async fn execute_tool_call(
         )
         .await;
 
-    Some(ToolCallExecution::Ready(ExecutedToolCall {
-        assistant_tool_call: AssistantContent::ToolCall(tool_call.clone()),
+    ExecutedToolCall {
+        index,
         tool_result_message: tool_result_to_user_message(
             tool_call.id,
             tool_call.call_id,
             tool_output,
         ),
         inline_notices,
-    }))
+    }
 }
 
-async fn wait_for_pending_spawn_tool_calls(
+async fn execute_tool_calls_concurrently(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
-    pending_spawn_tool_calls: Vec<PendingSpawnToolCall>,
+    pending_tool_calls: Vec<PendingToolCall>,
     cancellation_token: CancellationToken,
-) -> Option<Vec<ResolvedPendingSpawnToolCall>> {
-    let mut pending_futures = pending_spawn_tool_calls
+) -> Option<Vec<ExecutedToolCall>> {
+    let mut pending_futures = pending_tool_calls
         .into_iter()
-        .enumerate()
-        .map(|(index, pending)| {
-            resolve_pending_spawn_tool_call(Arc::clone(&session), Arc::clone(&ctx), index, pending)
-        })
+        .map(|pending| execute_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending))
         .collect::<FuturesUnordered<_>>();
     let mut resolved = Vec::new();
     while !pending_futures.is_empty() {
@@ -850,81 +721,76 @@ async fn wait_for_pending_spawn_tool_calls(
             _ = cancellation_token.cancelled() => return None,
             next = pending_futures.next() => next,
         };
-        let Some((index, executed)) = next else {
+        let Some(executed) = next else {
             break;
         };
-        resolved.push((index, executed));
+        resolved.push(executed);
     }
-    resolved.sort_by_key(|(index, _)| *index);
-    Some(
-        resolved
-            .into_iter()
-            .map(|(_, executed)| executed)
-            .collect::<Vec<_>>(),
-    )
+    resolved.sort_by_key(|executed| executed.index);
+    Some(resolved)
 }
 
-async fn resolve_pending_spawn_tool_call(
+async fn resolve_spawn_tool_call(
     session: Arc<Session>,
-    ctx: Arc<TurnContext>,
-    index: usize,
-    pending: PendingSpawnToolCall,
-) -> (usize, ResolvedPendingSpawnToolCall) {
-    let PendingSpawnToolCall {
-        tool_call_id,
-        tool_call_call_id,
-        internal_call_id,
-        mut agent_info,
-        waiter,
-        mut guard,
-    } = pending;
-
-    let (tool_output, success, error, inline_notices) = match waiter.await {
-        Ok(completion) => {
-            guard.disarm();
-            agent_info.status = Some(agent_status_label(&completion.status).to_string());
-            agent_info.status_detail = Some(completion.status.clone());
-            agent_info.last_assistant_message = completion.last_assistant_message.clone();
-            match serde_json::to_string(&agent_info) {
-                Ok(output) => (output, true, None, vec![completion.communication]),
+    arguments: serde_json::Value,
+) -> (
+    String,
+    bool,
+    Option<String>,
+    Vec<smooth_protocol::InterAgentCommunication>,
+) {
+    let args = match serde_json::from_value::<ManualSpawnAgentArgs>(arguments) {
+        Ok(args) => args,
+        Err(err) => {
+            let message = format!("invalid spawn_agent args: {err}");
+            return (message.clone(), false, Some(message), Vec::new());
+        }
+    };
+    let client = InProcessMultiAgentClient::new(session.id, session.agent_control.clone());
+    match client
+        .spawn_with_inline_wait(SpawnAgentParams {
+            message: args.message,
+            agent_type: args.agent_type,
+            model: args.model,
+            fork_context: args.fork_context,
+        })
+        .await
+    {
+        Ok((mut agent_info, waiter)) => {
+            let child_thread_id = match agent_info.thread_id.parse::<ThreadId>() {
+                Ok(thread_id) => thread_id,
                 Err(err) => {
-                    let message = format!("failed to encode spawn_agent output: {err}");
+                    let message = format!("invalid spawned thread id: {err}");
+                    return (message.clone(), false, Some(message), Vec::new());
+                }
+            };
+            let mut guard = InlineWaitGuard::new(session.agent_control.clone(), child_thread_id);
+            match waiter.await {
+                Ok(completion) => {
+                    guard.disarm();
+                    agent_info.status = Some(agent_status_label(&completion.status).to_string());
+                    agent_info.status_detail = Some(completion.status.clone());
+                    agent_info.last_assistant_message = completion.last_assistant_message.clone();
+                    match serde_json::to_string(&agent_info) {
+                        Ok(output) => (output, true, None, vec![completion.communication]),
+                        Err(err) => {
+                            let message = format!("failed to encode spawn_agent output: {err}");
+                            (message.clone(), false, Some(message), Vec::new())
+                        }
+                    }
+                }
+                Err(err) => {
+                    guard.disarm();
+                    let message = format!("spawn_agent inline wait failed to resolve: {err}");
                     (message.clone(), false, Some(message), Vec::new())
                 }
             }
         }
         Err(err) => {
-            guard.disarm();
-            let message = format!("spawn_agent inline wait failed to resolve: {err}");
+            let message = err.to_string();
             (message.clone(), false, Some(message), Vec::new())
         }
-    };
-
-    session
-        .emit_event(
-            &ctx,
-            EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
-                thread_id: session.id.to_string(),
-                turn_id: ctx.sub_id.clone(),
-                call_id: internal_call_id,
-                success,
-                output_preview: Some(tool_output.clone()),
-                error,
-            }),
-        )
-        .await;
-
-    (
-        index,
-        ResolvedPendingSpawnToolCall {
-            tool_result_message: tool_result_to_user_message(
-                tool_call_id,
-                tool_call_call_id,
-                tool_output,
-            ),
-            inline_notices,
-        },
-    )
+    }
 }
 
 fn build_history_for_request(history: &[Message], new_messages: &[Message]) -> Vec<Message> {
@@ -968,6 +834,13 @@ fn merge_reasoning_blocks(
     }
 }
 
+fn should_roundtrip_reasoning(
+    requires_provider_reasoning_ids: bool,
+    reasoning: &MessageReasoning,
+) -> bool {
+    !requires_provider_reasoning_ids || reasoning.id.is_some()
+}
+
 fn tool_result_to_user_message(
     id: String,
     call_id: Option<String>,
@@ -991,5 +864,33 @@ fn agent_status_label(status: &AgentStatus) -> &'static str {
         AgentStatus::Errored(_) => "errored",
         AgentStatus::Shutdown => "shutdown",
         AgentStatus::NotFound => "not_found",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rig::message::Reasoning as MessageReasoning;
+
+    use super::should_roundtrip_reasoning;
+
+    #[test]
+    fn idless_reasoning_roundtrips_for_non_openai_models() {
+        let reasoning = MessageReasoning::new("thinking");
+
+        assert!(should_roundtrip_reasoning(false, &reasoning));
+    }
+
+    #[test]
+    fn idless_reasoning_does_not_roundtrip_for_openai_models() {
+        let reasoning = MessageReasoning::new("thinking");
+
+        assert!(!should_roundtrip_reasoning(true, &reasoning));
+    }
+
+    #[test]
+    fn provider_identified_reasoning_roundtrips_for_openai_models() {
+        let reasoning = MessageReasoning::new("thinking").with_id("rs_123".to_string());
+
+        assert!(should_roundtrip_reasoning(true, &reasoning));
     }
 }

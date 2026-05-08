@@ -26,7 +26,7 @@ pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 #[tracing::instrument(name = "tui.run", skip_all)]
 pub async fn run() -> Result<()> {
     let mut terminal = init()?.ok_or_else(|| anyhow::anyhow!("smooth-tui requires a TTY"))?;
-    let mut app_server = AppServerSession::new(AppServerClient::start(512)?);
+    let mut app_server = AppServerSession::new(AppServerClient::start(512).await?);
     let mut app = App::new();
     let started_thread = app_server.start_thread().await?;
     app.current_thread_id = Some(started_thread.thread_id.parse()?);

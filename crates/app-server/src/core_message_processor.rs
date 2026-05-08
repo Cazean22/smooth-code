@@ -33,11 +33,7 @@ struct InProcessDynamicToolClient {
 impl DynamicToolClientFactory for InProcessDynamicToolClientFactory {
     fn build(&self, thread_id: ThreadId) -> Arc<dyn DynamicToolClient> {
         Arc::new(InProcessDynamicToolClient {
-            outgoing: ThreadScopedOutgoingMessageSender::new(
-                Arc::clone(&self.outgoing),
-                vec![crate::in_process::IN_PROCESS_CONNECTION_ID],
-                thread_id,
-            ),
+            outgoing: ThreadScopedOutgoingMessageSender::new(Arc::clone(&self.outgoing), thread_id),
         })
     }
 }

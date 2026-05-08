@@ -9,9 +9,9 @@ pub(crate) struct AppServerClient {
 }
 
 impl AppServerClient {
-    pub(crate) fn start(channel_capacity: usize) -> anyhow::Result<Self> {
+    pub(crate) async fn start(channel_capacity: usize) -> anyhow::Result<Self> {
         Ok(Self {
-            handle: in_process::start(InProcessStartArgs { channel_capacity }),
+            handle: in_process::start(InProcessStartArgs { channel_capacity }).await?,
         })
     }
 

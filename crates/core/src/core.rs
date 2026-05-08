@@ -13,7 +13,7 @@ use smooth_protocol::{
     AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, SessionSource, ThreadId,
     TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
 };
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tools::DynamicToolClient;
 use tracing::Instrument;
 
@@ -35,7 +35,6 @@ pub struct Core {
 /// A session has at most 1 running task at a time.
 pub(crate) struct Session {
     pub(crate) id: ThreadId,
-    agent_status: watch::Sender<AgentStatus>,
     event_tx: broadcast::Sender<Event>,
     state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
@@ -73,14 +72,12 @@ impl Core {
         session_source: SessionSource,
         agent_control: AgentControl,
     ) -> Self {
-        let (agent_status, _) = watch::channel(AgentStatus::PendingInit);
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (mailbox, mailbox_rx) = Mailbox::new();
         let mut context_manager = ContextManager::default();
         context_manager.replace(history);
         let session = Arc::new(Session {
             id,
-            agent_status,
             event_tx,
             state: Mutex::new(SessionState::new(context_manager)),
             active_turn: Mutex::new(None),
@@ -263,7 +260,7 @@ impl Session {
                             // (`InlineChildCompletionReceiver`, the per-child
                             // status watcher in `AgentControl`) unblocks
                             // instead of stalling on `Running` forever.
-                            let current_status = sess.agent_status.borrow().clone();
+                            let current_status = sess.agent_control.get_status(sess.id);
                             if crate::agent::status::is_final(&current_status) {
                                 tracing::debug!(
                                     thread_id = %sess.id,
@@ -414,7 +411,6 @@ impl Session {
     }
 
     pub(crate) async fn set_agent_status(&self, status: AgentStatus, ctx: Option<&TurnContext>) {
-        self.agent_status.send_replace(status.clone());
         self.agent_control.set_status(self.id, status.clone());
         let _ = self.event_tx.send(Event {
             id: ctx

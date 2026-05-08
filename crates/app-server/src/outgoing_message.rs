@@ -1,96 +1,43 @@
 use std::{
     collections::HashMap,
-    fmt,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use app_server_protocol::{JSONRPCErrorError, RequestId, ServerRequest, ServerRequestPayload};
-use serde::Serialize;
+use app_server_protocol::{JSONRPCErrorError, RequestId, ServerRequestPayload};
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 
-use crate::{ClientRequestResult, error_code::INTERNAL_ERROR_CODE};
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ConnectionId(pub(crate) u64);
-
-impl fmt::Display for ConnectionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)] // Kept for parity with codex's transport-facing API.
-pub(crate) struct ConnectionRequestId {
-    pub(crate) connection_id: ConnectionId,
-    pub(crate) request_id: RequestId,
-}
-
-#[derive(Debug)]
-pub(crate) enum OutgoingEnvelope {
-    ToConnection {
-        connection_id: ConnectionId,
-        message: OutgoingMessage,
-        write_complete_tx: Option<oneshot::Sender<()>>,
-    },
-    Broadcast {
-        message: OutgoingMessage,
-    },
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub(crate) enum OutgoingMessage {
-    Request(ServerRequest),
-    Response(OutgoingResponse),
-    Error(OutgoingError),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct OutgoingResponse {
-    pub id: RequestId,
-    pub result: serde_json::Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct OutgoingError {
-    pub id: RequestId,
-    pub error: JSONRPCErrorError,
-}
+use crate::{
+    ClientRequestResult,
+    error_code::{INTERNAL_ERROR_CODE, OVERLOADED_ERROR_CODE, SERVER_ERROR_CODE},
+    in_process::InProcessServerEvent,
+};
 
 pub(crate) struct OutgoingMessageSender {
     next_server_request_id: AtomicU64,
-    sender: mpsc::Sender<OutgoingEnvelope>,
+    event_tx: mpsc::Sender<InProcessServerEvent>,
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct ThreadScopedOutgoingMessageSender {
     outgoing: Arc<OutgoingMessageSender>,
-    connection_ids: Arc<Vec<ConnectionId>>,
     thread_id: ThreadId,
 }
 
 struct PendingCallbackEntry {
     callback: oneshot::Sender<ClientRequestResult>,
     thread_id: Option<ThreadId>,
-    request: ServerRequest,
 }
 
 impl ThreadScopedOutgoingMessageSender {
-    pub(crate) fn new(
-        outgoing: Arc<OutgoingMessageSender>,
-        connection_ids: Vec<ConnectionId>,
-        thread_id: ThreadId,
-    ) -> Self {
+    pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>, thread_id: ThreadId) -> Self {
         Self {
             outgoing,
-            connection_ids: Arc::new(connection_ids),
             thread_id,
         }
     }
@@ -100,30 +47,8 @@ impl ThreadScopedOutgoingMessageSender {
         payload: ServerRequestPayload,
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
         self.outgoing
-            .send_request_to_connections(
-                Some(self.connection_ids.as_slice()),
-                payload,
-                Some(self.thread_id),
-            )
+            .send_request_for_thread(payload, Some(self.thread_id))
             .await
-    }
-
-    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
-    pub(crate) async fn send_response<T: Serialize>(
-        &self,
-        request_id: ConnectionRequestId,
-        response: T,
-    ) {
-        self.outgoing.send_response(request_id, response).await;
-    }
-
-    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
-    pub(crate) async fn send_error(
-        &self,
-        request_id: ConnectionRequestId,
-        error: JSONRPCErrorError,
-    ) {
-        self.outgoing.send_error(request_id, error).await;
     }
 
     pub(crate) async fn abort_pending_server_requests(&self) {
@@ -142,36 +67,28 @@ impl ThreadScopedOutgoingMessageSender {
 }
 
 impl OutgoingMessageSender {
-    pub(crate) fn new(sender: mpsc::Sender<OutgoingEnvelope>) -> Self {
+    pub(crate) fn new(event_tx: mpsc::Sender<InProcessServerEvent>) -> Self {
         Self {
             next_server_request_id: AtomicU64::new(0),
-            sender,
+            event_tx,
             request_id_to_callback: Mutex::new(HashMap::new()),
         }
     }
 
-    #[allow(dead_code)] // Used by tests now; kept as public parity API for future transports.
+    #[cfg(test)]
     pub(crate) async fn send_request(
         &self,
         request: ServerRequestPayload,
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
-        self.send_request_to_connections(
-            /* connection_ids */ None, request, /* thread_id */ None,
-        )
-        .await
+        self.send_request_for_thread(request, None).await
     }
 
-    pub(crate) fn next_request_id(&self) -> RequestId {
-        RequestId(self.next_server_request_id.fetch_add(1, Ordering::Relaxed) as usize)
-    }
-
-    pub(crate) async fn send_request_to_connections(
+    async fn send_request_for_thread(
         &self,
-        connection_ids: Option<&[ConnectionId]>,
         request: ServerRequestPayload,
         thread_id: Option<ThreadId>,
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
-        let id = self.next_request_id();
+        let id = RequestId(self.next_server_request_id.fetch_add(1, Ordering::Relaxed) as usize);
         let request = request.request_with_id(id.clone());
         let (callback_tx, callback_rx) = oneshot::channel();
         {
@@ -181,99 +98,34 @@ impl OutgoingMessageSender {
                 PendingCallbackEntry {
                     callback: callback_tx,
                     thread_id,
-                    request: request.clone(),
                 },
             );
         }
 
-        let outgoing_message = OutgoingMessage::Request(request);
-        let send_result = match connection_ids {
-            None => {
-                self.sender
-                    .send(OutgoingEnvelope::Broadcast {
-                        message: outgoing_message,
-                    })
-                    .await
-            }
-            Some(connection_ids) => {
-                let mut send_error = None;
-                for connection_id in connection_ids {
-                    if let Err(err) = self
-                        .sender
-                        .send(OutgoingEnvelope::ToConnection {
-                            connection_id: *connection_id,
-                            message: outgoing_message.clone(),
-                            write_complete_tx: None,
-                        })
-                        .await
-                    {
-                        send_error = Some(err);
-                        break;
-                    }
-                }
-                match send_error {
-                    Some(err) => Err(err),
-                    None => Ok(()),
-                }
-            }
-        };
+        if let Err(send_error) = self
+            .event_tx
+            .try_send(InProcessServerEvent::ServerRequest(request))
+        {
+            let error = match send_error {
+                mpsc::error::TrySendError::Full(_) => JSONRPCErrorError {
+                    code: OVERLOADED_ERROR_CODE,
+                    data: None,
+                    message: "in-process server request queue is full".to_string(),
+                },
+                mpsc::error::TrySendError::Closed(_) => JSONRPCErrorError {
+                    code: SERVER_ERROR_CODE,
+                    data: None,
+                    message: "in-process server request consumer is closed".to_string(),
+                },
+            };
 
-        if let Err(err) = send_result {
-            warn!("failed to send request {id:?} to client: {err:?}");
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
-            request_id_to_callback.remove(&id);
+            if let Some((request_id, entry)) = self.take_request_callback(&id).await {
+                warn!("failed to send request {request_id:?} to client");
+                let _ = entry.callback.send(Err(error));
+            }
         }
 
         (id, callback_rx)
-    }
-
-    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
-    pub(crate) async fn send_response<T: Serialize>(
-        &self,
-        request_id: ConnectionRequestId,
-        response: T,
-    ) {
-        match serde_json::to_value(response) {
-            Ok(result) => {
-                self.send_outgoing_message_to_connection(
-                    request_id.connection_id,
-                    OutgoingMessage::Response(OutgoingResponse {
-                        id: request_id.request_id,
-                        result,
-                    }),
-                    "response",
-                )
-                .await;
-            }
-            Err(err) => {
-                self.send_error(
-                    request_id,
-                    JSONRPCErrorError {
-                        code: INTERNAL_ERROR_CODE,
-                        message: format!("failed to serialize response: {err}"),
-                        data: None,
-                    },
-                )
-                .await;
-            }
-        }
-    }
-
-    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
-    pub(crate) async fn send_error(
-        &self,
-        request_id: ConnectionRequestId,
-        error: JSONRPCErrorError,
-    ) {
-        self.send_outgoing_message_to_connection(
-            request_id.connection_id,
-            OutgoingMessage::Error(OutgoingError {
-                id: request_id.request_id,
-                error,
-            }),
-            "error",
-        )
-        .await;
     }
 
     pub(crate) async fn notify_client_response(&self, id: RequestId, result: serde_json::Value) {
@@ -303,11 +155,6 @@ impl OutgoingMessageSender {
         }
     }
 
-    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
-    pub(crate) async fn cancel_request(&self, id: &RequestId) -> bool {
-        self.take_request_callback(id).await.is_some()
-    }
-
     pub(crate) async fn cancel_all_requests(&self, error: Option<JSONRPCErrorError>) {
         let entries = {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
@@ -320,10 +167,7 @@ impl OutgoingMessageSender {
         if let Some(error) = error {
             for entry in entries {
                 if let Err(err) = entry.callback.send(Err(error.clone())) {
-                    warn!(
-                        "could not notify callback for {:?} due to: {err:?}",
-                        entry.request.id()
-                    );
+                    warn!("could not notify callback due to: {err:?}");
                 }
             }
         }
@@ -355,49 +199,8 @@ impl OutgoingMessageSender {
         if let Some(error) = error {
             for entry in entries {
                 if let Err(err) = entry.callback.send(Err(error.clone())) {
-                    warn!(
-                        "could not notify callback for {:?} due to: {err:?}",
-                        entry.request.id()
-                    );
+                    warn!("could not notify callback due to: {err:?}");
                 }
-            }
-        }
-    }
-
-    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
-    pub(crate) async fn pending_requests_for_thread(
-        &self,
-        thread_id: ThreadId,
-    ) -> Vec<ServerRequest> {
-        let request_id_to_callback = self.request_id_to_callback.lock().await;
-        let mut requests = request_id_to_callback
-            .values()
-            .filter_map(|entry| {
-                (entry.thread_id == Some(thread_id)).then_some(entry.request.clone())
-            })
-            .collect::<Vec<_>>();
-        requests.sort_by(|left, right| left.id().cmp(right.id()));
-        requests
-    }
-
-    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
-    pub(crate) async fn replay_requests_to_connection_for_thread(
-        &self,
-        connection_id: ConnectionId,
-        thread_id: ThreadId,
-    ) {
-        let requests = self.pending_requests_for_thread(thread_id).await;
-        for request in requests {
-            if let Err(err) = self
-                .sender
-                .send(OutgoingEnvelope::ToConnection {
-                    connection_id,
-                    message: OutgoingMessage::Request(request),
-                    write_complete_tx: None,
-                })
-                .await
-            {
-                warn!("failed to resend request to client: {err:?}");
             }
         }
     }
@@ -408,25 +211,6 @@ impl OutgoingMessageSender {
     ) -> Option<(RequestId, PendingCallbackEntry)> {
         let mut request_id_to_callback = self.request_id_to_callback.lock().await;
         request_id_to_callback.remove_entry(id)
-    }
-
-    async fn send_outgoing_message_to_connection(
-        &self,
-        connection_id: ConnectionId,
-        message: OutgoingMessage,
-        message_kind: &'static str,
-    ) {
-        if let Err(err) = self
-            .sender
-            .send(OutgoingEnvelope::ToConnection {
-                connection_id,
-                message,
-                write_complete_tx: None,
-            })
-            .await
-        {
-            warn!("failed to send {message_kind} to client: {err:?}");
-        }
     }
 }
 
@@ -453,70 +237,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_response_routes_to_target_connection() {
-        let (tx, mut rx) = mpsc::channel(1);
-        let outgoing = OutgoingMessageSender::new(tx);
-        let request_id = ConnectionRequestId {
-            connection_id: ConnectionId(7),
-            request_id: RequestId(42),
-        };
+    async fn send_request_emits_server_request_event() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let outgoing = OutgoingMessageSender::new(event_tx);
+        let thread_id = ThreadId::new();
 
-        outgoing
-            .send_response(request_id.clone(), json!({ "ok": true }))
+        let (request_id, _response_rx) = outgoing
+            .send_request(dynamic_tool_call(thread_id, "echo"))
             .await;
 
-        let envelope = rx.recv().await.expect("expected outgoing envelope");
-        assert!(matches!(
-            envelope,
-            OutgoingEnvelope::ToConnection {
-                connection_id: ConnectionId(7),
-                message: OutgoingMessage::Response(OutgoingResponse {
-                    id: RequestId(42),
-                    result
-                }),
-                write_complete_tx: None,
-            } if result == json!({ "ok": true })
-        ));
-    }
-
-    #[tokio::test]
-    async fn send_error_routes_to_target_connection() {
-        let (tx, mut rx) = mpsc::channel(1);
-        let outgoing = OutgoingMessageSender::new(tx);
-        let request_id = ConnectionRequestId {
-            connection_id: ConnectionId(9),
-            request_id: RequestId(77),
-        };
-        let error = JSONRPCErrorError {
-            code: -32001,
-            data: Some(json!({ "kind": "stub" })),
-            message: "failed".to_string(),
-        };
-
-        outgoing.send_error(request_id.clone(), error.clone()).await;
-
-        let envelope = rx.recv().await.expect("expected outgoing envelope");
-        assert!(matches!(
-            envelope,
-            OutgoingEnvelope::ToConnection {
-                connection_id: ConnectionId(9),
-                message: OutgoingMessage::Error(OutgoingError {
-                    id: RequestId(77),
-                    error: queued_error,
-                }),
-                write_complete_tx: None,
-            } if queued_error == error
-        ));
+        let event = event_rx.recv().await.expect("expected outgoing event");
+        match event {
+            InProcessServerEvent::ServerRequest(
+                app_server_protocol::ServerRequest::DynamicToolCall {
+                    request_id: observed,
+                    ..
+                },
+            ) => assert_eq!(observed, request_id),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn notify_client_error_forwards_error_to_waiter() {
-        let (tx, _rx) = mpsc::channel(1);
-        let outgoing = OutgoingMessageSender::new(tx);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let outgoing = OutgoingMessageSender::new(event_tx);
         let thread_id = ThreadId::new();
         let (request_id, response_rx) = outgoing
-            .send_request_to_connections(
-                Some(&[ConnectionId(0)]),
+            .send_request_for_thread(
                 dynamic_tool_call(thread_id, "dynamic_echo"),
                 Some(thread_id),
             )
@@ -539,67 +287,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_requests_for_thread_returns_thread_requests_in_request_id_order() {
-        let (tx, _rx) = mpsc::channel(8);
-        let outgoing = OutgoingMessageSender::new(tx);
+    async fn send_request_fails_when_event_consumer_is_closed() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        drop(event_rx);
+        let outgoing = OutgoingMessageSender::new(event_tx);
         let thread_id = ThreadId::new();
-        let other_thread_id = ThreadId::new();
 
-        let _ = outgoing
-            .send_request_to_connections(
-                Some(&[ConnectionId(0)]),
-                dynamic_tool_call(thread_id, "first"),
-                Some(thread_id),
-            )
-            .await;
-        let _ = outgoing
-            .send_request_to_connections(
-                Some(&[ConnectionId(0)]),
-                dynamic_tool_call(other_thread_id, "other"),
-                Some(other_thread_id),
-            )
-            .await;
-        let _ = outgoing
-            .send_request_to_connections(
-                Some(&[ConnectionId(0)]),
-                dynamic_tool_call(thread_id, "second"),
-                Some(thread_id),
-            )
+        let (_request_id, response_rx) = outgoing
+            .send_request(dynamic_tool_call(thread_id, "echo"))
             .await;
 
-        let pending = outgoing.pending_requests_for_thread(thread_id).await;
-        let ids = pending
-            .iter()
-            .map(|request| request.id().clone())
-            .collect::<Vec<_>>();
-
-        assert_eq!(ids, vec![RequestId(0), RequestId(2)]);
+        let response = timeout(Duration::from_secs(1), response_rx)
+            .await
+            .expect("response should resolve")
+            .expect("response channel should stay open");
+        assert!(matches!(
+            response,
+            Err(JSONRPCErrorError {
+                code: SERVER_ERROR_CODE,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
     async fn cancel_requests_for_thread_cancels_all_thread_requests() {
-        let (tx, _rx) = mpsc::channel(8);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(event_tx));
         let thread_id = ThreadId::new();
         let other_thread_id = ThreadId::new();
 
         let (_, first_rx) = outgoing
-            .send_request_to_connections(
-                Some(&[ConnectionId(0)]),
-                dynamic_tool_call(thread_id, "first"),
-                Some(thread_id),
-            )
+            .send_request_for_thread(dynamic_tool_call(thread_id, "first"), Some(thread_id))
             .await;
         let (_, second_rx) = outgoing
-            .send_request_to_connections(
-                Some(&[ConnectionId(0)]),
-                dynamic_tool_call(thread_id, "second"),
-                Some(thread_id),
-            )
+            .send_request_for_thread(dynamic_tool_call(thread_id, "second"), Some(thread_id))
             .await;
         let (_, other_rx) = outgoing
-            .send_request_to_connections(
-                Some(&[ConnectionId(0)]),
+            .send_request_for_thread(
                 dynamic_tool_call(other_thread_id, "other"),
                 Some(other_thread_id),
             )
@@ -625,19 +350,6 @@ mod tests {
 
         assert_eq!(first, Err(error.clone()));
         assert_eq!(second, Err(error));
-        assert!(
-            outgoing
-                .pending_requests_for_thread(thread_id)
-                .await
-                .is_empty()
-        );
-        assert_eq!(
-            outgoing
-                .pending_requests_for_thread(other_thread_id)
-                .await
-                .len(),
-            1
-        );
         assert!(timeout(Duration::from_millis(50), other_rx).await.is_err());
     }
 }

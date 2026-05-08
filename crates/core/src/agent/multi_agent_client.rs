@@ -343,7 +343,7 @@ mod tests {
     };
     use smooth_protocol::ThreadId;
     use tempfile::TempDir;
-    use tokio::{sync::watch, time::sleep};
+    use tokio::{sync::RwLock, time::sleep};
     use tools::{MultiAgentClient, SpawnAgentParams};
 
     use crate::{
@@ -384,7 +384,7 @@ mod tests {
             _cwd: PathBuf,
             _thread_id: ThreadId,
             _dynamic_tool_client: Option<Arc<dyn tools::DynamicToolClient>>,
-            _current_turn_id: Arc<watch::Sender<Option<String>>>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: crate::agent::AgentControl,
         ) -> Result<SessionModel> {

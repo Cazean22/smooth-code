@@ -390,7 +390,7 @@ mod tests {
         message::{Message, Text},
     };
     use tempfile::TempDir;
-    use tokio::sync::watch;
+    use tokio::sync::RwLock;
     use tools::DynamicToolClient;
 
     use super::ThreadManagerState;
@@ -431,7 +431,7 @@ mod tests {
             _cwd: PathBuf,
             _thread_id: ThreadId,
             _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-            _current_turn_id: Arc<watch::Sender<Option<String>>>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
         ) -> Result<SessionModel> {

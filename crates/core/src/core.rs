@@ -13,7 +13,7 @@ use smooth_protocol::{
     AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, SessionSource, ThreadId,
     TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
 };
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tools::DynamicToolClient;
 use tracing::Instrument;
 
@@ -44,7 +44,7 @@ pub(crate) struct Session {
     pub(crate) agent_control: AgentControl,
     pub(crate) mailbox: Mailbox,
     pub(crate) mailbox_rx: Mutex<MailboxReceiver>,
-    current_turn_id: Arc<watch::Sender<Option<String>>>,
+    current_turn_id: Arc<RwLock<Option<String>>>,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     next_internal_sub_id: AtomicU64,
     model: SessionModel,
@@ -68,7 +68,7 @@ impl Core {
         history: Vec<Message>,
         next_internal_sub_id: u64,
         rollout: RolloutRecorder,
-        current_turn_id: Arc<watch::Sender<Option<String>>>,
+        current_turn_id: Arc<RwLock<Option<String>>>,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         session_source: SessionSource,
         agent_control: AgentControl,
@@ -198,8 +198,7 @@ impl Session {
                 }),
             )
             .await;
-            self.current_turn_id
-                .send_replace(Some(turn_context.sub_id.clone()));
+            *self.current_turn_id.write().await = Some(turn_context.sub_id.clone());
             self.set_agent_status(AgentStatus::Running, Some(turn_context.as_ref()))
                 .await;
 
@@ -300,7 +299,7 @@ impl Session {
                             && turn.remove_task(&ctx_for_runner.sub_id)
                         {
                             *active_turn = None;
-                            sess.current_turn_id.send_replace(None);
+                            *sess.current_turn_id.write().await = None;
                         }
                         drop(active_turn);
 
@@ -342,7 +341,7 @@ impl Session {
         };
 
         if let Some(tasks) = drained {
-            self.current_turn_id.send_replace(None);
+            *self.current_turn_id.write().await = None;
             for task in tasks {
                 task.cancellation_token.cancel();
                 task.task
@@ -475,7 +474,7 @@ mod tests {
         message::{Message, Text},
     };
     use tempfile::TempDir;
-    use tokio::sync::{Notify, Semaphore, watch};
+    use tokio::sync::{Notify, RwLock, Semaphore};
 
     use crate::{
         SessionModel, SessionModelDriver, SessionStream, SessionStreamEvent, agent::AgentControl,
@@ -525,8 +524,7 @@ mod tests {
         let workspace = TempDir::new().expect("tempdir");
         let cwd = PathBuf::from(workspace.path());
         let thread_id = smooth_protocol::ThreadId::new();
-        let (current_turn_id, _) = watch::channel(None);
-        let current_turn_id = Arc::new(current_turn_id);
+        let current_turn_id = Arc::new(RwLock::new(None));
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd)
             .await
             .expect("rollout");
@@ -654,8 +652,7 @@ mod tests {
         let workspace = TempDir::new().expect("tempdir");
         let cwd = PathBuf::from(workspace.path());
         let thread_id = smooth_protocol::ThreadId::new();
-        let (current_turn_id, _) = watch::channel(None);
-        let current_turn_id = Arc::new(current_turn_id);
+        let current_turn_id = Arc::new(RwLock::new(None));
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd)
             .await
             .expect("rollout");

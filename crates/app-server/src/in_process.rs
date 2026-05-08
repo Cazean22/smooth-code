@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use app_server_protocol::{ClientCommand, JSONRPCErrorError};
 use smooth_protocol::Event;
@@ -6,13 +6,9 @@ use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use crate::{
-    OutboundConnectionState,
     error_code::{OVERLOADED_ERROR_CODE, SERVER_ERROR_CODE},
     message_processor::MessageProcessor,
-    outgoing_message::{
-        ConnectionId, OutgoingMessage, OutgoingMessageSender, QueuedOutgoingMessage,
-    },
-    route_outgoing_envelope,
+    outgoing_message::{ConnectionId, OutgoingEnvelope, OutgoingMessage, OutgoingMessageSender},
 };
 
 pub(crate) const IN_PROCESS_CONNECTION_ID: ConnectionId = ConnectionId(0);
@@ -58,72 +54,31 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
         .name("app_server.in_process.runtime")
         .spawn(
             async move {
-                let (writer_tx, mut writer_rx) =
-                    mpsc::channel::<QueuedOutgoingMessage>(channel_capacity);
-                let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
-                outbound_connections.insert(
-                    IN_PROCESS_CONNECTION_ID,
-                    OutboundConnectionState::new(writer_tx, None),
-                );
-
-                let outbound_handle = tokio::task::Builder::new()
-                    .name("app_server.outbound_router")
-                    .spawn(async move {
-                        while let Some(envelope) = outgoing_rx.recv().await {
-                            route_outgoing_envelope(&mut outbound_connections, envelope).await;
-                        }
-                    })
-                    .expect("failed to spawn app-server outbound router");
-
                 let processor_outgoing = Arc::clone(&runtime_outgoing);
                 let processor_event_tx = event_tx.clone();
-                let (processor_tx, mut processor_rx) =
-                    mpsc::channel::<ClientCommand>(channel_capacity);
-                let processor_handle = tokio::task::Builder::new()
-                    .name("app_server.message_processor")
-                    .spawn(async move {
-                        let processor = match MessageProcessor::new(
-                            processor_event_tx,
-                            processor_outgoing,
-                        )
-                        .await
-                        {
-                            Ok(processor) => Arc::new(processor),
-                            Err(err) => {
-                                tracing::error!(error = %err, "failed to initialize message processor");
-                                return;
-                            }
-                        };
-
-                        loop {
-                            match processor_rx.recv().await {
-                                Some(ClientCommand::Request { request, response_tx }) => {
-                                    processor
-                                        .process_client_request(*request, response_tx)
-                                        .await;
-                                }
-                                Some(
-                                    ClientCommand::ServerRequestResponse { .. }
-                                    | ClientCommand::ServerRequestError { .. },
-                                ) => {
-                                    tracing::warn!(
-                                        "received server request completion command on processor queue"
-                                    );
-                                }
-                                None => break,
-                            }
+                let processor =
+                    match MessageProcessor::new(processor_event_tx, processor_outgoing).await {
+                        Ok(processor) => Arc::new(processor),
+                        Err(err) => {
+                            tracing::error!(error = %err, "failed to initialize message processor");
+                            return;
                         }
-                    })
-                    .expect("failed to spawn app-server message processor");
+                    };
 
                 loop {
                     tokio::select! {
                         message = client_rx.recv() => {
                             match message {
-                                Some(command @ ClientCommand::Request { .. }) => {
-                                    if processor_tx.send(command).await.is_err() {
-                                        break;
-                                    }
+                                Some(ClientCommand::Request { request, response_tx }) => {
+                                    let processor = Arc::clone(&processor);
+                                    tokio::task::Builder::new()
+                                        .name("app_server.process_request")
+                                        .spawn(async move {
+                                            processor
+                                                .process_client_request(*request, response_tx)
+                                                .await;
+                                        })
+                                        .expect("failed to spawn request processor task");
                                 }
                                 Some(ClientCommand::ServerRequestResponse { request_id, result }) => {
                                     runtime_outgoing
@@ -138,61 +93,15 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
                                 None => break,
                             }
                         }
-                        queued_message = writer_rx.recv() => {
-                            let Some(queued_message) = queued_message else {
+                        envelope = outgoing_rx.recv() => {
+                            let Some(envelope) = envelope else {
                                 break;
                             };
-                            let write_complete_tx = queued_message.write_complete_tx;
-                            match queued_message.message {
-                                OutgoingMessage::Request(request) => {
-                                    let request_id = request.id().clone();
-                                    if let Err(send_error) = event_tx.try_send(
-                                        InProcessServerEvent::ServerRequest(request),
-                                    ) {
-                                        let (code, message) = match send_error {
-                                            mpsc::error::TrySendError::Full(_) => (
-                                                OVERLOADED_ERROR_CODE,
-                                                "in-process server request queue is full",
-                                            ),
-                                            mpsc::error::TrySendError::Closed(_) => (
-                                                SERVER_ERROR_CODE,
-                                                "in-process server request consumer is closed",
-                                            ),
-                                        };
-                                        runtime_outgoing
-                                            .notify_client_error(
-                                                request_id,
-                                                JSONRPCErrorError {
-                                                    code,
-                                                    data: None,
-                                                    message: message.to_string(),
-                                                },
-                                            )
-                                            .await;
-                                    }
-                                }
-                                OutgoingMessage::Response(response) => {
-                                    tracing::warn!(
-                                        request_id = ?response.id,
-                                        "dropping unexpected in-process outgoing response"
-                                    );
-                                }
-                                OutgoingMessage::Error(error) => {
-                                    tracing::warn!(
-                                        request_id = ?error.id,
-                                        "dropping unexpected in-process outgoing error"
-                                    );
-                                }
-                            }
-                            if let Some(write_complete_tx) = write_complete_tx {
-                                let _ = write_complete_tx.send(());
-                            }
+                            handle_outgoing_envelope(&event_tx, &runtime_outgoing, envelope).await;
                         }
                     }
                 }
 
-                drop(writer_rx);
-                drop(processor_tx);
                 runtime_outgoing
                     .cancel_all_requests(Some(JSONRPCErrorError {
                         code: SERVER_ERROR_CODE,
@@ -201,8 +110,6 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
                     }))
                     .await;
                 drop(runtime_outgoing);
-                let _ = outbound_handle.await;
-                let _ = processor_handle.await;
             }
             .instrument(runtime_span),
         )
@@ -216,6 +123,83 @@ fn start_internal(args: InProcessStartArgs) -> (InProcessClientHandle, Arc<Outgo
         },
         outgoing_message_sender,
     )
+}
+
+async fn handle_outgoing_envelope(
+    event_tx: &mpsc::Sender<InProcessServerEvent>,
+    outgoing: &Arc<OutgoingMessageSender>,
+    envelope: OutgoingEnvelope,
+) {
+    match envelope {
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message,
+            write_complete_tx,
+        } => {
+            if connection_id != IN_PROCESS_CONNECTION_ID {
+                tracing::warn!(
+                    connection_id = %connection_id,
+                    "dropping outgoing message for unknown in-process connection"
+                );
+            } else {
+                handle_outgoing_message(event_tx, outgoing, message).await;
+            }
+
+            if let Some(write_complete_tx) = write_complete_tx {
+                let _ = write_complete_tx.send(());
+            }
+        }
+        OutgoingEnvelope::Broadcast { message } => {
+            handle_outgoing_message(event_tx, outgoing, message).await;
+        }
+    }
+}
+
+async fn handle_outgoing_message(
+    event_tx: &mpsc::Sender<InProcessServerEvent>,
+    outgoing: &Arc<OutgoingMessageSender>,
+    message: OutgoingMessage,
+) {
+    match message {
+        OutgoingMessage::Request(request) => {
+            let request_id = request.id().clone();
+            if let Err(send_error) = event_tx.try_send(InProcessServerEvent::ServerRequest(request))
+            {
+                let (code, message) = match send_error {
+                    mpsc::error::TrySendError::Full(_) => (
+                        OVERLOADED_ERROR_CODE,
+                        "in-process server request queue is full",
+                    ),
+                    mpsc::error::TrySendError::Closed(_) => (
+                        SERVER_ERROR_CODE,
+                        "in-process server request consumer is closed",
+                    ),
+                };
+                outgoing
+                    .notify_client_error(
+                        request_id,
+                        JSONRPCErrorError {
+                            code,
+                            data: None,
+                            message: message.to_string(),
+                        },
+                    )
+                    .await;
+            }
+        }
+        OutgoingMessage::Response(response) => {
+            tracing::warn!(
+                request_id = ?response.id,
+                "dropping unexpected in-process outgoing response"
+            );
+        }
+        OutgoingMessage::Error(error) => {
+            tracing::warn!(
+                request_id = ?error.id,
+                "dropping unexpected in-process outgoing error"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

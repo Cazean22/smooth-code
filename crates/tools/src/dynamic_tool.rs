@@ -3,7 +3,7 @@ use std::sync::Arc;
 use app_server_protocol::DynamicToolCallParams;
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::Deserialize;
-use tokio::sync::watch;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{DynamicToolClient, ToolFailure};
@@ -18,7 +18,7 @@ pub struct DynamicTool {
     name: String,
     thread_id: smooth_protocol::ThreadId,
     client: Arc<dyn DynamicToolClient>,
-    current_turn_id: Arc<watch::Sender<Option<String>>>,
+    current_turn_id: Arc<RwLock<Option<String>>>,
 }
 
 impl DynamicTool {
@@ -26,7 +26,7 @@ impl DynamicTool {
         name: impl Into<String>,
         thread_id: smooth_protocol::ThreadId,
         client: Arc<dyn DynamicToolClient>,
-        current_turn_id: Arc<watch::Sender<Option<String>>>,
+        current_turn_id: Arc<RwLock<Option<String>>>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -69,7 +69,8 @@ impl Tool for DynamicTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let turn_id = self
             .current_turn_id
-            .borrow()
+            .read()
+            .await
             .clone()
             .ok_or_else(|| ToolFailure::new("no active turn id"))?;
         let arguments = serde_json::from_str(&args.payload)
@@ -129,12 +130,12 @@ mod tests {
             last_params: Mutex::new(None),
             result: serde_json::json!({ "ok": true }),
         });
-        let (current_turn_id, _) = watch::channel(Some("turn-42".to_string()));
+        let current_turn_id = Arc::new(RwLock::new(Some("turn-42".to_string())));
         let tool = DynamicTool::new(
             "dynamic_echo",
             smooth_protocol::ThreadId::new(),
             stub.clone(),
-            Arc::new(current_turn_id),
+            current_turn_id,
         );
 
         let definition = tool.definition(String::new()).await;
@@ -161,7 +162,7 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_tool_fails_without_an_active_turn() {
-        let (current_turn_id, _) = watch::channel(None);
+        let current_turn_id = Arc::new(RwLock::new(None));
         let tool = DynamicTool::new(
             "dynamic_echo",
             smooth_protocol::ThreadId::new(),
@@ -169,7 +170,7 @@ mod tests {
                 last_params: Mutex::new(None),
                 result: serde_json::json!({ "ok": true }),
             }),
-            Arc::new(current_turn_id),
+            current_turn_id,
         );
 
         let err = tool
@@ -184,7 +185,7 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_tool_fails_on_invalid_payload_json() {
-        let (current_turn_id, _) = watch::channel(Some("turn-42".to_string()));
+        let current_turn_id = Arc::new(RwLock::new(Some("turn-42".to_string())));
         let tool = DynamicTool::new(
             "dynamic_echo",
             smooth_protocol::ThreadId::new(),
@@ -192,7 +193,7 @@ mod tests {
                 last_params: Mutex::new(None),
                 result: serde_json::json!({ "ok": true }),
             }),
-            Arc::new(current_turn_id),
+            current_turn_id,
         );
 
         let err = tool

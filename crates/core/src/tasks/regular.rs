@@ -392,8 +392,7 @@ async fn run_manual_turn(
             if !turn_summary.response.is_empty() {
                 content_items.push(AssistantContent::text(&turn_summary.response));
             }
-            let requires_provider_reasoning_ids =
-                session.model().requires_provider_reasoning_ids();
+            let requires_provider_reasoning_ids = session.model().requires_provider_reasoning_ids();
             for reasoning in accumulated_reasoning.drain(..) {
                 if should_roundtrip_reasoning(requires_provider_reasoning_ids, &reasoning) {
                     content_items.push(AssistantContent::Reasoning(reasoning));
@@ -414,12 +413,12 @@ async fn run_manual_turn(
             }
 
             let executed_tool_calls = execute_tool_calls_concurrently(
-                    Arc::clone(&session),
-                    Arc::clone(&ctx),
-                    pending_tool_calls,
-                    cancellation_token.clone(),
-                )
-                .await?;
+                Arc::clone(&session),
+                Arc::clone(&ctx),
+                pending_tool_calls,
+                cancellation_token.clone(),
+            )
+            .await?;
             for executed in executed_tool_calls {
                 tool_result_messages.push(executed.tool_result_message);
                 inline_notices.extend(executed.inline_notices);
@@ -660,7 +659,8 @@ async fn execute_tool_call(
         internal_call_id,
     } = pending;
 
-    let (tool_output, success, error, inline_notices) = if tool_call.function.name == "spawn_agent" {
+    let (tool_output, success, error, inline_notices) = if tool_call.function.name == "spawn_agent"
+    {
         resolve_spawn_tool_call(Arc::clone(&session), tool_call.function.arguments.clone()).await
     } else {
         let (tool_output, success, error) = match session

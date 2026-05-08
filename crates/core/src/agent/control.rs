@@ -715,7 +715,7 @@ mod tests {
     };
     use smooth_state_db::StateDbHandle;
     use tempfile::TempDir;
-    use tokio::sync::watch;
+    use tokio::sync::RwLock;
 
     use super::AgentControl;
     use crate::{
@@ -769,7 +769,7 @@ mod tests {
             _cwd: PathBuf,
             thread_id: ThreadId,
             _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-            _current_turn_id: Arc<watch::Sender<Option<String>>>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
         ) -> Result<SessionModel> {
@@ -820,7 +820,7 @@ mod tests {
             _cwd: PathBuf,
             thread_id: ThreadId,
             _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-            _current_turn_id: Arc<watch::Sender<Option<String>>>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
         ) -> Result<SessionModel> {

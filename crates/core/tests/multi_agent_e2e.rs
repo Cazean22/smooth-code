@@ -18,7 +18,7 @@ use smooth_core::{
 };
 use smooth_protocol::{AgentStatus, EventMsg, ThreadId, TurnCompletedEvent, TurnStartedEvent};
 use tempfile::TempDir;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{RwLock, Semaphore};
 use tools::{AgentInfo, DynamicToolClient, SpawnAgentParams};
 
 static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -49,7 +49,7 @@ impl SessionModelFactory for AnyThreadFactory {
         _cwd: PathBuf,
         thread_id: ThreadId,
         _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-        _current_turn_id: Arc<watch::Sender<Option<String>>>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
     ) -> Result<SessionModel> {
@@ -370,10 +370,16 @@ impl SessionModelDriver for MixedBatchDriver {
             }
             1 => {
                 assert_eq!(history.len(), 4);
-                assert_eq!(first_user_text(&history[0]), Some("mixed batch".to_string()));
+                assert_eq!(
+                    first_user_text(&history[0]),
+                    Some("mixed batch".to_string())
+                );
                 let spawn_result = tool_result_agent_info(&history[2]);
                 assert_completed_spawn_result(&spawn_result);
-                assert_eq!(tool_result_text(&history[3]), Some("tool-output".to_string()));
+                assert_eq!(
+                    tool_result_text(&history[3]),
+                    Some("tool-output".to_string())
+                );
                 assert!(
                     first_user_text(&prompt)
                         .expect("completion notice text")
@@ -414,7 +420,7 @@ impl SessionModelFactory for MixedBatchFactory {
         _cwd: PathBuf,
         thread_id: ThreadId,
         _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-        _current_turn_id: Arc<watch::Sender<Option<String>>>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
     ) -> Result<SessionModel> {
@@ -445,7 +451,7 @@ impl SessionModelFactory for ConcurrentSpawnFactory {
         _cwd: PathBuf,
         thread_id: ThreadId,
         _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-        _current_turn_id: Arc<watch::Sender<Option<String>>>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
     ) -> Result<SessionModel> {

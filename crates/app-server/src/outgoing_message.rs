@@ -43,22 +43,6 @@ pub(crate) enum OutgoingEnvelope {
     },
 }
 
-#[derive(Debug)]
-pub(crate) struct QueuedOutgoingMessage {
-    pub(crate) message: OutgoingMessage,
-    pub(crate) write_complete_tx: Option<oneshot::Sender<()>>,
-}
-
-impl QueuedOutgoingMessage {
-    #[allow(dead_code)] // Kept for parity with codex's transport-facing API.
-    pub(crate) fn new(message: OutgoingMessage) -> Self {
-        Self {
-            message,
-            write_complete_tx: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub(crate) enum OutgoingMessage {

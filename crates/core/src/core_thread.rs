@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use rig::message::Message;
 use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent, SessionSource};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{RwLock, broadcast};
 use tools::DynamicToolClient;
 
 use crate::provider::{SessionModelFactory, default_session_model_factory};
@@ -61,8 +61,7 @@ impl CoreThread {
         initial_history: Vec<Message>,
     ) -> Result<Self> {
         let cwd = std::env::current_dir()?;
-        let (current_turn_id, _) = watch::channel(None);
-        let current_turn_id = Arc::new(current_turn_id);
+        let current_turn_id = Arc::new(RwLock::new(None));
         let role_override = role_override_from_source(&session_source);
         let model = model_factory
             .unwrap_or_else(default_session_model_factory)
@@ -116,8 +115,7 @@ impl CoreThread {
         agent_control: AgentControl,
     ) -> Result<Self> {
         let cwd = std::env::current_dir()?;
-        let (current_turn_id, _) = watch::channel(None);
-        let current_turn_id = Arc::new(current_turn_id);
+        let current_turn_id = Arc::new(RwLock::new(None));
         let role_override = role_override_from_source(&session_source);
         let model = model_factory
             .unwrap_or_else(default_session_model_factory)

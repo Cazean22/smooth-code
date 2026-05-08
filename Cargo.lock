@@ -41,7 +41,6 @@ dependencies = [
  "smooth-core",
  "smooth-protocol",
  "tokio",
- "tokio-util",
  "tracing",
 ]
 

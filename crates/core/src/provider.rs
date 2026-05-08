@@ -19,7 +19,7 @@ use rig::{
         StreamedAssistantContent, StreamedUserContent, StreamingChat, ToolCallDeltaContent,
     },
 };
-use tokio::sync::watch;
+use tokio::sync::RwLock;
 use tools::{
     CloseAgentTool, DynamicTool, DynamicToolClient, EditTool, ListAgentsTool, ListDirTool,
     ReadTool, RunCommandTool, SendMessageTool, SpawnAgentTool, WriteTool,
@@ -37,7 +37,7 @@ pub trait SessionModelFactory: Send + Sync {
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-        current_turn_id: Arc<watch::Sender<Option<String>>>,
+        current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
     ) -> Result<SessionModel>;
@@ -52,7 +52,7 @@ impl SessionModelFactory for EnvSessionModelFactory {
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-        current_turn_id: Arc<watch::Sender<Option<String>>>,
+        current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
     ) -> Result<SessionModel> {
@@ -151,7 +151,7 @@ impl SessionModel {
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-        current_turn_id: Arc<watch::Sender<Option<String>>>,
+        current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
     ) -> Result<Self> {
@@ -295,7 +295,7 @@ impl SessionModelFactory for StubSessionModelFactory {
         _cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-        _current_turn_id: Arc<watch::Sender<Option<String>>>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
     ) -> Result<SessionModel> {
@@ -313,7 +313,7 @@ fn build_agent<M>(
     cwd: PathBuf,
     thread_id: smooth_protocol::ThreadId,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-    current_turn_id: Arc<watch::Sender<Option<String>>>,
+    current_turn_id: Arc<RwLock<Option<String>>>,
     agent_control: AgentControl,
 ) -> Agent<M>
 where

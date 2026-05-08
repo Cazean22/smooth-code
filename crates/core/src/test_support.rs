@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use tokio::sync::watch;
+use tokio::sync::RwLock;
 use tools::DynamicToolClient;
 
 use crate::{
@@ -28,7 +28,7 @@ impl SessionModelFactory for StubSessionModelFactory {
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
-        current_turn_id: Arc<watch::Sender<Option<String>>>,
+        current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
     ) -> Result<SessionModel> {

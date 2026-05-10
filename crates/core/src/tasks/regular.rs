@@ -239,7 +239,8 @@ async fn run_manual_turn(
     history_before_turn: Vec<Message>,
     cancellation_token: CancellationToken,
 ) -> Option<String> {
-    let mut new_messages = vec![initial_prompt];
+    let mut request_history = history_before_turn;
+    let mut pending_prompt = initial_prompt;
     let mut saw_tool_loop = false;
 
     loop {
@@ -247,17 +248,9 @@ async fn run_manual_turn(
             return None;
         }
 
-        let current_prompt = new_messages
-            .last()
-            .cloned()
-            .expect("manual turn loop should keep a pending prompt");
-        let history_snapshot = build_history_for_request(
-            &history_before_turn,
-            &new_messages[..new_messages.len().saturating_sub(1)],
-        );
         let mut stream = match session
             .model()
-            .stream_completion_turn(current_prompt, &history_snapshot)
+            .stream_completion_turn(pending_prompt.clone(), &request_history)
             .await
         {
             Ok(stream) => stream,
@@ -267,7 +260,6 @@ async fn run_manual_turn(
             }
         };
         let mut pending_tool_calls = Vec::new();
-        let mut tool_result_messages = Vec::new();
         let mut inline_notices = Vec::new();
         let mut accumulated_reasoning = Vec::new();
         let mut pending_reasoning_delta_text = String::new();
@@ -388,6 +380,7 @@ async fn run_manual_turn(
         }
 
         if saw_tool_call_this_turn {
+            let mut continuation_messages = vec![pending_prompt];
             let mut content_items = Vec::new();
             if !turn_summary.response.is_empty() {
                 content_items.push(AssistantContent::text(&turn_summary.response));
@@ -405,7 +398,7 @@ async fn run_manual_turn(
             );
 
             if !content_items.is_empty() {
-                new_messages.push(Message::Assistant {
+                continuation_messages.push(Message::Assistant {
                     id: turn_summary.assistant_message_id.clone(),
                     content: OneOrMany::many(content_items)
                         .expect("tool phase assistant content should not be empty"),
@@ -420,10 +413,9 @@ async fn run_manual_turn(
             )
             .await?;
             for executed in executed_tool_calls {
-                tool_result_messages.push(executed.tool_result_message);
+                continuation_messages.push(executed.tool_result_message);
                 inline_notices.extend(executed.inline_notices);
             }
-            new_messages.extend(tool_result_messages);
 
             for communication in inline_notices {
                 session
@@ -436,14 +428,18 @@ async fn run_manual_turn(
                         ),
                     )
                     .await;
-                new_messages.push(Message::user(render_mailbox_message(&communication)));
+                continuation_messages.push(Message::user(render_mailbox_message(&communication)));
             }
+
+            pending_prompt = continuation_messages
+                .pop()
+                .expect("tool loop continuation should produce a follow-up prompt");
+            request_history.extend(continuation_messages);
             continue;
         }
 
         let last_assistant_message = turn_summary.response.clone();
-        let final_history =
-            build_full_history(&history_before_turn, new_messages.clone(), &turn_summary);
+        let final_history = build_full_history(request_history, pending_prompt, &turn_summary);
         session.replace_history(final_history).await;
         if !last_assistant_message.is_empty() {
             session
@@ -793,23 +789,16 @@ async fn resolve_spawn_tool_call(
     }
 }
 
-fn build_history_for_request(history: &[Message], new_messages: &[Message]) -> Vec<Message> {
-    history.iter().chain(new_messages.iter()).cloned().collect()
-}
-
 fn build_full_history(
-    history_before_turn: &[Message],
-    mut new_messages: Vec<Message>,
+    mut history_before_turn: Vec<Message>,
+    pending_prompt: Message,
     summary: &SessionTurnSummary,
 ) -> Vec<Message> {
+    history_before_turn.push(pending_prompt);
     if !summary.response.is_empty() {
-        new_messages.push(Message::assistant(&summary.response));
+        history_before_turn.push(Message::assistant(&summary.response));
     }
     history_before_turn
-        .iter()
-        .cloned()
-        .chain(new_messages)
-        .collect()
 }
 
 fn merge_reasoning_blocks(

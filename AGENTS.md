@@ -1,14 +1,14 @@
 # smooth-code agent notes
 - No additional `AGENTS.md`/`AGENT.md` files or Cursor/Claude/Windsurf/Cline/Goose/Copilot rule files were found in this repo.
 - Rust 2024 workspace; default member is `crates/tui`, so bare `cargo build/test/run` targets `smooth-tui` unless `--workspace` or `-p` is used.
-- Main crates: `smooth-tui` (`crates/tui`) is the terminal UI entrypoint; `app-server` is the in-process request/event bridge; `smooth-core` is the session/thread runtime; `smooth-protocol` and `app-server-protocol` hold shared wire types.
+- Main crates: `smooth-tui` (`crates/tui`) is the terminal UI entrypoint; `app-server` is the in-process request/event bridge; `smooth-core` is the session/thread runtime; `smooth-protocol` and `app-server-protocol` hold shared wire types; `smooth-state-db` owns the SQLite persistence layer.
 - Runtime flow: TUI -> `AppServerSession` -> `app_server::in_process` -> `MessageProcessor` -> `ThreadManagerState`/`CoreThread`/`Core` -> Rig streaming model/tool loop -> protocol events back to the TUI.
 - Subagent flow: only `spawn_agent` is registered as an LLM-callable agent tool; its schema lives in `crates/tools`, but execution is handled manually in `crates/core/src/tasks/regular.rs` through `AgentControl`.
 - Internal multi-agent controls (`send_input`/list/close/resume/status helpers) live behind `AgentControl`/`ThreadManagerState`; do not reintroduce the old `MultiAgentClient` adapter or expose `send_message`, `list_agents`, or `close_agent` as model tools.
 - Manual tool loop behavior: collect all streamed tool calls before execution, run normal tools concurrently, start all `spawn_agent` calls, return live spawn status only for mixed normal/subagent batches after the grace period, and keep the parent turn open for retained subagent completions.
-- Persistence: rollout sessions are newline-delimited JSON under `.smooth-code/sessions/YYYY/MM/DD/*.jsonl`, telemetry logs go to `.smooth-code/logs/smooth-tui.log`, and multi-agent thread metadata lives in SQLite at `.smooth-code/state.db`.
+- Persistence: rollout sessions are newline-delimited JSON under `.smooth-code/sessions/YYYY/MM/DD/*.jsonl`, telemetry logs go to `.smooth-code/logs/smooth-tui.log`, and multi-agent thread metadata lives in SQLite at `.smooth-code/state.db` via `smooth-state-db`.
 - Internal APIs: shared event/status/thread types live in `crates/protocol`; typed request/response envelopes (`ClientRequest`, `ServerRequest`, `Thread*`, `TurnStart*`) live in `crates/app-server-protocol`.
-- LLM config comes from env vars: `SMOOTH_CODE_LLM_PROVIDER`, `SMOOTH_CODE_LLM_MODEL`, `SMOOTH_CODE_LLM_PREAMBLE`; non-OpenAI providers also need their provider API keys.
+- LLM config comes from env vars: `SMOOTH_CODE_LLM_PROVIDER`, `SMOOTH_CODE_LLM_MODEL`, `SMOOTH_CODE_LLM_PREAMBLE`. Supported providers are `openai`, `openrouter`, `anthropic`, and `gemini`; defaults are `openai` and `gpt-5.4`. The current `openai` path is wired to a local OpenAI-compatible base URL at `http://localhost:8317/v1`, while `openrouter`, `anthropic`, and `gemini` require their respective API keys.
 - `.cargo/config.toml` enables `tokio_unstable`; do not remove it casually.
 - Build/check commands: `cargo check --workspace`, `cargo build --workspace`, `cargo run -p smooth-tui`.
 - Format/lint commands: `cargo fmt`, `cargo fmt -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`.
@@ -16,7 +16,7 @@
 - Single-test pattern: `cargo test -p <package> <module_path::test_name> -- --exact --nocapture`.
 - Example single test: `cargo test -p smooth-tui app::tests::completed_message_without_stream_renders_once -- --exact --nocapture`.
 - Multi-agent integration test target: `cargo test -p smooth-core --test multi_agent_e2e -- --nocapture`; note that `cargo test -p smooth-core multi_agent_e2e -- --nocapture` is only a name filter and may match zero tests.
-- `cargo clippy --all-targets --all-features -- -D warnings` currently fails on a pre-existing `clippy::new_without_default` in `crates/protocol/src/lib.rs`; do not confuse that with your own change.
+- Subagent limits are enforced in `AgentControl`: max depth `8`, max live threads `16`; `spawn_agent` `model` overrides are parsed but currently return `spawn_agent model override is not implemented yet`.
 - Follow `rustfmt`; keep imports grouped as `std`, external crates, then `crate`/local modules, matching the existing files.
 - Prefer `anyhow::Result` plus `.context(...)`/`.with_context(...)` at app boundaries, and `thiserror` for narrow domain/tool errors.
 - This project integrates LLM providers through `rig-core`; when a suitable type already exists there, prefer using the `rig-core` type directly instead of introducing a parallel local type.

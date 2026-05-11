@@ -6,18 +6,17 @@ use std::{
 
 use anyhow::{Context, Result};
 use smooth_protocol::{
-    AgentPath, AgentStatus, CollabResumeBeginEvent, CollabResumeEndEvent, Event, EventMsg, Op,
-    SessionSource, SubAgentSource, ThreadId,
+    AgentPath, AgentStatus, CollabAgentStatusEntry, CollabResumeBeginEvent, CollabResumeEndEvent,
+    Event, EventMsg, Op, SessionSource, SubAgentSource, ThreadId,
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, broadcast};
-use tools::{DynMultiAgentClient, DynamicToolClient, DynamicToolClientFactory};
+use tools::{DynamicToolClient, DynamicToolClientFactory};
 use uuid::Uuid;
 
 use crate::{
     ThreadSummary,
-    agent::AgentControl,
-    agent::InProcessMultiAgentClient,
+    agent::{AgentControl, registry::AgentMetadata, status::last_assistant_message},
     core_thread::CoreThread,
     provider::SessionModelFactory,
     rollout::{find_thread_path, list_threads, load_resume_state, workspace_root},
@@ -172,11 +171,44 @@ impl ThreadManagerState {
         self.agent_control.clone()
     }
 
-    pub fn multi_agent_client(&self, author_thread_id: ThreadId) -> DynMultiAgentClient {
-        Arc::new(InProcessMultiAgentClient::new(
-            author_thread_id,
-            self.agent_control.clone(),
-        ))
+    pub async fn spawn_agent_with_role(
+        &self,
+        parent_thread_id: ThreadId,
+        message: String,
+        agent_role: Option<String>,
+        model: Option<String>,
+        fork_context: bool,
+    ) -> Result<CollabAgentStatusEntry> {
+        let metadata = self
+            .agent_control
+            .spawn_agent_with_role(parent_thread_id, message, agent_role, model, fork_context)
+            .await?;
+        Ok(agent_status_entry(&self.agent_control, metadata))
+    }
+
+    pub fn list_agents(
+        &self,
+        author_thread_id: ThreadId,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<CollabAgentStatusEntry>> {
+        self.agent_control
+            .list_agents(author_thread_id, path_prefix)
+            .map(|agents| {
+                agents
+                    .into_iter()
+                    .map(|agent| agent_status_entry(&self.agent_control, agent))
+                    .collect()
+            })
+    }
+
+    pub async fn close_agent(
+        &self,
+        author_thread_id: ThreadId,
+        target: &str,
+    ) -> Result<AgentStatus> {
+        self.agent_control
+            .close_agent(author_thread_id, target)
+            .await
     }
 
     #[allow(dead_code)]
@@ -376,6 +408,21 @@ impl ThreadManagerState {
             &initial_messages,
         )?;
         Ok(())
+    }
+}
+
+fn agent_status_entry(control: &AgentControl, metadata: AgentMetadata) -> CollabAgentStatusEntry {
+    let thread_id = metadata
+        .agent_id
+        .expect("listed agent metadata should include a thread id");
+    let status = control.get_status(thread_id);
+    CollabAgentStatusEntry {
+        thread_id,
+        agent_path: metadata.agent_path,
+        agent_nickname: metadata.agent_nickname,
+        agent_role: metadata.agent_role,
+        last_assistant_message: last_assistant_message(&status),
+        status,
     }
 }
 

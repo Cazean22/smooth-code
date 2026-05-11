@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::{FutureExt, StreamExt, future::select_all, stream::FuturesUnordered};
 use rig::{
     OneOrMany,
     message::{
@@ -8,17 +8,19 @@ use rig::{
         ToolResult, ToolResultContent, UserContent,
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use smooth_protocol::{
     AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
     AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, EventMsg, ThreadId, ToolCallCompletedEvent,
     ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
-use tools::SpawnAgentParams;
 
 use crate::{
-    agent::InProcessMultiAgentClient,
+    agent::{
+        InlineChildCompletionReceiver, control::InlineChildCompletion, registry::AgentMetadata,
+        status::last_assistant_message,
+    },
     core::{Session, TurnContext},
     provider::{
         SessionAssistantContent, SessionCompletionEvent, SessionStreamEvent, SessionTurnSummary,
@@ -93,10 +95,23 @@ struct ManualSpawnAgentArgs {
     fork_context: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SpawnAgentResult {
+    thread_id: String,
+    agent_path: String,
+    agent_nickname: Option<String>,
+    agent_role: Option<String>,
+    status: Option<String>,
+    #[serde(default)]
+    status_detail: Option<AgentStatus>,
+    #[serde(default)]
+    last_assistant_message: Option<String>,
+}
+
 struct ExecutedToolCall {
     index: usize,
     tool_result_message: Message,
-    inline_notices: Vec<smooth_protocol::InterAgentCommunication>,
 }
 
 struct PendingToolCall {
@@ -106,33 +121,22 @@ struct PendingToolCall {
     internal_call_id: String,
 }
 
-struct InlineWaitGuard {
-    control: crate::agent::AgentControl,
+struct StartedSpawnToolCall {
+    index: usize,
+    tool_call_id: String,
+    tool_call_call_id: Option<String>,
+    internal_call_id: String,
+    metadata: AgentMetadata,
     child_thread_id: ThreadId,
-    armed: bool,
+    initial_status: AgentStatus,
+    waiter: Option<InlineChildCompletionReceiver>,
+    completion: Option<Result<InlineChildCompletion, String>>,
 }
 
-impl InlineWaitGuard {
-    fn new(control: crate::agent::AgentControl, child_thread_id: ThreadId) -> Self {
-        Self {
-            control,
-            child_thread_id,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for InlineWaitGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.control
-                .unregister_inline_child_completion_waiter(self.child_thread_id);
-        }
-    }
+struct RetainedSpawnCompletion {
+    metadata: AgentMetadata,
+    child_thread_id: ThreadId,
+    waiter: InlineChildCompletionReceiver,
 }
 
 impl SessionTask for RegularTask {
@@ -242,10 +246,20 @@ async fn run_manual_turn(
     let mut request_history = history_before_turn;
     let mut pending_prompt = initial_prompt;
     let mut saw_tool_loop = false;
+    let mut retained_subagents = Vec::new();
 
     loop {
         if cancellation_token.is_cancelled() {
             return None;
+        }
+        let ready_completion_texts = drain_ready_retained_subagents(&mut retained_subagents);
+        if !ready_completion_texts.is_empty() {
+            append_user_texts_to_context(
+                &mut request_history,
+                &mut pending_prompt,
+                ready_completion_texts,
+            );
+            continue;
         }
 
         let mut stream = match session
@@ -260,21 +274,41 @@ async fn run_manual_turn(
             }
         };
         let mut pending_tool_calls = Vec::new();
-        let mut inline_notices = Vec::new();
         let mut accumulated_reasoning = Vec::new();
         let mut pending_reasoning_delta_text = String::new();
         let mut pending_reasoning_delta_id = None;
         let mut saw_tool_call_this_turn = false;
+        let mut late_spawn_completion_texts = Vec::new();
         let mut turn_summary = SessionTurnSummary {
             assistant_message_id: None,
             response: String::new(),
         };
 
-        while let Some(item) = stream.next().await {
+        loop {
             if cancellation_token.is_cancelled() {
                 return None;
             }
 
+            let item = if retained_subagents.is_empty() {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => return None,
+                    item = stream.next() => item,
+                }
+            } else {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => return None,
+                    completion = next_retained_subagent_completion(&mut retained_subagents) => {
+                        if let Some(completion_text) = completion {
+                            late_spawn_completion_texts.push(completion_text);
+                        }
+                        continue;
+                    }
+                    item = stream.next() => item,
+                }
+            };
+            let Some(item) = item else {
+                break;
+            };
             let event = match item {
                 Ok(event) => event,
                 Err(err) => {
@@ -410,31 +444,52 @@ async fn run_manual_turn(
                 Arc::clone(&ctx),
                 pending_tool_calls,
                 cancellation_token.clone(),
+                &mut retained_subagents,
             )
             .await?;
             for executed in executed_tool_calls {
                 continuation_messages.push(executed.tool_result_message);
-                inline_notices.extend(executed.inline_notices);
             }
 
-            for communication in inline_notices {
-                session
-                    .emit_event(
-                        &ctx,
-                        EventMsg::InterAgentMessage(
-                            smooth_protocol::InterAgentCommunicationEvent {
-                                communication: communication.clone(),
-                            },
-                        ),
-                    )
-                    .await;
-                continuation_messages.push(Message::user(render_mailbox_message(&communication)));
+            for completion_text in late_spawn_completion_texts {
+                continuation_messages.push(Message::user(completion_text));
             }
 
             pending_prompt = continuation_messages
                 .pop()
                 .expect("tool loop continuation should produce a follow-up prompt");
             request_history.extend(continuation_messages);
+            continue;
+        }
+
+        if !late_spawn_completion_texts.is_empty() {
+            append_completion_texts_after_assistant_turn(
+                &mut request_history,
+                &mut pending_prompt,
+                &turn_summary,
+                &mut accumulated_reasoning,
+                session.model().requires_provider_reasoning_ids(),
+                late_spawn_completion_texts,
+            );
+            continue;
+        }
+
+        if !retained_subagents.is_empty() {
+            let completion_text = tokio::select! {
+                _ = cancellation_token.cancelled() => return None,
+                completion = next_retained_subagent_completion(&mut retained_subagents) => completion,
+            };
+            if let Some(completion_text) = completion_text {
+                append_completion_texts_after_assistant_turn(
+                    &mut request_history,
+                    &mut pending_prompt,
+                    &turn_summary,
+                    &mut accumulated_reasoning,
+                    session.model().requires_provider_reasoning_ids(),
+                    vec![completion_text],
+                );
+                continue;
+            }
             continue;
         }
 
@@ -643,7 +698,7 @@ async fn run_opaque_turn(
     Some(last_assistant_message)
 }
 
-async fn execute_tool_call(
+async fn execute_normal_tool_call(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     pending: PendingToolCall,
@@ -655,27 +710,47 @@ async fn execute_tool_call(
         internal_call_id,
     } = pending;
 
-    let (tool_output, success, error, inline_notices) = if tool_call.function.name == "spawn_agent"
+    let (tool_output, success, error) = match session
+        .model()
+        .call_tool(
+            &tool_call.function.name,
+            &tool_call.function.arguments.to_string(),
+        )
+        .await
     {
-        resolve_spawn_tool_call(Arc::clone(&session), tool_call.function.arguments.clone()).await
-    } else {
-        let (tool_output, success, error) = match session
-            .model()
-            .call_tool(
-                &tool_call.function.name,
-                &tool_call.function.arguments.to_string(),
-            )
-            .await
-        {
-            Ok(output) => (output, true, None),
-            Err(err) => {
-                let message = err.to_string();
-                (message.clone(), false, Some(message))
-            }
-        };
-        (tool_output, success, error, Vec::new())
+        Ok(output) => (output, true, None),
+        Err(err) => {
+            let message = err.to_string();
+            (message.clone(), false, Some(message))
+        }
     };
 
+    complete_tool_call(
+        session,
+        ctx,
+        index,
+        tool_call.id,
+        tool_call.call_id,
+        internal_call_id,
+        tool_output,
+        success,
+        error,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_tool_call(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    index: usize,
+    tool_call_id: String,
+    tool_call_call_id: Option<String>,
+    internal_call_id: String,
+    tool_output: String,
+    success: bool,
+    error: Option<String>,
+) -> ExecutedToolCall {
     session
         .emit_event(
             &ctx,
@@ -693,11 +768,10 @@ async fn execute_tool_call(
     ExecutedToolCall {
         index,
         tool_result_message: tool_result_to_user_message(
-            tool_call.id,
-            tool_call.call_id,
+            tool_call_id,
+            tool_call_call_id,
             tool_output,
         ),
-        inline_notices,
     }
 }
 
@@ -706,12 +780,28 @@ async fn execute_tool_calls_concurrently(
     ctx: Arc<TurnContext>,
     pending_tool_calls: Vec<PendingToolCall>,
     cancellation_token: CancellationToken,
+    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
 ) -> Option<Vec<ExecutedToolCall>> {
-    let mut pending_futures = pending_tool_calls
-        .into_iter()
-        .map(|pending| execute_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending))
-        .collect::<FuturesUnordered<_>>();
+    let mut normal_tool_calls = Vec::new();
+    let mut spawn_tool_calls = Vec::new();
     let mut resolved = Vec::new();
+
+    for pending in pending_tool_calls {
+        if pending.tool_call.function.name == "spawn_agent" {
+            match start_spawn_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending).await {
+                SpawnToolStart::Started(started) => spawn_tool_calls.push(started),
+                SpawnToolStart::Completed(executed) => resolved.push(executed),
+            }
+        } else {
+            normal_tool_calls.push(pending);
+        }
+    }
+
+    let has_normal_tools = !normal_tool_calls.is_empty();
+    let mut pending_futures = normal_tool_calls
+        .into_iter()
+        .map(|pending| execute_normal_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending))
+        .collect::<FuturesUnordered<_>>();
     while !pending_futures.is_empty() {
         let next = tokio::select! {
             _ = cancellation_token.cancelled() => return None,
@@ -722,70 +812,371 @@ async fn execute_tool_calls_concurrently(
         };
         resolved.push(executed);
     }
+
+    if !spawn_tool_calls.is_empty() {
+        let wait_mode = if has_normal_tools {
+            SpawnWaitMode::GracePeriod(Duration::from_secs(1))
+        } else {
+            SpawnWaitMode::UntilAllComplete
+        };
+        wait_for_spawn_tool_calls(&mut spawn_tool_calls, wait_mode, &cancellation_token).await?;
+
+        for mut spawn_call in spawn_tool_calls {
+            if spawn_call.completion.is_none()
+                && let Some(waiter) = spawn_call.waiter.take()
+            {
+                retained_subagents.push(RetainedSpawnCompletion {
+                    metadata: spawn_call.metadata.clone(),
+                    child_thread_id: spawn_call.child_thread_id,
+                    waiter,
+                });
+            }
+            let executed =
+                complete_spawn_tool_call(Arc::clone(&session), Arc::clone(&ctx), spawn_call).await;
+            resolved.push(executed);
+        }
+    }
+
     resolved.sort_by_key(|executed| executed.index);
     Some(resolved)
 }
 
-async fn resolve_spawn_tool_call(
+enum SpawnToolStart {
+    Started(StartedSpawnToolCall),
+    Completed(ExecutedToolCall),
+}
+
+async fn start_spawn_tool_call(
     session: Arc<Session>,
-    arguments: serde_json::Value,
-) -> (
-    String,
-    bool,
-    Option<String>,
-    Vec<smooth_protocol::InterAgentCommunication>,
-) {
-    let args = match serde_json::from_value::<ManualSpawnAgentArgs>(arguments) {
+    ctx: Arc<TurnContext>,
+    pending: PendingToolCall,
+) -> SpawnToolStart {
+    let PendingToolCall {
+        index,
+        assistant_tool_call: _,
+        tool_call,
+        internal_call_id,
+    } = pending;
+    let args = match serde_json::from_value::<ManualSpawnAgentArgs>(
+        tool_call.function.arguments.clone(),
+    ) {
         Ok(args) => args,
         Err(err) => {
             let message = format!("invalid spawn_agent args: {err}");
-            return (message.clone(), false, Some(message), Vec::new());
+            return SpawnToolStart::Completed(
+                complete_tool_call(
+                    session,
+                    ctx,
+                    index,
+                    tool_call.id,
+                    tool_call.call_id,
+                    internal_call_id,
+                    message.clone(),
+                    false,
+                    Some(message),
+                )
+                .await,
+            );
         }
     };
-    let client = InProcessMultiAgentClient::new(session.id, session.agent_control.clone());
-    match client
-        .spawn_with_inline_wait(SpawnAgentParams {
-            message: args.message,
-            agent_type: args.agent_type,
-            model: args.model,
-            fork_context: args.fork_context,
-        })
+
+    match session
+        .agent_control
+        .spawn_agent_with_role_for_tool(
+            session.id,
+            args.message,
+            args.agent_type,
+            args.model,
+            args.fork_context,
+        )
         .await
     {
-        Ok((mut agent_info, waiter)) => {
-            let child_thread_id = match agent_info.thread_id.parse::<ThreadId>() {
-                Ok(thread_id) => thread_id,
-                Err(err) => {
-                    let message = format!("invalid spawned thread id: {err}");
-                    return (message.clone(), false, Some(message), Vec::new());
-                }
-            };
-            let mut guard = InlineWaitGuard::new(session.agent_control.clone(), child_thread_id);
-            match waiter.await {
-                Ok(completion) => {
-                    guard.disarm();
-                    agent_info.status = Some(agent_status_label(&completion.status).to_string());
-                    agent_info.status_detail = Some(completion.status.clone());
-                    agent_info.last_assistant_message = completion.last_assistant_message.clone();
-                    match serde_json::to_string(&agent_info) {
-                        Ok(output) => (output, true, None, vec![completion.communication]),
-                        Err(err) => {
-                            let message = format!("failed to encode spawn_agent output: {err}");
-                            (message.clone(), false, Some(message), Vec::new())
-                        }
-                    }
-                }
-                Err(err) => {
-                    guard.disarm();
-                    let message = format!("spawn_agent inline wait failed to resolve: {err}");
-                    (message.clone(), false, Some(message), Vec::new())
-                }
-            }
-        }
+        Ok((metadata, initial_status, waiter)) => SpawnToolStart::Started(StartedSpawnToolCall {
+            index,
+            tool_call_id: tool_call.id,
+            tool_call_call_id: tool_call.call_id,
+            internal_call_id,
+            child_thread_id: metadata
+                .agent_id
+                .expect("spawned agent metadata should have a thread id"),
+            metadata,
+            initial_status,
+            waiter: Some(waiter),
+            completion: None,
+        }),
         Err(err) => {
             let message = err.to_string();
-            (message.clone(), false, Some(message), Vec::new())
+            SpawnToolStart::Completed(
+                complete_tool_call(
+                    session,
+                    ctx,
+                    index,
+                    tool_call.id,
+                    tool_call.call_id,
+                    internal_call_id,
+                    message.clone(),
+                    false,
+                    Some(message),
+                )
+                .await,
+            )
         }
+    }
+}
+
+enum SpawnWaitMode {
+    UntilAllComplete,
+    GracePeriod(Duration),
+}
+
+async fn wait_for_spawn_tool_calls(
+    spawn_tool_calls: &mut [StartedSpawnToolCall],
+    wait_mode: SpawnWaitMode,
+    cancellation_token: &CancellationToken,
+) -> Option<()> {
+    match wait_mode {
+        SpawnWaitMode::UntilAllComplete => {
+            while spawn_tool_calls.iter().any(|call| call.waiter.is_some()) {
+                let completion = tokio::select! {
+                    _ = cancellation_token.cancelled() => return None,
+                    completion = next_started_spawn_completion(spawn_tool_calls) => completion,
+                };
+                let Some((index, completion)) = completion else {
+                    break;
+                };
+                spawn_tool_calls[index].completion = Some(completion);
+            }
+        }
+        SpawnWaitMode::GracePeriod(duration) => {
+            let deadline = tokio::time::sleep(duration);
+            tokio::pin!(deadline);
+            while spawn_tool_calls.iter().any(|call| call.waiter.is_some()) {
+                let completion = tokio::select! {
+                    _ = cancellation_token.cancelled() => return None,
+                    _ = &mut deadline => break,
+                    completion = next_started_spawn_completion(spawn_tool_calls) => completion,
+                };
+                let Some((index, completion)) = completion else {
+                    break;
+                };
+                spawn_tool_calls[index].completion = Some(completion);
+            }
+        }
+    }
+    Some(())
+}
+
+async fn next_started_spawn_completion(
+    spawn_tool_calls: &mut [StartedSpawnToolCall],
+) -> Option<(usize, Result<InlineChildCompletion, String>)> {
+    let futures = spawn_tool_calls
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            call.waiter.as_mut().map(|waiter| {
+                waiter.map(move |result| {
+                    (
+                        index,
+                        result.map_err(|err| {
+                            format!("spawn_agent inline wait failed to resolve: {err}")
+                        }),
+                    )
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if futures.is_empty() {
+        return None;
+    }
+
+    let ((index, completion), _selected_index, remaining) = select_all(futures).await;
+    drop(remaining);
+    spawn_tool_calls[index].waiter = None;
+    Some((index, completion))
+}
+
+async fn complete_spawn_tool_call(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    spawn_call: StartedSpawnToolCall,
+) -> ExecutedToolCall {
+    let (tool_output, success, error) = spawn_tool_call_output(&session, &spawn_call);
+    complete_tool_call(
+        session,
+        ctx,
+        spawn_call.index,
+        spawn_call.tool_call_id,
+        spawn_call.tool_call_call_id,
+        spawn_call.internal_call_id,
+        tool_output,
+        success,
+        error,
+    )
+    .await
+}
+
+fn spawn_tool_call_output(
+    session: &Session,
+    spawn_call: &StartedSpawnToolCall,
+) -> (String, bool, Option<String>) {
+    match spawn_call.completion.as_ref() {
+        Some(Ok(completion)) => encode_spawn_agent_result(
+            &spawn_call.metadata,
+            &completion.status,
+            completion.last_assistant_message.clone(),
+        )
+        .map(|output| (output, true, None))
+        .unwrap_or_else(|message| (message.clone(), false, Some(message))),
+        Some(Err(message)) => (message.clone(), false, Some(message.clone())),
+        None => {
+            let status = match session.agent_control.get_status(spawn_call.child_thread_id) {
+                AgentStatus::NotFound => spawn_call.initial_status.clone(),
+                status => status,
+            };
+            encode_spawn_agent_result(&spawn_call.metadata, &status, None)
+                .map(|output| (output, true, None))
+                .unwrap_or_else(|message| (message.clone(), false, Some(message)))
+        }
+    }
+}
+
+fn drain_ready_retained_subagents(
+    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+) -> Vec<String> {
+    let mut ready = Vec::new();
+    let mut index = 0;
+    while index < retained_subagents.len() {
+        let completion = match retained_subagents[index].waiter.try_recv() {
+            Ok(completion) => Some(Ok(completion)),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some(Err(format!(
+                "spawn_agent inline wait failed to resolve for child {}",
+                retained_subagents[index].child_thread_id
+            ))),
+        };
+        if let Some(completion) = completion {
+            let retained = retained_subagents.remove(index);
+            ready.push(retained_completion_text(retained, completion));
+        } else {
+            index += 1;
+        }
+    }
+    ready
+}
+
+async fn next_retained_subagent_completion(
+    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+) -> Option<String> {
+    let futures = retained_subagents
+        .iter_mut()
+        .enumerate()
+        .map(|(index, retained)| {
+            (&mut retained.waiter).map(move |result| {
+                (
+                    index,
+                    result
+                        .map_err(|err| format!("spawn_agent inline wait failed to resolve: {err}")),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if futures.is_empty() {
+        return None;
+    }
+
+    let ((index, completion), _selected_index, remaining) = select_all(futures).await;
+    drop(remaining);
+    let retained = retained_subagents.remove(index);
+    Some(retained_completion_text(retained, completion))
+}
+
+fn retained_completion_text(
+    retained: RetainedSpawnCompletion,
+    completion: Result<InlineChildCompletion, String>,
+) -> String {
+    let (status, last_assistant_message) = match completion {
+        Ok(completion) => (completion.status, completion.last_assistant_message),
+        Err(message) => (AgentStatus::Errored(message), None),
+    };
+    encode_spawn_agent_result(&retained.metadata, &status, last_assistant_message)
+        .unwrap_or_else(|message| message)
+}
+
+fn append_user_texts_to_context(
+    request_history: &mut Vec<Message>,
+    pending_prompt: &mut Message,
+    user_texts: Vec<String>,
+) {
+    let mut continuation_messages = vec![pending_prompt.clone()];
+    continuation_messages.extend(user_texts.into_iter().map(Message::user));
+    *pending_prompt = continuation_messages
+        .pop()
+        .expect("user-text continuation should produce a follow-up prompt");
+    request_history.extend(continuation_messages);
+}
+
+fn append_completion_texts_after_assistant_turn(
+    request_history: &mut Vec<Message>,
+    pending_prompt: &mut Message,
+    turn_summary: &SessionTurnSummary,
+    accumulated_reasoning: &mut Vec<MessageReasoning>,
+    requires_provider_reasoning_ids: bool,
+    completion_texts: Vec<String>,
+) {
+    let mut continuation_messages = vec![pending_prompt.clone()];
+    let mut content_items = Vec::new();
+    if !turn_summary.response.is_empty() {
+        content_items.push(AssistantContent::text(&turn_summary.response));
+    }
+    for reasoning in accumulated_reasoning.drain(..) {
+        if should_roundtrip_reasoning(requires_provider_reasoning_ids, &reasoning) {
+            content_items.push(AssistantContent::Reasoning(reasoning));
+        }
+    }
+    if !content_items.is_empty() {
+        continuation_messages.push(Message::Assistant {
+            id: turn_summary.assistant_message_id.clone(),
+            content: OneOrMany::many(content_items)
+                .expect("assistant continuation content should not be empty"),
+        });
+    }
+    continuation_messages.extend(completion_texts.into_iter().map(Message::user));
+    *pending_prompt = continuation_messages
+        .pop()
+        .expect("completion continuation should produce a follow-up prompt");
+    request_history.extend(continuation_messages);
+}
+
+fn encode_spawn_agent_result(
+    metadata: &AgentMetadata,
+    status: &AgentStatus,
+    last_assistant_message_override: Option<String>,
+) -> Result<String, String> {
+    serde_json::to_string(&spawn_agent_result_from_metadata(
+        metadata,
+        status,
+        last_assistant_message_override,
+    ))
+    .map_err(|err| format!("failed to encode spawn_agent output: {err}"))
+}
+
+fn spawn_agent_result_from_metadata(
+    metadata: &AgentMetadata,
+    status: &AgentStatus,
+    last_assistant_message_override: Option<String>,
+) -> SpawnAgentResult {
+    SpawnAgentResult {
+        thread_id: metadata
+            .agent_id
+            .map(|thread_id| thread_id.to_string())
+            .unwrap_or_default(),
+        agent_path: metadata.agent_path.to_string(),
+        agent_nickname: metadata.agent_nickname.clone(),
+        agent_role: metadata.agent_role.clone(),
+        status: Some(agent_status_label(status).to_string()),
+        status_detail: Some(status.clone()),
+        last_assistant_message: last_assistant_message_override
+            .or_else(|| last_assistant_message(status)),
     }
 }
 

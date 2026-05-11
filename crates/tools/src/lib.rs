@@ -14,10 +14,7 @@ pub use dynamic_tool::{DynamicTool, DynamicToolArgs};
 pub use edit::{EditArgs, EditTool};
 pub use error::ToolFailure;
 pub use list_dir::{ListDirArgs, ListDirTool};
-pub use multi_agents::{
-    AgentInfo, CloseAgentTool, DynMultiAgentClient, ListAgentsTool, MultiAgentClient,
-    SendMessageTool, SpawnAgentParams, SpawnAgentTool,
-};
+pub use multi_agents::SpawnAgentTool;
 pub use read::{ReadArgs, ReadTool};
 pub use run_command::{RunCommandArgs, RunCommandTool};
 pub use write::{WriteArgs, WriteTool};

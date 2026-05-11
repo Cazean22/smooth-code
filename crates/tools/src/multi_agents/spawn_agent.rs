@@ -2,14 +2,10 @@ use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
-use crate::{
-    ToolFailure,
-    multi_agents::client::{DynMultiAgentClient, SpawnAgentParams},
-};
+use crate::ToolFailure;
 
 #[derive(Clone)]
 pub struct SpawnAgentTool {
-    client: DynMultiAgentClient,
     description: String,
 }
 
@@ -24,11 +20,8 @@ pub struct SpawnAgentArgs {
 }
 
 impl SpawnAgentTool {
-    pub fn new(client: DynMultiAgentClient, description: String) -> Self {
-        Self {
-            client,
-            description,
-        }
+    pub fn new(description: String) -> Self {
+        Self { description }
     }
 }
 
@@ -48,16 +41,9 @@ impl Tool for SpawnAgentTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let output = self
-            .client
-            .spawn(SpawnAgentParams {
-                message: args.message,
-                agent_type: args.agent_type,
-                model: args.model,
-                fork_context: args.fork_context,
-            })
-            .await?;
-        serde_json::to_string(&output)
-            .map_err(|err| ToolFailure::new(format!("failed to encode spawn_agent output: {err}")))
+        let _ = args;
+        Err(ToolFailure::new(
+            "spawn_agent is executed by the smooth-core manual tool loop",
+        ))
     }
 }

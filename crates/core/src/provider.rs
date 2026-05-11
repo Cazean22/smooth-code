@@ -21,12 +21,12 @@ use rig::{
 };
 use tokio::sync::RwLock;
 use tools::{
-    CloseAgentTool, DynamicTool, DynamicToolClient, EditTool, ListAgentsTool, ListDirTool,
-    ReadTool, RunCommandTool, SendMessageTool, SpawnAgentTool, WriteTool,
+    DynamicTool, DynamicToolClient, EditTool, ListDirTool, ReadTool, RunCommandTool,
+    SpawnAgentTool, WriteTool,
 };
 
 use crate::agent::{
-    AgentControl, InProcessMultiAgentClient,
+    AgentControl,
     role::{RoleOverride, render_spawn_agent_tool_description},
 };
 
@@ -314,7 +314,7 @@ fn build_agent<M>(
     thread_id: smooth_protocol::ThreadId,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     current_turn_id: Arc<RwLock<Option<String>>>,
-    agent_control: AgentControl,
+    _agent_control: AgentControl,
 ) -> Agent<M>
 where
     M: rig::completion::CompletionModel,
@@ -335,15 +335,7 @@ where
     } else {
         builder
     };
-    let multi_agent_client = Arc::new(InProcessMultiAgentClient::new(thread_id, agent_control));
-    let builder = builder
-        .tool(SpawnAgentTool::new(
-            multi_agent_client.clone(),
-            render_spawn_agent_tool_description(),
-        ))
-        .tool(SendMessageTool::new(multi_agent_client.clone()))
-        .tool(ListAgentsTool::new(multi_agent_client.clone()))
-        .tool(CloseAgentTool::new(multi_agent_client));
+    let builder = builder.tool(SpawnAgentTool::new(render_spawn_agent_tool_description()));
     builder.default_max_turns(99999).build()
 }
 
@@ -480,5 +472,94 @@ where
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashSet, sync::Arc};
+
+    use rig::{
+        agent::AgentBuilder,
+        completion::{
+            CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
+        },
+        streaming::StreamingCompletionResponse,
+    };
+    use serde::{Deserialize, Serialize};
+    use tokio::sync::RwLock;
+
+    use super::build_agent;
+    use crate::agent::AgentControl;
+
+    #[derive(Clone, Debug)]
+    struct DummyModel;
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct DummyStreamingResponse;
+
+    impl rig::completion::GetTokenUsage for DummyStreamingResponse {
+        fn token_usage(&self) -> Option<Usage> {
+            None
+        }
+    }
+
+    #[allow(refining_impl_trait)]
+    impl CompletionModel for DummyModel {
+        type Response = serde_json::Value;
+        type StreamingResponse = DummyStreamingResponse;
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse<Self::Response>, CompletionError> {
+            Err(CompletionError::ProviderError(
+                "dummy completion model".to_string(),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<
+            StreamingCompletionResponse<Self::StreamingResponse>,
+            CompletionError,
+        > {
+            Err(CompletionError::ProviderError(
+                "dummy completion model".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn build_agent_registers_only_spawn_agent_agent_tool() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let agent = build_agent(
+            AgentBuilder::new(DummyModel),
+            workspace.path().to_path_buf(),
+            smooth_protocol::ThreadId::new(),
+            None,
+            Arc::new(RwLock::new(None)),
+            AgentControl::new(),
+        );
+
+        let tool_names = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("tool definitions")
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<HashSet<_>>();
+
+        assert!(tool_names.contains("spawn_agent"));
+        assert!(!tool_names.contains("send_message"));
+        assert!(!tool_names.contains("list_agents"));
+        assert!(!tool_names.contains("close_agent"));
     }
 }

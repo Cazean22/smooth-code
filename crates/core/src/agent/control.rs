@@ -5,12 +5,13 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use smooth_protocol::{
-    AgentStatus, CollabAgentCompletedEvent, EventMsg, InterAgentCommunication, Op, SessionSource,
-    SubAgentSource, ThreadId,
+    AgentStatus, CollabAgentCompletedEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
+    EventMsg, InterAgentCommunication, Op, SessionSource, SubAgentSource, ThreadId,
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, oneshot, watch};
 use tools::DynamicToolClientFactory;
+use uuid::Uuid;
 
 use crate::{
     agent::{
@@ -237,6 +238,77 @@ impl AgentControl {
             .await?;
         let waiter = waiter.expect("inline waiter should be registered");
         Ok((metadata, waiter))
+    }
+
+    pub(crate) async fn spawn_agent_with_role_for_tool(
+        &self,
+        parent_thread_id: ThreadId,
+        message: String,
+        agent_role: Option<String>,
+        model: Option<String>,
+        fork_context: bool,
+    ) -> Result<(AgentMetadata, AgentStatus, InlineChildCompletionReceiver)> {
+        let call_id = Uuid::now_v7().to_string();
+        self.emit_collab_event(
+            parent_thread_id,
+            EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+                call_id: call_id.clone(),
+                sender_thread_id: parent_thread_id,
+                prompt: message.clone(),
+                model: model.clone(),
+            }),
+        )
+        .await;
+
+        match self
+            .spawn_agent_with_role_inline_wait(
+                parent_thread_id,
+                message.clone(),
+                agent_role.clone(),
+                model.clone(),
+                fork_context,
+            )
+            .await
+        {
+            Ok((metadata, waiter)) => {
+                let thread_id = metadata
+                    .agent_id
+                    .ok_or_else(|| anyhow!("spawned agent is missing thread id"))?;
+                let status = self.get_status(thread_id);
+                self.emit_collab_event(
+                    parent_thread_id,
+                    EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                        call_id,
+                        sender_thread_id: parent_thread_id,
+                        new_thread_id: Some(thread_id),
+                        new_agent_nickname: metadata.agent_nickname.clone(),
+                        new_agent_role: metadata.agent_role.clone(),
+                        prompt: message,
+                        model,
+                        status: status.clone(),
+                    }),
+                )
+                .await;
+                Ok((metadata, status, waiter))
+            }
+            Err(err) => {
+                self.emit_collab_event(
+                    parent_thread_id,
+                    EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                        call_id,
+                        sender_thread_id: parent_thread_id,
+                        new_thread_id: None,
+                        new_agent_nickname: None,
+                        new_agent_role: agent_role,
+                        prompt: message,
+                        model,
+                        status: AgentStatus::Errored(err.to_string()),
+                    }),
+                )
+                .await;
+                Err(err)
+            }
+        }
     }
 
     async fn spawn_agent_with_role_internal(

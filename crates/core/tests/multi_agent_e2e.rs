@@ -11,17 +11,34 @@ use rig::{
     agent::FinalResponse,
     message::{Message, Text, ToolCall, ToolFunction, UserContent},
 };
+use serde::Deserialize;
 use smooth_core::{
     AgentControl, RoleOverride, SessionAssistantContent, SessionCompletionEvent,
     SessionCompletionStream, SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
     SessionStreamEvent, SessionTurnSummary, ThreadManagerState,
 };
-use smooth_protocol::{AgentStatus, EventMsg, ThreadId, TurnCompletedEvent, TurnStartedEvent};
+use smooth_protocol::{
+    AgentStatus, CollabAgentStatusEntry, EventMsg, ThreadId, TurnCompletedEvent, TurnStartedEvent,
+};
 use tempfile::TempDir;
 use tokio::sync::{RwLock, Semaphore};
-use tools::{AgentInfo, DynamicToolClient, SpawnAgentParams};
+use tools::DynamicToolClient;
 
 static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct TestAgentInfo {
+    thread_id: String,
+    agent_path: String,
+    agent_nickname: Option<String>,
+    agent_role: Option<String>,
+    status: Option<String>,
+    #[serde(default)]
+    status_detail: Option<AgentStatus>,
+    #[serde(default)]
+    last_assistant_message: Option<String>,
+}
 
 struct StubDriver {
     text: String,
@@ -60,7 +77,7 @@ impl SessionModelFactory for AnyThreadFactory {
 }
 
 #[tokio::test]
-async fn multi_agent_client_round_trip_spawns_lists_closes_and_passively_notifies_parent() {
+async fn agent_control_round_trip_spawns_lists_closes_and_passively_notifies_parent() {
     let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
     let workspace = TempDir::new().expect("tempdir");
     let original_cwd = std::env::current_dir().expect("cwd");
@@ -72,18 +89,18 @@ async fn multi_agent_client_round_trip_spawns_lists_closes_and_passively_notifie
     let started = manager.start_thread().await.expect("start root");
     let root_id = started.thread_id;
     let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
-    let client = manager.multi_agent_client(root_id);
 
-    let spawned = client
-        .spawn(SpawnAgentParams {
-            message: "inspect workspace".to_string(),
-            agent_type: Some("explorer".to_string()),
-            model: None,
-            fork_context: false,
-        })
+    let spawned = manager
+        .spawn_agent_with_role(
+            root_id,
+            "inspect workspace".to_string(),
+            Some("explorer".to_string()),
+            None,
+            false,
+        )
         .await
         .expect("spawn should succeed");
-    assert!(spawned.agent_path.starts_with("/root/"));
+    assert!(spawned.agent_path.as_str().starts_with("/root/"));
     assert_eq!(spawned.agent_role.as_deref(), Some("explorer"));
 
     let mut saw_completion = false;
@@ -100,8 +117,8 @@ async fn multi_agent_client_round_trip_spawns_lists_closes_and_passively_notifie
         match event.msg {
             EventMsg::CollabAgentCompleted(event) => {
                 assert_eq!(event.parent_thread_id, root_id);
-                assert_eq!(event.child_thread_id.to_string(), spawned.thread_id);
-                assert_eq!(event.agent_path.as_str(), spawned.agent_path);
+                assert_eq!(event.child_thread_id, spawned.thread_id);
+                assert_eq!(event.agent_path, spawned.agent_path);
                 assert_eq!(
                     event.status,
                     AgentStatus::Completed(Some(format!("done:{}", spawned.thread_id)))
@@ -109,7 +126,7 @@ async fn multi_agent_client_round_trip_spawns_lists_closes_and_passively_notifie
                 saw_completion = true;
             }
             EventMsg::InterAgentMessage(event) => {
-                if event.communication.author.as_str() == spawned.agent_path {
+                if event.communication.author == spawned.agent_path {
                     assert_eq!(event.communication.recipient.as_str(), "/root");
                     assert!(event.communication.trigger_turn);
                     assert!(event.communication.content.contains("[agent_completed]"));
@@ -143,9 +160,8 @@ async fn multi_agent_client_round_trip_spawns_lists_closes_and_passively_notifie
         "expected passive completion notice in parent mailbox"
     );
 
-    let listed = client
-        .list_agents(Some("/root".to_string()))
-        .await
+    let listed = manager
+        .list_agents(root_id, Some("/root"))
         .expect("list should succeed");
     assert_eq!(listed.len(), 2);
     assert!(
@@ -154,11 +170,11 @@ async fn multi_agent_client_round_trip_spawns_lists_closes_and_passively_notifie
             .any(|agent| agent.agent_path == spawned.agent_path)
     );
 
-    let closed = client
-        .close_agent(spawned.agent_path)
+    let closed = manager
+        .close_agent(root_id, spawned.agent_path.as_str())
         .await
         .expect("close should succeed");
-    assert_eq!(closed, "shutdown");
+    assert_eq!(closed, AgentStatus::Shutdown);
 
     std::env::set_current_dir(original_cwd).expect("restore cwd");
 }
@@ -237,27 +253,17 @@ impl SessionModelDriver for ConcurrentSpawnDriver {
                 ])))
             }
             1 => {
-                assert_eq!(history.len(), 5);
+                assert_eq!(history.len(), 3);
                 assert_eq!(
                     first_user_text(&history[0]),
                     Some("delegate children".to_string())
                 );
                 let first_spawn = tool_result_agent_info(&history[2]);
-                let second_spawn = tool_result_agent_info(&history[3]);
+                let second_spawn = tool_result_agent_info(&prompt);
                 assert_completed_spawn_result(&first_spawn);
                 assert_completed_spawn_result(&second_spawn);
                 assert_ne!(first_spawn.thread_id, second_spawn.thread_id);
                 assert_ne!(first_spawn.agent_path, second_spawn.agent_path);
-                assert!(
-                    first_user_text(&history[4])
-                        .expect("first completion notice text")
-                        .contains("[agent_completed]")
-                );
-                assert!(
-                    first_user_text(&prompt)
-                        .expect("second completion notice text")
-                        .contains("[agent_completed]")
-                );
 
                 Ok(Box::pin(stream::iter(vec![
                     Ok(SessionCompletionEvent::AssistantItem(
@@ -369,22 +375,36 @@ impl SessionModelDriver for MixedBatchDriver {
                 ])))
             }
             1 => {
+                assert_eq!(history.len(), 3);
+                assert_eq!(
+                    first_user_text(&history[0]),
+                    Some("mixed batch".to_string())
+                );
+                let spawn_result = tool_result_agent_info(&history[2]);
+                assert_live_spawn_result(&spawn_result);
+                assert_eq!(tool_result_text(&prompt), Some("tool-output".to_string()));
+
+                Ok(Box::pin(stream::iter(vec![Ok(
+                    SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-waiting".to_string()),
+                        response: String::new(),
+                    }),
+                )])))
+            }
+            2 => {
                 assert_eq!(history.len(), 4);
                 assert_eq!(
                     first_user_text(&history[0]),
                     Some("mixed batch".to_string())
                 );
                 let spawn_result = tool_result_agent_info(&history[2]);
-                assert_completed_spawn_result(&spawn_result);
+                assert_live_spawn_result(&spawn_result);
                 assert_eq!(
                     tool_result_text(&history[3]),
                     Some("tool-output".to_string())
                 );
-                assert!(
-                    first_user_text(&prompt)
-                        .expect("completion notice text")
-                        .contains("[agent_completed]")
-                );
+                let completed = user_text_agent_info(&prompt);
+                assert_completed_spawn_result(&completed);
 
                 Ok(Box::pin(stream::iter(vec![
                     Ok(SessionCompletionEvent::AssistantItem(
@@ -490,7 +510,6 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
     let started = manager.start_thread().await.expect("start root");
     let root_id = started.thread_id;
     let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
-    let client = manager.multi_agent_client(root_id);
     let initial_turn_id = manager
         .start_user_input(root_id, "delegate children".to_string())
         .await
@@ -556,12 +575,11 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let spawned_agents = loop {
-        let listed = client
-            .list_agents(Some("/root".to_string()))
-            .await
+        let listed = manager
+            .list_agents(root_id, Some("/root"))
             .expect("list agents while children run")
             .into_iter()
-            .filter(|agent| agent.thread_id != root_id.to_string())
+            .filter(|agent| agent.thread_id != root_id)
             .collect::<Vec<_>>();
         if listed.len() == 2 || tokio::time::Instant::now() >= deadline {
             break listed;
@@ -570,23 +588,17 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
     };
     assert_eq!(spawned_agents.len(), 2, "expected two live child agents");
     for agent in &spawned_agents {
-        assert_live_spawn_result(agent);
+        assert_live_status_entry(agent);
     }
 
     let expected_child_ids = spawned_agents
         .iter()
-        .map(|agent| agent.thread_id.clone())
+        .map(|agent| agent.thread_id.to_string())
         .collect::<HashSet<_>>();
-    let expected_paths = spawned_agents
-        .iter()
-        .map(|agent| agent.agent_path.clone())
-        .collect::<HashSet<_>>();
-
     child_release.add_permits(2);
 
     let mut completed_children = HashSet::new();
     let mut completed_tool_results = HashSet::new();
-    let mut completion_notices = HashSet::new();
     let mut initial_turn_completed = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
@@ -615,7 +627,7 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
                     event.call_id.as_str(),
                     "internal-call-1" | "internal-call-2"
                 ) {
-                    let parsed: AgentInfo = serde_json::from_str(
+                    let parsed: TestAgentInfo = serde_json::from_str(
                         event
                             .output_preview
                             .as_deref()
@@ -624,12 +636,6 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
                     .expect("spawn_agent result json");
                     assert_completed_spawn_result(&parsed);
                     completed_tool_results.insert(parsed.thread_id);
-                }
-            }
-            EventMsg::InterAgentMessage(event) => {
-                if expected_paths.contains(event.communication.author.as_str()) {
-                    assert!(event.communication.content.contains("[agent_completed]"));
-                    completion_notices.insert(event.communication.author.to_string());
                 }
             }
             EventMsg::TurnCompleted(TurnCompletedEvent {
@@ -646,7 +652,6 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
 
         if completed_children.len() == 2
             && completed_tool_results.len() == 2
-            && completion_notices.len() == 2
             && initial_turn_completed
         {
             break;
@@ -666,11 +671,6 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
         completed_tool_results.len(),
         2,
         "expected both spawn_agent tool results to return final child statuses"
-    );
-    assert_eq!(
-        completion_notices.len(),
-        2,
-        "expected both completion notices to be surfaced inside the same turn"
     );
     assert!(
         initial_turn_completed,
@@ -699,7 +699,7 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
     let started = manager.start_thread().await.expect("start root");
     let root_id = started.thread_id;
     let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
-    manager
+    let initial_turn_id = manager
         .start_user_input(root_id, "mixed batch".to_string())
         .await
         .expect("start root turn");
@@ -721,7 +721,86 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
 
     assert_eq!(tool_calls_started, 2, "expected both tool calls to start");
 
+    let mut saw_live_spawn_result = false;
+    let mut saw_normal_result = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline && !(saw_live_spawn_result && saw_normal_result) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(err)) => panic!("root event channel closed: {err}"),
+            Err(_) => break,
+        };
+
+        if let EventMsg::ToolCallCompleted(event) = event.msg {
+            match event.call_id.as_str() {
+                "internal-call-1" => {
+                    let parsed: TestAgentInfo = serde_json::from_str(
+                        event
+                            .output_preview
+                            .as_deref()
+                            .expect("spawn_agent output preview"),
+                    )
+                    .expect("spawn_agent result json");
+                    assert_live_spawn_result(&parsed);
+                    saw_live_spawn_result = true;
+                }
+                "internal-call-2" => {
+                    assert_eq!(event.output_preview.as_deref(), Some("tool-output"));
+                    saw_normal_result = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        saw_live_spawn_result,
+        "expected mixed spawn_agent result to return live status after grace period"
+    );
+    assert!(saw_normal_result, "expected normal tool result");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(err)) => panic!("root event channel closed: {err}"),
+            Err(_) => break,
+        };
+
+        match event.msg {
+            EventMsg::TurnCompleted(TurnCompletedEvent { turn_id, .. }) => {
+                panic!("turn {turn_id} completed before retained subagent finished");
+            }
+            EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) => {
+                assert_eq!(turn_id, initial_turn_id, "did not expect a follow-up turn");
+            }
+            _ => {}
+        }
+    }
+
     child_release.add_permits(1);
+
+    let mut saw_child_completion = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(err)) => panic!("root event channel closed: {err}"),
+            Err(_) => break,
+        };
+
+        if matches!(event.msg, EventMsg::CollabAgentCompleted(_)) {
+            saw_child_completion = true;
+            break;
+        }
+    }
+    assert!(
+        saw_child_completion,
+        "expected child to complete before the retained parent turn finishes"
+    );
 
     let mut turn_completed = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -733,14 +812,21 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
             Err(_) => break,
         };
 
-        if let EventMsg::TurnCompleted(TurnCompletedEvent {
-            last_assistant_message,
-            ..
-        }) = event.msg
-        {
-            assert_eq!(last_assistant_message.as_deref(), Some("parent finished"));
-            turn_completed = true;
-            break;
+        match event.msg {
+            EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) => {
+                assert_eq!(turn_id, initial_turn_id, "did not expect a follow-up turn");
+            }
+            EventMsg::TurnCompleted(TurnCompletedEvent {
+                turn_id,
+                last_assistant_message,
+                ..
+            }) => {
+                assert_eq!(turn_id, initial_turn_id);
+                assert_eq!(last_assistant_message.as_deref(), Some("parent finished"));
+                turn_completed = true;
+                break;
+            }
+            _ => {}
         }
     }
 
@@ -749,7 +835,20 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
     std::env::set_current_dir(original_cwd).expect("restore cwd");
 }
 
-fn assert_live_spawn_result(agent: &AgentInfo) {
+fn assert_live_status_entry(agent: &CollabAgentStatusEntry) {
+    assert!(
+        matches!(
+            agent.status,
+            AgentStatus::PendingInit | AgentStatus::Running
+        ),
+        "expected a live child status, got {:?}",
+        agent.status
+    );
+    assert!(agent.last_assistant_message.is_none());
+    assert!(agent.agent_path.as_str().starts_with("/root/"));
+}
+
+fn assert_live_spawn_result(agent: &TestAgentInfo) {
     assert!(
         matches!(
             agent.status_detail,
@@ -763,7 +862,7 @@ fn assert_live_spawn_result(agent: &AgentInfo) {
     assert!(agent.agent_path.starts_with("/root/"));
 }
 
-fn assert_completed_spawn_result(agent: &AgentInfo) {
+fn assert_completed_spawn_result(agent: &TestAgentInfo) {
     assert!(
         matches!(agent.status_detail, Some(AgentStatus::Completed(_))),
         "expected a completed child status, got {:?}",
@@ -775,7 +874,7 @@ fn assert_completed_spawn_result(agent: &AgentInfo) {
     assert!(agent.agent_path.starts_with("/root/"));
 }
 
-fn tool_result_agent_info(message: &Message) -> AgentInfo {
+fn tool_result_agent_info(message: &Message) -> TestAgentInfo {
     let tool_result = match message {
         Message::User { content } => content
             .iter()
@@ -796,6 +895,12 @@ fn tool_result_agent_info(message: &Message) -> AgentInfo {
         .expect("tool result text");
     serde_json::from_str(&tool_result_text)
         .unwrap_or_else(|err| panic!("spawn_agent output json: {err}; payload={tool_result_text}"))
+}
+
+fn user_text_agent_info(message: &Message) -> TestAgentInfo {
+    let text = first_user_text(message).expect("user text spawn result");
+    serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("spawn_agent user text json: {err}; payload={text}"))
 }
 
 fn tool_result_text(message: &Message) -> Option<String> {

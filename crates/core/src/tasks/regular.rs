@@ -168,27 +168,15 @@ impl SessionTask for RegularTask {
 
         let input_count = input.len();
         let history_before_turn = session.history().await;
-        let mailbox_messages = session.drain_mailbox().await;
-        let mut prompt_parts = mailbox_messages
-            .iter()
-            .map(render_mailbox_message)
+        let prompt_parts = input
+            .into_iter()
+            .filter(|item| !item.is_empty())
             .collect::<Vec<_>>();
-        prompt_parts.extend(input.into_iter().filter(|item| !item.is_empty()));
         let prompt_text = prompt_parts.join("\n");
         session.record_user_message(prompt_text.clone()).await;
         session
             .emit_event(&ctx, EventMsg::UserMessage(prompt_text.clone()))
             .await;
-        for communication in mailbox_messages {
-            session
-                .emit_event(
-                    &ctx,
-                    EventMsg::InterAgentMessage(smooth_protocol::InterAgentCommunicationEvent {
-                        communication,
-                    }),
-                )
-                .await;
-        }
 
         let prompt = Message::User {
             content: OneOrMany::one(UserContent::Text(Text {
@@ -227,13 +215,6 @@ impl SessionTask for RegularTask {
         let _ = ctx;
         session.abort_pending_dynamic_tool_requests().await;
     }
-}
-
-fn render_mailbox_message(communication: &smooth_protocol::InterAgentCommunication) -> String {
-    format!(
-        "<inter_agent_message from=\"{}\">{}</inter_agent_message>",
-        communication.author, communication.content
-    )
 }
 
 async fn run_manual_turn(
@@ -789,8 +770,8 @@ async fn execute_tool_calls_concurrently(
     for pending in pending_tool_calls {
         if pending.tool_call.function.name == "spawn_agent" {
             match start_spawn_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending).await {
-                SpawnToolStart::Started(started) => spawn_tool_calls.push(started),
-                SpawnToolStart::Completed(executed) => resolved.push(executed),
+                SpawnToolStart::Started(started) => spawn_tool_calls.push(*started),
+                SpawnToolStart::Completed(executed) => resolved.push(*executed),
             }
         } else {
             normal_tool_calls.push(pending);
@@ -842,8 +823,8 @@ async fn execute_tool_calls_concurrently(
 }
 
 enum SpawnToolStart {
-    Started(StartedSpawnToolCall),
-    Completed(ExecutedToolCall),
+    Started(Box<StartedSpawnToolCall>),
+    Completed(Box<ExecutedToolCall>),
 }
 
 async fn start_spawn_tool_call(
@@ -863,7 +844,7 @@ async fn start_spawn_tool_call(
         Ok(args) => args,
         Err(err) => {
             let message = format!("invalid spawn_agent args: {err}");
-            return SpawnToolStart::Completed(
+            return SpawnToolStart::Completed(Box::new(
                 complete_tool_call(
                     session,
                     ctx,
@@ -876,7 +857,7 @@ async fn start_spawn_tool_call(
                     Some(message),
                 )
                 .await,
-            );
+            ));
         }
     };
 
@@ -891,22 +872,24 @@ async fn start_spawn_tool_call(
         )
         .await
     {
-        Ok((metadata, initial_status, waiter)) => SpawnToolStart::Started(StartedSpawnToolCall {
-            index,
-            tool_call_id: tool_call.id,
-            tool_call_call_id: tool_call.call_id,
-            internal_call_id,
-            child_thread_id: metadata
-                .agent_id
-                .expect("spawned agent metadata should have a thread id"),
-            metadata,
-            initial_status,
-            waiter: Some(waiter),
-            completion: None,
-        }),
+        Ok((metadata, initial_status, waiter)) => {
+            SpawnToolStart::Started(Box::new(StartedSpawnToolCall {
+                index,
+                tool_call_id: tool_call.id,
+                tool_call_call_id: tool_call.call_id,
+                internal_call_id,
+                child_thread_id: metadata
+                    .agent_id
+                    .expect("spawned agent metadata should have a thread id"),
+                metadata,
+                initial_status,
+                waiter: Some(waiter),
+                completion: None,
+            }))
+        }
         Err(err) => {
             let message = err.to_string();
-            SpawnToolStart::Completed(
+            SpawnToolStart::Completed(Box::new(
                 complete_tool_call(
                     session,
                     ctx,
@@ -919,7 +902,7 @@ async fn start_spawn_tool_call(
                     Some(message),
                 )
                 .await,
-            )
+            ))
         }
     }
 }

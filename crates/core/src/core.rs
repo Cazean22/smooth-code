@@ -18,7 +18,7 @@ use tools::DynamicToolClient;
 use tracing::Instrument;
 
 use crate::{
-    agent::{AgentControl, Mailbox, MailboxReceiver},
+    agent::AgentControl,
     context_manager::ContextManager,
     provider::SessionModel,
     rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persist_event},
@@ -41,8 +41,6 @@ pub(crate) struct Session {
     #[allow(dead_code)]
     pub(crate) session_source: SessionSource,
     pub(crate) agent_control: AgentControl,
-    pub(crate) mailbox: Mailbox,
-    pub(crate) mailbox_rx: Mutex<MailboxReceiver>,
     current_turn_id: Arc<RwLock<Option<String>>>,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     next_internal_sub_id: AtomicU64,
@@ -73,7 +71,6 @@ impl Core {
         agent_control: AgentControl,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let (mailbox, mailbox_rx) = Mailbox::new();
         let mut context_manager = ContextManager::default();
         context_manager.replace(history);
         let session = Arc::new(Session {
@@ -83,8 +80,6 @@ impl Core {
             active_turn: Mutex::new(None),
             session_source,
             agent_control,
-            mailbox,
-            mailbox_rx: Mutex::new(mailbox_rx),
             current_turn_id,
             dynamic_tool_client,
             next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
@@ -103,19 +98,6 @@ impl Core {
             Op::UserInput(input) => {
                 let sub_id = self.session.start_regular_turn(vec![input]).await;
                 Ok(sub_id)
-            }
-            Op::InterAgentCommunication { communication } => {
-                self.session
-                    .mailbox
-                    .send(communication)
-                    .map_err(anyhow::Error::msg)?;
-
-                if self.session.mailbox.has_trigger_turn_pending() && self.session.is_idle().await {
-                    let sub_id = self.session.start_regular_turn(vec![String::new()]).await;
-                    return Ok(sub_id);
-                }
-
-                Ok("queued".to_string())
             }
             Op::Interrupt => {
                 self.session.abort_all_tasks("interrupted").await;
@@ -300,15 +282,6 @@ impl Session {
                         }
                         drop(active_turn);
 
-                        if sess.mailbox.has_trigger_turn_pending() {
-                            let sess_for_follow_up = Arc::clone(&sess);
-                            tokio::spawn(async move {
-                                let _sub_id = sess_for_follow_up
-                                    .start_regular_turn(vec![String::new()])
-                                    .await;
-                            });
-                        }
-
                         done_for_runner.notify_waiters();
                     }
                     .instrument(task_span),
@@ -435,14 +408,6 @@ impl Session {
         }
     }
 
-    pub(crate) async fn drain_mailbox(&self) -> Vec<smooth_protocol::InterAgentCommunication> {
-        self.mailbox_rx.lock().await.try_drain_all()
-    }
-
-    pub(crate) async fn is_idle(&self) -> bool {
-        self.active_turn.lock().await.is_none()
-    }
-
     pub(crate) fn fresh_turn_context(&self) -> TurnContext {
         let sub_id = self.next_internal_sub_id();
         TurnContext {
@@ -461,55 +426,26 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{path::PathBuf, sync::Arc};
 
     use anyhow::Result;
-    use async_stream::stream;
-    use rig::{
-        agent::FinalResponse,
-        message::{Message, Text},
-    };
+    use rig::message::Message;
     use tempfile::TempDir;
-    use tokio::sync::{Notify, RwLock, Semaphore};
+    use tokio::sync::RwLock;
 
     use crate::{
-        SessionModel, SessionModelDriver, SessionStream, SessionStreamEvent, agent::AgentControl,
+        SessionModel, SessionModelDriver, SessionStream, agent::AgentControl,
         rollout::RolloutRecorder,
     };
 
     use super::Core;
-    use smooth_protocol::{
-        AgentPath, AgentStatusChangedEvent, EventMsg, InterAgentCommunicationEvent, Op,
-        SessionSource, TurnStartedEvent,
-    };
+    use smooth_protocol::{AgentStatusChangedEvent, EventMsg, SessionSource};
 
     struct EmptyDriver;
 
     impl SessionModelDriver for EmptyDriver {
         fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
             Ok(Box::pin(futures_util::stream::empty()))
-        }
-    }
-
-    struct BlockingDriver {
-        started: Arc<Notify>,
-        release: Arc<Semaphore>,
-        text: String,
-    }
-
-    impl SessionModelDriver for BlockingDriver {
-        fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-            let started = Arc::clone(&self.started);
-            let release = Arc::clone(&self.release);
-            let text = self.text.clone();
-            Ok(Box::pin(stream! {
-                started.notify_one();
-                let _permit = release.acquire().await.expect("release semaphore should stay open");
-                yield Ok(SessionStreamEvent::StreamAssistantItem(
-                    crate::SessionAssistantContent::Text(Text { text }),
-                ));
-                yield Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty()));
-            }))
         }
     }
 
@@ -578,176 +514,6 @@ mod tests {
                 turn_id: None,
                 status: smooth_protocol::AgentStatus::Shutdown,
             })
-        );
-    }
-
-    #[tokio::test]
-    async fn submit_inter_agent_communication_queues_without_trigger() {
-        let (core, mut rx) = test_core().await;
-
-        let result = core
-            .submit(Op::InterAgentCommunication {
-                communication: smooth_protocol::InterAgentCommunication::new(
-                    AgentPath::try_from("/root/child").expect("path"),
-                    AgentPath::root(),
-                    vec![],
-                    "child says hi".to_string(),
-                    false,
-                ),
-            })
-            .await
-            .expect("queue mail");
-        assert_eq!(result, "queued");
-
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), rx.recv())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn submit_inter_agent_communication_with_trigger_starts_turn() {
-        let (core, mut rx) = test_core().await;
-
-        let turn_id = core
-            .submit(Op::InterAgentCommunication {
-                communication: smooth_protocol::InterAgentCommunication::new(
-                    AgentPath::try_from("/root/child").expect("path"),
-                    AgentPath::root(),
-                    vec![],
-                    "child says hi".to_string(),
-                    true,
-                ),
-            })
-            .await
-            .expect("trigger mail");
-
-        let event = rx.recv().await.expect("turn started");
-        assert_eq!(
-            event.msg,
-            EventMsg::TurnStarted(TurnStartedEvent {
-                thread_id: core.session.id.to_string(),
-                turn_id: turn_id.clone(),
-            })
-        );
-
-        loop {
-            let event = rx.recv().await.expect("event");
-            if let EventMsg::InterAgentMessage(InterAgentCommunicationEvent { communication }) =
-                event.msg
-            {
-                assert_eq!(communication.content, "child says hi");
-                break;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn submit_inter_agent_communication_with_trigger_starts_follow_up_turn_when_busy() {
-        let workspace = TempDir::new().expect("tempdir");
-        let cwd = PathBuf::from(workspace.path());
-        let thread_id = smooth_protocol::ThreadId::new();
-        let current_turn_id = Arc::new(RwLock::new(None));
-        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd)
-            .await
-            .expect("rollout");
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Semaphore::new(0));
-        let core = Core::new(
-            thread_id,
-            SessionModel::Stub(Arc::new(BlockingDriver {
-                started: Arc::clone(&started),
-                release: Arc::clone(&release),
-                text: "done".to_string(),
-            })),
-            Vec::new(),
-            0,
-            rollout,
-            current_turn_id,
-            None,
-            SessionSource::Cli,
-            AgentControl::new(),
-        );
-        let mut rx = core.subscribe();
-
-        let initial_turn_id = core
-            .submit(Op::UserInput("first turn".to_string()))
-            .await
-            .expect("start user turn");
-        let initial_turn_id_for_assert = initial_turn_id.clone();
-
-        let event = rx.recv().await.expect("turn started");
-        assert_eq!(
-            event.msg,
-            EventMsg::TurnStarted(TurnStartedEvent {
-                thread_id: core.session.id.to_string(),
-                turn_id: initial_turn_id_for_assert,
-            })
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), started.notified())
-            .await
-            .expect("driver should start");
-
-        let result = core
-            .submit(Op::InterAgentCommunication {
-                communication: smooth_protocol::InterAgentCommunication::new(
-                    AgentPath::try_from("/root/child").expect("path"),
-                    AgentPath::root(),
-                    vec![],
-                    "child follow-up".to_string(),
-                    true,
-                ),
-            })
-            .await
-            .expect("queue trigger mail");
-        assert_eq!(result, "queued");
-
-        release.add_permits(1);
-
-        let mut saw_follow_up_turn = false;
-        let mut saw_mail = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-
-        while tokio::time::Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let event = match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(event)) => event,
-                Ok(Err(err)) => panic!("event channel closed: {err}"),
-                Err(_) => break,
-            };
-
-            match event.msg {
-                EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) => {
-                    if turn_id != initial_turn_id {
-                        saw_follow_up_turn = true;
-                    }
-                }
-                EventMsg::InterAgentMessage(InterAgentCommunicationEvent { communication }) => {
-                    if communication.content == "child follow-up" {
-                        saw_mail = true;
-                    }
-                }
-                _ => {}
-            }
-
-            if saw_follow_up_turn && saw_mail {
-                break;
-            }
-        }
-
-        assert!(
-            saw_follow_up_turn,
-            "expected follow-up turn to start; idle={}, pending_trigger_turn={}",
-            core.session.is_idle().await,
-            core.session.mailbox.has_trigger_turn_pending()
-        );
-        assert!(
-            saw_mail,
-            "expected queued mail to drain in follow-up turn; idle={}, pending_trigger_turn={}",
-            core.session.is_idle().await,
-            core.session.mailbox.has_trigger_turn_pending()
         );
     }
 }

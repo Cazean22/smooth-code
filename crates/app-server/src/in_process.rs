@@ -123,9 +123,11 @@ mod tests {
 
     #[tokio::test]
     async fn server_request_round_trip_resolves_waiter() {
-        let (mut handle, outgoing) = start_internal(InProcessStartArgs { channel_capacity: 8 })
-            .await
-            .expect("in-process app-server should initialize");
+        let (mut handle, outgoing) = start_internal(InProcessStartArgs {
+            channel_capacity: 8,
+        })
+        .await
+        .expect("in-process app-server should initialize");
         let thread_id = ThreadId::new();
         let (request_id, response_rx) = outgoing
             .send_request(ServerRequestPayload::DynamicToolCall(

@@ -302,47 +302,6 @@ impl App {
                     agent_status_label(&event.status)
                 ))));
             }
-            EventMsg::CollabSendMessageBegin(event) => {
-                self.push_history(Box::new(PlainHistoryCell::info(format!(
-                    "Sending message to {}",
-                    event.receiver_thread_id
-                ))));
-            }
-            EventMsg::CollabSendMessageEnd(event) => {
-                self.push_history(Box::new(PlainHistoryCell::info(format!(
-                    "Message delivered with status {}",
-                    agent_status_label(&event.status)
-                ))));
-            }
-            EventMsg::CollabWaitingBegin(event) => {
-                self.push_history(Box::new(PlainHistoryCell::info(format!(
-                    "Waiting on {} agent(s)",
-                    event.receiver_thread_ids.len()
-                ))));
-            }
-            EventMsg::CollabWaitingEnd(event) => {
-                let statuses = event
-                    .statuses
-                    .iter()
-                    .map(|status| agent_status_label(&status.status))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                self.push_history(Box::new(PlainHistoryCell::info(format!(
-                    "Wait finished: {statuses}"
-                ))));
-            }
-            EventMsg::CollabCloseBegin(event) => {
-                self.push_history(Box::new(PlainHistoryCell::info(format!(
-                    "Closing agent {}",
-                    event.receiver_thread_id
-                ))));
-            }
-            EventMsg::CollabCloseEnd(event) => {
-                self.push_history(Box::new(PlainHistoryCell::info(format!(
-                    "Close finished with status {}",
-                    agent_status_label(&event.status)
-                ))));
-            }
             EventMsg::CollabResumeBegin(event) => {
                 self.push_history(Box::new(PlainHistoryCell::info(format!(
                     "Resuming agent {}",
@@ -353,12 +312,6 @@ impl App {
                 self.push_history(Box::new(PlainHistoryCell::info(format!(
                     "Resume finished with status {}",
                     agent_status_label(&event.status)
-                ))));
-            }
-            EventMsg::InterAgentMessage(event) => {
-                self.push_history(Box::new(PlainHistoryCell::info(format!(
-                    "Inter-agent message from {}",
-                    event.communication.author
                 ))));
             }
             EventMsg::AgentMessage(_) => {}

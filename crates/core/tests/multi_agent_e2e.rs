@@ -77,7 +77,7 @@ impl SessionModelFactory for AnyThreadFactory {
 }
 
 #[tokio::test]
-async fn agent_control_round_trip_spawns_lists_closes_and_passively_notifies_parent() {
+async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() {
     let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
     let workspace = TempDir::new().expect("tempdir");
     let original_cwd = std::env::current_dir().expect("cwd");
@@ -104,7 +104,6 @@ async fn agent_control_round_trip_spawns_lists_closes_and_passively_notifies_par
     assert_eq!(spawned.agent_role.as_deref(), Some("explorer"));
 
     let mut saw_completion = false;
-    let mut saw_notice = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -125,39 +124,16 @@ async fn agent_control_round_trip_spawns_lists_closes_and_passively_notifies_par
                 );
                 saw_completion = true;
             }
-            EventMsg::InterAgentMessage(event) => {
-                if event.communication.author == spawned.agent_path {
-                    assert_eq!(event.communication.recipient.as_str(), "/root");
-                    assert!(event.communication.trigger_turn);
-                    assert!(event.communication.content.contains("[agent_completed]"));
-                    assert!(
-                        event
-                            .communication
-                            .content
-                            .contains(&format!("agent_path={}", spawned.agent_path))
-                    );
-                    assert!(event.communication.content.contains("status=completed"));
-                    assert!(event.communication.content.contains(&format!(
-                        "last_assistant_message=done:{}",
-                        spawned.thread_id
-                    )));
-                    saw_notice = true;
-                }
-            }
             _ => {}
         }
 
-        if saw_completion && saw_notice {
+        if saw_completion {
             break;
         }
     }
     assert!(
         saw_completion,
         "expected child completion event on parent thread"
-    );
-    assert!(
-        saw_notice,
-        "expected passive completion notice in parent mailbox"
     );
 
     let listed = manager

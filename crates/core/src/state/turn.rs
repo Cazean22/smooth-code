@@ -61,8 +61,6 @@ impl ActiveTurn {
 /// Mutable state for a single turn.
 #[derive(Default)]
 pub(crate) struct TurnState {
-    // Mailbox delivery is v1 turn-start-only, so turn state does not track any
-    // per-turn mailbox delivery phase.
     #[allow(dead_code)]
     pub(crate) tool_calls: u64,
 }

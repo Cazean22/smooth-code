@@ -270,7 +270,7 @@ impl SessionModelDriver for DeferredChildDriver {
         let release = Arc::clone(&self.release);
         Ok(Box::pin(
             stream::once(async move {
-                let _permit = release.acquire_owned().await.expect("release permit");
+                release.acquire().await.expect("release permit").forget();
                 Ok(SessionStreamEvent::StreamAssistantItem(
                     SessionAssistantContent::Text(Text { text }),
                 ))
@@ -408,6 +408,172 @@ impl SessionModelDriver for MixedBatchDriver {
 struct MixedBatchFactory {
     build_count: Mutex<usize>,
     child_release: Arc<Semaphore>,
+}
+
+struct TwoRetainedDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for TwoRetainedDriver {
+    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+        unreachable!("manual completion stream should be used for two retained test");
+    }
+
+    fn supports_manual_tool_loop(&self) -> bool {
+        true
+    }
+
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self.calls.lock().expect("calls mutex");
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(first_user_text(&prompt), Some("two retained".to_string()));
+                assert!(history.is_empty());
+                let spawn_tool_call_one = ToolCall::new(
+                    "spawn-1".to_string(),
+                    ToolFunction::new(
+                        "spawn_agent".to_string(),
+                        serde_json::json!({
+                            "message": "child one",
+                            "agent_type": "worker",
+                            "fork_context": false
+                        }),
+                    ),
+                )
+                .with_call_id("call-1".to_string());
+                let spawn_tool_call_two = ToolCall::new(
+                    "spawn-2".to_string(),
+                    ToolFunction::new(
+                        "spawn_agent".to_string(),
+                        serde_json::json!({
+                            "message": "child two",
+                            "agent_type": "worker",
+                            "fork_context": false
+                        }),
+                    ),
+                )
+                .with_call_id("call-2".to_string());
+                let normal_tool_call = ToolCall::new(
+                    "tool-3".to_string(),
+                    ToolFunction::new(
+                        "normal_tool".to_string(),
+                        serde_json::json!({
+                            "value": "ok"
+                        }),
+                    ),
+                )
+                .with_call_id("call-3".to_string());
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call: spawn_tool_call_one,
+                            internal_call_id: "internal-call-1".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call: spawn_tool_call_two,
+                            internal_call_id: "internal-call-2".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call: normal_tool_call,
+                            internal_call_id: "internal-call-3".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-tool-call".to_string()),
+                        response: String::new(),
+                    })),
+                ])))
+            }
+            1 => {
+                assert_eq!(history.len(), 4);
+                assert_eq!(
+                    first_user_text(&history[0]),
+                    Some("two retained".to_string())
+                );
+                assert_live_spawn_result(&tool_result_agent_info(&history[2]));
+                assert_live_spawn_result(&tool_result_agent_info(&history[3]));
+                assert_eq!(tool_result_text(&prompt), Some("tool-output".to_string()));
+
+                Ok(Box::pin(stream::iter(vec![Ok(
+                    SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-waiting".to_string()),
+                        response: String::new(),
+                    }),
+                )])))
+            }
+            2 => {
+                assert_eq!(history.len(), 6);
+                assert_eq!(
+                    tool_result_text(&history[4]),
+                    Some("tool-output".to_string())
+                );
+                assert_completed_spawn_result(&user_text_agent_info(&history[5]));
+                assert_completed_spawn_result(&user_text_agent_info(&prompt));
+
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "parent finished".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-final".to_string()),
+                        response: "parent finished".to_string(),
+                    })),
+                ])))
+            }
+            other => panic!("unexpected completion turn {other}"),
+        }
+    }
+
+    fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+        assert_eq!(tool_name, "normal_tool");
+        assert_eq!(args, r#"{"value":"ok"}"#);
+        Ok("tool-output".to_string())
+    }
+}
+
+struct TwoRetainedFactory {
+    build_count: Mutex<usize>,
+    child_release: Arc<Semaphore>,
+}
+
+impl SessionModelFactory for TwoRetainedFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        thread_id: ThreadId,
+        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        _role_override: RoleOverride,
+        _agent_control: AgentControl,
+    ) -> Result<SessionModel> {
+        let mut build_count = self.build_count.lock().expect("build count mutex");
+        let model = if *build_count == 0 {
+            SessionModel::Stub(Arc::new(TwoRetainedDriver {
+                calls: Mutex::new(0),
+            }))
+        } else {
+            SessionModel::Stub(Arc::new(DeferredChildDriver {
+                text: format!("child:{thread_id}"),
+                release: Arc::clone(&self.child_release),
+            }))
+        };
+        *build_count += 1;
+        Ok(model)
+    }
 }
 
 impl SessionModelFactory for MixedBatchFactory {
@@ -807,6 +973,122 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
     }
 
     assert!(turn_completed, "expected mixed batch turn to complete");
+
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+}
+
+#[tokio::test]
+async fn retained_subagents_all_finish_before_parent_continues() {
+    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
+    let workspace = TempDir::new().expect("tempdir");
+    let original_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(workspace.path()).expect("set cwd");
+    let child_release = Arc::new(Semaphore::new(0));
+    let manager = ThreadManagerState::new(
+        None,
+        Some(Arc::new(TwoRetainedFactory {
+            build_count: Mutex::new(0),
+            child_release: Arc::clone(&child_release),
+        })),
+    )
+    .await
+    .expect("thread manager");
+    let started = manager.start_thread().await.expect("start root");
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+    let initial_turn_id = manager
+        .start_user_input(root_id, "two retained".to_string())
+        .await
+        .expect("start root turn");
+
+    let mut tool_calls_completed = HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline && tool_calls_completed.len() < 3 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(err)) => panic!("root event channel closed: {err}"),
+            Err(_) => break,
+        };
+
+        if let EventMsg::ToolCallCompleted(event) = event.msg {
+            tool_calls_completed.insert(event.call_id);
+        }
+    }
+
+    assert_eq!(tool_calls_completed.len(), 3, "expected all tool results");
+
+    child_release.add_permits(1);
+    let mut saw_one_child_completion = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && !saw_one_child_completion {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(err)) => panic!("root event channel closed: {err}"),
+            Err(_) => break,
+        };
+
+        match event.msg {
+            EventMsg::CollabAgentCompleted(_) => saw_one_child_completion = true,
+            EventMsg::TurnCompleted(TurnCompletedEvent { turn_id, .. }) => {
+                panic!("turn {turn_id} completed before all retained subagents finished");
+            }
+            EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) => {
+                assert_eq!(turn_id, initial_turn_id, "did not expect a follow-up turn");
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_one_child_completion, "expected one child completion");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(err)) => panic!("root event channel closed: {err}"),
+            Err(_) => break,
+        };
+
+        if let EventMsg::TurnCompleted(TurnCompletedEvent { turn_id, .. }) = event.msg {
+            panic!("turn {turn_id} completed before second retained subagent finished");
+        }
+    }
+
+    child_release.add_permits(1);
+    let mut turn_completed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(err)) => panic!("root event channel closed: {err}"),
+            Err(_) => break,
+        };
+
+        match event.msg {
+            EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) => {
+                assert_eq!(turn_id, initial_turn_id, "did not expect a follow-up turn");
+            }
+            EventMsg::TurnCompleted(TurnCompletedEvent {
+                turn_id,
+                last_assistant_message,
+                ..
+            }) => {
+                assert_eq!(turn_id, initial_turn_id);
+                assert_eq!(last_assistant_message.as_deref(), Some("parent finished"));
+                turn_completed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        turn_completed,
+        "expected parent to finish after both children"
+    );
 
     std::env::set_current_dir(original_cwd).expect("restore cwd");
 }

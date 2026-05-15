@@ -135,7 +135,6 @@ struct StartedSpawnToolCall {
 
 struct RetainedSpawnCompletion {
     metadata: AgentMetadata,
-    child_thread_id: ThreadId,
     waiter: InlineChildCompletionReceiver,
 }
 
@@ -233,15 +232,6 @@ async fn run_manual_turn(
         if cancellation_token.is_cancelled() {
             return None;
         }
-        let ready_completion_texts = drain_ready_retained_subagents(&mut retained_subagents);
-        if !ready_completion_texts.is_empty() {
-            append_user_texts_to_context(
-                &mut request_history,
-                &mut pending_prompt,
-                ready_completion_texts,
-            );
-            continue;
-        }
 
         let mut stream = match session
             .model()
@@ -259,7 +249,6 @@ async fn run_manual_turn(
         let mut pending_reasoning_delta_text = String::new();
         let mut pending_reasoning_delta_id = None;
         let mut saw_tool_call_this_turn = false;
-        let mut late_spawn_completion_texts = Vec::new();
         let mut turn_summary = SessionTurnSummary {
             assistant_message_id: None,
             response: String::new(),
@@ -270,22 +259,9 @@ async fn run_manual_turn(
                 return None;
             }
 
-            let item = if retained_subagents.is_empty() {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => return None,
-                    item = stream.next() => item,
-                }
-            } else {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => return None,
-                    completion = next_retained_subagent_completion(&mut retained_subagents) => {
-                        if let Some(completion_text) = completion {
-                            late_spawn_completion_texts.push(completion_text);
-                        }
-                        continue;
-                    }
-                    item = stream.next() => item,
-                }
+            let item = tokio::select! {
+                _ = cancellation_token.cancelled() => return None,
+                item = stream.next() => item,
             };
             let Some(item) = item else {
                 break;
@@ -395,45 +371,50 @@ async fn run_manual_turn(
         }
 
         if saw_tool_call_this_turn {
-            let mut continuation_messages = vec![pending_prompt];
-            let mut content_items = Vec::new();
-            if !turn_summary.response.is_empty() {
-                content_items.push(AssistantContent::text(&turn_summary.response));
-            }
-            let requires_provider_reasoning_ids = session.model().requires_provider_reasoning_ids();
-            for reasoning in accumulated_reasoning.drain(..) {
-                if should_roundtrip_reasoning(requires_provider_reasoning_ids, &reasoning) {
-                    content_items.push(AssistantContent::Reasoning(reasoning));
-                }
-            }
-            content_items.extend(
-                pending_tool_calls
-                    .iter()
-                    .map(|pending| pending.assistant_tool_call.clone()),
+            let assistant_message = build_assistant_tool_message(
+                &turn_summary,
+                &mut accumulated_reasoning,
+                &pending_tool_calls,
+                session.model().requires_provider_reasoning_ids(),
             );
 
-            if !content_items.is_empty() {
-                continuation_messages.push(Message::Assistant {
-                    id: turn_summary.assistant_message_id.clone(),
-                    content: OneOrMany::many(content_items)
-                        .expect("tool phase assistant content should not be empty"),
-                });
-            }
+            let (normal_calls, spawn_calls) = partition_pending_tool_calls(pending_tool_calls);
 
-            let executed_tool_calls = execute_tool_calls_concurrently(
+            let started_spawns =
+                start_spawn_calls_concurrently(Arc::clone(&session), Arc::clone(&ctx), spawn_calls)
+                    .await;
+
+            let normal_results = execute_normal_tools_concurrently(
                 Arc::clone(&session),
                 Arc::clone(&ctx),
-                pending_tool_calls,
-                cancellation_token.clone(),
-                &mut retained_subagents,
+                normal_calls,
+                &cancellation_token,
             )
             .await?;
+
+            let has_normal_tools = !normal_results.is_empty();
+            let (started_spawns, immediate_spawn_results) =
+                split_started_and_immediate(started_spawns);
+            let started_spawns =
+                wait_for_spawn_batch(started_spawns, has_normal_tools, &cancellation_token).await?;
+
+            let mut spawn_results = collect_spawn_results(
+                Arc::clone(&session),
+                Arc::clone(&ctx),
+                started_spawns,
+                &mut retained_subagents,
+            )
+            .await;
+            spawn_results.extend(immediate_spawn_results);
+
+            let executed_tool_calls = merge_in_index_order(normal_results, spawn_results);
+
+            let mut continuation_messages = vec![pending_prompt];
+            if let Some(message) = assistant_message {
+                continuation_messages.push(message);
+            }
             for executed in executed_tool_calls {
                 continuation_messages.push(executed.tool_result_message);
-            }
-
-            for completion_text in late_spawn_completion_texts {
-                continuation_messages.push(Message::user(completion_text));
             }
 
             pending_prompt = continuation_messages
@@ -443,34 +424,19 @@ async fn run_manual_turn(
             continue;
         }
 
-        if !late_spawn_completion_texts.is_empty() {
+        if !retained_subagents.is_empty() {
+            let completion_texts = tokio::select! {
+                _ = cancellation_token.cancelled() => return None,
+                completions = drain_retained_subagent_completions(&mut retained_subagents) => completions,
+            };
             append_completion_texts_after_assistant_turn(
                 &mut request_history,
                 &mut pending_prompt,
                 &turn_summary,
                 &mut accumulated_reasoning,
                 session.model().requires_provider_reasoning_ids(),
-                late_spawn_completion_texts,
+                completion_texts,
             );
-            continue;
-        }
-
-        if !retained_subagents.is_empty() {
-            let completion_text = tokio::select! {
-                _ = cancellation_token.cancelled() => return None,
-                completion = next_retained_subagent_completion(&mut retained_subagents) => completion,
-            };
-            if let Some(completion_text) = completion_text {
-                append_completion_texts_after_assistant_turn(
-                    &mut request_history,
-                    &mut pending_prompt,
-                    &turn_summary,
-                    &mut accumulated_reasoning,
-                    session.model().requires_provider_reasoning_ids(),
-                    vec![completion_text],
-                );
-                continue;
-            }
             continue;
         }
 
@@ -756,33 +722,17 @@ async fn complete_tool_call(
     }
 }
 
-async fn execute_tool_calls_concurrently(
+async fn execute_normal_tools_concurrently(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
-    pending_tool_calls: Vec<PendingToolCall>,
-    cancellation_token: CancellationToken,
-    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+    normal_calls: Vec<PendingToolCall>,
+    cancellation_token: &CancellationToken,
 ) -> Option<Vec<ExecutedToolCall>> {
-    let mut normal_tool_calls = Vec::new();
-    let mut spawn_tool_calls = Vec::new();
-    let mut resolved = Vec::new();
-
-    for pending in pending_tool_calls {
-        if pending.tool_call.function.name == "spawn_agent" {
-            match start_spawn_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending).await {
-                SpawnToolStart::Started(started) => spawn_tool_calls.push(*started),
-                SpawnToolStart::Completed(executed) => resolved.push(*executed),
-            }
-        } else {
-            normal_tool_calls.push(pending);
-        }
-    }
-
-    let has_normal_tools = !normal_tool_calls.is_empty();
-    let mut pending_futures = normal_tool_calls
+    let mut pending_futures = normal_calls
         .into_iter()
         .map(|pending| execute_normal_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending))
         .collect::<FuturesUnordered<_>>();
+    let mut resolved = Vec::new();
     while !pending_futures.is_empty() {
         let next = tokio::select! {
             _ = cancellation_token.cancelled() => return None,
@@ -793,33 +743,128 @@ async fn execute_tool_calls_concurrently(
         };
         resolved.push(executed);
     }
+    Some(resolved)
+}
 
-    if !spawn_tool_calls.is_empty() {
-        let wait_mode = if has_normal_tools {
-            SpawnWaitMode::GracePeriod(Duration::from_secs(1))
+fn partition_pending_tool_calls(
+    pending_tool_calls: Vec<PendingToolCall>,
+) -> (Vec<PendingToolCall>, Vec<PendingToolCall>) {
+    let mut normal = Vec::new();
+    let mut spawn = Vec::new();
+    for pending in pending_tool_calls {
+        if pending.tool_call.function.name == "spawn_agent" {
+            spawn.push(pending);
         } else {
-            SpawnWaitMode::UntilAllComplete
-        };
-        wait_for_spawn_tool_calls(&mut spawn_tool_calls, wait_mode, &cancellation_token).await?;
+            normal.push(pending);
+        }
+    }
+    (normal, spawn)
+}
 
-        for mut spawn_call in spawn_tool_calls {
-            if spawn_call.completion.is_none()
-                && let Some(waiter) = spawn_call.waiter.take()
-            {
+/// Start every queued `spawn_agent` call concurrently and wait for all starts
+/// to finish before returning. We deliberately do NOT race this against the
+/// cancellation token: `start_spawn_tool_call` -> `spawn_agent_with_role_for_tool`
+/// performs side effects across multiple awaits (emits `CollabAgentSpawnBegin`,
+/// reserves a registry path, inserts the child thread, registers status/inline
+/// waiters, submits initial input, commits registry metadata, writes a DB
+/// edge). Dropping any of those futures mid-flight can leak threads, leave a
+/// dangling registry reservation, or drop the matching `CollabAgentSpawnEnd`.
+/// The outer `run_manual_turn` loop observes cancellation at its next
+/// checkpoint after all starts complete cleanly.
+async fn start_spawn_calls_concurrently(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    spawn_calls: Vec<PendingToolCall>,
+) -> Vec<SpawnToolStart> {
+    if spawn_calls.is_empty() {
+        return Vec::new();
+    }
+    let futures = spawn_calls
+        .into_iter()
+        .map(|pending| start_spawn_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending));
+    futures_util::future::join_all(futures).await
+}
+
+fn split_started_and_immediate(
+    spawns: Vec<SpawnToolStart>,
+) -> (Vec<StartedSpawnToolCall>, Vec<ExecutedToolCall>) {
+    let mut started = Vec::new();
+    let mut immediate = Vec::new();
+    for spawn in spawns {
+        match spawn {
+            SpawnToolStart::Started(call) => started.push(*call),
+            SpawnToolStart::Completed(executed) => immediate.push(*executed),
+        }
+    }
+    (started, immediate)
+}
+
+async fn wait_for_spawn_batch(
+    mut spawn_calls: Vec<StartedSpawnToolCall>,
+    has_normal_tools: bool,
+    cancellation_token: &CancellationToken,
+) -> Option<Vec<StartedSpawnToolCall>> {
+    if spawn_calls.is_empty() {
+        return Some(spawn_calls);
+    }
+    let wait_mode = if has_normal_tools {
+        SpawnWaitMode::GracePeriod(Duration::from_secs(1))
+    } else {
+        SpawnWaitMode::UntilAllComplete
+    };
+    wait_for_spawn_tool_calls(&mut spawn_calls, wait_mode, cancellation_token).await?;
+    Some(spawn_calls)
+}
+
+async fn collect_spawn_results(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    spawn_calls: Vec<StartedSpawnToolCall>,
+    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+) -> Vec<ExecutedToolCall> {
+    let mut resolved = Vec::with_capacity(spawn_calls.len());
+    for mut spawn_call in spawn_calls {
+        let (tool_output, success, error) = if let Some(completion) = spawn_call.completion.as_ref()
+        {
+            encode_completed_spawn_result(&spawn_call.metadata, completion)
+        } else {
+            if let Some(waiter) = spawn_call.waiter.take() {
                 retained_subagents.push(RetainedSpawnCompletion {
                     metadata: spawn_call.metadata.clone(),
-                    child_thread_id: spawn_call.child_thread_id,
                     waiter,
                 });
             }
-            let executed =
-                complete_spawn_tool_call(Arc::clone(&session), Arc::clone(&ctx), spawn_call).await;
-            resolved.push(executed);
-        }
+            encode_live_spawn_status(
+                &session,
+                &spawn_call.metadata,
+                &spawn_call.initial_status,
+                spawn_call.child_thread_id,
+            )
+        };
+        let executed = complete_tool_call(
+            Arc::clone(&session),
+            Arc::clone(&ctx),
+            spawn_call.index,
+            spawn_call.tool_call_id,
+            spawn_call.tool_call_call_id,
+            spawn_call.internal_call_id,
+            tool_output,
+            success,
+            error,
+        )
+        .await;
+        resolved.push(executed);
     }
+    resolved
+}
 
-    resolved.sort_by_key(|executed| executed.index);
-    Some(resolved)
+fn merge_in_index_order(
+    mut normal: Vec<ExecutedToolCall>,
+    spawn: Vec<ExecutedToolCall>,
+) -> Vec<ExecutedToolCall> {
+    normal.extend(spawn);
+    normal.sort_by_key(|executed| executed.index);
+    normal
 }
 
 enum SpawnToolStart {
@@ -978,124 +1023,69 @@ async fn next_started_spawn_completion(
     Some((index, completion))
 }
 
-async fn complete_spawn_tool_call(
-    session: Arc<Session>,
-    ctx: Arc<TurnContext>,
-    spawn_call: StartedSpawnToolCall,
-) -> ExecutedToolCall {
-    let (tool_output, success, error) = spawn_tool_call_output(&session, &spawn_call);
-    complete_tool_call(
-        session,
-        ctx,
-        spawn_call.index,
-        spawn_call.tool_call_id,
-        spawn_call.tool_call_call_id,
-        spawn_call.internal_call_id,
-        tool_output,
-        success,
-        error,
-    )
-    .await
-}
-
-fn spawn_tool_call_output(
-    session: &Session,
-    spawn_call: &StartedSpawnToolCall,
+fn encode_completed_spawn_result(
+    metadata: &AgentMetadata,
+    completion: &Result<InlineChildCompletion, String>,
 ) -> (String, bool, Option<String>) {
-    match spawn_call.completion.as_ref() {
-        Some(Ok(completion)) => encode_spawn_agent_result(
-            &spawn_call.metadata,
+    match completion {
+        Ok(completion) => encode_spawn_agent_result(
+            metadata,
             &completion.status,
             completion.last_assistant_message.clone(),
         )
         .map(|output| (output, true, None))
         .unwrap_or_else(|message| (message.clone(), false, Some(message))),
-        Some(Err(message)) => (message.clone(), false, Some(message.clone())),
-        None => {
-            let status = match session.agent_control.get_status(spawn_call.child_thread_id) {
-                AgentStatus::NotFound => spawn_call.initial_status.clone(),
-                status => status,
-            };
-            encode_spawn_agent_result(&spawn_call.metadata, &status, None)
-                .map(|output| (output, true, None))
-                .unwrap_or_else(|message| (message.clone(), false, Some(message)))
-        }
+        Err(message) => (message.clone(), false, Some(message.clone())),
     }
 }
 
-fn drain_ready_retained_subagents(
+fn encode_live_spawn_status(
+    session: &Session,
+    metadata: &AgentMetadata,
+    initial_status: &AgentStatus,
+    child_thread_id: ThreadId,
+) -> (String, bool, Option<String>) {
+    let status = match session.agent_control.get_status(child_thread_id) {
+        AgentStatus::NotFound => initial_status.clone(),
+        status => status,
+    };
+    encode_spawn_agent_result(metadata, &status, None)
+        .map(|output| (output, true, None))
+        .unwrap_or_else(|message| (message.clone(), false, Some(message)))
+}
+
+async fn drain_retained_subagent_completions(
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
 ) -> Vec<String> {
-    let mut ready = Vec::new();
-    let mut index = 0;
-    while index < retained_subagents.len() {
-        let completion = match retained_subagents[index].waiter.try_recv() {
-            Ok(completion) => Some(Ok(completion)),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some(Err(format!(
-                "spawn_agent inline wait failed to resolve for child {}",
-                retained_subagents[index].child_thread_id
-            ))),
-        };
-        if let Some(completion) = completion {
-            let retained = retained_subagents.remove(index);
-            ready.push(retained_completion_text(retained, completion));
-        } else {
-            index += 1;
-        }
-    }
-    ready
-}
-
-async fn next_retained_subagent_completion(
-    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
-) -> Option<String> {
-    let futures = retained_subagents
-        .iter_mut()
-        .enumerate()
-        .map(|(index, retained)| {
-            (&mut retained.waiter).map(move |result| {
-                (
-                    index,
-                    result
-                        .map_err(|err| format!("spawn_agent inline wait failed to resolve: {err}")),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    if futures.is_empty() {
-        return None;
-    }
-
-    let ((index, completion), _selected_index, remaining) = select_all(futures).await;
-    drop(remaining);
-    let retained = retained_subagents.remove(index);
-    Some(retained_completion_text(retained, completion))
+    let retained = std::mem::take(retained_subagents);
+    let completions = retained.into_iter().map(|retained| async move {
+        let RetainedSpawnCompletion { metadata, waiter } = retained;
+        let child_thread_id = metadata.agent_id;
+        let completion = waiter.await.map_err(|err| {
+            child_thread_id.map_or_else(
+                || format!("spawn_agent inline wait failed to resolve: {err}"),
+                |thread_id| {
+                    format!(
+                        "spawn_agent inline wait failed to resolve for child {thread_id}: {err}"
+                    )
+                },
+            )
+        });
+        retained_completion_text(metadata, completion)
+    });
+    futures_util::future::join_all(completions).await
 }
 
 fn retained_completion_text(
-    retained: RetainedSpawnCompletion,
+    metadata: AgentMetadata,
     completion: Result<InlineChildCompletion, String>,
 ) -> String {
     let (status, last_assistant_message) = match completion {
         Ok(completion) => (completion.status, completion.last_assistant_message),
         Err(message) => (AgentStatus::Errored(message), None),
     };
-    encode_spawn_agent_result(&retained.metadata, &status, last_assistant_message)
+    encode_spawn_agent_result(&metadata, &status, last_assistant_message)
         .unwrap_or_else(|message| message)
-}
-
-fn append_user_texts_to_context(
-    request_history: &mut Vec<Message>,
-    pending_prompt: &mut Message,
-    user_texts: Vec<String>,
-) {
-    let mut continuation_messages = vec![pending_prompt.clone()];
-    continuation_messages.extend(user_texts.into_iter().map(Message::user));
-    *pending_prompt = continuation_messages
-        .pop()
-        .expect("user-text continuation should produce a follow-up prompt");
-    request_history.extend(continuation_messages);
 }
 
 fn append_completion_texts_after_assistant_turn(
@@ -1202,6 +1192,36 @@ fn should_roundtrip_reasoning(
     reasoning: &MessageReasoning,
 ) -> bool {
     !requires_provider_reasoning_ids || reasoning.id.is_some()
+}
+
+fn build_assistant_tool_message(
+    turn_summary: &SessionTurnSummary,
+    accumulated_reasoning: &mut Vec<MessageReasoning>,
+    pending_tool_calls: &[PendingToolCall],
+    requires_provider_reasoning_ids: bool,
+) -> Option<Message> {
+    let mut content_items = Vec::new();
+    if !turn_summary.response.is_empty() {
+        content_items.push(AssistantContent::text(&turn_summary.response));
+    }
+    for reasoning in accumulated_reasoning.drain(..) {
+        if should_roundtrip_reasoning(requires_provider_reasoning_ids, &reasoning) {
+            content_items.push(AssistantContent::Reasoning(reasoning));
+        }
+    }
+    content_items.extend(
+        pending_tool_calls
+            .iter()
+            .map(|pending| pending.assistant_tool_call.clone()),
+    );
+    if content_items.is_empty() {
+        return None;
+    }
+    Some(Message::Assistant {
+        id: turn_summary.assistant_message_id.clone(),
+        content: OneOrMany::many(content_items)
+            .expect("tool phase assistant content should not be empty"),
+    })
 }
 
 fn tool_result_to_user_message(

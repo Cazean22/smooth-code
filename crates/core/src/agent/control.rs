@@ -571,6 +571,7 @@ impl AgentControl {
         parent_thread_id: ThreadId,
         _fork_mode: SpawnAgentForkMode,
     ) -> Result<Vec<rig::message::Message>> {
+        let parent_status = self.get_status(parent_thread_id);
         let runtime = self.runtime()?;
         let threads = runtime.threads.read().await;
         let parent_thread = threads
@@ -581,7 +582,17 @@ impl AgentControl {
 
         parent_thread.flush_rollout().await?;
         let items = read_persisted_items(parent_thread.rollout_path()).await?;
-        Ok(persisted_items_to_messages(items))
+        let mut history = persisted_items_to_messages(items);
+        if matches!(parent_status, AgentStatus::Running) {
+            Self::trim_active_prompt_from_fork_history(&mut history);
+        }
+        Ok(history)
+    }
+
+    fn trim_active_prompt_from_fork_history(history: &mut Vec<rig::message::Message>) {
+        if matches!(history.last(), Some(rig::message::Message::User { .. })) {
+            history.pop();
+        }
     }
 
     async fn handle_child_completion(
@@ -641,14 +652,14 @@ mod tests {
     };
 
     use anyhow::Result;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
     use rig::{
         agent::FinalResponse,
         message::{Message, Text, UserContent},
     };
     use smooth_state_db::StateDbHandle;
     use tempfile::TempDir;
-    use tokio::sync::RwLock;
+    use tokio::sync::{RwLock, Semaphore};
 
     use super::AgentControl;
     use crate::{
@@ -762,6 +773,64 @@ mod tests {
                 state: Arc::clone(&self.state),
                 text: "recorded".to_string(),
             })))
+        }
+    }
+
+    struct ForkAwareFactory {
+        build_count: Mutex<usize>,
+        state: Arc<RecordingState>,
+        release: Arc<Semaphore>,
+    }
+
+    impl SessionModelFactory for ForkAwareFactory {
+        fn build(
+            &self,
+            _cwd: PathBuf,
+            thread_id: ThreadId,
+            _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
+            _role_override: RoleOverride,
+            _agent_control: AgentControl,
+        ) -> Result<SessionModel> {
+            let mut build_count = self.build_count.lock().expect("build count mutex");
+            let build_index = *build_count;
+            *build_count += 1;
+            if build_index == 0 {
+                Ok(SessionModel::Stub(Arc::new(BlockingRootDriver {
+                    release: Arc::clone(&self.release),
+                    text: "root response".to_string(),
+                })))
+            } else {
+                Ok(SessionModel::Stub(Arc::new(RecordingDriver {
+                    thread_id,
+                    state: Arc::clone(&self.state),
+                    text: "recorded".to_string(),
+                })))
+            }
+        }
+    }
+
+    struct BlockingRootDriver {
+        release: Arc<Semaphore>,
+        text: String,
+    }
+
+    impl SessionModelDriver for BlockingRootDriver {
+        fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+            let _ = (prompt, history);
+            let release = Arc::clone(&self.release);
+            let text = self.text.clone();
+            Ok(Box::pin(
+                stream::once(async move {
+                    let _permit = release.acquire_owned().await.expect("release permit");
+                    Ok(SessionStreamEvent::StreamAssistantItem(
+                        crate::SessionAssistantContent::Text(Text { text }),
+                    ))
+                })
+                .chain(stream::iter(vec![Ok(SessionStreamEvent::FinalResponse(
+                    FinalResponse::empty(),
+                ))])),
+            ))
         }
     }
 
@@ -1118,6 +1187,73 @@ mod tests {
                     Some(UserContent::Text(Text { text })) if text == "parent asks"
                 )
         ));
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_with_fork_context_excludes_live_parent_prompt() {
+        let _cwd_guard = crate::test_support::cwd_test_lock()
+            .lock()
+            .expect("cwd lock");
+        let workspace = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+        let recording_state = Arc::new(RecordingState::default());
+        let release = Arc::new(Semaphore::new(0));
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(ForkAwareFactory {
+                build_count: Mutex::new(0),
+                state: Arc::clone(&recording_state),
+                release: Arc::clone(&release),
+            })),
+        )
+        .await
+        .expect("thread manager");
+        let started = manager.start_thread().await.expect("start root");
+        let root_id = started.thread_id;
+
+        manager
+            .start_user_input(
+                root_id,
+                "list crates, spawn two subagents to explore crates/protocol and crates/state-db"
+                    .to_string(),
+            )
+            .await
+            .expect("parent turn");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent_with_role(
+                root_id,
+                "explore crates/protocol".to_string(),
+                Some("explorer".to_string()),
+                None,
+                true,
+            )
+            .await
+            .expect("spawn child");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let child_id = child.agent_id.expect("child id");
+        let calls = recording_state
+            .calls
+            .lock()
+            .expect("calls mutex should lock");
+        let child_history = calls
+            .get(&child_id)
+            .and_then(|calls| calls.first())
+            .expect("child first call history");
+        assert!(
+            child_history.is_empty(),
+            "forked child should not inherit the live parent prompt"
+        );
+
+        release.add_permits(1);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
     }

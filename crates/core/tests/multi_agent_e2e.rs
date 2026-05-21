@@ -9,7 +9,10 @@ use anyhow::Result;
 use futures_util::{StreamExt, stream};
 use rig::{
     agent::FinalResponse,
-    message::{Message, Text, ToolCall, ToolFunction, UserContent},
+    message::{
+        AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction,
+        UserContent,
+    },
 };
 use serde::Deserialize;
 use smooth_core::{
@@ -1099,6 +1102,501 @@ async fn retained_subagents_all_finish_before_parent_continues() {
     std::env::set_current_dir(original_cwd).expect("restore cwd");
 }
 
+struct ReasoningStreamDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for ReasoningStreamDriver {
+    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+        unreachable!("manual completion stream should be used for reasoning stream test");
+    }
+
+    fn supports_manual_tool_loop(&self) -> bool {
+        true
+    }
+
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self.calls.lock().expect("calls mutex");
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(first_user_text(&prompt), Some("first input".to_string()));
+                assert!(history.is_empty());
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ReasoningDelta {
+                            id: Some("r1".to_string()),
+                            reasoning: "thinking-".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ReasoningDelta {
+                            id: Some("r1".to_string()),
+                            reasoning: "part-".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ReasoningDelta {
+                            id: Some("r2".to_string()),
+                            reasoning: "another".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "final-response".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-final".to_string()),
+                        response: "final-response".to_string(),
+                    })),
+                ])))
+            }
+            1 => {
+                assert_eq!(
+                    first_user_text(&prompt),
+                    Some("follow up".to_string()),
+                    "expected second user prompt"
+                );
+                assert_eq!(
+                    history.len(),
+                    2,
+                    "expected first user + terminal assistant in history"
+                );
+                assert_eq!(
+                    first_user_text(&history[0]),
+                    Some("first input".to_string())
+                );
+                let (text, reasonings) = assistant_text_and_reasonings(&history[1]);
+                assert_eq!(text.as_deref(), Some("final-response"));
+                assert_eq!(
+                    reasonings.len(),
+                    2,
+                    "expected both reasoning blocks preserved in terminal assistant message"
+                );
+                assert_eq!(reasonings[0].id.as_deref(), Some("r1"));
+                assert_eq!(reasoning_concat_text(&reasonings[0]), "thinking-part-");
+                assert_eq!(reasonings[1].id.as_deref(), Some("r2"));
+                assert_eq!(reasoning_concat_text(&reasonings[1]), "another");
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "ack".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-second".to_string()),
+                        response: "ack".to_string(),
+                    })),
+                ])))
+            }
+            other => panic!("unexpected completion turn {other}"),
+        }
+    }
+}
+
+struct ReasoningToolLoopDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for ReasoningToolLoopDriver {
+    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+        unreachable!("manual completion stream should be used for reasoning tool loop test");
+    }
+
+    fn supports_manual_tool_loop(&self) -> bool {
+        true
+    }
+
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self.calls.lock().expect("calls mutex");
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(first_user_text(&prompt), Some("tool loop".to_string()));
+                assert!(history.is_empty());
+                let tool_call = ToolCall::new(
+                    "tool-1".to_string(),
+                    ToolFunction::new(
+                        "normal_tool".to_string(),
+                        serde_json::json!({ "value": "ok" }),
+                    ),
+                )
+                .with_call_id("call-1".to_string());
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ReasoningDelta {
+                            id: Some("r-pre".to_string()),
+                            reasoning: "before-tool".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-call-1".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-tool-phase".to_string()),
+                        response: String::new(),
+                    })),
+                ])))
+            }
+            1 => {
+                assert_eq!(history.len(), 2);
+                assert_eq!(first_user_text(&history[0]), Some("tool loop".to_string()));
+                let (_, reasonings) = assistant_text_and_reasonings(&history[1]);
+                assert_eq!(reasonings.len(), 1);
+                assert_eq!(reasonings[0].id.as_deref(), Some("r-pre"));
+                assert_eq!(reasoning_concat_text(&reasonings[0]), "before-tool");
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ReasoningDelta {
+                            id: Some("r-post".to_string()),
+                            reasoning: "after-tool".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "tool-loop-done".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-final".to_string()),
+                        response: "tool-loop-done".to_string(),
+                    })),
+                ])))
+            }
+            2 => {
+                assert_eq!(first_user_text(&prompt), Some("verify".to_string()));
+                assert_eq!(
+                    history.len(),
+                    4,
+                    "expected user/assistant(tool)/user(result)/assistant(terminal)"
+                );
+                let (_, r1) = assistant_text_and_reasonings(&history[1]);
+                assert_eq!(r1.len(), 1);
+                assert_eq!(r1[0].id.as_deref(), Some("r-pre"));
+                assert_eq!(reasoning_concat_text(&r1[0]), "before-tool");
+                let (text2, r2) = assistant_text_and_reasonings(&history[3]);
+                assert_eq!(text2.as_deref(), Some("tool-loop-done"));
+                assert_eq!(r2.len(), 1);
+                assert_eq!(r2[0].id.as_deref(), Some("r-post"));
+                assert_eq!(reasoning_concat_text(&r2[0]), "after-tool");
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "verified".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-verify".to_string()),
+                        response: "verified".to_string(),
+                    })),
+                ])))
+            }
+            other => panic!("unexpected completion turn {other}"),
+        }
+    }
+
+    fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+        assert_eq!(tool_name, "normal_tool");
+        assert_eq!(args, r#"{"value":"ok"}"#);
+        Ok("tool-output".to_string())
+    }
+}
+
+struct ReasoningStreamFactory;
+
+impl SessionModelFactory for ReasoningStreamFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        _role_override: RoleOverride,
+        _agent_control: AgentControl,
+    ) -> Result<SessionModel> {
+        Ok(SessionModel::Stub(Arc::new(ReasoningStreamDriver {
+            calls: Mutex::new(0),
+        })))
+    }
+}
+
+struct ReasoningToolLoopFactory;
+
+impl SessionModelFactory for ReasoningToolLoopFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        _role_override: RoleOverride,
+        _agent_control: AgentControl,
+    ) -> Result<SessionModel> {
+        Ok(SessionModel::Stub(Arc::new(ReasoningToolLoopDriver {
+            calls: Mutex::new(0),
+        })))
+    }
+}
+
+/// Emits an Anthropic-shaped reasoning stream: idless `ReasoningDelta` chunks
+/// followed by a single idless full `Reasoning` block carrying a signature.
+/// Used to catch the regression where the pending idless delta bucket wasn't
+/// cleared by the idless completion — the resulting duplicate unsigned
+/// reasoning would be rejected by Anthropic on the next request.
+struct IdlessReasoningCompletionDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for IdlessReasoningCompletionDriver {
+    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+        unreachable!(
+            "manual completion stream should be used for idless reasoning completion test"
+        );
+    }
+
+    fn supports_manual_tool_loop(&self) -> bool {
+        true
+    }
+
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self.calls.lock().expect("calls mutex");
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(
+                    first_user_text(&prompt),
+                    Some("anthropic shape".to_string())
+                );
+                assert!(history.is_empty());
+                let signed_completion =
+                    Reasoning::new_with_signature("thinking", Some("sig-abc".to_string()));
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ReasoningDelta {
+                            id: None,
+                            reasoning: "think".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ReasoningDelta {
+                            id: None,
+                            reasoning: "ing".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Reasoning(signed_completion),
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "final".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-anthropic".to_string()),
+                        response: "final".to_string(),
+                    })),
+                ])))
+            }
+            1 => {
+                assert_eq!(first_user_text(&prompt), Some("follow up".to_string()));
+                assert_eq!(history.len(), 2);
+                let (text, reasonings) = assistant_text_and_reasonings(&history[1]);
+                assert_eq!(text.as_deref(), Some("final"));
+                assert_eq!(
+                    reasonings.len(),
+                    1,
+                    "expected exactly one reasoning block (the signed completion), \
+                     not a duplicate unsigned block from leftover deltas"
+                );
+                assert!(reasonings[0].id.is_none());
+                let signed = reasonings[0].content.iter().find_map(|item| match item {
+                    ReasoningContent::Text { text, signature } => {
+                        Some((text.clone(), signature.clone()))
+                    }
+                    _ => None,
+                });
+                assert_eq!(
+                    signed,
+                    Some(("thinking".to_string(), Some("sig-abc".to_string()))),
+                    "expected the signed completion content to be preserved verbatim"
+                );
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "ack".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-followup".to_string()),
+                        response: "ack".to_string(),
+                    })),
+                ])))
+            }
+            other => panic!("unexpected completion turn {other}"),
+        }
+    }
+}
+
+struct IdlessReasoningCompletionFactory;
+
+impl SessionModelFactory for IdlessReasoningCompletionFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        _role_override: RoleOverride,
+        _agent_control: AgentControl,
+    ) -> Result<SessionModel> {
+        Ok(SessionModel::Stub(Arc::new(
+            IdlessReasoningCompletionDriver {
+                calls: Mutex::new(0),
+            },
+        )))
+    }
+}
+
+async fn wait_for_turn_completion(
+    events: &mut tokio::sync::broadcast::Receiver<smooth_protocol::Event>,
+    turn_id: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(err)) => panic!("event channel closed: {err}"),
+            Err(_) => panic!("timed out waiting for turn {turn_id} to complete"),
+        };
+        if let EventMsg::TurnCompleted(TurnCompletedEvent {
+            turn_id: completed_id,
+            ..
+        }) = event.msg
+            && completed_id == turn_id
+        {
+            return;
+        }
+    }
+    panic!("turn {turn_id} did not complete in time");
+}
+
+#[tokio::test]
+async fn terminal_turn_preserves_multi_id_reasoning_in_history() {
+    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
+    let workspace = TempDir::new().expect("tempdir");
+    let original_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+    let manager = ThreadManagerState::new(None, Some(Arc::new(ReasoningStreamFactory)))
+        .await
+        .expect("thread manager");
+    let started = manager.start_thread().await.expect("start root");
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+
+    let first_turn = manager
+        .start_user_input(root_id, "first input".to_string())
+        .await
+        .expect("start first turn");
+    wait_for_turn_completion(&mut root_events, &first_turn).await;
+
+    // Second turn triggers the driver's assertions on the persisted history.
+    let second_turn = manager
+        .start_user_input(root_id, "follow up".to_string())
+        .await
+        .expect("start second turn");
+    wait_for_turn_completion(&mut root_events, &second_turn).await;
+
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+}
+
+#[tokio::test]
+async fn reasoning_persists_across_tool_call_iteration_and_terminal_turn() {
+    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
+    let workspace = TempDir::new().expect("tempdir");
+    let original_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+    let manager = ThreadManagerState::new(None, Some(Arc::new(ReasoningToolLoopFactory)))
+        .await
+        .expect("thread manager");
+    let started = manager.start_thread().await.expect("start root");
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+
+    let first_turn = manager
+        .start_user_input(root_id, "tool loop".to_string())
+        .await
+        .expect("start first turn");
+    wait_for_turn_completion(&mut root_events, &first_turn).await;
+
+    let second_turn = manager
+        .start_user_input(root_id, "verify".to_string())
+        .await
+        .expect("start verification turn");
+    wait_for_turn_completion(&mut root_events, &second_turn).await;
+
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+}
+
+#[tokio::test]
+async fn idless_reasoning_completion_supersedes_pending_deltas_without_duplicating() {
+    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
+    let workspace = TempDir::new().expect("tempdir");
+    let original_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+    let manager = ThreadManagerState::new(None, Some(Arc::new(IdlessReasoningCompletionFactory)))
+        .await
+        .expect("thread manager");
+    let started = manager.start_thread().await.expect("start root");
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+
+    let first_turn = manager
+        .start_user_input(root_id, "anthropic shape".to_string())
+        .await
+        .expect("start first turn");
+    wait_for_turn_completion(&mut root_events, &first_turn).await;
+
+    // The driver's call-1 arm asserts the persisted history contains exactly
+    // one reasoning content item (the signed completion) — no leftover unsigned
+    // duplicate from the pending delta bucket.
+    let second_turn = manager
+        .start_user_input(root_id, "follow up".to_string())
+        .await
+        .expect("start follow-up turn");
+    wait_for_turn_completion(&mut root_events, &second_turn).await;
+
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+}
+
 fn assert_live_status_entry(agent: &CollabAgentStatusEntry) {
     assert!(
         matches!(
@@ -1194,4 +1692,39 @@ fn first_user_text(message: &Message) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+fn assistant_text_and_reasonings(message: &Message) -> (Option<String>, Vec<Reasoning>) {
+    match message {
+        Message::Assistant { content, .. } => {
+            let mut text = None;
+            let mut reasonings = Vec::new();
+            for item in content.iter() {
+                match item {
+                    AssistantContent::Text(t) => {
+                        text = Some(t.text.clone());
+                    }
+                    AssistantContent::Reasoning(reasoning) => {
+                        reasonings.push(reasoning.clone());
+                    }
+                    _ => {}
+                }
+            }
+            (text, reasonings)
+        }
+        other => panic!("expected assistant message, got {other:?}"),
+    }
+}
+
+fn reasoning_concat_text(reasoning: &Reasoning) -> String {
+    reasoning
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            ReasoningContent::Text { text, .. } | ReasoningContent::Summary(text) => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect()
 }

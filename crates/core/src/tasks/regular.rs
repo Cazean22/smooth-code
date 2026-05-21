@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use futures_util::{FutureExt, StreamExt, future::select_all, stream::FuturesUnordered};
+use indexmap::IndexMap;
 use rig::{
     OneOrMany,
     message::{
@@ -138,6 +139,47 @@ struct RetainedSpawnCompletion {
     waiter: InlineChildCompletionReceiver,
 }
 
+/// Per-id buffer for `ReasoningDelta` chunks streamed alongside (or in place of)
+/// authoritative `Reasoning` completion events. Tracking deltas per id lets the
+/// fallback reconstruct one `MessageReasoning` per distinct block when the
+/// provider never sends completions, instead of collapsing every delta into a
+/// single block with the wrong id.
+///
+/// A `Reasoning` completion supersedes the deltas it summarizes, regardless of
+/// whether an id is present. For id'd completions that means clearing the
+/// matching id's bucket. For idless completions — Anthropic's signed
+/// `thinking` blocks are the canonical case — the same rule applies: the
+/// completion's content (with its signature) replaces the pending idless
+/// deltas. Leaving them in the bucket would emit an unsigned duplicate at
+/// finalize and the provider would reject the next request.
+#[derive(Default)]
+struct PendingReasoningDeltas {
+    deltas: IndexMap<Option<String>, String>,
+}
+
+impl PendingReasoningDeltas {
+    fn push_delta(&mut self, id: Option<String>, text: &str) {
+        self.deltas.entry(id).or_default().push_str(text);
+    }
+
+    fn on_completion(&mut self, id: &Option<String>) {
+        self.deltas.shift_remove(id);
+    }
+
+    fn finalize_into(self, accumulated: &mut Vec<MessageReasoning>) {
+        for (id, text) in self.deltas {
+            if text.is_empty() {
+                continue;
+            }
+            let mut reasoning = MessageReasoning::new(&text);
+            if let Some(id) = id {
+                reasoning = reasoning.with_id(id);
+            }
+            accumulated.push(reasoning);
+        }
+    }
+}
+
 impl SessionTask for RegularTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular
@@ -247,8 +289,7 @@ async fn run_manual_turn(
         };
         let mut pending_tool_calls = Vec::new();
         let mut accumulated_reasoning = Vec::new();
-        let mut pending_reasoning_delta_text = String::new();
-        let mut pending_reasoning_delta_id = None;
+        let mut pending_reasoning_deltas = PendingReasoningDeltas::default();
         let mut saw_tool_call_this_turn = false;
         let mut turn_summary = SessionTurnSummary {
             assistant_message_id: None,
@@ -318,10 +359,7 @@ async fn run_manual_turn(
                         let item_id = id
                             .clone()
                             .unwrap_or_else(|| format!("{}-reasoning", ctx.assistant_item_id));
-                        pending_reasoning_delta_text.push_str(&reasoning);
-                        if pending_reasoning_delta_id.is_none() {
-                            pending_reasoning_delta_id = id;
-                        }
+                        pending_reasoning_deltas.push_delta(id, &reasoning);
                         session
                             .emit_event(
                                 &ctx,
@@ -339,6 +377,7 @@ async fn run_manual_turn(
                         if text.is_empty() {
                             continue;
                         }
+                        pending_reasoning_deltas.on_completion(&reasoning.id);
                         merge_reasoning_blocks(&mut accumulated_reasoning, &reasoning);
                         session
                             .emit_event(
@@ -363,13 +402,7 @@ async fn run_manual_turn(
             }
         }
 
-        if accumulated_reasoning.is_empty() && !pending_reasoning_delta_text.is_empty() {
-            let mut reasoning = MessageReasoning::new(&pending_reasoning_delta_text);
-            if let Some(id) = pending_reasoning_delta_id.take() {
-                reasoning = reasoning.with_id(id);
-            }
-            accumulated_reasoning.push(reasoning);
-        }
+        pending_reasoning_deltas.finalize_into(&mut accumulated_reasoning);
 
         if saw_tool_call_this_turn {
             let assistant_message = build_assistant_tool_message(
@@ -434,8 +467,16 @@ async fn run_manual_turn(
             continue;
         }
 
+        if let Some(message) = build_assistant_text_reasoning_message(
+            &turn_summary,
+            &mut accumulated_reasoning,
+            session.model().requires_provider_reasoning_ids(),
+        ) {
+            new_messages.push(message);
+        }
         let last_assistant_message = turn_summary.response.clone();
-        let final_history = build_full_history(history_before_turn, new_messages, &turn_summary);
+        let mut final_history = history_before_turn;
+        final_history.extend(new_messages);
         session.replace_history(final_history).await;
         if !last_assistant_message.is_empty() {
             session
@@ -1085,6 +1126,23 @@ fn append_completion_texts_after_assistant_turn(
     requires_provider_reasoning_ids: bool,
     completion_texts: Vec<String>,
 ) {
+    if let Some(message) = build_assistant_text_reasoning_message(
+        turn_summary,
+        accumulated_reasoning,
+        requires_provider_reasoning_ids,
+    ) {
+        new_messages.push(message);
+    }
+    if let Some(message) = text_items_to_user_message(completion_texts) {
+        new_messages.push(message);
+    }
+}
+
+fn build_assistant_text_reasoning_message(
+    turn_summary: &SessionTurnSummary,
+    accumulated_reasoning: &mut Vec<MessageReasoning>,
+    requires_provider_reasoning_ids: bool,
+) -> Option<Message> {
     let mut content_items = Vec::new();
     if !turn_summary.response.is_empty() {
         content_items.push(AssistantContent::text(&turn_summary.response));
@@ -1094,16 +1152,13 @@ fn append_completion_texts_after_assistant_turn(
             content_items.push(AssistantContent::Reasoning(reasoning));
         }
     }
-    if !content_items.is_empty() {
-        new_messages.push(Message::Assistant {
-            id: turn_summary.assistant_message_id.clone(),
-            content: OneOrMany::many(content_items)
-                .expect("assistant continuation content should not be empty"),
-        });
+    if content_items.is_empty() {
+        return None;
     }
-    if let Some(message) = text_items_to_user_message(completion_texts) {
-        new_messages.push(message);
-    }
+    Some(Message::Assistant {
+        id: turn_summary.assistant_message_id.clone(),
+        content: OneOrMany::many(content_items).expect("assistant content should not be empty"),
+    })
 }
 
 fn encode_spawn_agent_result(
@@ -1147,18 +1202,6 @@ fn build_request_parts(
     let mut request_history = history_before_turn.to_vec();
     request_history.extend_from_slice(new_history);
     Some((pending_prompt.clone(), request_history))
-}
-
-fn build_full_history(
-    mut history_before_turn: Vec<Message>,
-    new_messages: Vec<Message>,
-    summary: &SessionTurnSummary,
-) -> Vec<Message> {
-    history_before_turn.extend(new_messages);
-    if !summary.response.is_empty() {
-        history_before_turn.push(Message::assistant(&summary.response));
-    }
-    history_before_turn
 }
 
 fn merge_reasoning_blocks(
@@ -1264,7 +1307,7 @@ fn agent_status_label(status: &AgentStatus) -> &'static str {
 mod tests {
     use rig::message::Reasoning as MessageReasoning;
 
-    use super::should_roundtrip_reasoning;
+    use super::{PendingReasoningDeltas, should_roundtrip_reasoning};
 
     #[test]
     fn idless_reasoning_roundtrips_for_non_openai_models() {
@@ -1285,5 +1328,125 @@ mod tests {
         let reasoning = MessageReasoning::new("thinking").with_id("rs_123".to_string());
 
         assert!(should_roundtrip_reasoning(true, &reasoning));
+    }
+
+    fn reasoning_text_content(reasoning: &MessageReasoning) -> String {
+        reasoning
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                rig::message::ReasoningContent::Text { text, .. }
+                | rig::message::ReasoningContent::Summary(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn distinct_idd_deltas_finalize_as_separate_blocks_in_insertion_order() {
+        let mut pending = PendingReasoningDeltas::default();
+        pending.push_delta(Some("r1".to_string()), "a");
+        pending.push_delta(Some("r1".to_string()), "b");
+        pending.push_delta(Some("r2".to_string()), "c");
+
+        let mut accumulated = Vec::new();
+        pending.finalize_into(&mut accumulated);
+
+        assert_eq!(accumulated.len(), 2);
+        assert_eq!(accumulated[0].id.as_deref(), Some("r1"));
+        assert_eq!(reasoning_text_content(&accumulated[0]), "ab");
+        assert_eq!(accumulated[1].id.as_deref(), Some("r2"));
+        assert_eq!(reasoning_text_content(&accumulated[1]), "c");
+    }
+
+    #[test]
+    fn idd_and_idless_deltas_both_finalize() {
+        let mut pending = PendingReasoningDeltas::default();
+        pending.push_delta(Some("r1".to_string()), "with id");
+        pending.push_delta(None, "no id");
+
+        let mut accumulated = Vec::new();
+        pending.finalize_into(&mut accumulated);
+
+        assert_eq!(accumulated.len(), 2);
+        assert_eq!(accumulated[0].id.as_deref(), Some("r1"));
+        assert_eq!(reasoning_text_content(&accumulated[0]), "with id");
+        assert!(accumulated[1].id.is_none());
+        assert_eq!(reasoning_text_content(&accumulated[1]), "no id");
+    }
+
+    #[test]
+    fn empty_pending_does_not_modify_accumulated() {
+        let pending = PendingReasoningDeltas::default();
+        let mut accumulated = vec![MessageReasoning::new("preexisting")];
+
+        pending.finalize_into(&mut accumulated);
+
+        assert_eq!(accumulated.len(), 1);
+        assert_eq!(reasoning_text_content(&accumulated[0]), "preexisting");
+    }
+
+    #[test]
+    fn idd_completion_clears_matching_pending_bucket() {
+        let mut pending = PendingReasoningDeltas::default();
+        pending.push_delta(Some("r1".to_string()), "deltas");
+        pending.push_delta(Some("r2".to_string()), "kept");
+        pending.on_completion(&Some("r1".to_string()));
+
+        let mut accumulated = Vec::new();
+        pending.finalize_into(&mut accumulated);
+
+        assert_eq!(accumulated.len(), 1);
+        assert_eq!(accumulated[0].id.as_deref(), Some("r2"));
+        assert_eq!(reasoning_text_content(&accumulated[0]), "kept");
+    }
+
+    #[test]
+    fn idless_completion_clears_pending_idless_bucket() {
+        // Anthropic streams idless `thinking` deltas and then emits a single
+        // idless signed `Reasoning` completion. The completion supersedes the
+        // deltas it summarizes — leaving them in the pending bucket would
+        // produce a duplicate unsigned reasoning at finalize, which the
+        // provider would reject on the next request.
+        let mut pending = PendingReasoningDeltas::default();
+        pending.push_delta(None, "thinking deltas");
+        pending.on_completion(&None);
+
+        let mut accumulated = Vec::new();
+        pending.finalize_into(&mut accumulated);
+
+        assert!(
+            accumulated.is_empty(),
+            "idless completion should have cleared the idless bucket so finalize emits no duplicate"
+        );
+    }
+
+    #[test]
+    fn idless_completion_does_not_disturb_idd_pending_bucket() {
+        let mut pending = PendingReasoningDeltas::default();
+        pending.push_delta(Some("r1".to_string()), "kept");
+        pending.push_delta(None, "thinking deltas");
+        pending.on_completion(&None);
+
+        let mut accumulated = Vec::new();
+        pending.finalize_into(&mut accumulated);
+
+        assert_eq!(accumulated.len(), 1);
+        assert_eq!(accumulated[0].id.as_deref(), Some("r1"));
+        assert_eq!(reasoning_text_content(&accumulated[0]), "kept");
+    }
+
+    #[test]
+    fn completion_for_unknown_id_is_a_noop() {
+        let mut pending = PendingReasoningDeltas::default();
+        pending.push_delta(Some("r1".to_string()), "intact");
+        pending.on_completion(&Some("rX".to_string()));
+
+        let mut accumulated = Vec::new();
+        pending.finalize_into(&mut accumulated);
+
+        assert_eq!(accumulated.len(), 1);
+        assert_eq!(accumulated[0].id.as_deref(), Some("r1"));
+        assert_eq!(reasoning_text_content(&accumulated[0]), "intact");
     }
 }

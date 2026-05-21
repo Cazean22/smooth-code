@@ -175,7 +175,11 @@ impl SessionModel {
                 builder = builder.base_url("http://localhost:8317/v1");
                 let client = builder.build()?;
                 let additional_params = AdditionalParameters {
-                    reasoning: Some(OpenAiReasoning::new().with_effort(ReasoningEffort::High)),
+                    reasoning: Some(
+                        OpenAiReasoning::new()
+                            .with_effort(ReasoningEffort::High)
+                            .with_summary_level(openai::responses_api::ReasoningSummaryLevel::Auto),
+                    ),
                     ..Default::default()
                 };
                 Ok(Self::OpenAi(Arc::new(build_agent(

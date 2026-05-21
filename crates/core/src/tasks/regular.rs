@@ -373,25 +373,38 @@ async fn run_manual_turn(
                             .await;
                     }
                     SessionAssistantContent::Reasoning(reasoning) => {
-                        let text = reasoning_text(&reasoning);
-                        if text.is_empty() {
+                        // Skip only truly empty completions. A block carrying
+                        // `Encrypted` or `Redacted` content has empty
+                        // human-readable text but still must be roundtripped
+                        // to the provider on the next turn — for OpenAI's
+                        // o-series, the encrypted chain-of-thought is what
+                        // preserves reasoning continuity, and dropping it
+                        // can produce refusals or degraded responses.
+                        if reasoning.content.is_empty() {
                             continue;
                         }
                         pending_reasoning_deltas.on_completion(&reasoning.id);
+                        let text = reasoning_text(&reasoning);
+                        let item_id = reasoning
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("{}-reasoning", ctx.assistant_item_id));
                         merge_reasoning_blocks(&mut accumulated_reasoning, &reasoning);
-                        session
-                            .emit_event(
-                                &ctx,
-                                EventMsg::AgentReasoningCompleted(AgentReasoningCompletedEvent {
-                                    thread_id: session.id.to_string(),
-                                    turn_id: ctx.sub_id.clone(),
-                                    item_id: reasoning.id.unwrap_or_else(|| {
-                                        format!("{}-reasoning", ctx.assistant_item_id)
-                                    }),
-                                    text,
-                                }),
-                            )
-                            .await;
+                        if !text.is_empty() {
+                            session
+                                .emit_event(
+                                    &ctx,
+                                    EventMsg::AgentReasoningCompleted(
+                                        AgentReasoningCompletedEvent {
+                                            thread_id: session.id.to_string(),
+                                            turn_id: ctx.sub_id.clone(),
+                                            item_id,
+                                            text,
+                                        },
+                                    ),
+                                )
+                                .await;
+                        }
                     }
                     SessionAssistantContent::ToolCallDelta { .. }
                     | SessionAssistantContent::Final => {}

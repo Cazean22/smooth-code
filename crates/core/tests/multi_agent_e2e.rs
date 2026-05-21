@@ -1482,6 +1482,120 @@ impl SessionModelFactory for IdlessReasoningCompletionFactory {
     }
 }
 
+/// Emits a `Reasoning` completion whose only content is encrypted bytes (the
+/// OpenAI o-series / gpt-oss shape). Used to verify that blocks without
+/// human-readable text are still preserved in history so they can be
+/// roundtripped to the provider on the next turn.
+struct EncryptedReasoningDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for EncryptedReasoningDriver {
+    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+        unreachable!("manual completion stream should be used for encrypted reasoning test");
+    }
+
+    fn supports_manual_tool_loop(&self) -> bool {
+        true
+    }
+
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self.calls.lock().expect("calls mutex");
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(
+                    first_user_text(&prompt),
+                    Some("encrypted shape".to_string())
+                );
+                assert!(history.is_empty());
+                // The Reasoning struct is `#[non_exhaustive]`, so we can't
+                // construct it via a struct literal from outside rig. Build
+                // it via the public constructor and replace its content vec
+                // with an Encrypted block.
+                let mut encrypted = Reasoning::new("");
+                encrypted.id = Some("rs_enc".to_string());
+                encrypted.content.clear();
+                encrypted
+                    .content
+                    .push(ReasoningContent::Encrypted("opaque-cot-bytes".to_string()));
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Reasoning(encrypted),
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "answer".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-encrypted".to_string()),
+                        response: "answer".to_string(),
+                    })),
+                ])))
+            }
+            1 => {
+                assert_eq!(first_user_text(&prompt), Some("follow up".to_string()));
+                assert_eq!(history.len(), 2);
+                let (text, reasonings) = assistant_text_and_reasonings(&history[1]);
+                assert_eq!(text.as_deref(), Some("answer"));
+                assert_eq!(
+                    reasonings.len(),
+                    1,
+                    "encrypted reasoning block should be preserved in history"
+                );
+                assert_eq!(reasonings[0].id.as_deref(), Some("rs_enc"));
+                let encrypted_payload = reasonings[0].content.iter().find_map(|item| match item {
+                    ReasoningContent::Encrypted(blob) => Some(blob.clone()),
+                    _ => None,
+                });
+                assert_eq!(
+                    encrypted_payload.as_deref(),
+                    Some("opaque-cot-bytes"),
+                    "expected encrypted payload to be roundtripped verbatim"
+                );
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "ack".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-followup".to_string()),
+                        response: "ack".to_string(),
+                    })),
+                ])))
+            }
+            other => panic!("unexpected completion turn {other}"),
+        }
+    }
+}
+
+struct EncryptedReasoningFactory;
+
+impl SessionModelFactory for EncryptedReasoningFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        _role_override: RoleOverride,
+        _agent_control: AgentControl,
+    ) -> Result<SessionModel> {
+        Ok(SessionModel::Stub(Arc::new(EncryptedReasoningDriver {
+            calls: Mutex::new(0),
+        })))
+    }
+}
+
 async fn wait_for_turn_completion(
     events: &mut tokio::sync::broadcast::Receiver<smooth_protocol::Event>,
     turn_id: &str,
@@ -1588,6 +1702,40 @@ async fn idless_reasoning_completion_supersedes_pending_deltas_without_duplicati
     // The driver's call-1 arm asserts the persisted history contains exactly
     // one reasoning content item (the signed completion) — no leftover unsigned
     // duplicate from the pending delta bucket.
+    let second_turn = manager
+        .start_user_input(root_id, "follow up".to_string())
+        .await
+        .expect("start follow-up turn");
+    wait_for_turn_completion(&mut root_events, &second_turn).await;
+
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+}
+
+#[tokio::test]
+async fn encrypted_reasoning_block_is_preserved_in_history() {
+    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
+    let workspace = TempDir::new().expect("tempdir");
+    let original_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+    let manager = ThreadManagerState::new(None, Some(Arc::new(EncryptedReasoningFactory)))
+        .await
+        .expect("thread manager");
+    let started = manager.start_thread().await.expect("start root");
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+
+    let first_turn = manager
+        .start_user_input(root_id, "encrypted shape".to_string())
+        .await
+        .expect("start first turn");
+    wait_for_turn_completion(&mut root_events, &first_turn).await;
+
+    // The driver's call-1 arm asserts the persisted history retained the
+    // encrypted reasoning block verbatim. The fix at the manual-turn
+    // Reasoning handler (gate on reasoning.content.is_empty() rather than
+    // text.is_empty()) is what makes this hold — previously the block was
+    // dropped because its human-readable text was empty.
     let second_turn = manager
         .start_user_input(root_id, "follow up".to_string())
         .await

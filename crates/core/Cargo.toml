@@ -12,7 +12,7 @@ async-stream.workspace = true
 async-channel.workspace = true
 futures-util.workspace = true
 indexmap.workspace = true
-rig-core.workspace = true
+rig.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smooth-protocol = { path = "../protocol" }

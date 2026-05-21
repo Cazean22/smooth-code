@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 app-server-protocol = { path = "../app-server-protocol" }
 futures-util.workspace = true
-rig-core.workspace = true
+rig.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

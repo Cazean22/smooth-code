@@ -111,7 +111,7 @@ struct SpawnAgentResult {
 
 struct ExecutedToolCall {
     index: usize,
-    tool_result_message: Message,
+    tool_result: ToolResult,
 }
 
 struct PendingToolCall {
@@ -223,8 +223,7 @@ async fn run_manual_turn(
     history_before_turn: Vec<Message>,
     cancellation_token: CancellationToken,
 ) -> Option<String> {
-    let mut request_history = history_before_turn;
-    let mut pending_prompt = initial_prompt;
+    let mut new_messages = vec![initial_prompt];
     let mut saw_tool_loop = false;
     let mut retained_subagents = Vec::new();
 
@@ -233,9 +232,11 @@ async fn run_manual_turn(
             return None;
         }
 
+        let (pending_prompt, request_history) =
+            build_request_parts(&history_before_turn, &new_messages)?;
         let mut stream = match session
             .model()
-            .stream_completion_turn(pending_prompt.clone(), &request_history)
+            .stream_completion_turn(pending_prompt, &request_history)
             .await
         {
             Ok(stream) => stream,
@@ -409,18 +410,12 @@ async fn run_manual_turn(
 
             let executed_tool_calls = merge_in_index_order(normal_results, spawn_results);
 
-            let mut continuation_messages = vec![pending_prompt];
             if let Some(message) = assistant_message {
-                continuation_messages.push(message);
+                new_messages.push(message);
             }
-            for executed in executed_tool_calls {
-                continuation_messages.push(executed.tool_result_message);
+            if let Some(message) = tool_results_to_user_message(executed_tool_calls) {
+                new_messages.push(message);
             }
-
-            pending_prompt = continuation_messages
-                .pop()
-                .expect("tool loop continuation should produce a follow-up prompt");
-            request_history.extend(continuation_messages);
             continue;
         }
 
@@ -430,8 +425,7 @@ async fn run_manual_turn(
                 completions = drain_retained_subagent_completions(&mut retained_subagents) => completions,
             };
             append_completion_texts_after_assistant_turn(
-                &mut request_history,
-                &mut pending_prompt,
+                &mut new_messages,
                 &turn_summary,
                 &mut accumulated_reasoning,
                 session.model().requires_provider_reasoning_ids(),
@@ -441,7 +435,7 @@ async fn run_manual_turn(
         }
 
         let last_assistant_message = turn_summary.response.clone();
-        let final_history = build_full_history(request_history, pending_prompt, &turn_summary);
+        let final_history = build_full_history(history_before_turn, new_messages, &turn_summary);
         session.replace_history(final_history).await;
         if !last_assistant_message.is_empty() {
             session
@@ -714,11 +708,7 @@ async fn complete_tool_call(
 
     ExecutedToolCall {
         index,
-        tool_result_message: tool_result_to_user_message(
-            tool_call_id,
-            tool_call_call_id,
-            tool_output,
-        ),
+        tool_result: tool_result(tool_call_id, tool_call_call_id, tool_output),
     }
 }
 
@@ -1089,14 +1079,12 @@ fn retained_completion_text(
 }
 
 fn append_completion_texts_after_assistant_turn(
-    request_history: &mut Vec<Message>,
-    pending_prompt: &mut Message,
+    new_messages: &mut Vec<Message>,
     turn_summary: &SessionTurnSummary,
     accumulated_reasoning: &mut Vec<MessageReasoning>,
     requires_provider_reasoning_ids: bool,
     completion_texts: Vec<String>,
 ) {
-    let mut continuation_messages = vec![pending_prompt.clone()];
     let mut content_items = Vec::new();
     if !turn_summary.response.is_empty() {
         content_items.push(AssistantContent::text(&turn_summary.response));
@@ -1107,17 +1095,15 @@ fn append_completion_texts_after_assistant_turn(
         }
     }
     if !content_items.is_empty() {
-        continuation_messages.push(Message::Assistant {
+        new_messages.push(Message::Assistant {
             id: turn_summary.assistant_message_id.clone(),
             content: OneOrMany::many(content_items)
                 .expect("assistant continuation content should not be empty"),
         });
     }
-    continuation_messages.extend(completion_texts.into_iter().map(Message::user));
-    *pending_prompt = continuation_messages
-        .pop()
-        .expect("completion continuation should produce a follow-up prompt");
-    request_history.extend(continuation_messages);
+    if let Some(message) = text_items_to_user_message(completion_texts) {
+        new_messages.push(message);
+    }
 }
 
 fn encode_spawn_agent_result(
@@ -1153,12 +1139,22 @@ fn spawn_agent_result_from_metadata(
     }
 }
 
+fn build_request_parts(
+    history_before_turn: &[Message],
+    new_messages: &[Message],
+) -> Option<(Message, Vec<Message>)> {
+    let (pending_prompt, new_history) = new_messages.split_last()?;
+    let mut request_history = history_before_turn.to_vec();
+    request_history.extend_from_slice(new_history);
+    Some((pending_prompt.clone(), request_history))
+}
+
 fn build_full_history(
     mut history_before_turn: Vec<Message>,
-    pending_prompt: Message,
+    new_messages: Vec<Message>,
     summary: &SessionTurnSummary,
 ) -> Vec<Message> {
-    history_before_turn.push(pending_prompt);
+    history_before_turn.extend(new_messages);
     if !summary.response.is_empty() {
         history_before_turn.push(Message::assistant(&summary.response));
     }
@@ -1224,17 +1220,31 @@ fn build_assistant_tool_message(
     })
 }
 
-fn tool_result_to_user_message(
-    id: String,
-    call_id: Option<String>,
-    tool_result: String,
-) -> Message {
-    Message::User {
-        content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-            id,
-            call_id,
-            content: ToolResultContent::from_tool_output(tool_result),
-        })),
+fn tool_results_to_user_message(executed_tool_calls: Vec<ExecutedToolCall>) -> Option<Message> {
+    let content = executed_tool_calls
+        .into_iter()
+        .map(|executed| UserContent::ToolResult(executed.tool_result))
+        .collect::<Vec<_>>();
+    OneOrMany::many(content)
+        .ok()
+        .map(|content| Message::User { content })
+}
+
+fn text_items_to_user_message(texts: Vec<String>) -> Option<Message> {
+    let content = texts
+        .into_iter()
+        .map(|text| UserContent::Text(Text { text }))
+        .collect::<Vec<_>>();
+    OneOrMany::many(content)
+        .ok()
+        .map(|content| Message::User { content })
+}
+
+fn tool_result(id: String, call_id: Option<String>, tool_result: String) -> ToolResult {
+    ToolResult {
+        id,
+        call_id,
+        content: ToolResultContent::from_tool_output(tool_result),
     }
 }
 

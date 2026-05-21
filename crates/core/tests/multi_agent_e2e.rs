@@ -229,15 +229,17 @@ impl SessionModelDriver for ConcurrentSpawnDriver {
                 ])))
             }
             1 => {
-                assert_eq!(history.len(), 3);
+                assert_eq!(history.len(), 2);
                 assert_eq!(
                     first_user_text(&history[0]),
                     Some("delegate children".to_string())
                 );
-                let first_spawn = tool_result_agent_info(&history[2]);
-                let second_spawn = tool_result_agent_info(&prompt);
-                assert_completed_spawn_result(&first_spawn);
-                assert_completed_spawn_result(&second_spawn);
+                let spawns = tool_result_agent_infos(&prompt);
+                assert_eq!(spawns.len(), 2);
+                let first_spawn = &spawns[0];
+                let second_spawn = &spawns[1];
+                assert_completed_spawn_result(first_spawn);
+                assert_completed_spawn_result(second_spawn);
                 assert_ne!(first_spawn.thread_id, second_spawn.thread_id);
                 assert_ne!(first_spawn.agent_path, second_spawn.agent_path);
 
@@ -351,14 +353,16 @@ impl SessionModelDriver for MixedBatchDriver {
                 ])))
             }
             1 => {
-                assert_eq!(history.len(), 3);
+                assert_eq!(history.len(), 2);
                 assert_eq!(
                     first_user_text(&history[0]),
                     Some("mixed batch".to_string())
                 );
-                let spawn_result = tool_result_agent_info(&history[2]);
+                let tool_results = tool_result_texts(&prompt);
+                assert_eq!(tool_results.len(), 2);
+                let spawn_result = parse_agent_info(&tool_results[0]);
                 assert_live_spawn_result(&spawn_result);
-                assert_eq!(tool_result_text(&prompt), Some("tool-output".to_string()));
+                assert_eq!(tool_results[1], "tool-output");
 
                 Ok(Box::pin(stream::iter(vec![Ok(
                     SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -368,17 +372,16 @@ impl SessionModelDriver for MixedBatchDriver {
                 )])))
             }
             2 => {
-                assert_eq!(history.len(), 4);
+                assert_eq!(history.len(), 3);
                 assert_eq!(
                     first_user_text(&history[0]),
                     Some("mixed batch".to_string())
                 );
-                let spawn_result = tool_result_agent_info(&history[2]);
+                let tool_results = tool_result_texts(&history[2]);
+                assert_eq!(tool_results.len(), 2);
+                let spawn_result = parse_agent_info(&tool_results[0]);
                 assert_live_spawn_result(&spawn_result);
-                assert_eq!(
-                    tool_result_text(&history[3]),
-                    Some("tool-output".to_string())
-                );
+                assert_eq!(tool_results[1], "tool-output");
                 let completed = user_text_agent_info(&prompt);
                 assert_completed_spawn_result(&completed);
 
@@ -497,14 +500,16 @@ impl SessionModelDriver for TwoRetainedDriver {
                 ])))
             }
             1 => {
-                assert_eq!(history.len(), 4);
+                assert_eq!(history.len(), 2);
                 assert_eq!(
                     first_user_text(&history[0]),
                     Some("two retained".to_string())
                 );
-                assert_live_spawn_result(&tool_result_agent_info(&history[2]));
-                assert_live_spawn_result(&tool_result_agent_info(&history[3]));
-                assert_eq!(tool_result_text(&prompt), Some("tool-output".to_string()));
+                let tool_results = tool_result_texts(&prompt);
+                assert_eq!(tool_results.len(), 3);
+                assert_live_spawn_result(&parse_agent_info(&tool_results[0]));
+                assert_live_spawn_result(&parse_agent_info(&tool_results[1]));
+                assert_eq!(tool_results[2], "tool-output");
 
                 Ok(Box::pin(stream::iter(vec![Ok(
                     SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -514,13 +519,14 @@ impl SessionModelDriver for TwoRetainedDriver {
                 )])))
             }
             2 => {
-                assert_eq!(history.len(), 6);
-                assert_eq!(
-                    tool_result_text(&history[4]),
-                    Some("tool-output".to_string())
-                );
-                assert_completed_spawn_result(&user_text_agent_info(&history[5]));
-                assert_completed_spawn_result(&user_text_agent_info(&prompt));
+                assert_eq!(history.len(), 3);
+                let tool_results = tool_result_texts(&history[2]);
+                assert_eq!(tool_results.len(), 3);
+                assert_eq!(tool_results[2], "tool-output");
+                let completed = user_text_agent_infos(&prompt);
+                assert_eq!(completed.len(), 2);
+                assert_completed_spawn_result(&completed[0]);
+                assert_completed_spawn_result(&completed[1]);
 
                 Ok(Box::pin(stream::iter(vec![
                     Ok(SessionCompletionEvent::AssistantItem(
@@ -1132,48 +1138,52 @@ fn assert_completed_spawn_result(agent: &TestAgentInfo) {
     assert!(agent.agent_path.starts_with("/root/"));
 }
 
-fn tool_result_agent_info(message: &Message) -> TestAgentInfo {
-    let tool_result = match message {
-        Message::User { content } => content
-            .iter()
-            .find_map(|item| match item {
-                UserContent::ToolResult(tool_result) => Some(tool_result),
-                _ => None,
-            })
-            .expect("tool result content"),
-        other => panic!("expected tool result message, got {other:?}"),
-    };
-    let tool_result_text = tool_result
-        .content
-        .iter()
-        .find_map(|item| match item {
-            rig::message::ToolResultContent::Text(text) => Some(text.text.clone()),
-            _ => None,
-        })
-        .expect("tool result text");
-    serde_json::from_str(&tool_result_text)
-        .unwrap_or_else(|err| panic!("spawn_agent output json: {err}; payload={tool_result_text}"))
+fn tool_result_agent_infos(message: &Message) -> Vec<TestAgentInfo> {
+    tool_result_texts(message)
+        .into_iter()
+        .map(|text| parse_agent_info(&text))
+        .collect()
+}
+
+fn parse_agent_info(text: &str) -> TestAgentInfo {
+    serde_json::from_str(text)
+        .unwrap_or_else(|err| panic!("spawn_agent output json: {err}; payload={text}"))
 }
 
 fn user_text_agent_info(message: &Message) -> TestAgentInfo {
     let text = first_user_text(message).expect("user text spawn result");
-    serde_json::from_str(&text)
-        .unwrap_or_else(|err| panic!("spawn_agent user text json: {err}; payload={text}"))
+    parse_agent_info(&text)
 }
 
-fn tool_result_text(message: &Message) -> Option<String> {
-    let tool_result = match message {
-        Message::User { content } => content.iter().find_map(|item| match item {
-            UserContent::ToolResult(tool_result) => Some(tool_result),
-            _ => None,
-        }),
-        _ => None,
-    }?;
+fn user_text_agent_infos(message: &Message) -> Vec<TestAgentInfo> {
+    match message {
+        Message::User { content } => content
+            .iter()
+            .filter_map(|item| match item {
+                UserContent::Text(text) => Some(parse_agent_info(&text.text)),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected user text message, got {other:?}"),
+    }
+}
 
-    tool_result.content.iter().find_map(|item| match item {
-        rig::message::ToolResultContent::Text(text) => Some(text.text.clone()),
-        _ => None,
-    })
+fn tool_result_texts(message: &Message) -> Vec<String> {
+    match message {
+        Message::User { content } => content
+            .iter()
+            .filter_map(|item| match item {
+                UserContent::ToolResult(tool_result) => {
+                    tool_result.content.iter().find_map(|item| match item {
+                        rig::message::ToolResultContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected tool result message, got {other:?}"),
+    }
 }
 
 fn first_user_text(message: &Message) -> Option<String> {

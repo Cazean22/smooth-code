@@ -291,6 +291,7 @@ async fn run_manual_turn(
         let mut accumulated_reasoning = Vec::new();
         let mut pending_reasoning_deltas = PendingReasoningDeltas::default();
         let mut saw_tool_call_this_turn = false;
+        let mut stream_phase_completions: Vec<String> = Vec::new();
         let mut turn_summary = SessionTurnSummary {
             assistant_message_id: None,
             response: String::new(),
@@ -303,6 +304,11 @@ async fn run_manual_turn(
 
             let item = tokio::select! {
                 _ = cancellation_token.cancelled() => return None,
+                Some(text) = next_retained_subagent_completion(&mut retained_subagents),
+                    if !retained_subagents.is_empty() => {
+                    stream_phase_completions.push(text);
+                    continue;
+                }
                 item = stream.next() => item,
             };
             let Some(item) = item else {
@@ -456,12 +462,39 @@ async fn run_manual_turn(
 
             let executed_tool_calls = merge_in_index_order(normal_results, spawn_results);
 
+            // Pure `spawn_agent` batch: also block on every retained receiver
+            // carried over from prior turns so the model sees their completed
+            // JSON in this same iteration. The drained completions ride along
+            // with anything captured mid-stream and surface together as a
+            // single user-text message below.
+            if !has_normal_tools {
+                let drained = tokio::select! {
+                    _ = cancellation_token.cancelled() => return None,
+                    completions = drain_retained_subagent_completions(&mut retained_subagents) => completions,
+                };
+                stream_phase_completions.extend(drained);
+            }
+
             if let Some(message) = assistant_message {
                 new_messages.push(message);
             }
             if let Some(message) = tool_results_to_user_message(executed_tool_calls) {
                 new_messages.push(message);
             }
+            if let Some(message) = text_items_to_user_message(stream_phase_completions) {
+                new_messages.push(message);
+            }
+            continue;
+        }
+
+        if !stream_phase_completions.is_empty() {
+            append_completion_texts_after_assistant_turn(
+                &mut new_messages,
+                &turn_summary,
+                &mut accumulated_reasoning,
+                session.model().requires_provider_reasoning_ids(),
+                stream_phase_completions,
+            );
             continue;
         }
 
@@ -1096,6 +1129,38 @@ fn encode_live_spawn_status(
     encode_spawn_agent_result(metadata, &status, None)
         .map(|output| (output, true, None))
         .unwrap_or_else(|message| (message.clone(), false, Some(message)))
+}
+
+/// Race every retained subagent receiver in parallel and resolve the first
+/// completion. Returns the rendered completion JSON for whichever finished
+/// first and removes it from `retained_subagents`; remaining receivers stay
+/// in the vec for the next race. Returns `None` only when the vec is empty
+/// (callers should already gate the await on `!retained_subagents.is_empty()`
+/// because `select_all` panics on an empty iterator).
+async fn next_retained_subagent_completion(
+    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+) -> Option<String> {
+    if retained_subagents.is_empty() {
+        return None;
+    }
+    let futures = retained_subagents
+        .iter_mut()
+        .enumerate()
+        .map(|(index, entry)| (&mut entry.waiter).map(move |result| (index, result)))
+        .collect::<Vec<_>>();
+    let ((index, result), _selected, remaining) = select_all(futures).await;
+    drop(remaining);
+    let entry = retained_subagents.swap_remove(index);
+    let child_thread_id = entry.metadata.agent_id;
+    let completion = result.map_err(|err| {
+        child_thread_id.map_or_else(
+            || format!("spawn_agent inline wait failed to resolve: {err}"),
+            |thread_id| {
+                format!("spawn_agent inline wait failed to resolve for child {thread_id}: {err}")
+            },
+        )
+    });
+    Some(retained_completion_text(entry.metadata, completion))
 }
 
 async fn drain_retained_subagent_completions(

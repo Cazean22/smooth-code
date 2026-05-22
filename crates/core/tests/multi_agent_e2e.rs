@@ -33,6 +33,7 @@ static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct TestAgentInfo {
+    event: Option<String>,
     thread_id: String,
     agent_path: String,
     agent_nickname: Option<String>,
@@ -42,6 +43,10 @@ struct TestAgentInfo {
     status_detail: Option<AgentStatus>,
     #[serde(default)]
     last_assistant_message: Option<String>,
+    #[serde(default)]
+    next_action: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
 }
 
 struct StubDriver {
@@ -1770,6 +1775,7 @@ fn assert_live_status_entry(agent: &CollabAgentStatusEntry) {
 }
 
 fn assert_live_spawn_result(agent: &TestAgentInfo) {
+    assert_eq!(agent.event.as_deref(), Some("agent_status"));
     assert!(
         matches!(
             agent.status_detail,
@@ -1779,11 +1785,22 @@ fn assert_live_spawn_result(agent: &TestAgentInfo) {
         agent.status_detail
     );
     assert!(agent.last_assistant_message.is_none());
+    assert_eq!(
+        agent.next_action.as_deref(),
+        Some("wait_for_agent_completed")
+    );
+    assert!(
+        agent
+            .instructions
+            .as_deref()
+            .is_some_and(|instructions| instructions.contains("No wait tool is needed"))
+    );
     assert!(!agent.thread_id.is_empty());
     assert!(agent.agent_path.starts_with("/root/"));
 }
 
 fn assert_completed_spawn_result(agent: &TestAgentInfo) {
+    assert_eq!(agent.event.as_deref(), Some("agent_completed"));
     assert!(
         matches!(agent.status_detail, Some(AgentStatus::Completed(_))),
         "expected a completed child status, got {:?}",
@@ -1791,6 +1808,7 @@ fn assert_completed_spawn_result(agent: &TestAgentInfo) {
     );
     assert_eq!(agent.status.as_deref(), Some("completed"));
     assert!(agent.last_assistant_message.is_some());
+    assert_eq!(agent.next_action.as_deref(), Some("use_agent_result"));
     assert!(!agent.thread_id.is_empty());
     assert!(agent.agent_path.starts_with("/root/"));
 }

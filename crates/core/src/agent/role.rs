@@ -52,9 +52,12 @@ pub(crate) fn render_spawn_agent_tool_description() -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Spawn a sub-agent. In a parent tool-loop turn, spawned children run concurrently and the \
-turn waits for all spawned children to reach a terminal state before their final tool results are \
-returned. Completion notices are surfaced as `[agent_completed]` inter-agent messages.\n\
+        "Spawn a sub-agent. Spawned children run concurrently. In mixed tool batches, \
+`spawn_agent` may return a live JSON result with `event=\"agent_status\"` and a \
+pending/running status; this means the child is still working, so do not produce a final answer \
+or guess from that status. No wait tool is needed: wait for a later user message with \
+`event=\"agent_completed\"` and the same `thread_id`, then use that result. Pure `spawn_agent` \
+batches wait for final child results before continuing.\n\
 Built-in agent roles:\n{roles}"
     )
 }
@@ -75,8 +78,8 @@ mod tests {
     fn renders_role_description() {
         let rendered = render_spawn_agent_tool_description();
         assert!(rendered.contains("run concurrently"));
-        assert!(rendered.contains("waits for all spawned children"));
-        assert!(rendered.contains("[agent_completed]"));
+        assert!(rendered.contains("No wait tool is needed"));
+        assert!(rendered.contains("event=\"agent_completed\""));
         assert!(rendered.contains("`default`"));
         assert!(rendered.contains("`explorer`"));
         assert!(rendered.contains("`worker`"));

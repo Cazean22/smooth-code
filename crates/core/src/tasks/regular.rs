@@ -99,6 +99,7 @@ struct ManualSpawnAgentArgs {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct SpawnAgentResult {
+    event: String,
     thread_id: String,
     agent_path: String,
     agent_nickname: Option<String>,
@@ -108,6 +109,8 @@ struct SpawnAgentResult {
     status_detail: Option<AgentStatus>,
     #[serde(default)]
     last_assistant_message: Option<String>,
+    next_action: String,
+    instructions: String,
 }
 
 struct ExecutedToolCall {
@@ -1302,7 +1305,13 @@ fn spawn_agent_result_from_metadata(
     status: &AgentStatus,
     last_assistant_message_override: Option<String>,
 ) -> SpawnAgentResult {
+    let is_live = matches!(status, AgentStatus::PendingInit | AgentStatus::Running);
     SpawnAgentResult {
+        event: if is_live {
+            String::from("agent_status")
+        } else {
+            String::from("agent_completed")
+        },
         thread_id: metadata
             .agent_id
             .map(|thread_id| thread_id.to_string())
@@ -1314,6 +1323,20 @@ fn spawn_agent_result_from_metadata(
         status_detail: Some(status.clone()),
         last_assistant_message: last_assistant_message_override
             .or_else(|| last_assistant_message(status)),
+        next_action: if is_live {
+            String::from("wait_for_agent_completed")
+        } else {
+            String::from("use_agent_result")
+        },
+        instructions: if is_live {
+            String::from(
+                "This sub-agent is still running. Do not answer or guess from this status. No wait tool is needed; wait for a later user message with event=\"agent_completed\" and the same thread_id.",
+            )
+        } else {
+            String::from(
+                "This sub-agent has finished. Use last_assistant_message and status_detail as the sub-agent result.",
+            )
+        },
     }
 }
 

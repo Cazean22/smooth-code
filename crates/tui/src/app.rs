@@ -306,10 +306,16 @@ impl App {
                 ))));
             }
             EventMsg::CollabAgentSpawnEnd(event) => {
-                self.push_history(Box::new(PlainHistoryCell::info(format!(
-                    "Spawn finished with status {}",
-                    agent_status_label(&event.status)
-                ))));
+                let status = agent_status_label(&event.status);
+                let message = if matches!(
+                    event.status,
+                    AgentStatus::PendingInit | AgentStatus::Running
+                ) {
+                    format!("Sub-agent started with status {status}")
+                } else {
+                    format!("Spawn ended with status {status}")
+                };
+                self.push_history(Box::new(PlainHistoryCell::info(message)));
             }
             EventMsg::CollabAgentCompleted(event) => {
                 self.complete_subagent_tool_call(event.child_thread_id, &event.status);
@@ -648,8 +654,8 @@ mod tests {
     use crate::streaming::StreamController;
     use smooth_protocol::{
         AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
-        AgentReasoningDeltaEvent, EventMsg, ToolCallCompletedEvent, ToolCallStartedEvent,
-        TurnCompletedEvent, TurnStartedEvent,
+        AgentReasoningDeltaEvent, CollabAgentSpawnEndEvent, EventMsg, ToolCallCompletedEvent,
+        ToolCallStartedEvent, TurnCompletedEvent, TurnStartedEvent,
     };
 
     fn event(id: &str, msg: EventMsg) -> Event {
@@ -1120,6 +1126,32 @@ mod tests {
 
         let joined = transcript_strings(&app).join("\n");
         assert!(joined.contains("Sub-agent child (/root/child) finished with completed (Done)"));
+    }
+
+    #[test]
+    fn running_spawn_end_renders_started_not_finished() {
+        let mut app = App::new();
+
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: String::from("call"),
+                    sender_thread_id: ThreadId::new(),
+                    new_thread_id: Some(ThreadId::new()),
+                    new_agent_nickname: Some(String::from("child")),
+                    new_agent_role: Some(String::from("explorer")),
+                    prompt: String::from("inspect"),
+                    model: None,
+                    status: AgentStatus::Running,
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("Sub-agent started with status running"));
+        assert!(!joined.contains("Spawn finished with status running"));
     }
 
     #[test]

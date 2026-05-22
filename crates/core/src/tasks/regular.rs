@@ -906,7 +906,8 @@ async fn execute_exit_plan_mode_call(
         internal_call_id,
     } = pending;
 
-    let (tool_output, success, error) = match session.apply_plan_mode(false, None).await {
+    let (tool_output, success, error) = match session.apply_plan_mode_unchecked(false, None).await
+    {
         Ok(_) => (
             "Plan mode exited. Implement the approved plan now using the full tool set."
                 .to_string(),

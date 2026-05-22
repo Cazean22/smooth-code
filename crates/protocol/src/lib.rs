@@ -221,6 +221,14 @@ pub struct ToolCallStartedEvent {
     pub args_preview: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallResultKind {
+    #[default]
+    Final,
+    StatusUpdate,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallCompletedEvent {
@@ -230,6 +238,10 @@ pub struct ToolCallCompletedEvent {
     pub success: bool,
     pub output_preview: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub result_kind: ToolCallResultKind,
+    #[serde(default)]
+    pub related_thread_id: Option<ThreadId>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -359,7 +371,10 @@ pub enum AgentStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentPath, AgentStatus, EventMsg, Op, SessionSource, SubAgentSource, ThreadId};
+    use super::{
+        AgentPath, AgentStatus, EventMsg, Op, SessionSource, SubAgentSource, ThreadId,
+        ToolCallCompletedEvent, ToolCallResultKind,
+    };
 
     #[test]
     fn op_serde_round_trip_for_user_input() {
@@ -403,5 +418,43 @@ mod tests {
         let value = serde_json::to_value(&msg).expect("serialize event");
         let decoded: EventMsg = serde_json::from_value(value).expect("deserialize event");
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn tool_call_completed_defaults_to_final_result_kind() {
+        let decoded: ToolCallCompletedEvent = serde_json::from_value(serde_json::json!({
+            "threadId": "thread",
+            "turnId": "turn",
+            "callId": "call",
+            "success": true,
+            "outputPreview": "done",
+            "error": null
+        }))
+        .expect("deserialize tool completion");
+
+        assert_eq!(decoded.result_kind, ToolCallResultKind::Final);
+        assert_eq!(decoded.related_thread_id, None);
+    }
+
+    #[test]
+    fn tool_call_completed_status_update_round_trip() {
+        let related_thread_id = ThreadId::new();
+        let event = ToolCallCompletedEvent {
+            thread_id: String::from("thread"),
+            turn_id: String::from("turn"),
+            call_id: String::from("call"),
+            success: true,
+            output_preview: Some(String::from("running")),
+            error: None,
+            result_kind: ToolCallResultKind::StatusUpdate,
+            related_thread_id: Some(related_thread_id),
+        };
+
+        let value = serde_json::to_value(&event).expect("serialize tool completion");
+        assert_eq!(value["resultKind"], "status_update");
+        assert_eq!(value["relatedThreadId"], related_thread_id.to_string());
+        let decoded: ToolCallCompletedEvent =
+            serde_json::from_value(value).expect("deserialize tool completion");
+        assert_eq!(decoded, event);
     }
 }

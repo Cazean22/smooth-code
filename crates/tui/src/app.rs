@@ -9,7 +9,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use smooth_protocol::{AgentStatus, Event, EventMsg, ThreadId};
+use smooth_protocol::{AgentStatus, Event, EventMsg, ThreadId, ToolCallResultKind};
 
 use crate::{
     AppTerminal,
@@ -35,6 +35,7 @@ pub(crate) struct App {
     assistant_stream: Option<StreamController>,
     reasoning_stream: Option<StreamController>,
     tool_call_rows: HashMap<String, (usize, usize)>,
+    subagent_tool_calls: HashMap<ThreadId, String>,
     pending_tool_group: Option<(usize, String)>,
     current_turn_id: Option<String>,
     committed_assistant_item_id: Option<String>,
@@ -59,6 +60,7 @@ impl App {
             assistant_stream: None,
             reasoning_stream: None,
             tool_call_rows: HashMap::new(),
+            subagent_tool_calls: HashMap::new(),
             pending_tool_group: None,
             current_turn_id: None,
             committed_assistant_item_id: None,
@@ -159,6 +161,7 @@ impl App {
             EventMsg::TurnStarted(turn) => {
                 self.is_turn_running = true;
                 self.tool_call_rows.clear();
+                self.subagent_tool_calls.clear();
                 self.pending_tool_group = None;
                 self.current_turn_id = Some(turn.turn_id.clone());
                 self.committed_assistant_item_id = None;
@@ -247,6 +250,23 @@ impl App {
             }
             EventMsg::ToolCallCompleted(tool) => {
                 self.finalize_assistant_stream(None);
+                if tool.result_kind == ToolCallResultKind::StatusUpdate && tool.success {
+                    if let Some(thread_id) = tool.related_thread_id {
+                        self.subagent_tool_calls
+                            .insert(thread_id, tool.call_id.clone());
+                    }
+                    if let Some((cell_idx, entry_idx)) =
+                        self.tool_call_rows.get(&tool.call_id).copied()
+                    {
+                        self.tool_group_mut(cell_idx).set_entry_outcome(
+                            entry_idx,
+                            ToolCallState::Running,
+                            None,
+                        );
+                    }
+                    return;
+                }
+
                 let new_state = if tool.success {
                     ToolCallState::Success
                 } else {
@@ -292,6 +312,7 @@ impl App {
                 ))));
             }
             EventMsg::CollabAgentCompleted(event) => {
+                self.complete_subagent_tool_call(event.child_thread_id, &event.status);
                 let nickname = event
                     .agent_nickname
                     .as_deref()
@@ -430,6 +451,26 @@ impl App {
             .as_any_mut()
             .downcast_mut::<ToolCallGroupCell>()
             .expect("tracked tool row should be a ToolCallGroupCell")
+    }
+
+    fn complete_subagent_tool_call(&mut self, child_thread_id: ThreadId, status: &AgentStatus) {
+        let Some(call_id) = self.subagent_tool_calls.remove(&child_thread_id) else {
+            return;
+        };
+        let Some((cell_idx, entry_idx)) = self.tool_call_rows.remove(&call_id) else {
+            return;
+        };
+
+        let (state, error) = match status {
+            AgentStatus::Completed(_) => (ToolCallState::Success, None),
+            AgentStatus::Errored(message) => (ToolCallState::Failure, Some(message.clone())),
+            AgentStatus::Interrupted => (ToolCallState::Failure, Some(String::from("interrupted"))),
+            AgentStatus::Shutdown => (ToolCallState::Failure, Some(String::from("shutdown"))),
+            AgentStatus::NotFound => (ToolCallState::Failure, Some(String::from("not found"))),
+            AgentStatus::PendingInit | AgentStatus::Running => (ToolCallState::Running, None),
+        };
+        self.tool_group_mut(cell_idx)
+            .set_entry_outcome(entry_idx, state, error);
     }
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -676,6 +717,8 @@ mod tests {
                     success,
                     output_preview: Some(String::from("BIG CONTENT")),
                     error: error.map(str::to_owned),
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
                 }),
             ),
             20,
@@ -1116,6 +1159,8 @@ mod tests {
                     success: true,
                     output_preview: Some(String::from("BIG CONTENT")),
                     error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
                 }),
             ),
             20,
@@ -1171,6 +1216,8 @@ mod tests {
                     success: true,
                     output_preview: Some(String::from("BIG CONTENT")),
                     error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
                 }),
             ),
             20,
@@ -1179,6 +1226,92 @@ mod tests {
         let joined = transcript_strings(&app).join("\n");
         assert!(joined.contains("✓ read foo.rs"));
         assert!(!joined.contains("⠋ read foo.rs"));
+    }
+
+    #[test]
+    fn spawn_agent_status_update_keeps_tool_row_running() {
+        let mut app = App::new();
+        let child_thread_id = ThreadId::new();
+
+        start_turn(&mut app);
+        start_tool_call(
+            &mut app,
+            "2",
+            "c1",
+            "spawn_agent",
+            "{\"message\":\"inspect\"}",
+        );
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("{\"status\":\"running\"}")),
+                    error: None,
+                    result_kind: ToolCallResultKind::StatusUpdate,
+                    related_thread_id: Some(child_thread_id),
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("⠋ spawn_agent {\"message\":\"inspect\"}"));
+        assert!(!joined.contains("✓ spawn_agent {\"message\":\"inspect\"}"));
+    }
+
+    #[test]
+    fn subagent_completion_finishes_status_update_tool_row() {
+        let mut app = App::new();
+        let child_thread_id = ThreadId::new();
+
+        start_turn(&mut app);
+        start_tool_call(
+            &mut app,
+            "2",
+            "c1",
+            "spawn_agent",
+            "{\"message\":\"inspect\"}",
+        );
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("{\"status\":\"running\"}")),
+                    error: None,
+                    result_kind: ToolCallResultKind::StatusUpdate,
+                    related_thread_id: Some(child_thread_id),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "4",
+                EventMsg::CollabAgentCompleted(smooth_protocol::CollabAgentCompletedEvent {
+                    parent_thread_id: ThreadId::new(),
+                    child_thread_id,
+                    agent_path: smooth_protocol::AgentPath::try_from("/root/child").expect("path"),
+                    agent_nickname: Some("child".to_string()),
+                    agent_role: Some("worker".to_string()),
+                    status: AgentStatus::Completed(Some("Done".to_string())),
+                    last_assistant_message: Some("Done".to_string()),
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("✓ spawn_agent {\"message\":\"inspect\"}"));
+        assert!(!joined.contains("⠋ spawn_agent {\"message\":\"inspect\"}"));
+        assert!(joined.contains("Sub-agent child (/root/child) finished with completed (Done)"));
     }
 
     #[test]

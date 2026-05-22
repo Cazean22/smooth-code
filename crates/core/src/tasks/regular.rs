@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use smooth_protocol::{
     AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
     AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, EventMsg, ThreadId, ToolCallCompletedEvent,
-    ToolCallStartedEvent,
+    ToolCallResultKind, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -682,6 +682,8 @@ async fn run_opaque_turn(
                                 success: true,
                                 output_preview: Some(output_preview),
                                 error: None,
+                                result_kind: ToolCallResultKind::Final,
+                                related_thread_id: None,
                             }),
                         )
                         .await;
@@ -779,6 +781,36 @@ async fn complete_tool_call(
     success: bool,
     error: Option<String>,
 ) -> ExecutedToolCall {
+    complete_tool_call_with_kind(
+        session,
+        ctx,
+        index,
+        tool_call_id,
+        tool_call_call_id,
+        internal_call_id,
+        tool_output,
+        success,
+        error,
+        ToolCallResultKind::Final,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_tool_call_with_kind(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    index: usize,
+    tool_call_id: String,
+    tool_call_call_id: Option<String>,
+    internal_call_id: String,
+    tool_output: String,
+    success: bool,
+    error: Option<String>,
+    result_kind: ToolCallResultKind,
+    related_thread_id: Option<ThreadId>,
+) -> ExecutedToolCall {
     session
         .emit_event(
             &ctx,
@@ -789,6 +821,8 @@ async fn complete_tool_call(
                 success,
                 output_preview: Some(tool_output.clone()),
                 error,
+                result_kind,
+                related_thread_id,
             }),
         )
         .await;
@@ -901,24 +935,33 @@ async fn collect_spawn_results(
 ) -> Vec<ExecutedToolCall> {
     let mut resolved = Vec::with_capacity(spawn_calls.len());
     for mut spawn_call in spawn_calls {
-        let (tool_output, success, error) = if let Some(completion) = spawn_call.completion.as_ref()
-        {
-            encode_completed_spawn_result(&spawn_call.metadata, completion)
-        } else {
-            if let Some(waiter) = spawn_call.waiter.take() {
-                retained_subagents.push(RetainedSpawnCompletion {
-                    metadata: spawn_call.metadata.clone(),
-                    waiter,
-                });
-            }
-            encode_live_spawn_status(
-                &session,
-                &spawn_call.metadata,
-                &spawn_call.initial_status,
-                spawn_call.child_thread_id,
-            )
-        };
-        let executed = complete_tool_call(
+        let (tool_output, success, error, result_kind, related_thread_id) =
+            if let Some(completion) = spawn_call.completion.as_ref() {
+                let (tool_output, success, error) =
+                    encode_completed_spawn_result(&spawn_call.metadata, completion);
+                (tool_output, success, error, ToolCallResultKind::Final, None)
+            } else {
+                if let Some(waiter) = spawn_call.waiter.take() {
+                    retained_subagents.push(RetainedSpawnCompletion {
+                        metadata: spawn_call.metadata.clone(),
+                        waiter,
+                    });
+                }
+                let (tool_output, success, error) = encode_live_spawn_status(
+                    &session,
+                    &spawn_call.metadata,
+                    &spawn_call.initial_status,
+                    spawn_call.child_thread_id,
+                );
+                (
+                    tool_output,
+                    success,
+                    error,
+                    ToolCallResultKind::StatusUpdate,
+                    Some(spawn_call.child_thread_id),
+                )
+            };
+        let executed = complete_tool_call_with_kind(
             Arc::clone(&session),
             Arc::clone(&ctx),
             spawn_call.index,
@@ -928,6 +971,8 @@ async fn collect_spawn_results(
             tool_output,
             success,
             error,
+            result_kind,
+            related_thread_id,
         )
         .await;
         resolved.push(executed);

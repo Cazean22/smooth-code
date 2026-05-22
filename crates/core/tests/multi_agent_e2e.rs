@@ -21,7 +21,8 @@ use smooth_core::{
     SessionStreamEvent, SessionTurnSummary, ThreadManagerState,
 };
 use smooth_protocol::{
-    AgentStatus, CollabAgentStatusEntry, EventMsg, ThreadId, TurnCompletedEvent, TurnStartedEvent,
+    AgentStatus, CollabAgentStatusEntry, EventMsg, ThreadId, ToolCallResultKind,
+    TurnCompletedEvent, TurnStartedEvent,
 };
 use tempfile::TempDir;
 use tokio::sync::{RwLock, Semaphore};
@@ -886,6 +887,8 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
         if let EventMsg::ToolCallCompleted(event) = event.msg {
             match event.call_id.as_str() {
                 "internal-call-1" => {
+                    assert_eq!(event.result_kind, ToolCallResultKind::StatusUpdate);
+                    assert!(event.related_thread_id.is_some());
                     let parsed: TestAgentInfo = serde_json::from_str(
                         event
                             .output_preview
@@ -894,9 +897,17 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
                     )
                     .expect("spawn_agent result json");
                     assert_live_spawn_result(&parsed);
+                    assert_eq!(
+                        event
+                            .related_thread_id
+                            .map(|thread_id| thread_id.to_string()),
+                        Some(parsed.thread_id.clone())
+                    );
                     saw_live_spawn_result = true;
                 }
                 "internal-call-2" => {
+                    assert_eq!(event.result_kind, ToolCallResultKind::Final);
+                    assert_eq!(event.related_thread_id, None);
                     assert_eq!(event.output_preview.as_deref(), Some("tool-output"));
                     saw_normal_result = true;
                 }

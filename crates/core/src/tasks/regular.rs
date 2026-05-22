@@ -227,7 +227,7 @@ impl SessionTask for RegularTask {
                 text: prompt_text.clone(),
             })),
         };
-        let result = if session.model().supports_manual_tool_loop() {
+        let result = if session.model().await.supports_manual_tool_loop() {
             run_manual_turn(
                 Arc::clone(&session),
                 Arc::clone(&ctx),
@@ -279,8 +279,8 @@ async fn run_manual_turn(
 
         let (pending_prompt, request_history) =
             build_request_parts(&history_before_turn, &new_messages)?;
-        let mut stream = match session
-            .model()
+        let model_for_stream = session.model().await;
+        let mut stream = match model_for_stream
             .stream_completion_turn(pending_prompt, &request_history)
             .await
         {
@@ -431,10 +431,11 @@ async fn run_manual_turn(
                 &turn_summary,
                 &mut accumulated_reasoning,
                 &pending_tool_calls,
-                session.model().requires_provider_reasoning_ids(),
+                session.model().await.requires_provider_reasoning_ids(),
             );
 
-            let (normal_calls, spawn_calls) = partition_pending_tool_calls(pending_tool_calls);
+            let (normal_calls, spawn_calls, exit_plan_calls) =
+                partition_pending_tool_calls(pending_tool_calls);
 
             let started_spawns =
                 start_spawn_calls_concurrently(Arc::clone(&session), Arc::clone(&ctx), spawn_calls)
@@ -448,7 +449,14 @@ async fn run_manual_turn(
             )
             .await?;
 
-            let has_normal_tools = !normal_results.is_empty();
+            let exit_plan_results = execute_exit_plan_mode_calls(
+                Arc::clone(&session),
+                Arc::clone(&ctx),
+                exit_plan_calls,
+            )
+            .await;
+
+            let has_normal_tools = !normal_results.is_empty() || !exit_plan_results.is_empty();
             let (started_spawns, immediate_spawn_results) =
                 split_started_and_immediate(started_spawns);
             let started_spawns =
@@ -463,7 +471,9 @@ async fn run_manual_turn(
             .await;
             spawn_results.extend(immediate_spawn_results);
 
-            let executed_tool_calls = merge_in_index_order(normal_results, spawn_results);
+            let mut combined_normal = normal_results;
+            combined_normal.extend(exit_plan_results);
+            let executed_tool_calls = merge_in_index_order(combined_normal, spawn_results);
 
             // Pure `spawn_agent` batch: also block on every retained receiver
             // carried over from prior turns so the model sees their completed
@@ -495,7 +505,7 @@ async fn run_manual_turn(
                 &mut new_messages,
                 &turn_summary,
                 &mut accumulated_reasoning,
-                session.model().requires_provider_reasoning_ids(),
+                session.model().await.requires_provider_reasoning_ids(),
                 stream_phase_completions,
             );
             continue;
@@ -510,7 +520,7 @@ async fn run_manual_turn(
                 &mut new_messages,
                 &turn_summary,
                 &mut accumulated_reasoning,
-                session.model().requires_provider_reasoning_ids(),
+                session.model().await.requires_provider_reasoning_ids(),
                 completion_texts,
             );
             continue;
@@ -519,7 +529,7 @@ async fn run_manual_turn(
         if let Some(message) = build_assistant_text_reasoning_message(
             &turn_summary,
             &mut accumulated_reasoning,
-            session.model().requires_provider_reasoning_ids(),
+            session.model().await.requires_provider_reasoning_ids(),
         ) {
             new_messages.push(message);
         }
@@ -563,8 +573,8 @@ async fn run_opaque_turn(
     history_before_turn: Vec<Message>,
     cancellation_token: CancellationToken,
 ) -> Option<String> {
-    let mut stream = match session
-        .model()
+    let model_for_stream = session.model().await;
+    let mut stream = match model_for_stream
         .stream_turn(prompt, &history_before_turn)
         .await
     {
@@ -743,8 +753,8 @@ async fn execute_normal_tool_call(
         internal_call_id,
     } = pending;
 
-    let (tool_output, success, error) = match session
-        .model()
+    let model_for_call = session.model().await;
+    let (tool_output, success, error) = match model_for_call
         .call_tool(
             &tool_call.function.name,
             &tool_call.function.arguments.to_string(),
@@ -862,17 +872,79 @@ async fn execute_normal_tools_concurrently(
 
 fn partition_pending_tool_calls(
     pending_tool_calls: Vec<PendingToolCall>,
-) -> (Vec<PendingToolCall>, Vec<PendingToolCall>) {
+) -> (
+    Vec<PendingToolCall>,
+    Vec<PendingToolCall>,
+    Vec<PendingToolCall>,
+) {
     let mut normal = Vec::new();
     let mut spawn = Vec::new();
+    let mut exit_plan = Vec::new();
     for pending in pending_tool_calls {
-        if pending.tool_call.function.name == "spawn_agent" {
-            spawn.push(pending);
-        } else {
-            normal.push(pending);
+        match pending.tool_call.function.name.as_str() {
+            "spawn_agent" => spawn.push(pending),
+            "exit_plan_mode" => exit_plan.push(pending),
+            _ => normal.push(pending),
         }
     }
-    (normal, spawn)
+    (normal, spawn, exit_plan)
+}
+
+/// Handle one queued `exit_plan_mode` tool call: flip plan mode off, swap in
+/// the non-plan-mode model so subsequent tool calls in this turn (or the next)
+/// see the full tool set, emit the `ToolCallCompleted` event, and return a
+/// tool-result the model can read.
+async fn execute_exit_plan_mode_call(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    pending: PendingToolCall,
+) -> ExecutedToolCall {
+    let PendingToolCall {
+        index,
+        assistant_tool_call: _,
+        tool_call,
+        internal_call_id,
+    } = pending;
+
+    let (tool_output, success, error) = match session.apply_plan_mode(false, None).await {
+        Ok(_) => (
+            "Plan mode exited. Implement the approved plan now using the full tool set."
+                .to_string(),
+            true,
+            None,
+        ),
+        Err(err) => {
+            let message = err.to_string();
+            (message.clone(), false, Some(message))
+        }
+    };
+
+    complete_tool_call(
+        session,
+        ctx,
+        index,
+        tool_call.id,
+        tool_call.call_id,
+        internal_call_id,
+        tool_output,
+        success,
+        error,
+    )
+    .await
+}
+
+async fn execute_exit_plan_mode_calls(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    exit_plan_calls: Vec<PendingToolCall>,
+) -> Vec<ExecutedToolCall> {
+    let mut resolved = Vec::with_capacity(exit_plan_calls.len());
+    for pending in exit_plan_calls {
+        let executed =
+            execute_exit_plan_mode_call(Arc::clone(&session), Arc::clone(&ctx), pending).await;
+        resolved.push(executed);
+    }
+    resolved
 }
 
 /// Start every queued `spawn_agent` call concurrently and wait for all starts

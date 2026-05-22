@@ -156,6 +156,12 @@ impl ThreadManagerState {
         thread.submit(op).await
     }
 
+    /// Toggle plan mode for the given thread. Returns the new effective state.
+    pub async fn set_plan_mode(&self, thread_id: ThreadId, enabled: bool) -> Result<bool> {
+        let thread = self.get(thread_id).await?;
+        thread.set_plan_mode(enabled).await
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn send_op(&self, thread_id: ThreadId, op: Op) -> Result<String> {
         self.submit(thread_id, op).await
@@ -481,6 +487,7 @@ mod tests {
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
+            _plan_mode: bool,
         ) -> Result<SessionModel> {
             Ok(self.model.clone())
         }

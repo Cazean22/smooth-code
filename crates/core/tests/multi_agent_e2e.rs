@@ -78,6 +78,7 @@ impl SessionModelFactory for AnyThreadFactory {
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
+        _plan_mode: bool,
     ) -> Result<SessionModel> {
         Ok(SessionModel::Stub(Arc::new(StubDriver {
             text: format!("done:{thread_id}"),
@@ -574,6 +575,7 @@ impl SessionModelFactory for TwoRetainedFactory {
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
+        _plan_mode: bool,
     ) -> Result<SessionModel> {
         let mut build_count = self.build_count.lock().expect("build count mutex");
         let model = if *build_count == 0 {
@@ -600,6 +602,7 @@ impl SessionModelFactory for MixedBatchFactory {
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
+        _plan_mode: bool,
     ) -> Result<SessionModel> {
         let mut build_count = self.build_count.lock().expect("build count mutex");
         let model = if *build_count == 0 {
@@ -631,6 +634,7 @@ impl SessionModelFactory for ConcurrentSpawnFactory {
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
+        _plan_mode: bool,
     ) -> Result<SessionModel> {
         let mut build_count = self.build_count.lock().expect("build count mutex");
         let model = if *build_count == 0 {
@@ -1347,6 +1351,7 @@ impl SessionModelFactory for ReasoningStreamFactory {
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
+        _plan_mode: bool,
     ) -> Result<SessionModel> {
         Ok(SessionModel::Stub(Arc::new(ReasoningStreamDriver {
             calls: Mutex::new(0),
@@ -1365,6 +1370,7 @@ impl SessionModelFactory for ReasoningToolLoopFactory {
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
+        _plan_mode: bool,
     ) -> Result<SessionModel> {
         Ok(SessionModel::Stub(Arc::new(ReasoningToolLoopDriver {
             calls: Mutex::new(0),
@@ -1489,6 +1495,7 @@ impl SessionModelFactory for IdlessReasoningCompletionFactory {
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
+        _plan_mode: bool,
     ) -> Result<SessionModel> {
         Ok(SessionModel::Stub(Arc::new(
             IdlessReasoningCompletionDriver {
@@ -1605,6 +1612,7 @@ impl SessionModelFactory for EncryptedReasoningFactory {
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
+        _plan_mode: bool,
     ) -> Result<SessionModel> {
         Ok(SessionModel::Stub(Arc::new(EncryptedReasoningDriver {
             calls: Mutex::new(0),

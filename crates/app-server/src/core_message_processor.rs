@@ -1,8 +1,9 @@
 use std::{collections::HashSet, sync::Arc};
 
 use app_server_protocol::{
-    ClientRequest, DynamicToolCallParams, JSONRPCErrorError, ServerRequestPayload, ThreadListItem,
-    ThreadListResponse, ThreadResumeResponse, ThreadStartResponse, TurnStartResponse,
+    ClientRequest, DynamicToolCallParams, JSONRPCErrorError, ServerRequestPayload,
+    SetPlanModeResponse, ThreadListItem, ThreadListResponse, ThreadResumeResponse,
+    ThreadStartResponse, TurnStartResponse,
 };
 use futures_util::future::BoxFuture;
 use smooth_core::{DynamicToolClient, DynamicToolClientFactory, ThreadManagerState, ThreadSummary};
@@ -177,6 +178,32 @@ impl CoreMessageProcessor {
                 serde_json::to_value(ThreadListResponse {
                     data: page,
                     next_cursor,
+                })
+                .map_err(internal_serde_error)
+            }
+            ClientRequest::SetPlanMode { params, .. } => {
+                tracing::debug!(
+                    thread_id = %params.thread_id,
+                    enabled = params.enabled,
+                    "processing set plan mode request"
+                );
+                let thread_id =
+                    params
+                        .thread_id
+                        .parse::<ThreadId>()
+                        .map_err(|err| JSONRPCErrorError {
+                            code: INVALID_PARAMS_ERROR_CODE,
+                            data: None,
+                            message: format!("invalid thread id: {err}"),
+                        })?;
+                let enabled = self
+                    .threads
+                    .set_plan_mode(thread_id, params.enabled)
+                    .await
+                    .map_err(internal_error)?;
+                serde_json::to_value(SetPlanModeResponse {
+                    thread_id: thread_id.to_string(),
+                    enabled,
                 })
                 .map_err(internal_serde_error)
             }

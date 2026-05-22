@@ -69,6 +69,20 @@ pub struct TurnStartResponse {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct SetPlanModeParams {
+    pub thread_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPlanModeResponse {
+    pub thread_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct DynamicToolCallParams {
     pub thread_id: String,
     pub turn_id: String,
@@ -114,6 +128,11 @@ pub enum ClientRequest {
         #[serde(rename = "id")]
         request_id: RequestId,
         params: ThreadListParams,
+    },
+    SetPlanMode {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: SetPlanModeParams,
     },
 }
 

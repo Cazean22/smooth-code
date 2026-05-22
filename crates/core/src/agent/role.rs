@@ -11,6 +11,14 @@ pub(crate) struct RoleConfig {
     pub(crate) override_config: RoleOverride,
 }
 
+pub(crate) fn role_override_from_source(source: &smooth_protocol::SessionSource) -> RoleOverride {
+    source
+        .get_agent_role()
+        .and_then(|role| resolve_role(&role))
+        .map(|config| config.override_config)
+        .unwrap_or_default()
+}
+
 pub(crate) fn resolve_role(role: &str) -> Option<RoleConfig> {
     match role {
         "default" => Some(RoleConfig {

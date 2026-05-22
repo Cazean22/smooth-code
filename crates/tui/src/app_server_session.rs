@@ -1,9 +1,9 @@
 use anyhow::Result;
 use app_server::in_process::InProcessServerEvent;
 use app_server_protocol::{
-    ClientRequest, RequestId, ThreadListParams, ThreadListResponse, ThreadResumeParams,
-    ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, TurnStartParams,
-    TurnStartResponse,
+    ClientRequest, RequestId, SetPlanModeParams, SetPlanModeResponse, ThreadListParams,
+    ThreadListResponse, ThreadResumeParams, ThreadResumeResponse, ThreadStartParams,
+    ThreadStartResponse, TurnStartParams, TurnStartResponse,
 };
 use smooth_protocol::ThreadId;
 
@@ -52,6 +52,32 @@ impl AppServerSession {
             params: TurnStartParams {
                 thread_id: thread_id.to_string(),
                 input,
+            },
+        };
+        self.next_request_id += 1;
+        let value = self
+            .client
+            .request(request)
+            .await
+            .map_err(|err| anyhow::anyhow!(err.message))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    #[tracing::instrument(
+        name = "tui.set_plan_mode",
+        skip(self),
+        fields(thread_id = %thread_id, enabled = enabled)
+    )]
+    pub(crate) async fn set_plan_mode(
+        &mut self,
+        thread_id: ThreadId,
+        enabled: bool,
+    ) -> Result<SetPlanModeResponse> {
+        let request = ClientRequest::SetPlanMode {
+            request_id: RequestId(self.next_request_id as usize),
+            params: SetPlanModeParams {
+                thread_id: thread_id.to_string(),
+                enabled,
             },
         };
         self.next_request_id += 1;

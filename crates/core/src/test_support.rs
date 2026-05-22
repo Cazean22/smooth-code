@@ -31,6 +31,7 @@ impl SessionModelFactory for StubSessionModelFactory {
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
+        plan_mode: bool,
     ) -> Result<SessionModel> {
         self.inner.build(
             cwd,
@@ -39,6 +40,7 @@ impl SessionModelFactory for StubSessionModelFactory {
             current_turn_id,
             role_override,
             agent_control,
+            plan_mode,
         )
     }
 }

@@ -716,6 +716,7 @@ mod tests {
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
+            _plan_mode: bool,
         ) -> Result<SessionModel> {
             let _ = thread_id;
             Ok(self.model.clone())
@@ -767,6 +768,7 @@ mod tests {
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
+            _plan_mode: bool,
         ) -> Result<SessionModel> {
             Ok(SessionModel::Stub(Arc::new(RecordingDriver {
                 thread_id,
@@ -791,6 +793,7 @@ mod tests {
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
+            _plan_mode: bool,
         ) -> Result<SessionModel> {
             let mut build_count = self.build_count.lock().expect("build count mutex");
             let build_index = *build_count;

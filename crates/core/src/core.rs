@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use anyhow::Result;
@@ -10,8 +10,8 @@ use rig::{
     message::{Message, Text, UserContent},
 };
 use smooth_protocol::{
-    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, SessionSource, ThreadId,
-    TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
+    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, PlanModeChangedEvent, SessionSource,
+    ThreadId, TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tools::DynamicToolClient;
@@ -20,7 +20,7 @@ use tracing::Instrument;
 use crate::{
     agent::AgentControl,
     context_manager::ContextManager,
-    provider::SessionModel,
+    provider::{SessionModel, SessionModelFactory},
     rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persist_event},
     state::{ActiveTurn, RunningTask, SessionState},
     tasks::{AnySessionTask, RegularTask},
@@ -44,7 +44,9 @@ pub(crate) struct Session {
     current_turn_id: Arc<RwLock<Option<String>>>,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     next_internal_sub_id: AtomicU64,
-    model: SessionModel,
+    model: Mutex<SessionModel>,
+    plan_mode: AtomicBool,
+    pub(crate) model_factory: Arc<dyn SessionModelFactory>,
     rollout: RolloutRecorder,
 }
 
@@ -69,6 +71,8 @@ impl Core {
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         session_source: SessionSource,
         agent_control: AgentControl,
+        plan_mode: bool,
+        model_factory: Arc<dyn SessionModelFactory>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut context_manager = ContextManager::default();
@@ -83,7 +87,9 @@ impl Core {
             current_turn_id,
             dynamic_tool_client,
             next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
-            model,
+            model: Mutex::new(model),
+            plan_mode: AtomicBool::new(plan_mode),
+            model_factory,
             rollout,
         });
         Self { session }
@@ -397,8 +403,71 @@ impl Session {
         });
     }
 
-    pub(crate) fn model(&self) -> &SessionModel {
-        &self.model
+    pub(crate) async fn model(&self) -> SessionModel {
+        self.model.lock().await.clone()
+    }
+
+    pub(crate) async fn set_model(&self, model: SessionModel) {
+        *self.model.lock().await = model;
+    }
+
+    pub(crate) fn plan_mode(&self) -> bool {
+        self.plan_mode.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_plan_mode_flag(&self, enabled: bool) {
+        self.plan_mode.store(enabled, Ordering::Release);
+    }
+
+    /// Re-build the thread's `SessionModel` with the requested plan-mode state
+    /// and swap it in. Refuses mid-turn so the active stream is not torn down
+    /// while a tool call is in flight. Use [`Self::apply_plan_mode_unchecked`]
+    /// from within the tool loop itself (where holding `active_turn` is a
+    /// pre-condition, not a conflict).
+    pub(crate) async fn apply_plan_mode(
+        self: &Arc<Self>,
+        enabled: bool,
+        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+    ) -> Result<bool> {
+        if self.active_turn.lock().await.is_some() {
+            return Err(anyhow::anyhow!(
+                "cannot toggle plan mode while a turn is in flight"
+            ));
+        }
+        self.apply_plan_mode_unchecked(enabled, dynamic_tool_client)
+            .await
+    }
+
+    /// Rebuild + swap without the in-turn guard. Used by the `exit_plan_mode`
+    /// tool handler, which by definition runs inside the parent turn's tool
+    /// loop.
+    pub(crate) async fn apply_plan_mode_unchecked(
+        self: &Arc<Self>,
+        enabled: bool,
+        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+    ) -> Result<bool> {
+        if self.plan_mode() == enabled {
+            return Ok(enabled);
+        }
+        let cwd = std::env::current_dir()?;
+        let role_override = crate::agent::role::role_override_from_source(&self.session_source);
+        let new_model = self.model_factory.build(
+            cwd,
+            self.id,
+            dynamic_tool_client,
+            Arc::clone(&self.current_turn_id),
+            role_override,
+            self.agent_control.clone(),
+            enabled,
+        )?;
+        self.set_model(new_model).await;
+        self.set_plan_mode_flag(enabled);
+        self.emit_session_event(EventMsg::PlanModeChanged(PlanModeChangedEvent {
+            thread_id: self.id.to_string(),
+            enabled,
+        }))
+        .await;
+        Ok(enabled)
     }
 
     pub(crate) async fn abort_pending_dynamic_tool_requests(&self) {
@@ -434,7 +503,9 @@ mod tests {
     use tokio::sync::RwLock;
 
     use crate::{
-        SessionModel, SessionModelDriver, SessionStream, agent::AgentControl,
+        SessionModel, SessionModelDriver, SessionStream,
+        agent::AgentControl,
+        provider::{SessionModelFactory, stub_session_model_factory},
         rollout::RolloutRecorder,
     };
 
@@ -460,9 +531,12 @@ mod tests {
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd)
             .await
             .expect("rollout");
+        let model = SessionModel::Stub(Arc::new(EmptyDriver));
+        let factory: Arc<dyn SessionModelFactory> =
+            stub_session_model_factory(std::iter::once((thread_id, model.clone())).collect());
         let core = Core::new(
             thread_id,
-            SessionModel::Stub(Arc::new(EmptyDriver)),
+            model,
             Vec::new(),
             0,
             rollout,
@@ -470,6 +544,8 @@ mod tests {
             None,
             SessionSource::Cli,
             AgentControl::new(),
+            false,
+            factory,
         );
         let rx = core.subscribe();
         (core, rx)

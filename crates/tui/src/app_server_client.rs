@@ -29,6 +29,7 @@ impl AppServerClient {
             ClientRequest::TurnStart { .. } => "turn_start",
             ClientRequest::ThreadResume { .. } => "thread_resume",
             ClientRequest::ThreadList { .. } => "thread_list",
+            ClientRequest::SetPlanMode { .. } => "set_plan_mode",
         };
         tracing::Span::current().record("request", request_name);
 

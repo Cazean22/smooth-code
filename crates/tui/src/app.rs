@@ -47,6 +47,7 @@ pub(crate) struct App {
     scroll: u16,
     auto_scroll: bool,
     is_turn_running: bool,
+    plan_mode: bool,
     terminal_width: u16,
 }
 
@@ -72,6 +73,7 @@ impl App {
             scroll: 0,
             auto_scroll: true,
             is_turn_running: false,
+            plan_mode: false,
             terminal_width: 80,
         }
     }
@@ -92,6 +94,9 @@ impl App {
             }
             KeyCode::Esc => return Ok(AppRunControl::Exit),
             KeyCode::Char('q') if self.composer.is_empty() => return Ok(AppRunControl::Exit),
+            KeyCode::BackTab if !self.is_turn_running => {
+                self.toggle_plan_mode(app_server).await;
+            }
             KeyCode::Enter if !self.is_turn_running => {
                 let message = std::mem::take(&mut self.composer);
                 if !message.trim().is_empty() {
@@ -137,6 +142,28 @@ impl App {
         let response = app_server.turn_start(thread_id, input).await?;
         self.status_line = format!("Turn {}", response.turn_id);
         Ok(())
+    }
+
+    async fn toggle_plan_mode(&mut self, app_server: &mut AppServerSession) {
+        let Some(thread_id) = self.current_thread_id else {
+            self.push_history(Box::new(PlainHistoryCell::info(
+                "no active thread; start a session before toggling plan mode",
+            )));
+            return;
+        };
+        let desired = !self.plan_mode;
+        match app_server.set_plan_mode(thread_id, desired).await {
+            Ok(response) => {
+                // The authoritative state will also arrive via PlanModeChanged
+                // event, but apply it now so the indicator updates immediately.
+                self.plan_mode = response.enabled;
+            }
+            Err(err) => {
+                self.push_history(Box::new(PlainHistoryCell::error(format!(
+                    "could not toggle plan mode: {err}"
+                ))));
+            }
+        }
     }
 
     pub(crate) fn handle_session_event(&mut self, event: Event, viewport_height: u16) {
@@ -340,6 +367,15 @@ impl App {
                     "Resume finished with status {}",
                     agent_status_label(&event.status)
                 ))));
+            }
+            EventMsg::PlanModeChanged(event) => {
+                self.plan_mode = event.enabled;
+                let message = if event.enabled {
+                    "plan mode enabled — agent restricted to read/list/spawn/plan_write/exit_plan_mode"
+                } else {
+                    "plan mode disabled — agent back to the full tool set"
+                };
+                self.push_history(Box::new(PlainHistoryCell::info(message)));
             }
             EventMsg::AgentMessage(_) => {}
         }
@@ -545,33 +581,50 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
-        let text = Line::from(vec![
-            Span::styled("Status ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(self.status_line.clone()),
-            Span::raw("  "),
-            Span::styled(
-                if self.is_turn_running {
-                    "agent running"
-                } else {
-                    "agent idle"
-                },
-                Style::default().dim(),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(text), area);
+        let mut spans = Vec::with_capacity(6);
+        spans.push(Span::styled(
+            "Status ",
+            Style::default().fg(Color::Yellow).bold(),
+        ));
+        spans.push(Span::raw(self.status_line.clone()));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            if self.is_turn_running {
+                "agent running"
+            } else {
+                "agent idle"
+            },
+            Style::default().dim(),
+        ));
+        if self.plan_mode {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                "⏸ PLAN MODE",
+                Style::default().fg(Color::Magenta).bold(),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_composer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let title = if self.plan_mode {
+            "Input (plan)"
+        } else {
+            "Input"
+        };
+        let border_style = if self.plan_mode {
+            Style::default().fg(Color::Magenta)
+        } else if self.is_turn_running {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
         let paragraph = Paragraph::new(self.composer.as_str())
             .block(
                 Block::default()
-                    .title("Input")
+                    .title(title)
                     .borders(Borders::ALL)
-                    .border_style(if self.is_turn_running {
-                        Style::default().fg(Color::DarkGray)
-                    } else {
-                        Style::default().fg(Color::Cyan)
-                    }),
+                    .border_style(border_style),
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);

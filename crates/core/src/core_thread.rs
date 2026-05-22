@@ -9,10 +9,7 @@ use tools::DynamicToolClient;
 
 use crate::provider::{SessionModelFactory, default_session_model_factory};
 use crate::{
-    agent::{
-        AgentControl,
-        role::{RoleOverride, resolve_role},
-    },
+    agent::{AgentControl, role::role_override_from_source},
     core::Core,
     rollout::{ResumeState, RolloutRecorder, workspace_root},
 };
@@ -21,6 +18,7 @@ use smooth_protocol::{Op, ThreadId};
 pub struct CoreThread {
     pub(crate) core: Core,
     rollout_path: PathBuf,
+    dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
 }
 
 impl CoreThread {
@@ -63,16 +61,17 @@ impl CoreThread {
         let cwd = std::env::current_dir()?;
         let current_turn_id = Arc::new(RwLock::new(None));
         let role_override = role_override_from_source(&session_source);
-        let model = model_factory
-            .unwrap_or_else(default_session_model_factory)
-            .build(
-                cwd.clone(),
-                id,
-                dynamic_tool_client.clone(),
-                Arc::clone(&current_turn_id),
-                role_override,
-                agent_control.clone(),
-            )?;
+        let resolved_factory = model_factory.unwrap_or_else(default_session_model_factory);
+        let plan_mode = false;
+        let model = resolved_factory.build(
+            cwd.clone(),
+            id,
+            dynamic_tool_client.clone(),
+            Arc::clone(&current_turn_id),
+            role_override,
+            agent_control.clone(),
+            plan_mode,
+        )?;
         let workspace_root = workspace_root()?;
         let rollout = RolloutRecorder::create(&workspace_root, id, &cwd).await?;
         for message in &initial_history {
@@ -93,11 +92,14 @@ impl CoreThread {
                 0,
                 rollout,
                 current_turn_id,
-                dynamic_tool_client,
+                dynamic_tool_client.clone(),
                 session_source,
                 agent_control,
+                plan_mode,
+                resolved_factory.clone(),
             ),
             rollout_path,
+            dynamic_tool_client,
         })
     }
 
@@ -117,16 +119,17 @@ impl CoreThread {
         let cwd = std::env::current_dir()?;
         let current_turn_id = Arc::new(RwLock::new(None));
         let role_override = role_override_from_source(&session_source);
-        let model = model_factory
-            .unwrap_or_else(default_session_model_factory)
-            .build(
-                cwd,
-                state.thread_id,
-                dynamic_tool_client.clone(),
-                Arc::clone(&current_turn_id),
-                role_override,
-                agent_control.clone(),
-            )?;
+        let resolved_factory = model_factory.unwrap_or_else(default_session_model_factory);
+        let plan_mode = false;
+        let model = resolved_factory.build(
+            cwd,
+            state.thread_id,
+            dynamic_tool_client.clone(),
+            Arc::clone(&current_turn_id),
+            role_override,
+            agent_control.clone(),
+            plan_mode,
+        )?;
         let rollout = RolloutRecorder::resume(path.clone()).await?;
         Ok(Self {
             core: Core::new(
@@ -136,11 +139,14 @@ impl CoreThread {
                 state.next_turn_index,
                 rollout,
                 current_turn_id,
-                dynamic_tool_client,
+                dynamic_tool_client.clone(),
                 session_source,
                 agent_control,
+                plan_mode,
+                resolved_factory.clone(),
             ),
             rollout_path: path,
+            dynamic_tool_client,
         })
     }
 
@@ -150,6 +156,14 @@ impl CoreThread {
 
     pub(crate) async fn submit(&self, op: Op) -> Result<String> {
         self.core.submit(op).await
+    }
+
+    /// Toggle plan mode for this thread. Returns the new effective plan-mode state.
+    pub(crate) async fn set_plan_mode(&self, enabled: bool) -> Result<bool> {
+        self.core
+            .session
+            .apply_plan_mode(enabled, self.dynamic_tool_client.clone())
+            .await
     }
 
     #[tracing::instrument(name = "core.thread.emit_session_configured", skip(self), fields(thread_id = %self.core.session.id))]
@@ -196,12 +210,4 @@ fn history_message_from_message(message: &Message) -> Option<crate::rollout::His
             _ => None,
         }),
     }
-}
-
-fn role_override_from_source(source: &SessionSource) -> RoleOverride {
-    source
-        .get_agent_role()
-        .and_then(|role| resolve_role(&role))
-        .map(|config| config.override_config)
-        .unwrap_or_default()
 }

@@ -81,6 +81,7 @@ pub enum EventMsg {
     CollabAgentCompleted(CollabAgentCompletedEvent),
     CollabResumeBegin(CollabResumeBeginEvent),
     CollabResumeEnd(CollabResumeEndEvent),
+    PlanModeChanged(PlanModeChangedEvent),
 
     /// User/system input message (what was sent to the model)
     UserMessage(String),
@@ -173,6 +174,13 @@ pub struct AgentStatusChangedEvent {
     pub thread_id: String,
     pub turn_id: Option<String>,
     pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanModeChangedEvent {
+    pub thread_id: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]

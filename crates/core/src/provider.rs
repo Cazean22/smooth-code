@@ -21,17 +21,18 @@ use rig::{
 };
 use tokio::sync::RwLock;
 use tools::{
-    DynamicTool, DynamicToolClient, EditTool, ListDirTool, ReadTool, RunCommandTool,
-    SpawnAgentTool, WriteTool,
+    DynamicTool, DynamicToolClient, EditTool, ExitPlanModeTool, ListDirTool, PlanWriteTool,
+    ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
 };
 
 use crate::agent::{
-    AgentControl,
+    AgentControl, PLAN_MODE_INSTRUCTIONS,
     role::{RoleOverride, render_spawn_agent_tool_description},
 };
 
 /// Injectable builder for session-scoped models.
 pub trait SessionModelFactory: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &self,
         cwd: PathBuf,
@@ -40,6 +41,7 @@ pub trait SessionModelFactory: Send + Sync {
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
+        plan_mode: bool,
     ) -> Result<SessionModel>;
 }
 
@@ -55,6 +57,7 @@ impl SessionModelFactory for EnvSessionModelFactory {
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
+        plan_mode: bool,
     ) -> Result<SessionModel> {
         SessionModel::from_env(
             cwd,
@@ -63,6 +66,7 @@ impl SessionModelFactory for EnvSessionModelFactory {
             current_turn_id,
             role_override,
             agent_control,
+            plan_mode,
         )
     }
 }
@@ -154,6 +158,7 @@ impl SessionModel {
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
+        plan_mode: bool,
     ) -> Result<Self> {
         let provider = env::var("SMOOTH_CODE_LLM_PROVIDER")
             .unwrap_or_else(|_| "openai".to_string())
@@ -163,11 +168,16 @@ impl SessionModel {
             .clone()
             .or_else(|| env::var("SMOOTH_CODE_LLM_MODEL").ok())
             .unwrap_or_else(|| "gpt-5.4".to_string());
-        let preamble = role_override
+        let base_preamble = role_override
             .preamble
             .clone()
             .or_else(|| env::var("SMOOTH_CODE_LLM_PREAMBLE").ok())
             .unwrap_or_else(|| "You are smooth-code, a code agent.".to_string());
+        let preamble = if plan_mode {
+            format!("{base_preamble}\n\n{PLAN_MODE_INSTRUCTIONS}")
+        } else {
+            base_preamble
+        };
 
         match provider.as_str() {
             "openai" => {
@@ -192,6 +202,7 @@ impl SessionModel {
                     dynamic_tool_client.clone(),
                     Arc::clone(&current_turn_id),
                     agent_control.clone(),
+                    plan_mode,
                 ))))
             }
             "openrouter" => {
@@ -203,6 +214,7 @@ impl SessionModel {
                     dynamic_tool_client.clone(),
                     Arc::clone(&current_turn_id),
                     agent_control.clone(),
+                    plan_mode,
                 ))))
             }
             "anthropic" => {
@@ -214,6 +226,7 @@ impl SessionModel {
                     dynamic_tool_client.clone(),
                     Arc::clone(&current_turn_id),
                     agent_control.clone(),
+                    plan_mode,
                 ))))
             }
             "gemini" => {
@@ -225,6 +238,7 @@ impl SessionModel {
                     dynamic_tool_client,
                     current_turn_id,
                     agent_control,
+                    plan_mode,
                 ))))
             }
             other => bail!("unsupported SMOOTH_CODE_LLM_PROVIDER `{other}`"),
@@ -302,6 +316,7 @@ impl SessionModelFactory for StubSessionModelFactory {
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
+        _plan_mode: bool,
     ) -> Result<SessionModel> {
         self.models
             .lock()
@@ -319,16 +334,27 @@ fn build_agent<M>(
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     current_turn_id: Arc<RwLock<Option<String>>>,
     _agent_control: AgentControl,
+    plan_mode: bool,
 ) -> Agent<M>
 where
     M: rig::completion::CompletionModel,
 {
+    // Read-only tools are always present.
     let builder = builder
-        .tool(EditTool::new(cwd.clone()))
         .tool(ListDirTool::new(cwd.clone()))
-        .tool(ReadTool::new(cwd.clone()))
-        .tool(RunCommandTool::new(cwd.clone()))
-        .tool(WriteTool::new(cwd));
+        .tool(ReadTool::new(cwd.clone()));
+    // Mutating tools are only registered outside plan mode; plan-mode-specific
+    // tools (`plan_write`, `exit_plan_mode`) are only registered inside plan mode.
+    let builder = if plan_mode {
+        builder
+            .tool(PlanWriteTool::new(cwd.clone(), thread_id))
+            .tool(ExitPlanModeTool::new())
+    } else {
+        builder
+            .tool(EditTool::new(cwd.clone()))
+            .tool(RunCommandTool::new(cwd.clone()))
+            .tool(WriteTool::new(cwd))
+    };
     let builder = if let Some(dynamic_tool_client) = dynamic_tool_client {
         builder.tool(DynamicTool::new(
             "dynamic_echo",
@@ -550,6 +576,7 @@ mod tests {
             None,
             Arc::new(RwLock::new(None)),
             AgentControl::new(),
+            false,
         );
 
         let tool_names = agent
@@ -565,5 +592,43 @@ mod tests {
         assert!(!tool_names.contains("send_message"));
         assert!(!tool_names.contains("list_agents"));
         assert!(!tool_names.contains("close_agent"));
+        // Plan-mode-only tools must not be present in the default agent.
+        assert!(!tool_names.contains("plan_write"));
+        assert!(!tool_names.contains("exit_plan_mode"));
+    }
+
+    #[tokio::test]
+    async fn build_agent_in_plan_mode_swaps_mutating_for_planning_tools() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let agent = build_agent(
+            AgentBuilder::new(DummyModel),
+            workspace.path().to_path_buf(),
+            smooth_protocol::ThreadId::new(),
+            None,
+            Arc::new(RwLock::new(None)),
+            AgentControl::new(),
+            true,
+        );
+
+        let tool_names = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("tool definitions")
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<HashSet<_>>();
+
+        // Read-only and sub-agent tools remain available.
+        assert!(tool_names.contains("read"));
+        assert!(tool_names.contains("list_dir"));
+        assert!(tool_names.contains("spawn_agent"));
+        // Plan-mode planning tools are registered.
+        assert!(tool_names.contains("plan_write"));
+        assert!(tool_names.contains("exit_plan_mode"));
+        // Mutating tools must be stripped.
+        assert!(!tool_names.contains("edit"));
+        assert!(!tool_names.contains("write"));
+        assert!(!tool_names.contains("run_command"));
     }
 }

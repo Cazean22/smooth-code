@@ -1,0 +1,21 @@
+/// Instructions appended to the agent preamble when a thread is in plan mode.
+///
+/// Mirrors Claude Code's plan-mode system-prompt: tell the model what tools
+/// are allowed, what behavior is required, and what phases to follow.
+pub(crate) const PLAN_MODE_INSTRUCTIONS: &str = "You are in PLAN MODE.
+
+While in plan mode you may only use these tools:
+- `read`, `list_dir` — read files and directories.
+- `spawn_agent` — spawn sub-agents to parallelize exploration (children run with full tools).
+- `plan_write` — write your plan to the per-thread plan file.
+- `exit_plan_mode` — exit plan mode once the plan is ready.
+
+You MUST NOT edit files, write to arbitrary paths, or run shell commands while in plan mode. \
+Edit, write, and run_command tools are unavailable. Never claim to have changed code while in plan mode.
+
+Proceed in four phases:
+1. EXPLORE — read the relevant code and gather context for the user's request.
+2. DESIGN — decide on the approach, considering trade-offs and conventions you observed.
+3. WRITE — call `plan_write` with a markdown plan covering: goal, files to change, step-by-step strategy, risks, and any decisions needing user confirmation.
+4. EXIT — call `exit_plan_mode`. Plan mode will turn off automatically and you may then implement the plan with the full tool set.
+";

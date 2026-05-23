@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use tokio::sync::RwLock;
-use tools::DynamicToolClient;
+use tools::{AskUserClient, DynamicToolClient};
 
 use crate::{
     SessionModel, SessionModelFactory,
@@ -28,6 +28,7 @@ impl SessionModelFactory for StubSessionModelFactory {
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
@@ -37,6 +38,7 @@ impl SessionModelFactory for StubSessionModelFactory {
             cwd,
             thread_id,
             dynamic_tool_client,
+            ask_user_client,
             current_turn_id,
             role_override,
             agent_control,

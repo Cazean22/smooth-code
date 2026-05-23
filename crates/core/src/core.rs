@@ -14,7 +14,7 @@ use smooth_protocol::{
     ThreadId, TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tools::DynamicToolClient;
+use tools::{AskUserClient, DynamicToolClient};
 use tracing::Instrument;
 
 use crate::{
@@ -43,6 +43,8 @@ pub(crate) struct Session {
     pub(crate) agent_control: AgentControl,
     current_turn_id: Arc<RwLock<Option<String>>>,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+    #[allow(dead_code)]
+    ask_user_client: Option<Arc<dyn AskUserClient>>,
     next_internal_sub_id: AtomicU64,
     model: Mutex<SessionModel>,
     plan_mode: AtomicBool,
@@ -69,6 +71,7 @@ impl Core {
         rollout: RolloutRecorder,
         current_turn_id: Arc<RwLock<Option<String>>>,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
         session_source: SessionSource,
         agent_control: AgentControl,
         plan_mode: bool,
@@ -86,6 +89,7 @@ impl Core {
             agent_control,
             current_turn_id,
             dynamic_tool_client,
+            ask_user_client,
             next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
             model: Mutex::new(model),
             plan_mode: AtomicBool::new(plan_mode),
@@ -428,13 +432,14 @@ impl Session {
         self: &Arc<Self>,
         enabled: bool,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
     ) -> Result<bool> {
         if self.active_turn.lock().await.is_some() {
             return Err(anyhow::anyhow!(
                 "cannot toggle plan mode while a turn is in flight"
             ));
         }
-        self.apply_plan_mode_unchecked(enabled, dynamic_tool_client)
+        self.apply_plan_mode_unchecked(enabled, dynamic_tool_client, ask_user_client)
             .await
     }
 
@@ -445,6 +450,7 @@ impl Session {
         self: &Arc<Self>,
         enabled: bool,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
     ) -> Result<bool> {
         if self.plan_mode() == enabled {
             return Ok(enabled);
@@ -455,6 +461,7 @@ impl Session {
             cwd,
             self.id,
             dynamic_tool_client,
+            ask_user_client,
             Arc::clone(&self.current_turn_id),
             role_override,
             self.agent_control.clone(),
@@ -541,6 +548,7 @@ mod tests {
             0,
             rollout,
             current_turn_id,
+            None,
             None,
             SessionSource::Cli,
             AgentControl::new(),

@@ -5,7 +5,7 @@ use anyhow::Result;
 use rig::message::Message;
 use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent, SessionSource};
 use tokio::sync::{RwLock, broadcast};
-use tools::DynamicToolClient;
+use tools::{AskUserClient, DynamicToolClient};
 
 use crate::provider::{SessionModelFactory, default_session_model_factory};
 use crate::{
@@ -19,17 +19,19 @@ pub struct CoreThread {
     pub(crate) core: Core,
     rollout_path: PathBuf,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+    ask_user_client: Option<Arc<dyn AskUserClient>>,
 }
 
 impl CoreThread {
     #[tracing::instrument(
         name = "core.thread.new",
-        skip(dynamic_tool_client, model_factory, agent_control),
+        skip(dynamic_tool_client, ask_user_client, model_factory, agent_control),
         fields(thread_id = %id)
     )]
     pub(crate) async fn new(
         id: ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         agent_control: AgentControl,
@@ -37,6 +39,7 @@ impl CoreThread {
         Self::new_with_history(
             id,
             dynamic_tool_client,
+            ask_user_client,
             model_factory,
             session_source,
             agent_control,
@@ -47,12 +50,19 @@ impl CoreThread {
 
     #[tracing::instrument(
         name = "core.thread.new_with_history",
-        skip(dynamic_tool_client, model_factory, agent_control, initial_history),
+        skip(
+            dynamic_tool_client,
+            ask_user_client,
+            model_factory,
+            agent_control,
+            initial_history
+        ),
         fields(thread_id = %id, history_items = initial_history.len())
     )]
     pub(crate) async fn new_with_history(
         id: ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         agent_control: AgentControl,
@@ -67,6 +77,7 @@ impl CoreThread {
             cwd.clone(),
             id,
             dynamic_tool_client.clone(),
+            ask_user_client.clone(),
             Arc::clone(&current_turn_id),
             role_override,
             agent_control.clone(),
@@ -93,6 +104,7 @@ impl CoreThread {
                 rollout,
                 current_turn_id,
                 dynamic_tool_client.clone(),
+                ask_user_client.clone(),
                 session_source,
                 agent_control,
                 plan_mode,
@@ -100,18 +112,27 @@ impl CoreThread {
             ),
             rollout_path,
             dynamic_tool_client,
+            ask_user_client,
         })
     }
 
     #[tracing::instrument(
         name = "core.thread.resume",
-        skip(path, state, dynamic_tool_client, model_factory, agent_control),
+        skip(
+            path,
+            state,
+            dynamic_tool_client,
+            ask_user_client,
+            model_factory,
+            agent_control
+        ),
         fields(thread_id = %state.thread_id)
     )]
     pub(crate) async fn resume(
         path: PathBuf,
         state: ResumeState,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         agent_control: AgentControl,
@@ -125,6 +146,7 @@ impl CoreThread {
             cwd,
             state.thread_id,
             dynamic_tool_client.clone(),
+            ask_user_client.clone(),
             Arc::clone(&current_turn_id),
             role_override,
             agent_control.clone(),
@@ -140,6 +162,7 @@ impl CoreThread {
                 rollout,
                 current_turn_id,
                 dynamic_tool_client.clone(),
+                ask_user_client.clone(),
                 session_source,
                 agent_control,
                 plan_mode,
@@ -147,6 +170,7 @@ impl CoreThread {
             ),
             rollout_path: path,
             dynamic_tool_client,
+            ask_user_client,
         })
     }
 
@@ -162,7 +186,11 @@ impl CoreThread {
     pub(crate) async fn set_plan_mode(&self, enabled: bool) -> Result<bool> {
         self.core
             .session
-            .apply_plan_mode(enabled, self.dynamic_tool_client.clone())
+            .apply_plan_mode(
+                enabled,
+                self.dynamic_tool_client.clone(),
+                self.ask_user_client.clone(),
+            )
             .await
     }
 

@@ -92,15 +92,59 @@ pub struct DynamicToolCallParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AskUserQuestionParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    pub questions: Vec<AskUserQuestion>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AskUserQuestion {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<AskUserQuestionOption>,
+    pub multi_select: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AskUserQuestionOption {
+    pub label: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AskUserQuestionResponse {
+    pub answers: Vec<AskUserQuestionAnswer>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AskUserQuestionAnswer {
+    pub question: String,
+    pub selected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[allow(clippy::large_enum_variant)]
 pub enum ServerRequestPayload {
     DynamicToolCall(DynamicToolCallParams),
+    AskUserQuestion(AskUserQuestionParams),
 }
 
 impl ServerRequestPayload {
     pub fn request_with_id(self, request_id: RequestId) -> ServerRequest {
         match self {
             Self::DynamicToolCall(params) => ServerRequest::DynamicToolCall { request_id, params },
+            Self::AskUserQuestion(params) => ServerRequest::AskUserQuestion { request_id, params },
         }
     }
 }
@@ -148,12 +192,20 @@ pub enum ServerRequest {
         request_id: RequestId,
         params: DynamicToolCallParams,
     },
+    #[doc = r" Ask the user one or more multiple-choice questions interactively."]
+    #[serde(rename = "item/ask_user_question")]
+    AskUserQuestion {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: AskUserQuestionParams,
+    },
 }
 
 impl ServerRequest {
     pub fn id(&self) -> &RequestId {
         match self {
             Self::DynamicToolCall { request_id, .. } => request_id,
+            Self::AskUserQuestion { request_id, .. } => request_id,
         }
     }
 }

@@ -10,7 +10,7 @@ use smooth_protocol::{
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, oneshot, watch};
-use tools::DynamicToolClientFactory;
+use tools::{AskUserClientFactory, DynamicToolClientFactory};
 use uuid::Uuid;
 
 use crate::{
@@ -53,6 +53,7 @@ pub(crate) type InlineChildCompletionReceiver = oneshot::Receiver<InlineChildCom
 struct AgentControlRuntime {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
     dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
+    ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
     model_factory: Option<Arc<dyn SessionModelFactory>>,
     state_db: StateDbHandle,
 }
@@ -73,6 +74,7 @@ impl AgentControl {
         &self,
         threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
         dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
+        ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         state_db: StateDbHandle,
     ) {
@@ -83,6 +85,7 @@ impl AgentControl {
             .expect("agent control runtime mutex should lock") = Some(AgentControlRuntime {
             threads,
             dynamic_tool_client_factory,
+            ask_user_client_factory,
             model_factory,
             state_db,
         });
@@ -357,6 +360,10 @@ impl AgentControl {
             .dynamic_tool_client_factory
             .as_ref()
             .map(|factory| factory.build(child_thread_id));
+        let ask_user_client = runtime
+            .ask_user_client_factory
+            .as_ref()
+            .map(|factory| factory.build(child_thread_id));
         let initial_history = if fork_context {
             self.load_fork_history(parent_thread_id, SpawnAgentForkMode::ParentHistory)
                 .await?
@@ -367,6 +374,7 @@ impl AgentControl {
             CoreThread::new_with_history(
                 child_thread_id,
                 dynamic_tool_client,
+                ask_user_client,
                 runtime.model_factory.clone(),
                 child_source,
                 self.clone(),
@@ -668,7 +676,7 @@ mod tests {
         thread_manager::ThreadManagerState,
     };
     use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
-    use tools::DynamicToolClient;
+    use tools::{AskUserClient, DynamicToolClient};
 
     #[test]
     fn clones_share_registry_and_status_state() {
@@ -713,6 +721,7 @@ mod tests {
             _cwd: PathBuf,
             thread_id: ThreadId,
             _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+            _ask_user_client: Option<Arc<dyn AskUserClient>>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
@@ -765,6 +774,7 @@ mod tests {
             _cwd: PathBuf,
             thread_id: ThreadId,
             _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+            _ask_user_client: Option<Arc<dyn AskUserClient>>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
@@ -790,6 +800,7 @@ mod tests {
             _cwd: PathBuf,
             thread_id: ThreadId,
             _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+            _ask_user_client: Option<Arc<dyn AskUserClient>>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
@@ -847,6 +858,7 @@ mod tests {
         std::env::set_current_dir(workspace.path()).expect("set cwd");
 
         let manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
@@ -909,6 +921,7 @@ mod tests {
 
         let manager = ThreadManagerState::new(
             None,
+            None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
                     text: "response".into(),
@@ -949,6 +962,7 @@ mod tests {
         std::env::set_current_dir(workspace.path()).expect("set cwd");
 
         let manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
@@ -996,6 +1010,7 @@ mod tests {
         std::env::set_current_dir(workspace.path()).expect("set cwd");
 
         let manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
@@ -1067,6 +1082,7 @@ mod tests {
         std::env::set_current_dir(workspace.path()).expect("set cwd");
 
         let manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
@@ -1145,6 +1161,7 @@ mod tests {
         let recording_state = Arc::new(RecordingState::default());
         let manager = ThreadManagerState::new(
             None,
+            None,
             Some(Arc::new(RecordingFactory {
                 state: Arc::clone(&recording_state),
             })),
@@ -1206,6 +1223,7 @@ mod tests {
         let recording_state = Arc::new(RecordingState::default());
         let release = Arc::new(Semaphore::new(0));
         let manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(ForkAwareFactory {
                 build_count: Mutex::new(0),

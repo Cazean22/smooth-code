@@ -18,4 +18,4 @@ pub use provider::{
 };
 pub use rollout::ThreadSummary;
 pub use thread_manager::{ResumedThread, StartedThread, ThreadManagerState};
-pub use tools::{DynamicToolClient, DynamicToolClientFactory};
+pub use tools::{AskUserClient, AskUserClientFactory, DynamicToolClient, DynamicToolClientFactory};

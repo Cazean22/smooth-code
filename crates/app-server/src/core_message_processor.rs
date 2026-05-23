@@ -1,12 +1,15 @@
 use std::{collections::HashSet, sync::Arc};
 
 use app_server_protocol::{
-    ClientRequest, DynamicToolCallParams, JSONRPCErrorError, ServerRequestPayload,
-    SetPlanModeResponse, ThreadListItem, ThreadListResponse, ThreadResumeResponse,
-    ThreadStartResponse, TurnStartResponse,
+    AskUserQuestionParams, AskUserQuestionResponse, ClientRequest, DynamicToolCallParams,
+    JSONRPCErrorError, ServerRequestPayload, SetPlanModeResponse, ThreadListItem,
+    ThreadListResponse, ThreadResumeResponse, ThreadStartResponse, TurnStartResponse,
 };
 use futures_util::future::BoxFuture;
-use smooth_core::{DynamicToolClient, DynamicToolClientFactory, ThreadManagerState, ThreadSummary};
+use smooth_core::{
+    AskUserClient, AskUserClientFactory, DynamicToolClient, DynamicToolClientFactory,
+    ThreadManagerState, ThreadSummary,
+};
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
@@ -28,6 +31,14 @@ struct InProcessDynamicToolClientFactory {
 }
 
 struct InProcessDynamicToolClient {
+    outgoing: ThreadScopedOutgoingMessageSender,
+}
+
+struct InProcessAskUserClientFactory {
+    outgoing: Arc<OutgoingMessageSender>,
+}
+
+struct InProcessAskUserClient {
     outgoing: ThreadScopedOutgoingMessageSender,
 }
 
@@ -68,15 +79,71 @@ impl DynamicToolClient for InProcessDynamicToolClient {
     }
 }
 
+impl AskUserClientFactory for InProcessAskUserClientFactory {
+    fn build(&self, thread_id: ThreadId) -> Arc<dyn AskUserClient> {
+        Arc::new(InProcessAskUserClient {
+            outgoing: ThreadScopedOutgoingMessageSender::new(Arc::clone(&self.outgoing), thread_id),
+        })
+    }
+}
+
+impl AskUserClient for InProcessAskUserClient {
+    fn ask(
+        &self,
+        params: AskUserQuestionParams,
+    ) -> BoxFuture<'static, Result<AskUserQuestionResponse, JSONRPCErrorError>> {
+        let outgoing = self.outgoing.clone();
+        Box::pin(async move {
+            let (_, response_rx) = outgoing
+                .send_request(ServerRequestPayload::AskUserQuestion(params))
+                .await;
+            let value = match response_rx.await {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => return Err(err),
+                Err(err) => {
+                    return Err(JSONRPCErrorError {
+                        code: SERVER_ERROR_CODE,
+                        data: None,
+                        message: err.to_string(),
+                    });
+                }
+            };
+            serde_json::from_value::<AskUserQuestionResponse>(value).map_err(|err| {
+                JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    data: None,
+                    message: format!("invalid ask_user_question response: {err}"),
+                }
+            })
+        })
+    }
+
+    fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()> {
+        let outgoing = self.outgoing.clone();
+        Box::pin(async move {
+            outgoing.abort_pending_server_requests().await;
+        })
+    }
+}
+
 impl CoreMessageProcessor {
     pub async fn new(
         event_tx: mpsc::Sender<InProcessServerEvent>,
         outgoing: Arc<OutgoingMessageSender>,
     ) -> anyhow::Result<Self> {
         let dynamic_tool_client_factory: Arc<dyn DynamicToolClientFactory> =
-            Arc::new(InProcessDynamicToolClientFactory { outgoing });
+            Arc::new(InProcessDynamicToolClientFactory {
+                outgoing: Arc::clone(&outgoing),
+            });
+        let ask_user_client_factory: Arc<dyn AskUserClientFactory> =
+            Arc::new(InProcessAskUserClientFactory { outgoing });
         Ok(Self {
-            threads: ThreadManagerState::new(Some(dynamic_tool_client_factory), None).await?,
+            threads: ThreadManagerState::new(
+                Some(dynamic_tool_client_factory),
+                Some(ask_user_client_factory),
+                None,
+            )
+            .await?,
             event_tx,
             subscribed_threads: Mutex::new(HashSet::new()),
         })

@@ -5,6 +5,7 @@ mod history_cell;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
+mod question_picker;
 mod streaming;
 
 use std::io::{IsTerminal, Stdout};
@@ -70,6 +71,13 @@ pub async fn run() -> Result<()> {
                                         )
                                         .await?;
                                 }
+                            }
+                            app_server_protocol::ServerRequest::AskUserQuestion {
+                                request_id,
+                                params,
+                            } => {
+                                app.begin_question_picker(request_id, params);
+                                terminal.draw(|frame| app.render(frame))?;
                             }
                         }
                     }

@@ -21,8 +21,8 @@ use rig::{
 };
 use tokio::sync::RwLock;
 use tools::{
-    DynamicTool, DynamicToolClient, EditTool, ExitPlanModeTool, ListDirTool, PlanWriteTool,
-    ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
+    AskUserClient, AskUserQuestionTool, DynamicTool, DynamicToolClient, EditTool, ExitPlanModeTool,
+    ListDirTool, PlanWriteTool, ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
 };
 
 use crate::agent::{
@@ -38,6 +38,7 @@ pub trait SessionModelFactory: Send + Sync {
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
@@ -54,6 +55,7 @@ impl SessionModelFactory for EnvSessionModelFactory {
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
@@ -63,6 +65,7 @@ impl SessionModelFactory for EnvSessionModelFactory {
             cwd,
             thread_id,
             dynamic_tool_client,
+            ask_user_client,
             current_turn_id,
             role_override,
             agent_control,
@@ -151,10 +154,12 @@ impl SessionModel {
         matches!(self, Self::OpenAi(_))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_env(
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        ask_user_client: Option<Arc<dyn AskUserClient>>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
         agent_control: AgentControl,
@@ -200,6 +205,7 @@ impl SessionModel {
                     cwd,
                     thread_id,
                     dynamic_tool_client.clone(),
+                    ask_user_client.clone(),
                     Arc::clone(&current_turn_id),
                     agent_control.clone(),
                     plan_mode,
@@ -212,6 +218,7 @@ impl SessionModel {
                     cwd,
                     thread_id,
                     dynamic_tool_client.clone(),
+                    ask_user_client.clone(),
                     Arc::clone(&current_turn_id),
                     agent_control.clone(),
                     plan_mode,
@@ -224,6 +231,7 @@ impl SessionModel {
                     cwd,
                     thread_id,
                     dynamic_tool_client.clone(),
+                    ask_user_client.clone(),
                     Arc::clone(&current_turn_id),
                     agent_control.clone(),
                     plan_mode,
@@ -236,6 +244,7 @@ impl SessionModel {
                     cwd,
                     thread_id,
                     dynamic_tool_client,
+                    ask_user_client,
                     current_turn_id,
                     agent_control,
                     plan_mode,
@@ -313,6 +322,7 @@ impl SessionModelFactory for StubSessionModelFactory {
         _cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+        _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
         _agent_control: AgentControl,
@@ -327,11 +337,13 @@ impl SessionModelFactory for StubSessionModelFactory {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_agent<M>(
     builder: rig::agent::AgentBuilder<M, (), rig::agent::NoToolConfig>,
     cwd: PathBuf,
     thread_id: smooth_protocol::ThreadId,
     dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+    ask_user_client: Option<Arc<dyn AskUserClient>>,
     current_turn_id: Arc<RwLock<Option<String>>>,
     _agent_control: AgentControl,
     plan_mode: bool,
@@ -360,6 +372,15 @@ where
             "dynamic_echo",
             thread_id,
             dynamic_tool_client,
+            Arc::clone(&current_turn_id),
+        ))
+    } else {
+        builder
+    };
+    let builder = if let Some(ask_user_client) = ask_user_client {
+        builder.tool(AskUserQuestionTool::new(
+            thread_id,
+            ask_user_client,
             current_turn_id,
         ))
     } else {
@@ -574,6 +595,7 @@ mod tests {
             workspace.path().to_path_buf(),
             smooth_protocol::ThreadId::new(),
             None,
+            None,
             Arc::new(RwLock::new(None)),
             AgentControl::new(),
             false,
@@ -604,6 +626,7 @@ mod tests {
             AgentBuilder::new(DummyModel),
             workspace.path().to_path_buf(),
             smooth_protocol::ThreadId::new(),
+            None,
             None,
             Arc::new(RwLock::new(None)),
             AgentControl::new(),

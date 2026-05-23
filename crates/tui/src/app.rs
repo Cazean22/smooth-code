@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use app_server_protocol::{AskUserQuestionParams, JSONRPCErrorError, RequestId};
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
@@ -18,6 +19,7 @@ use crate::{
         AgentMessageCell, HistoryCell, PlainHistoryCell, ReasoningCell, ToolCallGroupCell,
         ToolCallState, UserHistoryCell,
     },
+    question_picker::{PickerOutcome, QuestionPicker},
     streaming::StreamController,
 };
 
@@ -49,6 +51,7 @@ pub(crate) struct App {
     is_turn_running: bool,
     plan_mode: bool,
     terminal_width: u16,
+    question_picker: Option<QuestionPicker>,
 }
 
 impl App {
@@ -75,6 +78,54 @@ impl App {
             is_turn_running: false,
             plan_mode: false,
             terminal_width: 80,
+            question_picker: None,
+        }
+    }
+
+    pub(crate) fn begin_question_picker(
+        &mut self,
+        request_id: RequestId,
+        params: AskUserQuestionParams,
+    ) {
+        self.question_picker = Some(QuestionPicker::new(request_id, params));
+    }
+
+    async fn dispatch_picker_key(
+        &mut self,
+        app_server: &mut AppServerSession,
+        key_event: KeyEvent,
+    ) -> Result<AppRunControl> {
+        let outcome = self
+            .question_picker
+            .as_mut()
+            .map(|picker| picker.handle_key(key_event))
+            .unwrap_or(PickerOutcome::None);
+        match outcome {
+            PickerOutcome::None => Ok(AppRunControl::Continue),
+            PickerOutcome::Confirm(response) => {
+                if let Some(picker) = self.question_picker.take() {
+                    let value = serde_json::to_value(response)?;
+                    app_server
+                        .respond_to_server_request(picker.request_id, value)
+                        .await?;
+                }
+                Ok(AppRunControl::Continue)
+            }
+            PickerOutcome::Cancel => {
+                if let Some(picker) = self.question_picker.take() {
+                    app_server
+                        .fail_server_request(
+                            picker.request_id,
+                            JSONRPCErrorError {
+                                code: -32001,
+                                data: None,
+                                message: "user declined to answer".to_string(),
+                            },
+                        )
+                        .await?;
+                }
+                Ok(AppRunControl::Continue)
+            }
         }
     }
 
@@ -86,6 +137,17 @@ impl App {
     ) -> Result<AppRunControl> {
         if key_event.kind != crossterm::event::KeyEventKind::Press {
             return Ok(AppRunControl::Continue);
+        }
+
+        // Ctrl-C always exits, even while the picker is open.
+        if matches!(key_event.code, KeyCode::Char('c'))
+            && key_event.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return Ok(AppRunControl::Exit);
+        }
+
+        if self.question_picker.is_some() {
+            return self.dispatch_picker_key(app_server, key_event).await;
         }
 
         match key_event.code {
@@ -546,18 +608,41 @@ impl App {
 
     pub(crate) fn render(&mut self, frame: &mut Frame<'_>) {
         self.terminal_width = frame.area().width;
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        let picker_height = self
+            .question_picker
+            .as_ref()
+            .map(|picker| picker.desired_height(frame.area().width).min(20))
+            .unwrap_or(0);
+        let constraints: Vec<Constraint> = if picker_height > 0 {
+            vec![
+                Constraint::Min(5),
+                Constraint::Length(picker_height),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ]
+        } else {
+            vec![
                 Constraint::Min(5),
                 Constraint::Length(1),
                 Constraint::Length(3),
-            ])
+            ]
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
             .split(frame.area());
 
         self.render_transcript(frame, chunks[0]);
-        self.render_status(frame, chunks[1]);
-        self.render_composer(frame, chunks[2]);
+        if picker_height > 0 {
+            if let Some(picker) = &self.question_picker {
+                picker.render(frame, chunks[1]);
+            }
+            self.render_status(frame, chunks[2]);
+            self.render_composer(frame, chunks[3]);
+        } else {
+            self.render_status(frame, chunks[1]);
+            self.render_composer(frame, chunks[2]);
+        }
     }
 
     fn render_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {

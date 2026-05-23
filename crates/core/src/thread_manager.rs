@@ -11,7 +11,7 @@ use smooth_protocol::{
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, broadcast};
-use tools::{DynamicToolClient, DynamicToolClientFactory};
+use tools::{AskUserClient, AskUserClientFactory, DynamicToolClient, DynamicToolClientFactory};
 use uuid::Uuid;
 
 use crate::{
@@ -36,6 +36,7 @@ pub struct ResumedThread {
 pub struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
     dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
+    ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
     model_factory: Option<Arc<dyn SessionModelFactory>>,
     agent_control: AgentControl,
     state_db: StateDbHandle,
@@ -44,6 +45,7 @@ pub struct ThreadManagerState {
 impl ThreadManagerState {
     pub async fn new(
         dynamic_tool_client_factory: Option<Arc<dyn DynamicToolClientFactory>>,
+        ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
     ) -> Result<Self> {
         let threads = Arc::new(RwLock::new(HashMap::new()));
@@ -54,12 +56,14 @@ impl ThreadManagerState {
         agent_control.attach_runtime(
             Arc::clone(&threads),
             dynamic_tool_client_factory.clone(),
+            ask_user_client_factory.clone(),
             model_factory.clone(),
             state_db.clone(),
         );
         Ok(Self {
             threads,
             dynamic_tool_client_factory,
+            ask_user_client_factory,
             model_factory,
             agent_control,
             state_db,
@@ -73,6 +77,7 @@ impl ThreadManagerState {
             CoreThread::new(
                 thread_id,
                 self.dynamic_tool_client(thread_id),
+                self.ask_user_client(thread_id),
                 self.model_factory.clone(),
                 SessionSource::Cli,
                 self.agent_control.clone(),
@@ -112,6 +117,7 @@ impl ThreadManagerState {
                 rollout_path.clone(),
                 resume_state,
                 self.dynamic_tool_client(thread_id),
+                self.ask_user_client(thread_id),
                 self.model_factory.clone(),
                 SessionSource::Cli,
                 self.agent_control.clone(),
@@ -247,6 +253,12 @@ impl ThreadManagerState {
 
     fn dynamic_tool_client(&self, thread_id: ThreadId) -> Option<Arc<dyn DynamicToolClient>> {
         self.dynamic_tool_client_factory
+            .as_ref()
+            .map(|factory| factory.build(thread_id))
+    }
+
+    fn ask_user_client(&self, thread_id: ThreadId) -> Option<Arc<dyn AskUserClient>> {
+        self.ask_user_client_factory
             .as_ref()
             .map(|factory| factory.build(thread_id))
     }
@@ -389,6 +401,7 @@ impl ThreadManagerState {
                 rollout_path,
                 resume_state,
                 self.dynamic_tool_client(child_thread_id),
+                self.ask_user_client(child_thread_id),
                 self.model_factory.clone(),
                 SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id,
@@ -444,7 +457,7 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::sync::RwLock;
-    use tools::DynamicToolClient;
+    use tools::{AskUserClient, DynamicToolClient};
 
     use super::ThreadManagerState;
     use crate::{
@@ -484,6 +497,7 @@ mod tests {
             _cwd: PathBuf,
             _thread_id: ThreadId,
             _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
+            _ask_user_client: Option<Arc<dyn AskUserClient>>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
@@ -501,6 +515,7 @@ mod tests {
         std::env::set_current_dir(workspace.path()).expect("set cwd");
 
         let manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
@@ -526,6 +541,7 @@ mod tests {
         drop(manager);
 
         let resumed_manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
@@ -571,6 +587,7 @@ mod tests {
 
         let manager = ThreadManagerState::new(
             None,
+            None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
                     text: "done".to_string(),
@@ -593,6 +610,7 @@ mod tests {
         drop(manager);
 
         let resumed_manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
@@ -633,6 +651,7 @@ mod tests {
 
         let manager = ThreadManagerState::new(
             None,
+            None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
                     text: "done".to_string(),
@@ -659,6 +678,7 @@ mod tests {
         drop(manager);
 
         let resumed_manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
@@ -710,6 +730,7 @@ mod tests {
 
         let manager = ThreadManagerState::new(
             None,
+            None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {
                     text: "done".to_string(),
@@ -729,6 +750,7 @@ mod tests {
         drop(manager);
 
         let resumed_manager = ThreadManagerState::new(
+            None,
             None,
             Some(Arc::new(StubFactory {
                 model: SessionModel::Stub(Arc::new(StubDriver {

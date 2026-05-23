@@ -1,3 +1,4 @@
+mod ask_user_question;
 mod client;
 mod dynamic_tool;
 mod edit;
@@ -11,7 +12,12 @@ mod run_command;
 mod shared;
 mod write;
 
-pub use client::{DynamicToolClient, DynamicToolClientFactory};
+pub use ask_user_question::{
+    AskUserQuestionArgs, AskUserQuestionInput, AskUserQuestionOptionInput, AskUserQuestionTool,
+};
+pub use client::{
+    AskUserClient, AskUserClientFactory, DynamicToolClient, DynamicToolClientFactory,
+};
 pub use dynamic_tool::{DynamicTool, DynamicToolArgs};
 pub use edit::{EditArgs, EditTool};
 pub use error::ToolFailure;

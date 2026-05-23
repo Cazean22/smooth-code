@@ -1,5 +1,6 @@
 # smooth-code agent notes
 - No additional `AGENTS.md`/`AGENT.md` files or Cursor/Claude/Windsurf/Cline/Goose/Copilot rule files were found in this repo.
+- When a task yields durable insights worth preserving, record them in `PROGRESS.md` before the final response; organize entries by topic or subsystem rather than timeline, and keep them focused on reusable repo knowledge, decisions, caveats, and verification notes rather than chat transcripts or routine task logs.
 - Rust 2024 workspace; default member is `crates/tui`, so bare `cargo build/test/run` targets `smooth-tui` unless `--workspace` or `-p` is used.
 - Main crates: `smooth-tui` (`crates/tui`) is the terminal UI entrypoint; `app-server` is the in-process request/event bridge; `smooth-core` is the session/thread runtime; `smooth-protocol` and `app-server-protocol` hold shared wire types; `smooth-state-db` owns the SQLite persistence layer.
 - Runtime flow: TUI -> `AppServerSession` -> `app_server::in_process` -> `MessageProcessor` -> `ThreadManagerState`/`CoreThread`/`Core` -> Rig streaming model/tool loop -> protocol events back to the TUI.

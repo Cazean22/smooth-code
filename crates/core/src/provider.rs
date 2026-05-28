@@ -172,7 +172,7 @@ impl SessionModel {
             .model
             .clone()
             .or_else(|| env::var("SMOOTH_CODE_LLM_MODEL").ok())
-            .unwrap_or_else(|| "gpt-5.4".to_string());
+            .unwrap_or_else(|| "gpt-5.5".to_string());
         let base_preamble = role_override
             .preamble
             .clone()

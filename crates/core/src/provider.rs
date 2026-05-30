@@ -53,6 +53,8 @@ use crate::agent::{
     role::{RoleOverride, render_spawn_agent_tool_description},
 };
 
+const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../docs/system_prompt.md");
+
 /// Injectable builder for session-scoped models.
 pub trait SessionModelFactory: Send + Sync {
     #[allow(clippy::too_many_arguments)]
@@ -203,16 +205,11 @@ impl SessionModel {
             .clone()
             .or_else(|| env::var("SMOOTH_CODE_LLM_MODEL").ok())
             .unwrap_or_else(|| "gpt-5.5".to_string());
-        let base_preamble = role_override
-            .preamble
-            .clone()
-            .or_else(|| env::var("SMOOTH_CODE_LLM_PREAMBLE").ok())
-            .unwrap_or_else(|| "You are smooth-code, a code agent.".to_string());
-        let preamble = if plan_mode {
-            format!("{base_preamble}\n\n{PLAN_MODE_INSTRUCTIONS}")
-        } else {
-            base_preamble
-        };
+        let preamble = compose_session_preamble(
+            &role_override,
+            env::var("SMOOTH_CODE_LLM_PREAMBLE").ok(),
+            plan_mode,
+        );
 
         match provider.as_str() {
             "openai" => {
@@ -372,6 +369,26 @@ impl SessionModelFactory for StubSessionModelFactory {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("missing stub session model for thread {thread_id}"))
     }
+}
+
+fn compose_session_preamble(
+    role_override: &RoleOverride,
+    env_preamble: Option<String>,
+    plan_mode: bool,
+) -> String {
+    let mut preamble = env_preamble.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    if let Some(role_preamble) = role_override
+        .preamble
+        .as_deref()
+        .map(str::trim)
+        .filter(|preamble| !preamble.is_empty())
+    {
+        preamble = format!("{}\n\n{role_preamble}", preamble.trim_end());
+    }
+    if plan_mode {
+        preamble = format!("{}\n\n{PLAN_MODE_INSTRUCTIONS}", preamble.trim_end());
+    }
+    preamble
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1562,8 +1579,8 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use tokio::sync::RwLock;
 
-    use super::build_agent;
-    use crate::agent::AgentControl;
+    use super::{build_agent, compose_session_preamble};
+    use crate::agent::{AgentControl, PLAN_MODE_INSTRUCTIONS, role::RoleOverride};
 
     #[derive(Clone, Debug)]
     struct DummyModel;
@@ -1607,6 +1624,42 @@ mod tests {
                 "dummy completion model".to_string(),
             ))
         }
+    }
+
+    #[test]
+    fn default_session_preamble_uses_markdown_system_prompt() {
+        let preamble = compose_session_preamble(&RoleOverride::default(), None, false);
+
+        assert!(preamble.starts_with("# Smooth Code System Prompt"));
+        assert!(preamble.contains("You are Smooth Code"));
+        assert!(!preamble.contains("You are in PLAN MODE."));
+    }
+
+    #[test]
+    fn configured_preamble_replaces_markdown_system_prompt() {
+        let preamble = compose_session_preamble(
+            &RoleOverride::default(),
+            Some("Custom prompt.".to_string()),
+            false,
+        );
+
+        assert_eq!(preamble, "Custom prompt.");
+    }
+
+    #[test]
+    fn role_and_plan_mode_preambles_layer_on_base_prompt() {
+        let role_override = RoleOverride {
+            preamble: Some("Role-specific instructions.".to_string()),
+            model: None,
+        };
+
+        let preamble =
+            compose_session_preamble(&role_override, Some("Base prompt.\n".to_string()), true);
+
+        assert_eq!(
+            preamble,
+            format!("Base prompt.\n\nRole-specific instructions.\n\n{PLAN_MODE_INSTRUCTIONS}")
+        );
     }
 
     #[tokio::test]

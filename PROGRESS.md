@@ -15,3 +15,10 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - The local OpenAI-compatible WebSocket proxy closes immediately after upgrade when `input` contains `role: system`; after Rig builds the Responses request, move system-role input items into the provider-level `instructions` field instead of downgrading them to user-visible text.
 - Keep OpenAI WebSocket inbound parsing local and tolerant rather than relying on Rig's private `StreamingCompletionChunk` parser; the local proxy emits provider telemetry and some known event types with payload shapes that may not match Rig's strict structs.
 - OpenAI WebSocket lifecycle responses from the local proxy may omit `output`; parse lifecycle fields (`status`, `usage`, errors, optional output IDs) from raw JSON instead of deserializing the full Responses completion object.
+
+## TUI Subagent Display
+
+- The parent TUI does not subscribe to child thread streams or render a child transcript. Child-visible output reaches the parent as collaboration lifecycle events emitted on the parent thread (`CollabAgentSpawnBegin`, `CollabAgentSpawnEnd`, `CollabAgentCompleted`).
+- A live `spawn_agent` tool result is emitted as `ToolCallCompleted` with `result_kind: StatusUpdate` and `related_thread_id`; the TUI records that child-thread-to-call mapping and keeps the `spawn_agent` row running until the matching `CollabAgentCompleted` arrives.
+- `CollabAgentSpawnBegin` and `CollabAgentSpawnEnd` are transcript-silent in the TUI because the `spawn_agent` tool row already displays the prompt/arguments and running state; keep prompt/status text out of extra info rows unless adding a distinct subagent transcript surface.
+- `CollabAgentCompleted` is transcript-silent in the TUI; it only finalizes the correlated `spawn_agent` tool row. The detailed child result for the model is separate structured JSON returned by the manual tool loop.

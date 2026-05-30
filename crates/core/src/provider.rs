@@ -20,8 +20,9 @@ use rig::{
             self,
             responses_api::{
                 AdditionalParameters, CompletionRequest as OpenAiResponsesCompletionRequest,
-                Output, OutputTokensDetails, Reasoning as OpenAiReasoning, ReasoningEffort,
-                ReasoningSummary, ResponseStatus, ResponsesUsage,
+                InputItem as OpenAiResponsesInputItem, Output, OutputTokensDetails,
+                Reasoning as OpenAiReasoning, ReasoningEffort, ReasoningSummary, ResponseStatus,
+                ResponsesUsage,
                 streaming::{
                     ContentPartChunkPart, ItemChunk, ItemChunkKind, ResponseChunkKind,
                     StreamingCompletionResponse as OpenAiStreamingCompletionResponse,
@@ -533,7 +534,6 @@ async fn stream_openai_agent_completion(
         .await
         .context("failed to build OpenAI WebSocket completion request")?
         .build();
-    let completion_request = normalize_openai_websocket_completion_request(completion_request);
     let openai = Arc::clone(openai);
     Ok(Box::pin(async_stream::try_stream! {
         for attempt in 1..=OPENAI_WEBSOCKET_START_ATTEMPTS {
@@ -597,56 +597,6 @@ async fn stream_openai_agent_completion(
             break;
         }
     }))
-}
-
-fn normalize_openai_websocket_completion_request(request: CompletionRequest) -> CompletionRequest {
-    let CompletionRequest {
-        model,
-        preamble,
-        chat_history,
-        documents,
-        tools,
-        temperature,
-        max_tokens,
-        tool_choice,
-        additional_params,
-        output_schema,
-    } = request;
-
-    let mut system_messages = Vec::new();
-    let mut chat_messages = Vec::new();
-    for message in chat_history {
-        match message {
-            Message::System { content } => system_messages.push(content),
-            message => chat_messages.push(message),
-        }
-    }
-
-    if !system_messages.is_empty() {
-        chat_messages.insert(
-            0,
-            Message::user(format!(
-                "System instructions:\n{}",
-                system_messages.join("\n\n")
-            )),
-        );
-    }
-
-    let chat_history = OneOrMany::many(chat_messages)
-        .expect("OpenAI WebSocket completion request must keep at least one message");
-
-    CompletionRequest {
-        model,
-        preamble,
-        chat_history,
-        documents,
-        tools,
-        temperature,
-        max_tokens,
-        tool_choice,
-        additional_params,
-        output_schema,
-    }
 }
 
 async fn openai_websocket_completion_stream(
@@ -804,6 +754,7 @@ fn openai_websocket_create_payload(
 ) -> std::result::Result<String, CompletionError> {
     let mut request =
         OpenAiResponsesCompletionRequest::try_from((model.to_string(), completion_request))?;
+    normalize_openai_websocket_response_request(&mut request)?;
     request.stream = None;
     request.additional_parameters.background = None;
     serde_json::to_string(&OpenAiWebSocketCreateEvent {
@@ -811,6 +762,113 @@ fn openai_websocket_create_payload(
         request,
     })
     .map_err(CompletionError::from)
+}
+
+fn normalize_openai_websocket_response_request(
+    request: &mut OpenAiResponsesCompletionRequest,
+) -> std::result::Result<(), CompletionError> {
+    let mut saw_system_input = false;
+    let mut system_instructions = Vec::new();
+    let mut input = Vec::new();
+
+    for item in request.input.iter().cloned() {
+        match openai_websocket_system_input_text(&item)? {
+            Some(instructions) => {
+                saw_system_input = true;
+                let instructions = instructions.trim();
+                if !instructions.is_empty() {
+                    system_instructions.push(instructions.to_string());
+                }
+            }
+            None => input.push(item),
+        }
+    }
+
+    if !saw_system_input {
+        return Ok(());
+    }
+
+    request.input = OneOrMany::many(input).map_err(|_| {
+        CompletionError::RequestError(
+            "OpenAI WebSocket request must contain at least one non-system input item".into(),
+        )
+    })?;
+
+    if !system_instructions.is_empty() {
+        request.instructions = Some(openai_websocket_merge_instructions(
+            &system_instructions.join("\n\n"),
+            request.instructions.as_deref(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn openai_websocket_system_input_text(
+    item: &OpenAiResponsesInputItem,
+) -> std::result::Result<Option<String>, CompletionError> {
+    let value = serde_json::to_value(item)?;
+    if !value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|role| role == "system" || role == "developer")
+    {
+        return Ok(None);
+    }
+
+    let Some(content) = value.get("content") else {
+        return Ok(Some(String::new()));
+    };
+
+    let mut parts = Vec::new();
+    openai_websocket_collect_text_content(content, &mut parts)?;
+    Ok(Some(parts.join("\n")))
+}
+
+fn openai_websocket_collect_text_content(
+    value: &serde_json::Value,
+    parts: &mut Vec<String>,
+) -> std::result::Result<(), CompletionError> {
+    match value {
+        serde_json::Value::String(text) => parts.push(text.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                openai_websocket_collect_text_content(item, parts)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let text = map
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CompletionError::RequestError(
+                        "OpenAI WebSocket system input contained non-text content".into(),
+                    )
+                })?;
+            parts.push(text.to_string());
+        }
+        serde_json::Value::Null => {}
+        _ => {
+            return Err(CompletionError::RequestError(
+                "OpenAI WebSocket system input contained non-text content".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn openai_websocket_merge_instructions(
+    system_instructions: &str,
+    existing_instructions: Option<&str>,
+) -> String {
+    match existing_instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(existing) => format!("{system_instructions}\n\n{existing}"),
+        None => system_instructions.to_string(),
+    }
 }
 
 fn openai_websocket_message_to_text(
@@ -1491,7 +1549,7 @@ mod tests {
         completion::{
             CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
         },
-        message::{Message, UserContent},
+        message::Message,
         providers::openai::responses_api::{
             Output, OutputFunctionCall, ToolStatus,
             streaming::{
@@ -1620,10 +1678,10 @@ mod tests {
     }
 
     #[test]
-    fn openai_websocket_request_normalization_removes_system_inputs() {
+    fn openai_websocket_payload_moves_system_inputs_to_instructions() {
         let request = CompletionRequest {
             model: None,
-            preamble: None,
+            preamble: Some("Use concise answers.".to_string()),
             chat_history: OneOrMany::many(vec![
                 Message::system("Follow repo instructions."),
                 Message::user("Inspect the workspace."),
@@ -1638,27 +1696,31 @@ mod tests {
             output_schema: None,
         };
 
-        let normalized = super::normalize_openai_websocket_completion_request(request);
-        assert!(
-            normalized
-                .chat_history
-                .iter()
-                .all(|message| !matches!(message, Message::System { .. }))
-        );
+        let payload = super::openai_websocket_create_payload("gpt-test", request).expect("payload");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("json payload");
 
-        let mut messages = normalized.chat_history.iter();
-        let first = messages.next().expect("instruction shim message");
-        match first {
-            Message::User { content } => match content.first_ref() {
-                UserContent::Text(text) => {
-                    assert!(text.text.contains("System instructions:"));
-                    assert!(text.text.contains("Follow repo instructions."));
-                }
-                other => panic!("unexpected instruction content: {other:?}"),
-            },
-            other => panic!("unexpected first message: {other:?}"),
-        }
-        assert!(matches!(messages.next(), Some(Message::User { .. })));
+        assert_eq!(
+            value
+                .get("instructions")
+                .and_then(serde_json::Value::as_str),
+            Some("Use concise answers.\n\nFollow repo instructions.")
+        );
+        let input = value
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .expect("input array");
+        assert!(input.iter().all(|item| {
+            !item
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|role| role == "system" || role == "developer")
+        }));
+        assert!(input.iter().any(|item| {
+            item.get("role")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|role| role == "user")
+        }));
+        assert!(!payload.contains("System instructions:"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod agent;
 mod context_manager;
 mod core;
 mod core_thread;
+mod environment;
 mod provider;
 mod rollout;
 mod state;

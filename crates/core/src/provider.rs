@@ -52,6 +52,7 @@ use crate::agent::{
     AgentControl, PLAN_MODE_INSTRUCTIONS,
     role::{RoleOverride, render_spawn_agent_tool_description},
 };
+use crate::environment::EnvironmentContext;
 
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../docs/system_prompt.md");
 
@@ -205,9 +206,11 @@ impl SessionModel {
             .clone()
             .or_else(|| env::var("SMOOTH_CODE_LLM_MODEL").ok())
             .unwrap_or_else(|| "gpt-5.5".to_string());
+        let environment_context = EnvironmentContext::gather(&cwd);
         let preamble = compose_session_preamble(
             &role_override,
             env::var("SMOOTH_CODE_LLM_PREAMBLE").ok(),
+            &environment_context,
             plan_mode,
         );
 
@@ -374,9 +377,11 @@ impl SessionModelFactory for StubSessionModelFactory {
 fn compose_session_preamble(
     role_override: &RoleOverride,
     env_preamble: Option<String>,
+    environment_context: &EnvironmentContext,
     plan_mode: bool,
 ) -> String {
-    let mut preamble = env_preamble.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let base_preamble = env_preamble.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let mut preamble = environment_context.apply(&base_preamble);
     if let Some(role_preamble) = role_override
         .preamble
         .as_deref()
@@ -1580,7 +1585,10 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::{build_agent, compose_session_preamble};
-    use crate::agent::{AgentControl, PLAN_MODE_INSTRUCTIONS, role::RoleOverride};
+    use crate::{
+        agent::{AgentControl, PLAN_MODE_INSTRUCTIONS, role::RoleOverride},
+        environment::EnvironmentContext,
+    };
 
     #[derive(Clone, Debug)]
     struct DummyModel;
@@ -1626,12 +1634,30 @@ mod tests {
         }
     }
 
+    fn environment_context() -> EnvironmentContext {
+        EnvironmentContext {
+            working_directory: "/workspace/smooth-code".to_string(),
+            is_git_repo: "yes".to_string(),
+            platform: "macos".to_string(),
+            os_version: "25.0.0".to_string(),
+            shell: "/bin/zsh".to_string(),
+        }
+    }
+
     #[test]
     fn default_session_preamble_uses_markdown_system_prompt() {
-        let preamble = compose_session_preamble(&RoleOverride::default(), None, false);
+        let preamble = compose_session_preamble(
+            &RoleOverride::default(),
+            None,
+            &environment_context(),
+            false,
+        );
 
         assert!(preamble.starts_with("# Smooth Code System Prompt"));
         assert!(preamble.contains("You are Smooth Code"));
+        assert!(preamble.contains("Working directory: /workspace/smooth-code"));
+        assert!(preamble.contains("Shell: /bin/zsh"));
+        assert!(!preamble.contains("${"));
         assert!(!preamble.contains("You are in PLAN MODE."));
     }
 
@@ -1639,26 +1665,33 @@ mod tests {
     fn configured_preamble_replaces_markdown_system_prompt() {
         let preamble = compose_session_preamble(
             &RoleOverride::default(),
-            Some("Custom prompt.".to_string()),
+            Some("Custom prompt for ${shell}.".to_string()),
+            &environment_context(),
             false,
         );
 
-        assert_eq!(preamble, "Custom prompt.");
+        assert_eq!(preamble, "Custom prompt for /bin/zsh.");
     }
 
     #[test]
     fn role_and_plan_mode_preambles_layer_on_base_prompt() {
         let role_override = RoleOverride {
-            preamble: Some("Role-specific instructions.".to_string()),
+            preamble: Some("Role-specific instructions for ${shell}.".to_string()),
             model: None,
         };
 
-        let preamble =
-            compose_session_preamble(&role_override, Some("Base prompt.\n".to_string()), true);
+        let preamble = compose_session_preamble(
+            &role_override,
+            Some("Base prompt.\n".to_string()),
+            &environment_context(),
+            true,
+        );
 
         assert_eq!(
             preamble,
-            format!("Base prompt.\n\nRole-specific instructions.\n\n{PLAN_MODE_INSTRUCTIONS}")
+            format!(
+                "Base prompt.\n\nRole-specific instructions for ${{shell}}.\n\n{PLAN_MODE_INSTRUCTIONS}"
+            )
         );
     }
 

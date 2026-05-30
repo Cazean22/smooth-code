@@ -101,10 +101,7 @@ Working directory: ${working_directory}
 Git repository: ${is_git_repo}
 Platform: ${platform}
 OS version: ${os_version}
-Current date: ${current_date}
-Current branch: ${current_branch}
-Initial git status: ${git_status}
-Recent commits: ${recent_commits}
+Shell: ${shell}
 ```
 
 Use these details as context, but refresh state with tools when exact current information matters.

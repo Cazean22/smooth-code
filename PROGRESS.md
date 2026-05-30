@@ -7,6 +7,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - `PROGRESS.md` is for judgment-based durable insights worth preserving, not every task.
 - Organize `PROGRESS.md` by topic or subsystem instead of chronological task history.
 - `docs/system_prompt.md` is the runtime default base prompt via `include_str!` in `crates/core/src/provider.rs`; `SMOOTH_CODE_LLM_PREAMBLE` still replaces that default, while role-specific preambles from `crates/core/src/agent/role.rs` layer on top of the selected base.
+- Environment context placeholders in the selected base preamble are filled by `crates/core/src/environment.rs` before role-specific and plan-mode text is appended. Keep this context cache-stable: working directory, git-repo yes/no, platform, OS version, and shell.
 
 ## OpenAI Provider
 

@@ -356,37 +356,43 @@ impl App {
                     return;
                 }
 
-                if tool.success
-                    && let Some(file_change) = tool.file_change
-                    && self.replace_tool_call_with_file_change(&tool.call_id, file_change)
-                {
-                    return;
-                }
-
-                let new_state = if tool.success {
-                    ToolCallState::Success
+                let handled_file_change = if tool.success {
+                    match tool.file_change {
+                        Some(file_change) => {
+                            self.replace_tool_call_with_file_change(&tool.call_id, file_change)
+                        }
+                        None => false,
+                    }
                 } else {
-                    ToolCallState::Failure
-                };
-                let error = if tool.success {
-                    None
-                } else {
-                    Some(tool.error.unwrap_or_else(|| String::from("tool failed")))
+                    false
                 };
 
-                if let Some((cell_idx, entry_idx)) = self.tool_call_rows.remove(&tool.call_id) {
-                    self.tool_group_mut(cell_idx)
-                        .set_entry_outcome(entry_idx, new_state, error);
-                } else if let Some(error) = error {
-                    self.push_history(Box::new(PlainHistoryCell::error(format!(
-                        "tool {} failed: {}",
-                        tool.call_id, error
-                    ))));
-                } else {
-                    self.push_history(Box::new(PlainHistoryCell::info(format!(
-                        "tool {} completed",
-                        tool.call_id
-                    ))));
+                if !handled_file_change {
+                    let new_state = if tool.success {
+                        ToolCallState::Success
+                    } else {
+                        ToolCallState::Failure
+                    };
+                    let error = if tool.success {
+                        None
+                    } else {
+                        Some(tool.error.unwrap_or_else(|| String::from("tool failed")))
+                    };
+
+                    if let Some((cell_idx, entry_idx)) = self.tool_call_rows.remove(&tool.call_id) {
+                        self.tool_group_mut(cell_idx)
+                            .set_entry_outcome(entry_idx, new_state, error);
+                    } else if let Some(error) = error {
+                        self.push_history(Box::new(PlainHistoryCell::error(format!(
+                            "tool {} failed: {}",
+                            tool.call_id, error
+                        ))));
+                    } else {
+                        self.push_history(Box::new(PlainHistoryCell::info(format!(
+                            "tool {} completed",
+                            tool.call_id
+                        ))));
+                    }
                 }
             }
             EventMsg::Error(error) => {
@@ -1492,6 +1498,43 @@ mod tests {
         assert!(joined.contains("1 - old"));
         assert!(joined.contains("1 + new"));
         assert!(!joined.contains("✓ edit src/lib.rs"));
+    }
+
+    #[test]
+    fn file_change_completion_auto_scrolls_after_diff_expands() {
+        let mut app = App::new();
+        let viewport_height = 3;
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "write", "large.txt");
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("wrote bytes to large.txt")),
+                    error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
+                    file_change: Some(smooth_protocol::FileChangeOutput {
+                        path: "large.txt".into(),
+                        change: smooth_protocol::FileChange::Add {
+                            content: (0..40)
+                                .map(|idx| format!("line {idx}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        },
+                    }),
+                }),
+            ),
+            viewport_height,
+        );
+
+        assert!(app.scroll > 0);
+        assert_eq!(app.scroll, app.max_scroll(viewport_height));
     }
 
     #[test]

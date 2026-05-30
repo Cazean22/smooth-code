@@ -239,8 +239,20 @@ pub enum ToolCallResultKind {
     StatusUpdate,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeOperation {
+    Add,
+    Delete,
+    Update,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum FileChange {
     Add {
         content: String,
@@ -253,6 +265,7 @@ pub enum FileChange {
         move_path: Option<PathBuf>,
     },
     Omitted {
+        operation: FileChangeOperation,
         reason: String,
         added: usize,
         removed: usize,
@@ -412,8 +425,8 @@ pub enum AgentStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentPath, AgentStatus, EventMsg, FileChange, FileChangeOutput, Op, SessionSource,
-        SubAgentSource, ThreadId, ToolCallCompletedEvent, ToolCallResultKind,
+        AgentPath, AgentStatus, EventMsg, FileChange, FileChangeOperation, FileChangeOutput, Op,
+        SessionSource, SubAgentSource, ThreadId, ToolCallCompletedEvent, ToolCallResultKind,
     };
 
     #[test]
@@ -522,6 +535,12 @@ mod tests {
 
         let value = serde_json::to_value(&event).expect("serialize tool completion");
         assert_eq!(value["fileChange"]["path"], "file.txt");
+        assert_eq!(
+            value["fileChange"]["change"]["unifiedDiff"],
+            "@@ -1 +1 @@\n-old\n+new\n"
+        );
+        assert!(value["fileChange"]["change"].get("unified_diff").is_none());
+        assert!(value["fileChange"]["change"].get("move_path").is_none());
         let decoded: ToolCallCompletedEvent =
             serde_json::from_value(value).expect("deserialize tool completion");
         assert_eq!(decoded, event);
@@ -530,6 +549,7 @@ mod tests {
     #[test]
     fn omitted_file_change_round_trip() {
         let change = FileChange::Omitted {
+            operation: FileChangeOperation::Add,
             reason: "too large".to_string(),
             added: 10,
             removed: 2,
@@ -538,6 +558,7 @@ mod tests {
 
         let value = serde_json::to_value(&change).expect("serialize omitted change");
         assert_eq!(value["type"], "omitted");
+        assert_eq!(value["operation"], "add");
         let decoded: FileChange =
             serde_json::from_value(value).expect("deserialize omitted change");
         assert_eq!(decoded, change);

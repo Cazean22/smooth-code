@@ -3,7 +3,7 @@ use std::{fs, io::ErrorKind, path::PathBuf};
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
-use smooth_protocol::{FileChange, FileChangeOutput};
+use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 
 use crate::{
     MAX_FILE_CHANGE_BYTES, ToolFailure, encode_tool_output, shared::resolve_path_for_write,
@@ -75,6 +75,7 @@ impl Tool for WriteTool {
                 let (added, removed) = diff_line_counts(&unified_diff);
                 if unified_diff.len() > MAX_FILE_CHANGE_BYTES {
                     FileChange::Omitted {
+                        operation: FileChangeOperation::Update,
                         reason: format!(
                             "diff omitted because it exceeds {} bytes",
                             MAX_FILE_CHANGE_BYTES
@@ -93,6 +94,7 @@ impl Tool for WriteTool {
             PreviousContent::Missing => {
                 if args.content.len() > MAX_FILE_CHANGE_BYTES {
                     FileChange::Omitted {
+                        operation: FileChangeOperation::Add,
                         reason: format!(
                             "new file content omitted because it exceeds {} bytes",
                             MAX_FILE_CHANGE_BYTES
@@ -108,6 +110,7 @@ impl Tool for WriteTool {
                 }
             }
             PreviousContent::Unreadable(reason) => FileChange::Omitted {
+                operation: FileChangeOperation::Update,
                 reason: format!("previous file content unavailable: {reason}"),
                 added: args.content.lines().count(),
                 removed: 0,
@@ -225,11 +228,13 @@ mod tests {
         let decoded = decode_tool_output_for_tool("write", output, true);
         match decoded.file_change.expect("file change metadata").change {
             FileChange::Omitted {
+                operation,
                 reason,
                 added,
                 removed,
                 bytes,
             } => {
+                assert_eq!(operation, FileChangeOperation::Add);
                 assert!(reason.contains("new file content omitted"));
                 assert_eq!(added, 1);
                 assert_eq!(removed, 0);
@@ -252,7 +257,10 @@ mod tests {
 
         let decoded = decode_tool_output_for_tool("write", output, true);
         match decoded.file_change.expect("file change metadata").change {
-            FileChange::Omitted { reason, .. } => {
+            FileChange::Omitted {
+                operation, reason, ..
+            } => {
+                assert_eq!(operation, FileChangeOperation::Update);
                 assert!(reason.contains("previous file content unavailable"));
             }
             _ => panic!("expected omitted file change"),

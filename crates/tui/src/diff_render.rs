@@ -3,7 +3,7 @@ use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
 };
-use smooth_protocol::{FileChange, FileChangeOutput};
+use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 
 const MAX_RENDERED_DIFF_LINES: usize = 1_000;
 
@@ -13,7 +13,7 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
         FileChange::Add { .. } => "Added",
         FileChange::Delete { .. } => "Deleted",
         FileChange::Update { .. } => "Edited",
-        FileChange::Omitted { .. } => "Edited",
+        FileChange::Omitted { operation, .. } => operation_verb(&operation),
     };
 
     let mut lines = vec![Line::from(vec![
@@ -51,6 +51,14 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
         ]));
     }
     lines
+}
+
+fn operation_verb(operation: &FileChangeOperation) -> &'static str {
+    match operation {
+        FileChangeOperation::Add => "Added",
+        FileChangeOperation::Delete => "Deleted",
+        FileChangeOperation::Update => "Edited",
+    }
 }
 
 fn line_counts(change: &FileChange) -> (usize, usize) {
@@ -280,6 +288,7 @@ mod tests {
         let output = FileChangeOutput {
             path: "large.txt".into(),
             change: FileChange::Omitted {
+                operation: FileChangeOperation::Update,
                 reason: "too large".to_string(),
                 added: 10,
                 removed: 0,
@@ -295,6 +304,24 @@ mod tests {
                 .iter()
                 .any(|line| { line.contains("diff omitted (600000 bytes): too large") })
         );
+    }
+
+    #[test]
+    fn renders_omitted_added_file_as_added() {
+        let output = FileChangeOutput {
+            path: "large.txt".into(),
+            change: FileChange::Omitted {
+                operation: FileChangeOperation::Add,
+                reason: "too large".to_string(),
+                added: 10,
+                removed: 0,
+                bytes: 600_000,
+            },
+        };
+
+        let rendered = line_texts(create_diff_summary(&output, 80));
+
+        assert_eq!(rendered[0], "• Added 1 file (+10 -0)");
     }
 
     #[test]

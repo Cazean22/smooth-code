@@ -35,3 +35,4 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - Structured file-change tool output is a private transport and must only be decoded for successful final built-in `edit`/`write` completions; arbitrary tool stdout, dynamic tools, and opaque stream outputs stay plain text to avoid spoofed diffs.
 - File-change metadata is capped at 512 KiB; oversized diffs/new-file contents and unreadable/non-UTF8 existing files use `FileChange::Omitted` so the TUI can show counts/reason without carrying or rendering large/unavailable content.
 - The TUI diff renderer caps rendered diff body lines at 1,000 and appends a truncation marker, protecting transcript recalculation and scroll performance.
+- Omitted file changes must preserve the original operation (`add`, `delete`, or `update`) so large added files still render as Added and external JSON clients receive operation-aware metadata.

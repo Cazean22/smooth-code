@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
-use smooth_protocol::{FileChange, FileChangeOutput};
+use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 
 use crate::{
     MAX_FILE_CHANGE_BYTES, ToolFailure, encode_tool_output, shared::resolve_path_for_write,
@@ -112,6 +112,7 @@ impl Tool for EditTool {
         let (added, removed) = diff_line_counts(&unified_diff);
         let change = if unified_diff.len() > MAX_FILE_CHANGE_BYTES {
             FileChange::Omitted {
+                operation: FileChangeOperation::Update,
                 reason: format!(
                     "diff omitted because it exceeds {} bytes",
                     MAX_FILE_CHANGE_BYTES

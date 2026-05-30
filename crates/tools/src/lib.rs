@@ -25,7 +25,9 @@ pub use error::ToolFailure;
 pub use exit_plan_mode::{ExitPlanModeArgs, ExitPlanModeTool};
 pub use list_dir::{ListDirArgs, ListDirTool};
 pub use multi_agents::SpawnAgentTool;
-pub use output::{DecodedToolOutput, decode_tool_output, encode_tool_output};
+pub use output::{
+    DecodedToolOutput, MAX_FILE_CHANGE_BYTES, decode_tool_output_for_tool, encode_tool_output,
+};
 pub use plan_write::{PlanWriteArgs, PlanWriteTool};
 pub use read::{ReadArgs, ReadTool};
 pub use run_command::{RunCommandArgs, RunCommandTool};

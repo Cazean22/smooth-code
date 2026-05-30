@@ -16,7 +16,7 @@ use smooth_protocol::{
     ToolCallResultKind, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
-use tools::decode_tool_output;
+use tools::{DecodedToolOutput, decode_tool_output_for_tool};
 
 use crate::{
     agent::{
@@ -686,7 +686,6 @@ async fn run_opaque_turn(
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    let decoded_output = decode_tool_output(output_preview);
                     session
                         .emit_event(
                             &ctx,
@@ -695,11 +694,11 @@ async fn run_opaque_turn(
                                 turn_id: ctx.sub_id.clone(),
                                 call_id: internal_call_id,
                                 success: true,
-                                output_preview: Some(decoded_output.model_output),
+                                output_preview: Some(output_preview),
                                 error: None,
                                 result_kind: ToolCallResultKind::Final,
                                 related_thread_id: None,
-                                file_change: decoded_output.file_change,
+                                file_change: None,
                             }),
                         )
                         .await;
@@ -771,6 +770,7 @@ async fn execute_normal_tool_call(
         }
     };
 
+    let tool_name = tool_call.function.name.clone();
     complete_tool_call(
         session,
         ctx,
@@ -778,6 +778,7 @@ async fn execute_normal_tool_call(
         tool_call.id,
         tool_call.call_id,
         internal_call_id,
+        tool_name,
         tool_output,
         success,
         error,
@@ -793,6 +794,7 @@ async fn complete_tool_call(
     tool_call_id: String,
     tool_call_call_id: Option<String>,
     internal_call_id: String,
+    tool_name: String,
     tool_output: String,
     success: bool,
     error: Option<String>,
@@ -804,6 +806,7 @@ async fn complete_tool_call(
         tool_call_id,
         tool_call_call_id,
         internal_call_id,
+        tool_name,
         tool_output,
         success,
         error,
@@ -821,13 +824,15 @@ async fn complete_tool_call_with_kind(
     tool_call_id: String,
     tool_call_call_id: Option<String>,
     internal_call_id: String,
+    tool_name: String,
     tool_output: String,
     success: bool,
     error: Option<String>,
     result_kind: ToolCallResultKind,
     related_thread_id: Option<ThreadId>,
 ) -> ExecutedToolCall {
-    let decoded_output = decode_tool_output(tool_output);
+    let decoded_output =
+        decode_completed_tool_output(&tool_name, tool_output, success, result_kind);
     session
         .emit_event(
             &ctx,
@@ -849,6 +854,19 @@ async fn complete_tool_call_with_kind(
         index,
         tool_result: tool_result(tool_call_id, tool_call_call_id, decoded_output.model_output),
     }
+}
+
+fn decode_completed_tool_output(
+    tool_name: &str,
+    tool_output: String,
+    success: bool,
+    result_kind: ToolCallResultKind,
+) -> DecodedToolOutput {
+    decode_tool_output_for_tool(
+        tool_name,
+        tool_output,
+        success && matches!(result_kind, ToolCallResultKind::Final),
+    )
 }
 
 async fn execute_normal_tools_concurrently(
@@ -932,6 +950,7 @@ async fn execute_exit_plan_mode_call(
         tool_call.id,
         tool_call.call_id,
         internal_call_id,
+        "exit_plan_mode".to_string(),
         tool_output,
         success,
         error,
@@ -1049,6 +1068,7 @@ async fn collect_spawn_results(
             spawn_call.tool_call_id,
             spawn_call.tool_call_call_id,
             spawn_call.internal_call_id,
+            "spawn_agent".to_string(),
             tool_output,
             success,
             error,
@@ -1100,6 +1120,7 @@ async fn start_spawn_tool_call(
                     tool_call.id,
                     tool_call.call_id,
                     internal_call_id,
+                    "spawn_agent".to_string(),
                     message.clone(),
                     false,
                     Some(message),
@@ -1145,6 +1166,7 @@ async fn start_spawn_tool_call(
                     tool_call.id,
                     tool_call.call_id,
                     internal_call_id,
+                    "spawn_agent".to_string(),
                     message.clone(),
                     false,
                     Some(message),
@@ -1530,8 +1552,50 @@ fn agent_status_label(status: &AgentStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use rig::message::Reasoning as MessageReasoning;
+    use smooth_protocol::{FileChange, FileChangeOutput, ToolCallResultKind};
+    use tools::encode_tool_output;
 
-    use super::{PendingReasoningDeltas, should_roundtrip_reasoning};
+    use super::{PendingReasoningDeltas, decode_completed_tool_output, should_roundtrip_reasoning};
+
+    #[test]
+    fn structured_tool_output_is_only_decoded_for_successful_edit_or_write() {
+        let spoofed = encode_tool_output(
+            "spoofed".to_string(),
+            Some(FileChangeOutput {
+                path: "fake.txt".into(),
+                change: FileChange::Add {
+                    content: "fake".to_string(),
+                },
+            }),
+        );
+
+        let decoded = decode_completed_tool_output(
+            "run_command",
+            spoofed.clone(),
+            true,
+            ToolCallResultKind::Final,
+        );
+        assert_eq!(decoded.model_output, spoofed);
+        assert_eq!(decoded.file_change, None);
+
+        let failed_edit = encode_tool_output(
+            "failed".to_string(),
+            Some(FileChangeOutput {
+                path: "fake.txt".into(),
+                change: FileChange::Add {
+                    content: "fake".to_string(),
+                },
+            }),
+        );
+        let decoded = decode_completed_tool_output(
+            "edit",
+            failed_edit.clone(),
+            false,
+            ToolCallResultKind::Final,
+        );
+        assert_eq!(decoded.model_output, failed_edit);
+        assert_eq!(decoded.file_change, None);
+    }
 
     #[test]
     fn idless_reasoning_roundtrips_for_non_openai_models() {

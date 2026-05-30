@@ -252,6 +252,12 @@ pub enum FileChange {
         unified_diff: String,
         move_path: Option<PathBuf>,
     },
+    Omitted {
+        reason: String,
+        added: usize,
+        removed: usize,
+        bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -519,5 +525,21 @@ mod tests {
         let decoded: ToolCallCompletedEvent =
             serde_json::from_value(value).expect("deserialize tool completion");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn omitted_file_change_round_trip() {
+        let change = FileChange::Omitted {
+            reason: "too large".to_string(),
+            added: 10,
+            removed: 2,
+            bytes: 600_000,
+        };
+
+        let value = serde_json::to_value(&change).expect("serialize omitted change");
+        assert_eq!(value["type"], "omitted");
+        let decoded: FileChange =
+            serde_json::from_value(value).expect("deserialize omitted change");
+        assert_eq!(decoded, change);
     }
 }

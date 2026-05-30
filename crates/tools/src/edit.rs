@@ -5,7 +5,9 @@ use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use smooth_protocol::{FileChange, FileChangeOutput};
 
-use crate::{ToolFailure, encode_tool_output, shared::resolve_path_for_write};
+use crate::{
+    MAX_FILE_CHANGE_BYTES, ToolFailure, encode_tool_output, shared::resolve_path_for_write,
+};
 
 const DESCRIPTION: &str = r#"Perform exact string replacements in a UTF-8 text file.
 
@@ -106,22 +108,49 @@ impl Tool for EditTool {
             replacement_count,
             plural_suffix
         );
-        let file_change = FileChangeOutput {
-            path,
-            change: FileChange::Update {
-                unified_diff: diffy::create_patch(&content, &new_content).to_string(),
+        let unified_diff = diffy::create_patch(&content, &new_content).to_string();
+        let (added, removed) = diff_line_counts(&unified_diff);
+        let change = if unified_diff.len() > MAX_FILE_CHANGE_BYTES {
+            FileChange::Omitted {
+                reason: format!(
+                    "diff omitted because it exceeds {} bytes",
+                    MAX_FILE_CHANGE_BYTES
+                ),
+                added,
+                removed,
+                bytes: unified_diff.len(),
+            }
+        } else {
+            FileChange::Update {
+                unified_diff,
                 move_path: None,
-            },
+            }
         };
+        let file_change = FileChangeOutput { path, change };
         Ok(encode_tool_output(model_output, Some(file_change)))
     }
+}
+
+fn diff_line_counts(unified_diff: &str) -> (usize, usize) {
+    diffy::Patch::from_str(unified_diff)
+        .map(|patch| {
+            patch.hunks().iter().flat_map(diffy::Hunk::lines).fold(
+                (0, 0),
+                |(added, removed), line| match line {
+                    diffy::Line::Insert(_) => (added + 1, removed),
+                    diffy::Line::Delete(_) => (added, removed + 1),
+                    diffy::Line::Context(_) => (added, removed),
+                },
+            )
+        })
+        .unwrap_or((0, 0))
 }
 
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
-    use crate::decode_tool_output;
+    use crate::decode_tool_output_for_tool;
 
     use super::*;
 
@@ -157,7 +186,7 @@ mod tests {
 
         let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
         assert_eq!(fs::read_to_string(path).unwrap(), "hello there\n");
-        let decoded = decode_tool_output(output);
+        let decoded = decode_tool_output_for_tool("edit", output, true);
         assert_eq!(
             decoded.model_output,
             format!("edited {} (1 replacement)", resolved_path.display())
@@ -191,7 +220,7 @@ mod tests {
 
         let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
         assert_eq!(fs::read_to_string(path).unwrap(), "hello there\nthere\n");
-        let decoded = decode_tool_output(output);
+        let decoded = decode_tool_output_for_tool("edit", output, true);
         assert_eq!(
             decoded.model_output,
             format!("edited {} (2 replacements)", resolved_path.display())

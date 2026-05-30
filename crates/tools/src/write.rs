@@ -1,11 +1,13 @@
-use std::{fs, path::PathBuf};
+use std::{fs, io::ErrorKind, path::PathBuf};
 
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use smooth_protocol::{FileChange, FileChangeOutput};
 
-use crate::{ToolFailure, encode_tool_output, shared::resolve_path_for_write};
+use crate::{
+    MAX_FILE_CHANGE_BYTES, ToolFailure, encode_tool_output, shared::resolve_path_for_write,
+};
 
 const DESCRIPTION: &str = r#"Write a UTF-8 text file to the local filesystem.
 
@@ -53,19 +55,63 @@ impl Tool for WriteTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let path = resolve_path_for_write(&self.cwd, &args.file_path)?;
-        let previous_content = fs::read_to_string(&path).ok();
+        let previous_content = match fs::metadata(&path) {
+            Ok(_) => match fs::read_to_string(&path) {
+                Ok(content) => PreviousContent::Utf8(content),
+                Err(err) => PreviousContent::Unreadable(err.to_string()),
+            },
+            Err(err) if err.kind() == ErrorKind::NotFound => PreviousContent::Missing,
+            Err(err) => PreviousContent::Unreadable(err.to_string()),
+        };
         let bytes = args.content.len();
         fs::write(&path, &args.content).map_err(|err| {
             ToolFailure::new(format!("failed to write {}: {err}", path.display()))
         })?;
         let model_output = format!("wrote {bytes} bytes to {}", path.display());
         let change = match previous_content {
-            Some(previous_content) => FileChange::Update {
-                unified_diff: diffy::create_patch(&previous_content, &args.content).to_string(),
-                move_path: None,
-            },
-            None => FileChange::Add {
-                content: args.content,
+            PreviousContent::Utf8(previous_content) => {
+                let unified_diff =
+                    diffy::create_patch(&previous_content, &args.content).to_string();
+                let (added, removed) = diff_line_counts(&unified_diff);
+                if unified_diff.len() > MAX_FILE_CHANGE_BYTES {
+                    FileChange::Omitted {
+                        reason: format!(
+                            "diff omitted because it exceeds {} bytes",
+                            MAX_FILE_CHANGE_BYTES
+                        ),
+                        added,
+                        removed,
+                        bytes: unified_diff.len(),
+                    }
+                } else {
+                    FileChange::Update {
+                        unified_diff,
+                        move_path: None,
+                    }
+                }
+            }
+            PreviousContent::Missing => {
+                if args.content.len() > MAX_FILE_CHANGE_BYTES {
+                    FileChange::Omitted {
+                        reason: format!(
+                            "new file content omitted because it exceeds {} bytes",
+                            MAX_FILE_CHANGE_BYTES
+                        ),
+                        added: args.content.lines().count(),
+                        removed: 0,
+                        bytes: args.content.len(),
+                    }
+                } else {
+                    FileChange::Add {
+                        content: args.content,
+                    }
+                }
+            }
+            PreviousContent::Unreadable(reason) => FileChange::Omitted {
+                reason: format!("previous file content unavailable: {reason}"),
+                added: args.content.lines().count(),
+                removed: 0,
+                bytes: args.content.len(),
             },
         };
         Ok(encode_tool_output(
@@ -75,11 +121,32 @@ impl Tool for WriteTool {
     }
 }
 
+enum PreviousContent {
+    Missing,
+    Utf8(String),
+    Unreadable(String),
+}
+
+fn diff_line_counts(unified_diff: &str) -> (usize, usize) {
+    diffy::Patch::from_str(unified_diff)
+        .map(|patch| {
+            patch.hunks().iter().flat_map(diffy::Hunk::lines).fold(
+                (0, 0),
+                |(added, removed), line| match line {
+                    diffy::Line::Insert(_) => (added + 1, removed),
+                    diffy::Line::Delete(_) => (added, removed + 1),
+                    diffy::Line::Context(_) => (added, removed),
+                },
+            )
+        })
+        .unwrap_or((0, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
-    use crate::decode_tool_output;
+    use crate::decode_tool_output_for_tool;
 
     use super::*;
 
@@ -108,7 +175,7 @@ mod tests {
         let path = tmp.path().join("foo.txt");
         let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
-        let decoded = decode_tool_output(output);
+        let decoded = decode_tool_output_for_tool("write", output, true);
         assert_eq!(
             decoded.model_output,
             format!("wrote 5 bytes to {}", resolved_path.display())
@@ -135,13 +202,60 @@ mod tests {
             .expect("write should succeed");
 
         assert_eq!(fs::read_to_string(path).unwrap(), "after");
-        let decoded = decode_tool_output(output);
+        let decoded = decode_tool_output_for_tool("write", output, true);
         match decoded.file_change.expect("file change metadata").change {
             FileChange::Update { unified_diff, .. } => {
                 assert!(unified_diff.contains("-before"));
                 assert!(unified_diff.contains("+after"));
             }
             _ => panic!("expected update file change"),
+        }
+    }
+
+    #[tokio::test]
+    async fn large_new_file_omits_file_change_content() {
+        let (tool, _tmp) = fixture();
+        let large_content = "x".repeat(MAX_FILE_CHANGE_BYTES + 1);
+
+        let output = tool
+            .call(args("large.txt", large_content.clone()))
+            .await
+            .expect("write should succeed");
+
+        let decoded = decode_tool_output_for_tool("write", output, true);
+        match decoded.file_change.expect("file change metadata").change {
+            FileChange::Omitted {
+                reason,
+                added,
+                removed,
+                bytes,
+            } => {
+                assert!(reason.contains("new file content omitted"));
+                assert_eq!(added, 1);
+                assert_eq!(removed, 0);
+                assert_eq!(bytes, large_content.len());
+            }
+            _ => panic!("expected omitted file change"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_utf8_existing_file_is_not_reported_as_added() {
+        let (tool, tmp) = fixture();
+        let path = tmp.path().join("binary.dat");
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+
+        let output = tool
+            .call(args("binary.dat", "replacement"))
+            .await
+            .expect("write should succeed");
+
+        let decoded = decode_tool_output_for_tool("write", output, true);
+        match decoded.file_change.expect("file change metadata").change {
+            FileChange::Omitted { reason, .. } => {
+                assert!(reason.contains("previous file content unavailable"));
+            }
+            _ => panic!("expected omitted file change"),
         }
     }
 
@@ -210,7 +324,7 @@ mod tests {
         let path = tmp.path().join("empty.txt");
         let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("empty.txt");
         assert_eq!(fs::read_to_string(&path).unwrap(), "");
-        let decoded = decode_tool_output(output);
+        let decoded = decode_tool_output_for_tool("write", output, true);
         assert_eq!(
             decoded.model_output,
             format!("wrote 0 bytes to {}", resolved_path.display())

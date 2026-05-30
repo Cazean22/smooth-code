@@ -5,12 +5,15 @@ use ratatui::{
 };
 use smooth_protocol::{FileChange, FileChangeOutput};
 
+const MAX_RENDERED_DIFF_LINES: usize = 1_000;
+
 pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<Line<'static>> {
     let (added, removed) = line_counts(&change.change);
     let verb = match change.change {
         FileChange::Add { .. } => "Added",
         FileChange::Delete { .. } => "Deleted",
         FileChange::Update { .. } => "Edited",
+        FileChange::Omitted { .. } => "Edited",
     };
 
     let mut lines = vec![Line::from(vec![
@@ -34,10 +37,18 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
     ]));
 
     let diff_width = usize::from(width.saturating_sub(4).max(20));
-    for line in render_change(&change.change, diff_width) {
+    let rendered_change = render_change(&change.change, diff_width);
+    let rendered_len = rendered_change.len();
+    for line in rendered_change.into_iter().take(MAX_RENDERED_DIFF_LINES) {
         let mut spans = vec![Span::raw("    ")];
         spans.extend(line.spans);
         lines.push(Line::from(spans).style(line.style));
+    }
+    if rendered_len > MAX_RENDERED_DIFF_LINES {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            format!("⋮ diff truncated after {MAX_RENDERED_DIFF_LINES} rendered lines").dim(),
+        ]));
     }
     lines
 }
@@ -46,6 +57,7 @@ fn line_counts(change: &FileChange) -> (usize, usize) {
     match change {
         FileChange::Add { content } => (content.lines().count(), 0),
         FileChange::Delete { content } => (0, content.lines().count()),
+        FileChange::Omitted { added, removed, .. } => (*added, *removed),
         FileChange::Update { unified_diff, .. } => Patch::from_str(unified_diff)
             .map(|patch| {
                 patch
@@ -67,6 +79,10 @@ fn render_change(change: &FileChange, width: usize) -> Vec<Line<'static>> {
         FileChange::Add { content } => render_whole_file(content, DiffLineKind::Insert, width),
         FileChange::Delete { content } => render_whole_file(content, DiffLineKind::Delete, width),
         FileChange::Update { unified_diff, .. } => render_unified_diff(unified_diff, width),
+        FileChange::Omitted { reason, bytes, .. } => vec![Line::from(vec![
+            "⋮ ".dim(),
+            format!("diff omitted ({bytes} bytes): {reason}").dim(),
+        ])],
     }
 }
 
@@ -257,5 +273,48 @@ mod tests {
         assert_eq!(rendered[0], "• Edited 1 file (+1 -1)");
         assert!(rendered.iter().any(|line| line.contains("1 - old")));
         assert!(rendered.iter().any(|line| line.contains("1 + new")));
+    }
+
+    #[test]
+    fn renders_omitted_file_change_message() {
+        let output = FileChangeOutput {
+            path: "large.txt".into(),
+            change: FileChange::Omitted {
+                reason: "too large".to_string(),
+                added: 10,
+                removed: 0,
+                bytes: 600_000,
+            },
+        };
+
+        let rendered = line_texts(create_diff_summary(&output, 80));
+
+        assert_eq!(rendered[0], "• Edited 1 file (+10 -0)");
+        assert!(
+            rendered
+                .iter()
+                .any(|line| { line.contains("diff omitted (600000 bytes): too large") })
+        );
+    }
+
+    #[test]
+    fn caps_rendered_diff_lines() {
+        let content = (0..1_010)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = FileChangeOutput {
+            path: "large.txt".into(),
+            change: FileChange::Add { content },
+        };
+
+        let rendered = line_texts(create_diff_summary(&output, 80));
+
+        assert!(rendered.len() <= 1_003);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| { line.contains("diff truncated after 1000 rendered lines") })
+        );
     }
 }

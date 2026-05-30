@@ -29,3 +29,9 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - Successful `edit` and `write` tools can carry structured `FileChangeOutput` metadata through `ToolCallCompletedEvent.file_change`; core decodes this metadata before sending tool results back to the model so model-visible output remains the concise success message.
 - The TUI replaces a single completed file-mutating tool row with a `PatchHistoryCell` and Codex-style diff summary; grouped file tool calls keep their group row and append the diff cell so other entries are not lost.
 - The first Smooth diff renderer intentionally omits Codex's syntax-highlighting/theme stack and uses `diffy` plus ratatui styles for line counts, gutters, hunk separators, and red/green insert/delete cues.
+
+## TUI File Change Safety
+
+- Structured file-change tool output is a private transport and must only be decoded for successful final built-in `edit`/`write` completions; arbitrary tool stdout, dynamic tools, and opaque stream outputs stay plain text to avoid spoofed diffs.
+- File-change metadata is capped at 512 KiB; oversized diffs/new-file contents and unreadable/non-UTF8 existing files use `FileChange::Omitted` so the TUI can show counts/reason without carrying or rendering large/unavailable content.
+- The TUI diff renderer caps rendered diff body lines at 1,000 and appends a truncation marker, protecting transcript recalculation and scroll performance.

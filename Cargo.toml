@@ -17,6 +17,7 @@ anyhow = "1.0.102"
 async-stream = "0.3.6"
 async-channel = "2.5.0"
 console-subscriber = "0.5.0"
+diffy = "0.4.2"
 futures-util = "0.3.32"
 indexmap = "2.14.0"
 rig = { package = "rig-core", version = "0.37.0", features = ["websocket"] }

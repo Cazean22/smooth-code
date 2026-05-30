@@ -16,6 +16,7 @@ use smooth_protocol::{
     ToolCallResultKind, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
+use tools::decode_tool_output;
 
 use crate::{
     agent::{
@@ -685,6 +686,7 @@ async fn run_opaque_turn(
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let decoded_output = decode_tool_output(output_preview);
                     session
                         .emit_event(
                             &ctx,
@@ -693,10 +695,11 @@ async fn run_opaque_turn(
                                 turn_id: ctx.sub_id.clone(),
                                 call_id: internal_call_id,
                                 success: true,
-                                output_preview: Some(output_preview),
+                                output_preview: Some(decoded_output.model_output),
                                 error: None,
                                 result_kind: ToolCallResultKind::Final,
                                 related_thread_id: None,
+                                file_change: decoded_output.file_change,
                             }),
                         )
                         .await;
@@ -824,6 +827,7 @@ async fn complete_tool_call_with_kind(
     result_kind: ToolCallResultKind,
     related_thread_id: Option<ThreadId>,
 ) -> ExecutedToolCall {
+    let decoded_output = decode_tool_output(tool_output);
     session
         .emit_event(
             &ctx,
@@ -832,17 +836,18 @@ async fn complete_tool_call_with_kind(
                 turn_id: ctx.sub_id.clone(),
                 call_id: internal_call_id,
                 success,
-                output_preview: Some(tool_output.clone()),
+                output_preview: Some(decoded_output.model_output.clone()),
                 error,
                 result_kind,
                 related_thread_id,
+                file_change: decoded_output.file_change,
             }),
         )
         .await;
 
     ExecutedToolCall {
         index,
-        tool_result: tool_result(tool_call_id, tool_call_call_id, tool_output),
+        tool_result: tool_result(tool_call_id, tool_call_call_id, decoded_output.model_output),
     }
 }
 

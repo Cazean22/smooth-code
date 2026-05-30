@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 app-server-protocol = { path = "../app-server-protocol" }
+diffy.workspace = true
 futures-util.workspace = true
 rig.workspace = true
 schemars.workspace = true

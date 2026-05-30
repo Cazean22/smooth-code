@@ -2,6 +2,8 @@ mod agent_path;
 
 pub use agent_path::AgentPath;
 
+use std::path::PathBuf;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -238,6 +240,28 @@ pub enum ToolCallResultKind {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileChange {
+    Add {
+        content: String,
+    },
+    Delete {
+        content: String,
+    },
+    Update {
+        unified_diff: String,
+        move_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeOutput {
+    pub path: PathBuf,
+    pub change: FileChange,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallCompletedEvent {
     pub thread_id: String,
@@ -250,6 +274,8 @@ pub struct ToolCallCompletedEvent {
     pub result_kind: ToolCallResultKind,
     #[serde(default)]
     pub related_thread_id: Option<ThreadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_change: Option<FileChangeOutput>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -380,8 +406,8 @@ pub enum AgentStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentPath, AgentStatus, EventMsg, Op, SessionSource, SubAgentSource, ThreadId,
-        ToolCallCompletedEvent, ToolCallResultKind,
+        AgentPath, AgentStatus, EventMsg, FileChange, FileChangeOutput, Op, SessionSource,
+        SubAgentSource, ThreadId, ToolCallCompletedEvent, ToolCallResultKind,
     };
 
     #[test]
@@ -442,6 +468,7 @@ mod tests {
 
         assert_eq!(decoded.result_kind, ToolCallResultKind::Final);
         assert_eq!(decoded.related_thread_id, None);
+        assert_eq!(decoded.file_change, None);
     }
 
     #[test]
@@ -456,11 +483,39 @@ mod tests {
             error: None,
             result_kind: ToolCallResultKind::StatusUpdate,
             related_thread_id: Some(related_thread_id),
+            file_change: None,
         };
 
         let value = serde_json::to_value(&event).expect("serialize tool completion");
         assert_eq!(value["resultKind"], "status_update");
         assert_eq!(value["relatedThreadId"], related_thread_id.to_string());
+        let decoded: ToolCallCompletedEvent =
+            serde_json::from_value(value).expect("deserialize tool completion");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn tool_call_completed_file_change_round_trip() {
+        let event = ToolCallCompletedEvent {
+            thread_id: String::from("thread"),
+            turn_id: String::from("turn"),
+            call_id: String::from("call"),
+            success: true,
+            output_preview: Some(String::from("edited file.txt (1 replacement)")),
+            error: None,
+            result_kind: ToolCallResultKind::Final,
+            related_thread_id: None,
+            file_change: Some(FileChangeOutput {
+                path: "file.txt".into(),
+                change: FileChange::Update {
+                    unified_diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                    move_path: None,
+                },
+            }),
+        };
+
+        let value = serde_json::to_value(&event).expect("serialize tool completion");
+        assert_eq!(value["fileChange"]["path"], "file.txt");
         let decoded: ToolCallCompletedEvent =
             serde_json::from_value(value).expect("deserialize tool completion");
         assert_eq!(decoded, event);

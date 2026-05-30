@@ -3,8 +3,9 @@ use std::{fs, path::PathBuf};
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
+use smooth_protocol::{FileChange, FileChangeOutput};
 
-use crate::{ToolFailure, shared::resolve_path_for_write};
+use crate::{ToolFailure, encode_tool_output, shared::resolve_path_for_write};
 
 const DESCRIPTION: &str = r#"Perform exact string replacements in a UTF-8 text file.
 
@@ -99,18 +100,28 @@ impl Tool for EditTool {
         })?;
 
         let plural_suffix = if replacement_count == 1 { "" } else { "s" };
-        Ok(format!(
+        let model_output = format!(
             "edited {} ({} replacement{})",
             path.display(),
             replacement_count,
             plural_suffix
-        ))
+        );
+        let file_change = FileChangeOutput {
+            path,
+            change: FileChange::Update {
+                unified_diff: diffy::create_patch(&content, &new_content).to_string(),
+                move_path: None,
+            },
+        };
+        Ok(encode_tool_output(model_output, Some(file_change)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+
+    use crate::decode_tool_output;
 
     use super::*;
 
@@ -146,10 +157,20 @@ mod tests {
 
         let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
         assert_eq!(fs::read_to_string(path).unwrap(), "hello there\n");
+        let decoded = decode_tool_output(output);
         assert_eq!(
-            output,
+            decoded.model_output,
             format!("edited {} (1 replacement)", resolved_path.display())
         );
+        let file_change = decoded.file_change.expect("file change metadata");
+        assert_eq!(file_change.path, resolved_path);
+        match file_change.change {
+            FileChange::Update { unified_diff, .. } => {
+                assert!(unified_diff.contains("-hello world"));
+                assert!(unified_diff.contains("+hello there"));
+            }
+            _ => panic!("expected update file change"),
+        }
     }
 
     #[tokio::test]
@@ -170,10 +191,20 @@ mod tests {
 
         let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
         assert_eq!(fs::read_to_string(path).unwrap(), "hello there\nthere\n");
+        let decoded = decode_tool_output(output);
         assert_eq!(
-            output,
+            decoded.model_output,
             format!("edited {} (2 replacements)", resolved_path.display())
         );
+        let file_change = decoded.file_change.expect("file change metadata");
+        match file_change.change {
+            FileChange::Update { unified_diff, .. } => {
+                assert!(unified_diff.contains("-hello world"));
+                assert!(unified_diff.contains("+hello there"));
+                assert!(unified_diff.contains("+there"));
+            }
+            _ => panic!("expected update file change"),
+        }
     }
 
     #[tokio::test]

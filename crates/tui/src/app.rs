@@ -16,8 +16,8 @@ use crate::{
     AppTerminal,
     app_server_session::AppServerSession,
     history_cell::{
-        AgentMessageCell, HistoryCell, PlainHistoryCell, ReasoningCell, ToolCallGroupCell,
-        ToolCallState, UserHistoryCell,
+        AgentMessageCell, HistoryCell, PatchHistoryCell, PlainHistoryCell, ReasoningCell,
+        ToolCallGroupCell, ToolCallState, UserHistoryCell,
     },
     question_picker::{PickerOutcome, QuestionPicker},
     streaming::StreamController,
@@ -356,6 +356,13 @@ impl App {
                     return;
                 }
 
+                if tool.success
+                    && let Some(file_change) = tool.file_change
+                    && self.replace_tool_call_with_file_change(&tool.call_id, file_change)
+                {
+                    return;
+                }
+
                 let new_state = if tool.success {
                     ToolCallState::Success
                 } else {
@@ -530,6 +537,34 @@ impl App {
             .as_any_mut()
             .downcast_mut::<ToolCallGroupCell>()
             .expect("tracked tool row should be a ToolCallGroupCell")
+    }
+
+    fn replace_tool_call_with_file_change(
+        &mut self,
+        call_id: &str,
+        file_change: smooth_protocol::FileChangeOutput,
+    ) -> bool {
+        let Some((cell_idx, entry_idx)) = self.tool_call_rows.remove(call_id) else {
+            self.push_history(Box::new(PatchHistoryCell::new(file_change)));
+            return true;
+        };
+
+        if self.tool_group_mut(cell_idx).entry_count() == 1 {
+            self.transcript_cells[cell_idx] = Box::new(PatchHistoryCell::new(file_change));
+            if self
+                .pending_tool_group
+                .as_ref()
+                .is_some_and(|(idx, _)| *idx == cell_idx)
+            {
+                self.pending_tool_group = None;
+            }
+            return true;
+        }
+
+        self.tool_group_mut(cell_idx)
+            .set_entry_outcome(entry_idx, ToolCallState::Success, None);
+        self.push_history(Box::new(PatchHistoryCell::new(file_change)));
+        true
     }
 
     fn complete_subagent_tool_call(&mut self, child_thread_id: ThreadId, status: &AgentStatus) {
@@ -838,6 +873,7 @@ mod tests {
                     error: error.map(str::to_owned),
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
+                    file_change: None,
                 }),
             ),
             20,
@@ -1351,6 +1387,7 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
+                    file_change: None,
                 }),
             ),
             20,
@@ -1408,6 +1445,7 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
+                    file_change: None,
                 }),
             ),
             20,
@@ -1416,6 +1454,44 @@ mod tests {
         let joined = transcript_strings(&app).join("\n");
         assert!(joined.contains("✓ read foo.rs"));
         assert!(!joined.contains("⠋ read foo.rs"));
+    }
+
+    #[test]
+    fn file_change_completion_replaces_tool_row_with_diff() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "edit", "src/lib.rs");
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("edited src/lib.rs (1 replacement)")),
+                    error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
+                    file_change: Some(smooth_protocol::FileChangeOutput {
+                        path: "src/lib.rs".into(),
+                        change: smooth_protocol::FileChange::Update {
+                            unified_diff: diffy::create_patch("old\n", "new\n").to_string(),
+                            move_path: None,
+                        },
+                    }),
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("• Edited 1 file (+1 -1)"));
+        assert!(joined.contains("src/lib.rs (+1 -1)"));
+        assert!(joined.contains("1 - old"));
+        assert!(joined.contains("1 + new"));
+        assert!(!joined.contains("✓ edit src/lib.rs"));
     }
 
     #[test]
@@ -1443,6 +1519,7 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::StatusUpdate,
                     related_thread_id: Some(child_thread_id),
+                    file_change: None,
                 }),
             ),
             20,
@@ -1478,6 +1555,7 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::StatusUpdate,
                     related_thread_id: Some(child_thread_id),
+                    file_change: None,
                 }),
             ),
             20,

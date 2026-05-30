@@ -3,8 +3,9 @@ use std::{fs, path::PathBuf};
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
+use smooth_protocol::{FileChange, FileChangeOutput};
 
-use crate::{ToolFailure, shared::resolve_path_for_write};
+use crate::{ToolFailure, encode_tool_output, shared::resolve_path_for_write};
 
 const DESCRIPTION: &str = r#"Write a UTF-8 text file to the local filesystem.
 
@@ -52,17 +53,33 @@ impl Tool for WriteTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let path = resolve_path_for_write(&self.cwd, &args.file_path)?;
+        let previous_content = fs::read_to_string(&path).ok();
         let bytes = args.content.len();
         fs::write(&path, &args.content).map_err(|err| {
             ToolFailure::new(format!("failed to write {}: {err}", path.display()))
         })?;
-        Ok(format!("wrote {bytes} bytes to {}", path.display()))
+        let model_output = format!("wrote {bytes} bytes to {}", path.display());
+        let change = match previous_content {
+            Some(previous_content) => FileChange::Update {
+                unified_diff: diffy::create_patch(&previous_content, &args.content).to_string(),
+                move_path: None,
+            },
+            None => FileChange::Add {
+                content: args.content,
+            },
+        };
+        Ok(encode_tool_output(
+            model_output,
+            Some(FileChangeOutput { path, change }),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+
+    use crate::decode_tool_output;
 
     use super::*;
 
@@ -91,9 +108,18 @@ mod tests {
         let path = tmp.path().join("foo.txt");
         let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+        let decoded = decode_tool_output(output);
         assert_eq!(
-            output,
+            decoded.model_output,
             format!("wrote 5 bytes to {}", resolved_path.display())
+        );
+        let file_change = decoded.file_change.expect("file change metadata");
+        assert_eq!(file_change.path, resolved_path);
+        assert_eq!(
+            file_change.change,
+            FileChange::Add {
+                content: "hello".to_string(),
+            }
         );
     }
 
@@ -103,11 +129,20 @@ mod tests {
         let path = tmp.path().join("foo.txt");
         fs::write(&path, "before").unwrap();
 
-        tool.call(args("foo.txt", "after"))
+        let output = tool
+            .call(args("foo.txt", "after"))
             .await
             .expect("write should succeed");
 
         assert_eq!(fs::read_to_string(path).unwrap(), "after");
+        let decoded = decode_tool_output(output);
+        match decoded.file_change.expect("file change metadata").change {
+            FileChange::Update { unified_diff, .. } => {
+                assert!(unified_diff.contains("-before"));
+                assert!(unified_diff.contains("+after"));
+            }
+            _ => panic!("expected update file change"),
+        }
     }
 
     #[tokio::test]
@@ -175,9 +210,16 @@ mod tests {
         let path = tmp.path().join("empty.txt");
         let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("empty.txt");
         assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        let decoded = decode_tool_output(output);
         assert_eq!(
-            output,
+            decoded.model_output,
             format!("wrote 0 bytes to {}", resolved_path.display())
+        );
+        assert_eq!(
+            decoded.file_change.expect("file change metadata").change,
+            FileChange::Add {
+                content: String::new(),
+            }
         );
     }
 }

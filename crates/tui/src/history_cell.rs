@@ -4,6 +4,9 @@ use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
 };
+use smooth_protocol::FileChangeOutput;
+
+use crate::diff_render::create_diff_summary;
 
 pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
@@ -139,6 +142,27 @@ impl HistoryCell for PlainHistoryCell {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PatchHistoryCell {
+    file_change: FileChangeOutput,
+}
+
+impl PatchHistoryCell {
+    pub(crate) fn new(file_change: FileChangeOutput) -> Self {
+        Self { file_change }
+    }
+}
+
+impl HistoryCell for PatchHistoryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        create_diff_summary(&self.file_change, width)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ToolCallState {
     Running,
@@ -183,6 +207,10 @@ impl ToolCallGroupCell {
             error: None,
         });
         entry_idx
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     pub(crate) fn set_entry_outcome(

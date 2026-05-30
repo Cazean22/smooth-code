@@ -686,6 +686,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "diffy"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
+dependencies = [
+ "nu-ansi-term",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3102,6 +3111,7 @@ dependencies = [
  "app-server-protocol",
  "console-subscriber",
  "crossterm",
+ "diffy",
  "futures-util",
  "pulldown-cmark",
  "ratatui",
@@ -3819,6 +3829,7 @@ name = "tools"
 version = "0.0.1"
 dependencies = [
  "app-server-protocol",
+ "diffy",
  "futures-util",
  "rig-core",
  "schemars",
@@ -4445,7 +4456,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

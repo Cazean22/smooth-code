@@ -1,6 +1,7 @@
 mod app;
 mod app_server_client;
 mod app_server_session;
+mod diff_render;
 mod history_cell;
 mod markdown;
 mod markdown_render;

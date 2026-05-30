@@ -45,7 +45,7 @@ use tokio_tungstenite::{
 };
 use tools::{
     AskUserClient, AskUserQuestionTool, DynamicTool, DynamicToolClient, EditTool, ExitPlanModeTool,
-    ListDirTool, PlanWriteTool, ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
+    PlanWriteTool, ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
 };
 
 use crate::agent::{
@@ -410,12 +410,13 @@ fn build_agent<M>(
 where
     M: rig::completion::CompletionModel,
 {
-    // Read-only tools are always present.
+    // File reads, shell inspection, and sub-agent spawning are always present.
     let builder = builder
-        .tool(ListDirTool::new(cwd.clone()))
-        .tool(ReadTool::new(cwd.clone()));
-    // Mutating tools are only registered outside plan mode; plan-mode-specific
-    // tools (`plan_write`, `exit_plan_mode`) are only registered inside plan mode.
+        .tool(ReadTool::new(cwd.clone()))
+        .tool(RunCommandTool::new(cwd.clone()));
+    // File-mutating tools are only registered outside plan mode;
+    // plan-mode-specific tools (`plan_write`, `exit_plan_mode`) are only
+    // registered inside plan mode.
     let builder = if plan_mode {
         builder
             .tool(PlanWriteTool::new(cwd.clone(), thread_id))
@@ -423,7 +424,6 @@ where
     } else {
         builder
             .tool(EditTool::new(cwd.clone()))
-            .tool(RunCommandTool::new(cwd.clone()))
             .tool(WriteTool::new(cwd))
     };
     let builder = if let Some(dynamic_tool_client) = dynamic_tool_client {
@@ -563,12 +563,12 @@ async fn stream_openai_agent_completion(
                 Ok(stream) => stream,
                 Err(error)
                     if attempt < OPENAI_WEBSOCKET_START_ATTEMPTS
-                        && is_openai_websocket_connection_reset(&error) =>
+                        && is_openai_websocket_transient_start_error(&error) =>
                 {
                     tracing::debug!(
                         attempt,
                         error = %error,
-                        "OpenAI WebSocket reset before the turn stream started; retrying"
+                        "OpenAI WebSocket transient failure before the turn stream started; retrying"
                     );
                     continue;
                 }
@@ -576,7 +576,7 @@ async fn stream_openai_agent_completion(
             };
 
             let mut yielded_assistant_item = false;
-            let mut retry_after_start_reset = false;
+            let mut retry_after_start_error = false;
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(item) => {
@@ -587,20 +587,20 @@ async fn stream_openai_agent_completion(
                     Err(error)
                         if !yielded_assistant_item
                             && attempt < OPENAI_WEBSOCKET_START_ATTEMPTS
-                            && is_openai_websocket_connection_reset(&error) =>
+                            && is_openai_websocket_transient_start_error(&error) =>
                     {
                         tracing::debug!(
                             attempt,
                             error = %error,
-                            "OpenAI WebSocket reset before any assistant item; retrying"
+                            "OpenAI WebSocket transient failure before any assistant item; retrying"
                         );
-                        retry_after_start_reset = true;
+                        retry_after_start_error = true;
                         break;
                     }
                     Err(error) => Err(openai_websocket_stream_error(error))?,
                 }
             }
-            if retry_after_start_reset {
+            if retry_after_start_error {
                 continue;
             }
 
@@ -1132,6 +1132,15 @@ fn is_openai_websocket_connection_reset(error: &CompletionError) -> bool {
     let message = error.to_string();
     message.contains("Connection reset without closing handshake")
         || message.contains("connection reset without closing handshake")
+        || message.contains("OpenAI WebSocket connection reset before response.completed")
+}
+
+fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
+    let message = error.to_string();
+    is_openai_websocket_connection_reset(error)
+        || message.contains("The OpenAI WebSocket connection closed before the turn finished")
+        || message.contains("The OpenAI WebSocket connection closed without a close reason")
+        || message.contains("An error occurred while processing the request.")
 }
 
 struct OpenAiWebSocketAccumulator {
@@ -1641,6 +1650,9 @@ mod tests {
             platform: "macos".to_string(),
             os_version: "25.0.0".to_string(),
             shell: "/bin/zsh".to_string(),
+            rg_available: "yes".to_string(),
+            fd_available: "yes".to_string(),
+            eza_available: "yes".to_string(),
         }
     }
 
@@ -1657,6 +1669,9 @@ mod tests {
         assert!(preamble.contains("You are Smooth Code"));
         assert!(preamble.contains("Working directory: /workspace/smooth-code"));
         assert!(preamble.contains("Shell: /bin/zsh"));
+        assert!(preamble.contains("rg available: yes"));
+        assert!(preamble.contains("fd available: yes"));
+        assert!(preamble.contains("eza available: yes"));
         assert!(!preamble.contains("${"));
         assert!(!preamble.contains("You are in PLAN MODE."));
     }
@@ -1719,6 +1734,7 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert!(tool_names.contains("spawn_agent"));
+        assert!(!tool_names.contains("list_dir"));
         assert!(!tool_names.contains("send_message"));
         assert!(!tool_names.contains("list_agents"));
         assert!(!tool_names.contains("close_agent"));
@@ -1750,17 +1766,17 @@ mod tests {
             .map(|definition| definition.name)
             .collect::<HashSet<_>>();
 
-        // Read-only and sub-agent tools remain available.
+        // File reads, shell inspection, and sub-agent tools remain available.
         assert!(tool_names.contains("read"));
-        assert!(tool_names.contains("list_dir"));
+        assert!(tool_names.contains("run_command"));
         assert!(tool_names.contains("spawn_agent"));
+        assert!(!tool_names.contains("list_dir"));
         // Plan-mode planning tools are registered.
         assert!(tool_names.contains("plan_write"));
         assert!(tool_names.contains("exit_plan_mode"));
         // Mutating tools must be stripped.
         assert!(!tool_names.contains("edit"));
         assert!(!tool_names.contains("write"));
-        assert!(!tool_names.contains("run_command"));
     }
 
     #[test]
@@ -2092,10 +2108,35 @@ mod tests {
         );
 
         assert!(super::is_openai_websocket_connection_reset(&error));
+        assert!(super::is_openai_websocket_transient_start_error(&error));
         assert_eq!(
             super::openai_websocket_stream_error(error).to_string(),
             "ProviderError: OpenAI WebSocket connection reset before response.completed"
         );
+    }
+
+    #[test]
+    fn openai_websocket_transient_start_errors_are_retryable() {
+        let retryable = [
+            "OpenAI WebSocket connection reset before response.completed",
+            "The OpenAI WebSocket connection closed before the turn finished",
+            "The OpenAI WebSocket connection closed without a close reason",
+            "An error occurred while processing the request.",
+        ];
+
+        for message in retryable {
+            let error = CompletionError::ProviderError(message.to_string());
+            assert!(
+                super::is_openai_websocket_transient_start_error(&error),
+                "{message} should be retryable"
+            );
+        }
+
+        let invalid_request =
+            CompletionError::ProviderError("invalid_request_error: Bad input".to_string());
+        assert!(!super::is_openai_websocket_transient_start_error(
+            &invalid_request
+        ));
     }
 
     #[test]

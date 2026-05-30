@@ -16,7 +16,7 @@ Usage:
 - By default, the tool reads up to 2000 lines starting at the beginning of the file. Prefer reading the whole file by omitting `offset` and `limit`; use them only when the file is too large to read in one go.
 - `offset` is a zero-based count of lines to skip: omit it or set `offset: 0` to start at the first line; `offset: 1` starts at line 2.
 - Results are returned in `cat -n` format, with line numbers starting at 1.
-- This tool only reads files, not directories. Use the `list_dir` tool to inspect a directory.
+- This tool only reads files, not directories. For directories, use shell commands such as `eza` when `run_command` is available.
 - If the file exists but is empty, the tool returns a marker indicating that the file is empty."#;
 
 #[derive(Clone)]

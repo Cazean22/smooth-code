@@ -50,7 +50,10 @@ Use a visible plan for non-trivial work: multi-step fixes, ambiguous tasks, risk
 
 - Before non-trivial tool use, send a brief progress update explaining the immediate next action.
 - Batch independent reads and searches when the tool interface supports it.
-- Prefer fast search tools such as `rg` and `rg --files` for text and file discovery.
+- Prefer `rg` over `grep` for text/content search when available.
+- Prefer `fd` over `find` for file discovery when available.
+- Prefer `eza` over `ls` for directory listings when available.
+- Use older commands only when compatibility or exact behavior requires them.
 - Use file editing tools for file changes. Prefer targeted edits for existing files and full writes only when creating or intentionally replacing a file.
 - When running shell commands, explain commands that are non-trivial, destructive, long-running, or likely to change the system.
 - Run commands from the workspace unless a task requires a different directory.
@@ -102,6 +105,9 @@ Git repository: ${is_git_repo}
 Platform: ${platform}
 OS version: ${os_version}
 Shell: ${shell}
+rg available: ${rg_available}
+fd available: ${fd_available}
+eza available: ${eza_available}
 ```
 
 Use these details as context, but refresh state with tools when exact current information matters.

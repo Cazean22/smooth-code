@@ -7,6 +7,9 @@ pub(crate) struct EnvironmentContext {
     pub(crate) platform: String,
     pub(crate) os_version: String,
     pub(crate) shell: String,
+    pub(crate) rg_available: String,
+    pub(crate) fd_available: String,
+    pub(crate) eza_available: String,
 }
 
 impl EnvironmentContext {
@@ -17,6 +20,9 @@ impl EnvironmentContext {
             platform: env::consts::OS.to_string(),
             os_version: os_version(),
             shell: env::var("SHELL").unwrap_or_else(|_| "unknown".to_string()),
+            rg_available: command_available("rg"),
+            fd_available: command_available("fd"),
+            eza_available: command_available("eza"),
         }
     }
 
@@ -27,6 +33,9 @@ impl EnvironmentContext {
             .replace("${platform}", &self.platform)
             .replace("${os_version}", &self.os_version)
             .replace("${shell}", &self.shell)
+            .replace("${rg_available}", &self.rg_available)
+            .replace("${fd_available}", &self.fd_available)
+            .replace("${eza_available}", &self.eza_available)
     }
 }
 
@@ -55,6 +64,15 @@ fn os_version() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn command_available(command: &str) -> String {
+    let available = Command::new(command)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+
+    if available { "yes" } else { "no" }.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::Command;
@@ -68,6 +86,9 @@ mod tests {
             platform: "macos".to_string(),
             os_version: "25.0.0".to_string(),
             shell: "/bin/zsh".to_string(),
+            rg_available: "yes".to_string(),
+            fd_available: "no".to_string(),
+            eza_available: "yes".to_string(),
         }
     }
 
@@ -78,7 +99,10 @@ mod tests {
             "Git repository: ${is_git_repo}\n",
             "Platform: ${platform}\n",
             "OS version: ${os_version}\n",
-            "Shell: ${shell}\n"
+            "Shell: ${shell}\n",
+            "rg available: ${rg_available}\n",
+            "fd available: ${fd_available}\n",
+            "eza available: ${eza_available}\n"
         );
 
         assert_eq!(
@@ -88,7 +112,10 @@ mod tests {
                 "Git repository: yes\n",
                 "Platform: macos\n",
                 "OS version: 25.0.0\n",
-                "Shell: /bin/zsh\n"
+                "Shell: /bin/zsh\n",
+                "rg available: yes\n",
+                "fd available: no\n",
+                "eza available: yes\n"
             )
         );
     }

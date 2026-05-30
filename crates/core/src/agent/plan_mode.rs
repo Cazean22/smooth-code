@@ -5,13 +5,14 @@
 pub(crate) const PLAN_MODE_INSTRUCTIONS: &str = "You are in PLAN MODE.
 
 While in plan mode you may only use these tools:
-- `read`, `list_dir` — read files and directories.
+- `read` — read known files.
+- `run_command` — run read-only shell commands for exploration and validation, such as `eza`, `fd`, `rg`, and test/build checks.
 - `spawn_agent` — spawn sub-agents to parallelize exploration (children run with full tools).
 - `plan_write` — write your plan to the per-thread plan file.
 - `exit_plan_mode` — exit plan mode once the plan is ready.
 
-You MUST NOT edit files, write to arbitrary paths, or run shell commands while in plan mode. \
-Edit, write, and run_command tools are unavailable. Never claim to have changed code while in plan mode.
+You MUST NOT edit files or write to arbitrary paths while in plan mode. Use `run_command` only for read-only inspection or validation commands; do not run shell commands that modify files or system state. \
+Edit and write tools are unavailable. Never claim to have changed code while in plan mode.
 
 Proceed in four phases:
 1. EXPLORE — read the relevant code and gather context for the user's request.

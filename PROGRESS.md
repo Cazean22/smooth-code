@@ -7,13 +7,15 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - `PROGRESS.md` is for judgment-based durable insights worth preserving, not every task.
 - Organize `PROGRESS.md` by topic or subsystem instead of chronological task history.
 - `docs/system_prompt.md` is the runtime default base prompt via `include_str!` in `crates/core/src/provider.rs`; `SMOOTH_CODE_LLM_PREAMBLE` still replaces that default, while role-specific preambles from `crates/core/src/agent/role.rs` layer on top of the selected base.
-- Environment context placeholders in the selected base preamble are filled by `crates/core/src/environment.rs` before role-specific and plan-mode text is appended. Keep this context cache-stable: working directory, git-repo yes/no, platform, OS version, and shell.
+- Environment context placeholders in the selected base preamble are filled by `crates/core/src/environment.rs` before role-specific and plan-mode text is appended. Keep this context cache-stable: working directory, git-repo yes/no, platform, OS version, shell, and preferred CLI availability (`rg`, `fd`, `eza`).
+- The model-facing `list_dir` tool was removed; directory listings should go through shell commands such as `eza`. Plan mode includes `run_command` for read-only exploration/validation, but still withholds file-mutating `edit` and `write`.
 
 ## OpenAI Provider
 
 - The OpenAI provider uses Rig's Responses WebSocket session for the manual tool loop; keep OpenAI turn streaming on `stream_completion_turn` and do not route OpenAI through the generic `CompletionModel::stream()` SSE path.
 - WebSocket item decoding in `crates/core/src/provider.rs` preserves provider item IDs for reasoning deltas and reuses one internal call ID across tool-call name, args, and final tool-call events so the TUI/core can correlate streamed tool state.
 - The local OpenAI-compatible proxy can close/reset WebSocket sessions without a closing handshake; retry only before any assistant item is yielded, and only treat a reset as graceful after a complete output item or terminal response has been observed.
+- The local OpenAI-compatible proxy can also fail during WebSocket startup with early close/no-close-reason messages or the generic `An error occurred while processing the request.` provider error. These are retryable only before any assistant item is yielded, to avoid duplicating visible output or tool calls.
 - The local OpenAI-compatible WebSocket proxy closes immediately after upgrade when `input` contains `role: system`; after Rig builds the Responses request, move system-role input items into the provider-level `instructions` field instead of downgrading them to user-visible text.
 - Keep OpenAI WebSocket inbound parsing local and tolerant rather than relying on Rig's private `StreamingCompletionChunk` parser; the local proxy emits provider telemetry and some known event types with payload shapes that may not match Rig's strict structs.
 - OpenAI WebSocket lifecycle responses from the local proxy may omit `output`; parse lifecycle fields (`status`, `usage`, errors, optional output IDs) from raw JSON instead of deserializing the full Responses completion object.

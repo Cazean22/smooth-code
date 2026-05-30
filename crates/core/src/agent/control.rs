@@ -647,7 +647,11 @@ impl AgentControl {
 fn should_notify_parent_on_completion(status: &AgentStatus) -> bool {
     matches!(
         status,
-        AgentStatus::Completed(_) | AgentStatus::Interrupted | AgentStatus::Errored(_)
+        AgentStatus::Completed(_)
+            | AgentStatus::Interrupted
+            | AgentStatus::Errored(_)
+            | AgentStatus::Shutdown
+            | AgentStatus::NotFound
     )
 }
 
@@ -995,6 +999,72 @@ mod tests {
                 .await
                 .expect("list open children")
                 .is_empty()
+        );
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+    }
+
+    #[tokio::test]
+    async fn completion_watcher_emits_parent_event_for_shutdown_child() {
+        let _cwd_guard = crate::test_support::cwd_test_lock()
+            .lock()
+            .expect("cwd lock");
+        let workspace = TempDir::new().expect("tempdir");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(workspace.path()).expect("set cwd");
+
+        let release = Arc::new(Semaphore::new(0));
+        let manager = ThreadManagerState::new(
+            None,
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(BlockingRootDriver {
+                    release: Arc::clone(&release),
+                    text: "response".into(),
+                })),
+            })),
+        )
+        .await
+        .expect("thread manager");
+        let started = manager.start_thread().await.expect("start root");
+        let root_id = started.thread_id;
+        let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent(root_id, "hello child".to_string())
+            .await
+            .expect("spawn child");
+        let child_id = child.agent_id.expect("child id");
+
+        let status = control
+            .close_agent(root_id, child.agent_path.as_str())
+            .await
+            .expect("close child");
+        assert_eq!(status, AgentStatus::Shutdown);
+
+        let mut saw_shutdown_completion = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+                Ok(Ok(event)) => event,
+                Ok(Err(err)) => panic!("root event channel closed: {err}"),
+                Err(_) => break,
+            };
+
+            if let EventMsg::CollabAgentCompleted(completion) = event.msg {
+                assert_eq!(completion.parent_thread_id, root_id);
+                assert_eq!(completion.child_thread_id, child_id);
+                assert_eq!(completion.status, AgentStatus::Shutdown);
+                assert_eq!(completion.last_assistant_message, None);
+                saw_shutdown_completion = true;
+                break;
+            }
+        }
+
+        assert!(
+            saw_shutdown_completion,
+            "expected shutdown child completion event on parent thread"
         );
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");

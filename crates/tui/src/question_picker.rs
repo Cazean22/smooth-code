@@ -111,13 +111,13 @@ impl QuestionPicker {
 
         match key.code {
             KeyCode::Esc => PickerOutcome::Cancel,
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 if state.cursor > 0 {
                     state.cursor -= 1;
                 }
                 PickerOutcome::None
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if state.cursor < other_row {
                     state.cursor += 1;
                 }

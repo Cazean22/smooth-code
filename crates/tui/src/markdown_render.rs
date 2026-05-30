@@ -4,6 +4,11 @@ use ratatui::{
     text::{Line, Span, Text},
 };
 
+/// Foreground color used for both inline code and fenced code blocks. Shared so
+/// the transcript wrapper can recognize code lines (every span code-colored) and
+/// wrap them column-faithfully instead of word-wrapping them like prose.
+pub(crate) const CODE_COLOR: Color = Color::Cyan;
+
 #[derive(Default)]
 struct ListState {
     next_ordered: Option<u64>,
@@ -51,7 +56,7 @@ impl Renderer {
                 }
             }
             Event::Code(code) => {
-                let style = Style::default().fg(Color::Cyan);
+                let style = Style::default().fg(CODE_COLOR);
                 self.current_line
                     .push(Span::styled(code.into_string(), style));
             }
@@ -156,26 +161,33 @@ impl Renderer {
             }
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
-                let code_style = Style::default().fg(Color::Cyan);
+                let code_style = Style::default().fg(CODE_COLOR);
+                // Mark fenced-code lines at the LINE level too. Inline code only
+                // ever sets a span-level color, so the transcript wrapper can use
+                // this line-level marker to tell a fenced block apart from a
+                // paragraph that merely consists of inline code.
                 if let Some(lang) = self.code_block_lang.take()
                     && !lang.is_empty()
                 {
-                    self.lines.push(Line::from(vec![
-                        Span::styled("```", code_style),
-                        Span::styled(lang, code_style),
-                    ]));
+                    self.lines.push(
+                        Line::from(vec![
+                            Span::styled("```", code_style),
+                            Span::styled(lang, code_style),
+                        ])
+                        .style(code_style),
+                    );
                 }
                 for line in self.code_block_buffer.lines() {
-                    self.lines.push(Line::from(vec![Span::styled(
-                        format!("    {line}"),
-                        code_style,
-                    )]));
+                    self.lines.push(
+                        Line::from(vec![Span::styled(format!("    {line}"), code_style)])
+                            .style(code_style),
+                    );
                 }
                 if self.code_block_buffer.ends_with('\n')
                     && self.code_block_buffer.trim().is_empty()
                 {
                     self.lines
-                        .push(Line::from(Span::styled("    ", code_style)));
+                        .push(Line::from(Span::styled("    ", code_style)).style(code_style));
                 }
                 self.code_block_buffer.clear();
             }

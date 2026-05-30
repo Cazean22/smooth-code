@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use app_server_protocol::{ClientCommand, JSONRPCErrorError};
-use smooth_protocol::Event;
+use smooth_protocol::{Event, ThreadId};
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
@@ -19,7 +19,7 @@ pub struct InProcessStartArgs {
 #[derive(Debug, Clone)]
 pub enum InProcessServerEvent {
     ServerRequest(app_server_protocol::ServerRequest),
-    SessionEvent(Event),
+    SessionEvent { thread_id: ThreadId, event: Event },
 }
 
 pub struct InProcessClientHandle {

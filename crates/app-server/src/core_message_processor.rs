@@ -301,7 +301,7 @@ impl CoreMessageProcessor {
                         match rx.recv().await {
                             Ok(event) => {
                                 if event_tx
-                                    .send(InProcessServerEvent::SessionEvent(event))
+                                    .send(InProcessServerEvent::SessionEvent { thread_id, event })
                                     .await
                                     .is_err()
                                 {

@@ -5,6 +5,8 @@ use ratatui::{
 };
 use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 
+use crate::wrap;
+
 const MAX_RENDERED_DIFF_LINES: usize = 1_000;
 
 pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<Line<'static>> {
@@ -16,27 +18,34 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
         FileChange::Omitted { operation, .. } => operation_verb(&operation),
     };
 
-    let mut lines = vec![Line::from(vec![
-        "• ".dim(),
-        Span::raw(format!("{verb} 1 file ")),
-        "(".into(),
-        format!("+{added}").green(),
-        " ".into(),
-        format!("-{removed}").red(),
-        ")".into(),
-    ])];
-    lines.push(Line::from(vec![
-        "  ".into(),
-        Span::raw(change.path.display().to_string()),
-        " ".into(),
-        "(".into(),
-        format!("+{added}").green(),
-        " ".into(),
-        format!("-{removed}").red(),
-        ")".into(),
-    ]));
+    let wrap_width = usize::from(width.max(1));
+    let mut lines = wrap::wrap_line_char(
+        Line::from(vec![
+            "• ".dim(),
+            Span::raw(format!("{verb} 1 file ")),
+            "(".into(),
+            format!("+{added}").green(),
+            " ".into(),
+            format!("-{removed}").red(),
+            ")".into(),
+        ]),
+        wrap_width,
+    );
+    lines.extend(wrap::wrap_line_char(
+        Line::from(vec![
+            "  ".into(),
+            Span::raw(change.path.display().to_string()),
+            " ".into(),
+            "(".into(),
+            format!("+{added}").green(),
+            " ".into(),
+            format!("-{removed}").red(),
+            ")".into(),
+        ]),
+        wrap_width,
+    ));
 
-    let diff_width = usize::from(width.saturating_sub(4).max(20));
+    let diff_width = usize::from(width.saturating_sub(4).max(1));
     let rendered_change = render_change(&change.change, diff_width);
     let rendered_len = rendered_change.len();
     for line in rendered_change.into_iter().take(MAX_RENDERED_DIFF_LINES) {
@@ -87,10 +96,13 @@ fn render_change(change: &FileChange, width: usize) -> Vec<Line<'static>> {
         FileChange::Add { content } => render_whole_file(content, DiffLineKind::Insert, width),
         FileChange::Delete { content } => render_whole_file(content, DiffLineKind::Delete, width),
         FileChange::Update { unified_diff, .. } => render_unified_diff(unified_diff, width),
-        FileChange::Omitted { reason, bytes, .. } => vec![Line::from(vec![
-            "⋮ ".dim(),
-            format!("diff omitted ({bytes} bytes): {reason}").dim(),
-        ])],
+        FileChange::Omitted { reason, bytes, .. } => wrap::wrap_line_char(
+            Line::from(vec![
+                "⋮ ".dim(),
+                format!("diff omitted ({bytes} bytes): {reason}").dim(),
+            ]),
+            width,
+        ),
     }
 }
 
@@ -107,7 +119,7 @@ fn render_unified_diff(unified_diff: &str, width: usize) -> Vec<Line<'static>> {
     let Ok(patch) = Patch::from_str(unified_diff) else {
         return unified_diff
             .lines()
-            .map(|line| Line::from(line.to_string()))
+            .flat_map(|line| wrap::wrap_line_char(Line::from(line.to_string()), width))
             .collect();
     };
 
@@ -188,7 +200,7 @@ fn render_diff_line(
 ) -> Vec<Line<'static>> {
     let gutter_width = line_number_width + 2;
     let available = width.saturating_sub(gutter_width).max(1);
-    let chunks = wrap_text(text, available);
+    let chunks = wrap::wrap_text(text, available);
     let mut out = Vec::with_capacity(chunks.len());
 
     for (idx, chunk) in chunks.into_iter().enumerate() {
@@ -209,25 +221,6 @@ fn render_diff_line(
         ]));
     }
     out
-}
-
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        current.push(ch);
-        if current.chars().count() >= width {
-            chunks.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 fn line_number_width(max_line_number: usize) -> usize {
@@ -322,6 +315,21 @@ mod tests {
         let rendered = line_texts(create_diff_summary(&output, 80));
 
         assert_eq!(rendered[0], "• Added 1 file (+10 -0)");
+    }
+
+    #[test]
+    fn wraps_long_summary_paths_to_requested_width() {
+        let output = FileChangeOutput {
+            path: format!("src/{}{}", "very_long_path_segment_".repeat(4), "file.rs").into(),
+            change: FileChange::Add {
+                content: "line\n".to_string(),
+            },
+        };
+
+        let rendered = line_texts(create_diff_summary(&output, 24));
+
+        assert!(rendered.len() > 3);
+        assert!(rendered.iter().all(|line| line.len() <= 24), "{rendered:?}");
     }
 
     #[test]

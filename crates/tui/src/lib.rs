@@ -8,6 +8,7 @@ mod markdown_render;
 mod markdown_stream;
 mod question_picker;
 mod streaming;
+mod wrap;
 
 use std::io::{IsTerminal, Stdout};
 
@@ -21,7 +22,6 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ratatui::{Terminal, prelude::CrosstermBackend};
-use serde_json::json;
 
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -30,57 +30,35 @@ pub async fn run() -> Result<()> {
     let mut terminal = init()?.ok_or_else(|| anyhow::anyhow!("smooth-tui requires a TTY"))?;
     let mut app_server = AppServerSession::new(AppServerClient::start(512).await?);
     let mut app = App::new();
-    let started_thread = app_server.start_thread().await?;
-    app.current_thread_id = Some(started_thread.thread_id.parse()?);
     let mut event_stream = crossterm::event::EventStream::new();
+    terminal.draw(|frame| app.render(frame))?;
+    let viewport_height = app.viewport_height_for(&terminal)?;
+    if matches!(
+        app.startup(&mut app_server, viewport_height).await?,
+        crate::app::AppRunControl::Exit
+    ) {
+        return restore(Some(&mut terminal));
+    }
     terminal.draw(|frame| app.render(frame))?;
 
     loop {
         tokio::select! {
             event = app_server.next_event() => {
                 match event {
-                    Some(InProcessServerEvent::SessionEvent(event)) => {
+                    Some(InProcessServerEvent::SessionEvent { thread_id, event }) => {
                         let viewport_height = app.viewport_height_for(&terminal)?;
-                        app.handle_session_event(event, viewport_height);
+                        app.handle_session_event_from_thread(thread_id, event, viewport_height);
                         terminal.draw(|frame| app.render(frame))?;
                     }
                     Some(InProcessServerEvent::ServerRequest(request)) => {
-                        match request {
-                            app_server_protocol::ServerRequest::DynamicToolCall {
-                                request_id,
-                                params,
-                            } => {
-                                if params.tool == "dynamic_error" {
-                                    app_server
-                                        .fail_server_request(
-                                            request_id,
-                                            app_server_protocol::JSONRPCErrorError {
-                                                code: -32000,
-                                                data: None,
-                                                message: "stub dynamic tool failure".to_string(),
-                                            },
-                                        )
-                                        .await?;
-                                } else {
-                                    app_server
-                                        .respond_to_server_request(
-                                            request_id,
-                                            json!({
-                                                "stub": true,
-                                                "tool": params.tool,
-                                            }),
-                                        )
-                                        .await?;
-                                }
-                            }
-                            app_server_protocol::ServerRequest::AskUserQuestion {
-                                request_id,
-                                params,
-                            } => {
-                                app.begin_question_picker(request_id, params);
-                                terminal.draw(|frame| app.render(frame))?;
-                            }
+                        let viewport_height = app.viewport_height_for(&terminal)?;
+                        if matches!(
+                            app.handle_server_request(&mut app_server, request, viewport_height).await?,
+                            crate::app::AppRunControl::Exit
+                        ) {
+                            break;
                         }
+                        terminal.draw(|frame| app.render(frame))?;
                     }
                     None => break,
                 }

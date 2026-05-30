@@ -1,166 +1,214 @@
-use std::any::Any;
-
 use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
 };
 use smooth_protocol::FileChangeOutput;
 
-use crate::diff_render::create_diff_summary;
+use crate::{diff_render::create_diff_summary, wrap};
 
-pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
+pub(crate) type TranscriptItemId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TranscriptDetailMode {
+    Inline,
+    Detail,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct UserHistoryCell {
-    message: String,
+pub(crate) struct TranscriptItem {
+    id: TranscriptItemId,
+    version: u64,
+    kind: TranscriptItemKind,
 }
 
-impl UserHistoryCell {
-    pub(crate) fn new(message: String) -> Self {
-        Self { message }
-    }
-}
-
-impl HistoryCell for UserHistoryCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        prefix_multiline_text(&self.message, "› ".cyan().bold(), "  ".cyan())
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AgentMessageCell {
-    lines: Vec<Line<'static>>,
-    is_first_line: bool,
-}
-
-impl AgentMessageCell {
-    pub(crate) fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
+impl TranscriptItem {
+    pub(crate) fn user(id: TranscriptItemId, message: String) -> Self {
         Self {
-            lines,
-            is_first_line,
+            id,
+            version: 0,
+            kind: TranscriptItemKind::User { message },
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn lines(&self) -> &[Line<'static>] {
-        &self.lines
-    }
-}
-
-impl HistoryCell for AgentMessageCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let first_prefix = if self.is_first_line {
-            "• ".green().bold()
-        } else {
-            "  ".green()
-        };
-        prefix_lines(self.lines.clone(), first_prefix, "  ".green())
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReasoningCell {
-    lines: Vec<Line<'static>>,
-    is_first_line: bool,
-}
-
-impl ReasoningCell {
-    pub(crate) fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
+    pub(crate) fn assistant(
+        id: TranscriptItemId,
+        lines: Vec<Line<'static>>,
+        is_first_line: bool,
+    ) -> Self {
         Self {
-            lines,
-            is_first_line,
+            id,
+            version: 0,
+            kind: TranscriptItemKind::Assistant {
+                lines,
+                is_first_line,
+            },
         }
     }
-}
 
-impl HistoryCell for ReasoningCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let first_prefix = if self.is_first_line {
-            Span::styled("… ", Style::default().fg(Color::Magenta).dim().bold())
-        } else {
-            Span::styled("  ", Style::default().fg(Color::Magenta).dim())
-        };
-        prefix_lines(
-            self.lines
-                .clone()
-                .into_iter()
-                .map(|line| line.style(Style::default().dim()))
-                .collect(),
-            first_prefix,
-            Span::styled("  ", Style::default().fg(Color::Magenta).dim()),
+    pub(crate) fn reasoning(
+        id: TranscriptItemId,
+        lines: Vec<Line<'static>>,
+        is_first_line: bool,
+    ) -> Self {
+        Self {
+            id,
+            version: 0,
+            kind: TranscriptItemKind::Reasoning {
+                lines,
+                is_first_line,
+            },
+        }
+    }
+
+    pub(crate) fn plain(id: TranscriptItemId, lines: Vec<Line<'static>>) -> Self {
+        Self {
+            id,
+            version: 0,
+            kind: TranscriptItemKind::Plain { lines },
+        }
+    }
+
+    pub(crate) fn info(id: TranscriptItemId, message: impl Into<String>) -> Self {
+        Self::plain(
+            id,
+            vec![Line::from(vec![
+                Span::styled("i ", Style::default().fg(Color::Yellow).bold()),
+                Span::styled(message.into(), Style::default().dim()),
+            ])],
         )
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+    pub(crate) fn error(id: TranscriptItemId, message: impl Into<String>) -> Self {
+        Self::plain(
+            id,
+            vec![Line::from(vec![
+                Span::styled("! ", Style::default().fg(Color::Red).bold()),
+                Span::styled(message.into(), Style::default().fg(Color::Red)),
+            ])],
+        )
+    }
+
+    pub(crate) fn patch(id: TranscriptItemId, file_change: FileChangeOutput) -> Self {
+        Self {
+            id,
+            version: 0,
+            kind: TranscriptItemKind::Patch { file_change },
+        }
+    }
+
+    pub(crate) fn tool_group(id: TranscriptItemId, cell: ToolCallGroupCell) -> Self {
+        Self {
+            id,
+            version: 0,
+            kind: TranscriptItemKind::ToolCallGroup(cell),
+        }
+    }
+
+    pub(crate) fn id(&self) -> TranscriptItemId {
+        self.id
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub(crate) fn display_lines(
+        &self,
+        width: u16,
+        detail_mode: TranscriptDetailMode,
+    ) -> Vec<Line<'static>> {
+        match &self.kind {
+            TranscriptItemKind::User { message } => wrap_display(
+                prefix_multiline_text(message, "› ".cyan().bold(), "  ".cyan()),
+                width,
+            ),
+            TranscriptItemKind::Assistant {
+                lines,
+                is_first_line,
+            } => {
+                let first_prefix = if *is_first_line {
+                    "• ".green().bold()
+                } else {
+                    "  ".green()
+                };
+                wrap_markdown_lines(lines, first_prefix, "  ".green(), false, width)
+            }
+            TranscriptItemKind::Reasoning {
+                lines,
+                is_first_line,
+            } => {
+                let first_prefix = if *is_first_line {
+                    Span::styled("… ", Style::default().fg(Color::Magenta).dim().bold())
+                } else {
+                    Span::styled("  ", Style::default().fg(Color::Magenta).dim())
+                };
+                wrap_markdown_lines(
+                    lines,
+                    first_prefix,
+                    Span::styled("  ", Style::default().fg(Color::Magenta).dim()),
+                    true,
+                    width,
+                )
+            }
+            TranscriptItemKind::Plain { lines } => wrap_display(lines.clone(), width),
+            TranscriptItemKind::Patch { file_change } => match detail_mode {
+                TranscriptDetailMode::Inline => {
+                    let mut lines = create_diff_summary(file_change, width);
+                    lines.truncate(2);
+                    lines
+                }
+                TranscriptDetailMode::Detail => create_diff_summary(file_change, width),
+            },
+            TranscriptItemKind::ToolCallGroup(cell) => {
+                wrap::wrap_lines_char(cell.display_lines(), usize::from(width.max(1)))
+            }
+        }
+    }
+
+    pub(crate) fn tool_group_mut(&mut self) -> Option<&mut ToolCallGroupCell> {
+        match &mut self.kind {
+            TranscriptItemKind::ToolCallGroup(cell) => Some(cell),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn replace_with_patch(&mut self, file_change: FileChangeOutput) {
+        self.kind = TranscriptItemKind::Patch { file_change };
+        self.version = self.version.saturating_add(1);
+    }
+
+    pub(crate) fn patch_change(&self) -> Option<&FileChangeOutput> {
+        match &self.kind {
+            TranscriptItemKind::Patch { file_change } => Some(file_change),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn mark_mutated(&mut self) {
+        self.version = self.version.saturating_add(1);
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlainHistoryCell {
-    lines: Vec<Line<'static>>,
-}
-
-impl PlainHistoryCell {
-    pub(crate) fn new(lines: Vec<Line<'static>>) -> Self {
-        Self { lines }
-    }
-
-    pub(crate) fn info(message: impl Into<String>) -> Self {
-        Self::new(vec![Line::from(vec![
-            Span::styled("i ", Style::default().fg(Color::Yellow).bold()),
-            Span::styled(message.into(), Style::default().dim()),
-        ])])
-    }
-
-    pub(crate) fn error(message: impl Into<String>) -> Self {
-        Self::new(vec![Line::from(vec![
-            Span::styled("! ", Style::default().fg(Color::Red).bold()),
-            Span::styled(message.into(), Style::default().fg(Color::Red)),
-        ])])
-    }
-}
-
-impl HistoryCell for PlainHistoryCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        self.lines.clone()
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PatchHistoryCell {
-    file_change: FileChangeOutput,
-}
-
-impl PatchHistoryCell {
-    pub(crate) fn new(file_change: FileChangeOutput) -> Self {
-        Self { file_change }
-    }
-}
-
-impl HistoryCell for PatchHistoryCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        create_diff_summary(&self.file_change, width)
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
+enum TranscriptItemKind {
+    User {
+        message: String,
+    },
+    Assistant {
+        lines: Vec<Line<'static>>,
+        is_first_line: bool,
+    },
+    Reasoning {
+        lines: Vec<Line<'static>>,
+        is_first_line: bool,
+    },
+    Plain {
+        lines: Vec<Line<'static>>,
+    },
+    Patch {
+        file_change: FileChangeOutput,
+    },
+    ToolCallGroup(ToolCallGroupCell),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -226,10 +274,8 @@ impl ToolCallGroupCell {
         entry.state = state;
         entry.error = error;
     }
-}
 
-impl HistoryCell for ToolCallGroupCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    pub(crate) fn display_lines(&self) -> Vec<Line<'static>> {
         let header_state = if self
             .entries
             .iter()
@@ -277,10 +323,6 @@ impl HistoryCell for ToolCallGroupCell {
             }
         }
         lines
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
     }
 }
 
@@ -347,6 +389,56 @@ pub(crate) fn prefix_lines(
     out
 }
 
+fn wrap_display(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    wrap::wrap_lines(lines, usize::from(width.max(1)))
+}
+
+/// Wrap markdown-rendered content, choosing the wrap policy per logical line:
+/// prose word-wraps, while fenced code lines (marked at the line level)
+/// wrap column-faithfully so indentation and alignment survive. `dim` applies
+/// the reasoning styling. The prefix is added to the first row of each logical
+/// line, matching the earlier prefix-then-wrap behavior.
+fn wrap_markdown_lines(
+    lines: &[Line<'static>],
+    first_prefix: Span<'static>,
+    rest_prefix: Span<'static>,
+    dim: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let wrap_width = usize::from(width.max(1));
+    let mut out = Vec::new();
+    for (idx, raw) in lines.iter().enumerate() {
+        let preformatted = is_preformatted_line(raw);
+        let line_style = if dim {
+            Style::default().dim()
+        } else {
+            raw.style
+        };
+        let prefix = if idx == 0 {
+            first_prefix.clone()
+        } else {
+            rest_prefix.clone()
+        };
+        let mut spans = Vec::with_capacity(raw.spans.len() + 1);
+        spans.push(prefix);
+        spans.extend(raw.spans.iter().cloned());
+        let prefixed = Line::from(spans).style(line_style);
+        if preformatted {
+            out.extend(wrap::wrap_line_char(prefixed, wrap_width));
+        } else {
+            out.extend(wrap::wrap_line(prefixed, wrap_width));
+        }
+    }
+    out
+}
+
+/// A markdown line is preformatted (column-faithful wrapping) when the markdown
+/// renderer marked the whole line as fenced code. Inline code only colors spans,
+/// so even an inline-code-only paragraph still word-wraps as prose.
+fn is_preformatted_line(line: &Line<'static>) -> bool {
+    !line.spans.is_empty() && line.style.fg == Some(crate::markdown_render::CODE_COLOR)
+}
+
 fn prefix_multiline_text(
     text: &str,
     first_prefix: Span<'static>,
@@ -361,4 +453,44 @@ fn prefix_multiline_text(
         .map(|line| Line::from(line.to_owned()))
         .collect::<Vec<_>>();
     prefix_lines(lines, first_prefix, rest_prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markdown_render::CODE_COLOR;
+
+    #[test]
+    fn fenced_code_line_marker_is_preformatted() {
+        let line = Line::from(vec![Span::styled(
+            "    let x = 1;",
+            Style::default().fg(CODE_COLOR),
+        )])
+        .style(Style::default().fg(CODE_COLOR));
+        assert!(is_preformatted_line(&line));
+    }
+
+    #[test]
+    fn prose_with_inline_code_is_not_preformatted() {
+        let line = Line::from(vec![
+            Span::raw("use the "),
+            Span::styled("foo", Style::default().fg(CODE_COLOR)),
+            Span::raw(" helper"),
+        ]);
+        assert!(!is_preformatted_line(&line));
+    }
+
+    #[test]
+    fn inline_code_only_line_is_not_preformatted() {
+        let line = Line::from(vec![Span::styled(
+            "cargo test -p smooth-tui",
+            Style::default().fg(CODE_COLOR),
+        )]);
+        assert!(!is_preformatted_line(&line));
+    }
+
+    #[test]
+    fn blank_line_is_not_preformatted() {
+        assert!(!is_preformatted_line(&Line::default()));
+    }
 }

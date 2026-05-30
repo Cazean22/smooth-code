@@ -14,6 +14,7 @@ const DESCRIPTION: &str = r#"Read a UTF-8 text file from the local filesystem. A
 Usage:
 - `file_path` may be an absolute path, or a path relative to the current working directory.
 - By default, the tool reads up to 2000 lines starting at the beginning of the file. Prefer reading the whole file by omitting `offset` and `limit`; use them only when the file is too large to read in one go.
+- `offset` is a zero-based count of lines to skip: omit it or set `offset: 0` to start at the first line; `offset: 1` starts at line 2.
 - Results are returned in `cat -n` format, with line numbers starting at 1.
 - This tool only reads files, not directories. Use the `list_dir` tool to inspect a directory.
 - If the file exists but is empty, the tool returns a marker indicating that the file is empty."#;
@@ -35,7 +36,9 @@ pub struct ReadArgs {
     /// Absolute path to the file, or a path relative to the current working directory.
     file_path: String,
 
-    /// The line number to start reading from. Only provide if the file is too large to read at once.
+    /// Zero-based line offset, i.e. the number of lines to skip before reading.
+    /// Omit or use 0 to start at the first line; offset 1 starts at line 2.
+    /// Only provide if the file is too large to read at once.
     #[serde(default)]
     #[schemars(range(min = 0, max = MAX_SAFE_INTEGER))]
     offset: Option<usize>,

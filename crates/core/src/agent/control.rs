@@ -9,7 +9,7 @@ use smooth_protocol::{
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, oneshot, watch};
-use tools::AskUserClientFactory;
+use tools::AskUserClient;
 use uuid::Uuid;
 
 use crate::{
@@ -52,7 +52,7 @@ pub(crate) type InlineChildCompletionReceiver = oneshot::Receiver<InlineChildCom
 #[derive(Clone)]
 struct AgentControlRuntime {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
-    ask_user_client_factory: Option<AskUserClientFactory>,
+    ask_user_client: Option<AskUserClient>,
     model_factory: Option<Arc<dyn SessionModelFactory>>,
     state_db: StateDbHandle,
 }
@@ -72,13 +72,13 @@ impl AgentControl {
     pub(crate) fn attach_runtime(
         &self,
         threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
-        ask_user_client_factory: Option<AskUserClientFactory>,
+        ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         state_db: StateDbHandle,
     ) -> CoreResult<()> {
         *lock_mutex(&self.state.runtime, "agent_control.runtime")? = Some(AgentControlRuntime {
             threads,
-            ask_user_client_factory,
+            ask_user_client,
             model_factory,
             state_db,
         });
@@ -343,10 +343,7 @@ impl AgentControl {
             agent_nickname: Some(reservation.agent_path().name().to_string()),
             agent_role: agent_role.clone(),
         });
-        let ask_user_client = runtime
-            .ask_user_client_factory
-            .as_ref()
-            .map(|factory| factory.build(child_thread_id));
+        let ask_user_client = runtime.ask_user_client.clone();
         let initial_history = if fork_context {
             self.load_fork_history(parent_thread_id, SpawnAgentForkMode::ParentHistory)
                 .await?

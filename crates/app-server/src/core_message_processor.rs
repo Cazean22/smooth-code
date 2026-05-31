@@ -5,16 +5,16 @@ use app_server_protocol::{
     ServerRequestPayload, SetPlanModeResponse, ThreadListItem, ThreadListResponse,
     ThreadResumeResponse, ThreadStartResponse, TurnStartResponse,
 };
-use smooth_core::{AskUserClient, AskUserClientFactory, ThreadManagerState, ThreadSummary};
+use smooth_core::{AskUserClient, ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
 use crate::{
     error::{AppServerError, AppServerResult},
-    error_code::{INTERNAL_ERROR_CODE, SERVER_ERROR_CODE},
+    error_code::{INTERNAL_ERROR_CODE, INVALID_PARAMS_ERROR_CODE, SERVER_ERROR_CODE},
     in_process::InProcessServerEvent,
-    outgoing_message::{OutgoingMessageSender, ThreadScopedOutgoingMessageSender},
+    outgoing_message::OutgoingMessageSender,
 };
 
 pub(crate) struct CoreMessageProcessor {
@@ -23,46 +23,54 @@ pub(crate) struct CoreMessageProcessor {
     subscribed_threads: Mutex<HashSet<ThreadId>>,
 }
 
-fn ask_user_client_factory(outgoing: Arc<OutgoingMessageSender>) -> AskUserClientFactory {
-    AskUserClientFactory::new(move |thread_id| {
-        let outgoing = ThreadScopedOutgoingMessageSender::new(Arc::clone(&outgoing), thread_id);
-        let ask_outgoing = outgoing.clone();
-        let abort_outgoing = outgoing;
-        AskUserClient::new(
-            move |params: AskUserQuestionParams| {
-                let outgoing = ask_outgoing.clone();
-                async move {
-                    let (_, response_rx) = outgoing
-                        .send_request(ServerRequestPayload::AskUserQuestion(params))
-                        .await;
-                    let value = match response_rx.await {
-                        Ok(Ok(value)) => value,
-                        Ok(Err(err)) => return Err(err),
-                        Err(err) => {
-                            return Err(JsonRpcError::message_only(
-                                SERVER_ERROR_CODE,
-                                "server_request_waiter_closed",
-                                err.to_string(),
-                            ));
-                        }
-                    };
-                    serde_json::from_value::<AskUserQuestionResponse>(value).map_err(|err| {
-                        JsonRpcError::message_only(
-                            INTERNAL_ERROR_CODE,
-                            "invalid_ask_user_question_response",
-                            format!("invalid ask_user_question response: {err}"),
-                        )
-                    })
-                }
-            },
-            move || {
-                let outgoing = abort_outgoing.clone();
-                async move {
-                    outgoing.abort_pending_server_requests().await;
-                }
-            },
-        )
-    })
+fn ask_user_client(outgoing: Arc<OutgoingMessageSender>) -> AskUserClient {
+    let ask_source = Arc::clone(&outgoing);
+    AskUserClient::new(
+        move |params: AskUserQuestionParams| {
+            let outgoing = Arc::clone(&ask_source);
+            async move {
+                let thread_id = params.thread_id.parse::<ThreadId>().map_err(|err| {
+                    JsonRpcError::message_only(
+                        INVALID_PARAMS_ERROR_CODE,
+                        "invalid_thread_id",
+                        format!("invalid ask_user_question thread id: {err}"),
+                    )
+                })?;
+                let (_, response_rx) = outgoing
+                    .send_request_for_thread(
+                        thread_id,
+                        ServerRequestPayload::AskUserQuestion(params),
+                    )
+                    .await;
+                let value = match response_rx.await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(err)) => return Err(err),
+                    Err(err) => {
+                        return Err(JsonRpcError::message_only(
+                            SERVER_ERROR_CODE,
+                            "server_request_waiter_closed",
+                            err.to_string(),
+                        ));
+                    }
+                };
+                serde_json::from_value::<AskUserQuestionResponse>(value).map_err(|err| {
+                    JsonRpcError::message_only(
+                        INTERNAL_ERROR_CODE,
+                        "invalid_ask_user_question_response",
+                        format!("invalid ask_user_question response: {err}"),
+                    )
+                })
+            }
+        },
+        move |thread_id| {
+            let outgoing = Arc::clone(&outgoing);
+            async move {
+                outgoing
+                    .abort_pending_server_requests_for_thread(thread_id)
+                    .await;
+            }
+        },
+    )
 }
 
 impl CoreMessageProcessor {
@@ -71,7 +79,7 @@ impl CoreMessageProcessor {
         outgoing: Arc<OutgoingMessageSender>,
     ) -> AppServerResult<Self> {
         Ok(Self {
-            threads: ThreadManagerState::new(Some(ask_user_client_factory(outgoing)), None).await?,
+            threads: ThreadManagerState::new(Some(ask_user_client(outgoing)), None).await?,
             event_tx,
             subscribed_threads: Mutex::new(HashSet::new()),
         })
@@ -253,10 +261,10 @@ fn map_thread_summary(summary: ThreadSummary) -> ThreadListItem {
 mod tests {
     use std::{path::PathBuf, sync::Arc, sync::LazyLock};
 
-    use app_server_protocol::{ClientRequest, RequestId, TurnStartParams};
-    use tokio::sync::{Mutex as TokioMutex, mpsc};
+    use app_server_protocol::{AskUserQuestionParams, ClientRequest, RequestId, TurnStartParams};
+    use tokio::sync::{Mutex as TokioMutex, mpsc, mpsc::error::TryRecvError};
 
-    use super::CoreMessageProcessor;
+    use super::{CoreMessageProcessor, ask_user_client};
     use crate::{
         error_code::INVALID_PARAMS_ERROR_CODE, in_process::InProcessServerEvent,
         outgoing_message::OutgoingMessageSender,
@@ -301,6 +309,29 @@ mod tests {
         assert_eq!(info.kind, "invalid_thread_id");
         assert_eq!(info.source.as_deref(), Some("app-server"));
         assert_eq!(error.message, info.message);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_user_client_routes_from_params_thread_id() -> TestResult {
+        let (event_tx, mut event_rx) = mpsc::channel::<InProcessServerEvent>(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(event_tx));
+        let client = ask_user_client(outgoing);
+
+        let Err(error) = client
+            .ask(AskUserQuestionParams {
+                thread_id: "not-a-thread-id".to_string(),
+                turn_id: "turn-1".to_string(),
+                call_id: "call-1".to_string(),
+                questions: Vec::new(),
+            })
+            .await
+        else {
+            panic!("invalid ask_user_question thread id should fail");
+        };
+
+        assert_eq!(error.code, INVALID_PARAMS_ERROR_CODE);
+        assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
         Ok(())
     }
 }

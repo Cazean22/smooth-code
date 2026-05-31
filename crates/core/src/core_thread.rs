@@ -18,7 +18,6 @@ use smooth_protocol::{Op, ThreadId};
 pub struct CoreThread {
     pub(crate) core: Core,
     rollout_path: PathBuf,
-    ask_user_client: Option<AskUserClient>,
 }
 
 impl CoreThread {
@@ -109,7 +108,6 @@ impl CoreThread {
                 resolved_factory.clone(),
             ),
             rollout_path,
-            ask_user_client,
         })
     }
 
@@ -166,7 +164,6 @@ impl CoreThread {
                 resolved_factory.clone(),
             ),
             rollout_path: path,
-            ask_user_client,
         })
     }
 
@@ -180,10 +177,7 @@ impl CoreThread {
 
     /// Toggle plan mode for this thread. Returns the new effective plan-mode state.
     pub(crate) async fn set_plan_mode(&self, enabled: bool) -> CoreResult<bool> {
-        self.core
-            .session
-            .apply_plan_mode(enabled, self.ask_user_client.clone())
-            .await
+        self.core.session.apply_plan_mode(enabled).await
     }
 
     #[tracing::instrument(name = "core.thread.emit_session_configured", skip(self), fields(thread_id = %self.core.session.id))]

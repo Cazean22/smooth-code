@@ -17,7 +17,7 @@ mod write;
 pub use ask_user_question::{
     AskUserQuestionArgs, AskUserQuestionInput, AskUserQuestionOptionInput, AskUserQuestionTool,
 };
-pub use client::{AskUserClient, AskUserClientFactory};
+pub use client::AskUserClient;
 pub use delete::{DeleteArgs, DeleteTool};
 pub use edit::{EditArgs, EditTool};
 pub use error::{ToolError, ToolResult};

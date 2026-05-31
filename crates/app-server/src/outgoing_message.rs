@@ -1,9 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use app_server_protocol::{JsonRpcError, RequestId, ServerRequestPayload};
@@ -23,49 +20,9 @@ pub(crate) struct OutgoingMessageSender {
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
 }
 
-#[derive(Clone)]
-pub(crate) struct ThreadScopedOutgoingMessageSender {
-    outgoing: Arc<OutgoingMessageSender>,
-    thread_id: ThreadId,
-}
-
 struct PendingCallbackEntry {
     callback: oneshot::Sender<ClientRequestResult>,
     thread_id: Option<ThreadId>,
-}
-
-impl ThreadScopedOutgoingMessageSender {
-    pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>, thread_id: ThreadId) -> Self {
-        Self {
-            outgoing,
-            thread_id,
-        }
-    }
-
-    pub(crate) async fn send_request(
-        &self,
-        payload: ServerRequestPayload,
-    ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
-        self.outgoing
-            .send_request_for_thread(payload, Some(self.thread_id))
-            .await
-    }
-
-    pub(crate) async fn abort_pending_server_requests(&self) {
-        self.outgoing
-            .cancel_requests_for_thread(
-                self.thread_id,
-                Some(JsonRpcError::new(
-                    INTERNAL_ERROR_CODE,
-                    ErrorInfo::new(
-                        "turn_transition_pending_request",
-                        "client request resolved because the turn state was changed",
-                    )
-                    .with_source("app-server"),
-                )),
-            )
-            .await;
-    }
 }
 
 impl OutgoingMessageSender {
@@ -82,10 +39,33 @@ impl OutgoingMessageSender {
         &self,
         request: ServerRequestPayload,
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
-        self.send_request_for_thread(request, None).await
+        self.send_request_inner(request, None).await
     }
 
-    async fn send_request_for_thread(
+    pub(crate) async fn send_request_for_thread(
+        &self,
+        thread_id: ThreadId,
+        request: ServerRequestPayload,
+    ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
+        self.send_request_inner(request, Some(thread_id)).await
+    }
+
+    pub(crate) async fn abort_pending_server_requests_for_thread(&self, thread_id: ThreadId) {
+        self.cancel_requests_for_thread(
+            thread_id,
+            Some(JsonRpcError::new(
+                INTERNAL_ERROR_CODE,
+                ErrorInfo::new(
+                    "turn_transition_pending_request",
+                    "client request resolved because the turn state was changed",
+                )
+                .with_source("app-server"),
+            )),
+        )
+        .await;
+    }
+
+    async fn send_request_inner(
         &self,
         request: ServerRequestPayload,
         thread_id: Option<ThreadId>,
@@ -274,7 +254,7 @@ mod tests {
         let outgoing = OutgoingMessageSender::new(event_tx);
         let thread_id = ThreadId::new();
         let (request_id, response_rx) = outgoing
-            .send_request_for_thread(ask_user_request(thread_id, "call-1"), Some(thread_id))
+            .send_request_for_thread(thread_id, ask_user_request(thread_id, "call-1"))
             .await;
         let error = JsonRpcError::new(
             -32000,
@@ -320,16 +300,13 @@ mod tests {
         let other_thread_id = ThreadId::new();
 
         let (_, first_rx) = outgoing
-            .send_request_for_thread(ask_user_request(thread_id, "first"), Some(thread_id))
+            .send_request_for_thread(thread_id, ask_user_request(thread_id, "first"))
             .await;
         let (_, second_rx) = outgoing
-            .send_request_for_thread(ask_user_request(thread_id, "second"), Some(thread_id))
+            .send_request_for_thread(thread_id, ask_user_request(thread_id, "second"))
             .await;
         let (_, other_rx) = outgoing
-            .send_request_for_thread(
-                ask_user_request(other_thread_id, "other"),
-                Some(other_thread_id),
-            )
+            .send_request_for_thread(other_thread_id, ask_user_request(other_thread_id, "other"))
             .await;
         let error = JsonRpcError::new(
             -32002,

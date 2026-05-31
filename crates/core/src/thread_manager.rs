@@ -10,7 +10,7 @@ use smooth_protocol::{
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, broadcast};
-use tools::{AskUserClient, AskUserClientFactory};
+use tools::AskUserClient;
 use uuid::Uuid;
 
 use crate::{
@@ -35,7 +35,7 @@ pub struct ResumedThread {
 
 pub struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
-    ask_user_client_factory: Option<AskUserClientFactory>,
+    ask_user_client: Option<AskUserClient>,
     model_factory: Option<Arc<dyn SessionModelFactory>>,
     agent_control: AgentControl,
     state_db: StateDbHandle,
@@ -43,7 +43,7 @@ pub struct ThreadManagerState {
 
 impl ThreadManagerState {
     pub async fn new(
-        ask_user_client_factory: Option<AskUserClientFactory>,
+        ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
     ) -> CoreResult<Self> {
         let threads = Arc::new(RwLock::new(HashMap::new()));
@@ -53,13 +53,13 @@ impl ThreadManagerState {
         let agent_control = AgentControl::new();
         agent_control.attach_runtime(
             Arc::clone(&threads),
-            ask_user_client_factory.clone(),
+            ask_user_client.clone(),
             model_factory.clone(),
             state_db.clone(),
         )?;
         Ok(Self {
             threads,
-            ask_user_client_factory,
+            ask_user_client,
             model_factory,
             agent_control,
             state_db,
@@ -72,7 +72,7 @@ impl ThreadManagerState {
         let thread = Arc::new(
             CoreThread::new(
                 thread_id,
-                self.ask_user_client(thread_id),
+                self.ask_user_client.clone(),
                 self.model_factory.clone(),
                 SessionSource::Cli,
                 self.agent_control.clone(),
@@ -115,7 +115,7 @@ impl ThreadManagerState {
             CoreThread::resume(
                 rollout_path.clone(),
                 resume_state,
-                self.ask_user_client(thread_id),
+                self.ask_user_client.clone(),
                 self.model_factory.clone(),
                 SessionSource::Cli,
                 self.agent_control.clone(),
@@ -249,12 +249,6 @@ impl ThreadManagerState {
             .get(&thread_id)
             .cloned()
             .ok_or(CoreError::UnknownThread { thread_id })
-    }
-
-    fn ask_user_client(&self, thread_id: ThreadId) -> Option<AskUserClient> {
-        self.ask_user_client_factory
-            .as_ref()
-            .map(|factory| factory.build(thread_id))
     }
 
     async fn resume_child_subtree(&self, root_thread_id: ThreadId) -> CoreResult<Vec<EventMsg>> {
@@ -404,7 +398,7 @@ impl ThreadManagerState {
             CoreThread::resume(
                 rollout_path,
                 resume_state,
-                self.ask_user_client(child_thread_id),
+                self.ask_user_client.clone(),
                 self.model_factory.clone(),
                 SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id,

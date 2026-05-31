@@ -11,7 +11,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - The model-facing `list_dir` and `dynamic_echo` tools were removed; directory listings should go through shell commands such as `eza`, and client-mediated interaction should use the typed `ask_user_question` tool/server request. Plan mode includes `run_command` for read-only exploration/validation, but still withholds file-mutating `delete`, `edit`, and `write`.
 - Source changes should go through structured file tools (`edit`, `write`, `delete`) so the runtime can emit structured `FileChangeOutput`; keep `run_command` for inspection, validation, formatters, and project commands rather than Python/`sed -i`/`awk`/redirection rewrite scripts.
 - Plan-mode model rebuilds must preserve typed client-backed tools such as `ask_user_question`; the unchecked `exit_plan_mode` path runs in-turn and should reuse the `Session`'s stored client when no explicit client is passed.
-- `AskUserClientFactory` and `AskUserClient` are concrete cloneable callback wrappers. The factory remains the boundary for producing thread-scoped `ask_user_question` clients when root, resumed, and spawned child threads are created inside core, while avoiding app-server request plumbing in core/tools.
+- `AskUserClient` is a concrete cloneable callback wrapper shared by root, resumed, and spawned child threads. `ask` routes from `AskUserQuestionParams.thread_id` to avoid duplicate thread identity at the call boundary; `abort_pending_server_requests` still takes `ThreadId` for cancellation. No separate ask-user client factory or thread-scoped outgoing sender wrapper is needed. Keep the stored client on `Core::Session`; `CoreThread` should not duplicate it.
 
 ## Error Handling
 

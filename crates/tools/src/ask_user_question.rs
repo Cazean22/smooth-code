@@ -210,7 +210,7 @@ mod tests {
                 let result = result.clone();
                 async move { result }
             },
-            || async {},
+            |_thread_id| async {},
         );
         (client, last_params)
     }

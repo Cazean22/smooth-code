@@ -450,18 +450,13 @@ impl Session {
     /// while a tool call is in flight. Use [`Self::apply_plan_mode_unchecked`]
     /// from within the tool loop itself (where holding `active_turn` is a
     /// pre-condition, not a conflict).
-    pub(crate) async fn apply_plan_mode(
-        self: &Arc<Self>,
-        enabled: bool,
-        ask_user_client: Option<AskUserClient>,
-    ) -> CoreResult<bool> {
+    pub(crate) async fn apply_plan_mode(self: &Arc<Self>, enabled: bool) -> CoreResult<bool> {
         if self.active_turn.lock().await.is_some() {
             return Err(CoreError::invariant(
                 "cannot toggle plan mode while a turn is in flight",
             ));
         }
-        self.apply_plan_mode_unchecked(enabled, ask_user_client)
-            .await
+        self.apply_plan_mode_unchecked(enabled).await
     }
 
     /// Rebuild + swap without the in-turn guard. Used by the `exit_plan_mode`
@@ -470,20 +465,18 @@ impl Session {
     pub(crate) async fn apply_plan_mode_unchecked(
         self: &Arc<Self>,
         enabled: bool,
-        ask_user_client: Option<AskUserClient>,
     ) -> CoreResult<bool> {
         if self.plan_mode() == enabled {
             return Ok(enabled);
         }
         let cwd = std::env::current_dir()?;
         let role_override = crate::agent::role::role_override_from_source(&self.session_source);
-        let ask_user_client = ask_user_client.or_else(|| self.ask_user_client.clone());
         let new_model = self
             .model_factory
             .build(
                 cwd,
                 self.id,
-                ask_user_client,
+                self.ask_user_client.clone(),
                 Arc::clone(&self.current_turn_id),
                 role_override,
                 self.agent_control.clone(),
@@ -502,7 +495,7 @@ impl Session {
 
     pub(crate) async fn abort_pending_server_requests(&self) {
         if let Some(ask_user_client) = &self.ask_user_client {
-            ask_user_client.abort_pending_server_requests().await;
+            ask_user_client.abort_pending_server_requests(self.id).await;
         }
     }
 
@@ -584,7 +577,7 @@ mod tests {
                     answers: Vec::new(),
                 })
             },
-            || async {},
+            |_thread_id| async {},
         )
     }
 
@@ -682,7 +675,7 @@ mod tests {
             factory,
         );
 
-        core.session.apply_plan_mode_unchecked(false, None).await?;
+        core.session.apply_plan_mode_unchecked(false).await?;
 
         assert_eq!(
             *calls

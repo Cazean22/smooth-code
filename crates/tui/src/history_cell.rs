@@ -8,12 +8,6 @@ use crate::{diff_render::create_diff_summary, wrap};
 
 pub(crate) type TranscriptItemId = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum TranscriptDetailMode {
-    Inline,
-    Detail,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptItem {
     id: TranscriptItemId,
@@ -112,11 +106,7 @@ impl TranscriptItem {
         self.version
     }
 
-    pub(crate) fn display_lines(
-        &self,
-        width: u16,
-        detail_mode: TranscriptDetailMode,
-    ) -> Vec<Line<'static>> {
+    pub(crate) fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         match &self.kind {
             TranscriptItemKind::User { message } => wrap_display(
                 prefix_multiline_text(message, "› ".cyan().bold(), "  ".cyan()),
@@ -151,14 +141,7 @@ impl TranscriptItem {
                 )
             }
             TranscriptItemKind::Plain { lines } => wrap_display(lines.clone(), width),
-            TranscriptItemKind::Patch { file_change } => match detail_mode {
-                TranscriptDetailMode::Inline => {
-                    let mut lines = create_diff_summary(file_change, width);
-                    lines.truncate(2);
-                    lines
-                }
-                TranscriptDetailMode::Detail => create_diff_summary(file_change, width),
-            },
+            TranscriptItemKind::Patch { file_change } => create_diff_summary(file_change, width),
             TranscriptItemKind::ToolCallGroup(cell) => {
                 wrap::wrap_lines_char(cell.display_lines(), usize::from(width.max(1)))
             }
@@ -175,13 +158,6 @@ impl TranscriptItem {
     pub(crate) fn replace_with_patch(&mut self, file_change: FileChangeOutput) {
         self.kind = TranscriptItemKind::Patch { file_change };
         self.version = self.version.saturating_add(1);
-    }
-
-    pub(crate) fn patch_change(&self) -> Option<&FileChangeOutput> {
-        match &self.kind {
-            TranscriptItemKind::Patch { file_change } => Some(file_change),
-            _ => None,
-        }
     }
 
     pub(crate) fn mark_mutated(&mut self) {

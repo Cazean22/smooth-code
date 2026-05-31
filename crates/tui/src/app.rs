@@ -21,9 +21,7 @@ use smooth_protocol::{
 use crate::{
     AppTerminal,
     app_server_session::AppServerSession,
-    history_cell::{
-        ToolCallGroupCell, ToolCallState, TranscriptDetailMode, TranscriptItem, TranscriptItemId,
-    },
+    history_cell::{ToolCallGroupCell, ToolCallState, TranscriptItem, TranscriptItemId},
     question_picker::{PickerOutcome, QuestionPicker},
     streaming::StreamController,
 };
@@ -359,7 +357,6 @@ struct UiModel {
     dashboard: DashboardState,
     running_tools: HashMap<String, RunningToolInfo>,
     recent_file_changes: Vec<FileChangeOutput>,
-    selected_item: Option<usize>,
     render_cache: RenderedTranscriptCache,
     // Active (in-flight) assistant/reasoning streams are not in `render_cache`
     // (they mutate every delta). `active_version` bumps on every change to the
@@ -410,7 +407,6 @@ impl UiModel {
             dashboard: DashboardState::default(),
             running_tools: HashMap::new(),
             recent_file_changes: Vec::new(),
-            selected_item: None,
             render_cache: RenderedTranscriptCache::default(),
             active_version: 0,
             active_wrap: None,
@@ -1293,18 +1289,12 @@ impl UiModel {
         let reasoning = self
             .active_reasoning_lines
             .as_ref()
-            .map(|lines| {
-                TranscriptItem::reasoning(0, lines.clone(), true)
-                    .display_lines(width, TranscriptDetailMode::Inline)
-            })
+            .map(|lines| TranscriptItem::reasoning(0, lines.clone(), true).display_lines(width))
             .unwrap_or_default();
         let assistant = self
             .active_assistant_lines
             .as_ref()
-            .map(|lines| {
-                TranscriptItem::assistant(0, lines.clone(), true)
-                    .display_lines(width, TranscriptDetailMode::Inline)
-            })
+            .map(|lines| TranscriptItem::assistant(0, lines.clone(), true).display_lines(width))
             .unwrap_or_default();
         self.active_wrap = Some(ActiveWrap {
             width,
@@ -1381,7 +1371,6 @@ impl UiModel {
 
     fn push_history(&mut self, item: TranscriptItem) {
         self.pending_tool_group = None;
-        self.selected_item = Some(self.transcript_items.len());
         self.transcript_items.push(item);
     }
 
@@ -1402,7 +1391,6 @@ impl UiModel {
         self.transcript_items
             .push(TranscriptItem::tool_group(id, cell));
         self.pending_tool_group = Some((cell_idx, tool_name));
-        self.selected_item = Some(cell_idx);
         cell_idx
     }
 
@@ -1436,7 +1424,6 @@ impl UiModel {
 
         if self.tool_group_mut(cell_idx).entry_count() == 1 {
             self.transcript_items[cell_idx].replace_with_patch(file_change);
-            self.selected_item = Some(cell_idx);
             if self
                 .pending_tool_group
                 .as_ref()
@@ -1488,7 +1475,6 @@ impl UiModel {
         self.pending_tool_group = None;
         self.running_tools.clear();
         self.recent_file_changes.clear();
-        self.selected_item = None;
         self.scroll = 0;
         self.auto_scroll = true;
         self.render_cache.clear();
@@ -1512,7 +1498,7 @@ impl UiModel {
             if idx > 0 {
                 lines.push(Line::default());
             }
-            lines.extend(item.display_lines(width, TranscriptDetailMode::Inline));
+            lines.extend(item.display_lines(width));
         }
         self.append_active_lines(&mut lines, width);
         if lines.is_empty() {
@@ -1536,17 +1522,13 @@ impl UiModel {
                 append_visible_line(&mut lines, Line::default(), all_rows, start, end);
                 all_rows += 1;
             }
-            let item_height =
-                self.render_cache
-                    .item_height(item, width, TranscriptDetailMode::Inline);
+            let item_height = self.render_cache.item_height(item, width);
             if all_rows >= end || all_rows.saturating_add(item_height) <= start {
                 all_rows = all_rows.saturating_add(item_height);
                 continue;
             }
 
-            let item_lines =
-                self.render_cache
-                    .item_lines(item, width, TranscriptDetailMode::Inline);
+            let item_lines = self.render_cache.item_lines(item, width);
             for line in item_lines {
                 append_visible_line(&mut lines, line, all_rows, start, end);
                 all_rows += 1;
@@ -1591,14 +1573,14 @@ impl UiModel {
                 lines.push(Line::default());
             }
             let item = TranscriptItem::reasoning(0, active_lines.clone(), true);
-            lines.extend(item.display_lines(width, TranscriptDetailMode::Inline));
+            lines.extend(item.display_lines(width));
         }
         if let Some(active_lines) = self.active_assistant_lines.as_ref() {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
             let item = TranscriptItem::assistant(0, active_lines.clone(), true);
-            lines.extend(item.display_lines(width, TranscriptDetailMode::Inline));
+            lines.extend(item.display_lines(width));
         }
     }
 
@@ -1616,9 +1598,7 @@ impl UiModel {
             if idx > 0 {
                 rows += 1;
             }
-            rows += self
-                .render_cache
-                .item_height(item, width, TranscriptDetailMode::Inline);
+            rows += self.render_cache.item_height(item, width);
         }
 
         self.refresh_active_wrap(width);
@@ -1872,25 +1852,6 @@ impl UiModel {
             }
         }
 
-        if let Some(item) = self
-            .selected_item
-            .and_then(|idx| self.transcript_items.get(idx))
-            && item.patch_change().is_some()
-        {
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Selected Diff",
-                Style::default().bold(),
-            )));
-            for line in item
-                .display_lines(area.width.saturating_sub(2), TranscriptDetailMode::Detail)
-                .into_iter()
-                .take(area.height.saturating_sub(10) as usize)
-            {
-                lines.push(line);
-            }
-        }
-
         frame.render_widget(
             Paragraph::new(lines)
                 .block(Block::default().title("Inspector").borders(Borders::ALL))
@@ -2074,7 +2035,6 @@ struct RenderCacheKey {
     item_id: TranscriptItemId,
     version: u64,
     width: u16,
-    detail_mode: TranscriptDetailMode,
 }
 
 /// Wrapped active assistant/reasoning streams cached for one `(width, version)`.
@@ -2098,40 +2058,24 @@ struct CachedRenderedRows {
 }
 
 impl RenderedTranscriptCache {
-    fn item_lines(
-        &mut self,
-        item: &TranscriptItem,
-        width: u16,
-        detail_mode: TranscriptDetailMode,
-    ) -> Vec<Line<'static>> {
-        self.item_entry(item, width, detail_mode).lines.clone()
+    fn item_lines(&mut self, item: &TranscriptItem, width: u16) -> Vec<Line<'static>> {
+        self.item_entry(item, width).lines.clone()
     }
 
-    fn item_height(
-        &mut self,
-        item: &TranscriptItem,
-        width: u16,
-        detail_mode: TranscriptDetailMode,
-    ) -> usize {
-        self.item_entry(item, width, detail_mode).lines.len()
+    fn item_height(&mut self, item: &TranscriptItem, width: u16) -> usize {
+        self.item_entry(item, width).lines.len()
     }
 
-    fn item_entry(
-        &mut self,
-        item: &TranscriptItem,
-        width: u16,
-        detail_mode: TranscriptDetailMode,
-    ) -> &CachedRenderedRows {
+    fn item_entry(&mut self, item: &TranscriptItem, width: u16) -> &CachedRenderedRows {
         let key = RenderCacheKey {
             item_id: item.id(),
             version: item.version(),
             width,
-            detail_mode,
         };
         self.entries
             .entry(key)
             .or_insert_with(|| CachedRenderedRows {
-                lines: item.display_lines(width, detail_mode),
+                lines: item.display_lines(width),
             })
     }
 
@@ -2519,7 +2463,7 @@ mod tests {
     }
 
     #[test]
-    fn file_change_completion_renders_concise_inline_summary() {
+    fn file_change_completion_renders_diff_in_transcript() {
         let mut app = App::new();
 
         start_turn(&mut app);
@@ -2551,9 +2495,19 @@ mod tests {
         let joined = transcript_strings(&app).join("\n");
         assert!(joined.contains("• Edited 1 file (+1 -1)"));
         assert!(joined.contains("src/lib.rs (+1 -1)"));
-        assert!(!joined.contains("1 - old"));
+        assert!(joined.contains("1 - old"));
+        assert!(joined.contains("1 + new"));
         assert!(!joined.contains("✓ edit src/lib.rs"));
         assert_eq!(app.model.recent_file_changes.len(), 1);
+
+        app.model.screen = Screen::Workspace;
+        app.model.focus = FocusTarget::Transcript;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        let rendered = rendered_buffer_text(&terminal);
+        assert!(rendered.contains("1 - old"), "{rendered}");
+        assert!(rendered.contains("1 + new"), "{rendered}");
+        assert!(!rendered.contains("Selected Diff"), "{rendered}");
     }
 
     #[test]

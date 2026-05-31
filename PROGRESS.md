@@ -35,7 +35,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - Successful `delete`, `edit`, and `write` tools can carry structured `FileChangeOutput` metadata through `ToolCallCompletedEvent.file_change`; core decodes this metadata before sending tool results back to the model so model-visible output remains the concise success message.
 - The TUI replaces a single completed file-mutating tool row with a patch transcript item and Codex-style diff summary; grouped file tool calls keep their group row and append the diff item so other entries are not lost.
 - The first Smooth diff renderer intentionally omits Codex's syntax-highlighting/theme stack and uses `diffy` plus ratatui styles for line counts, gutters, hunk separators, and red/green insert/delete cues.
-- After the reducer rewrite, committed file changes render as concise inline transcript summaries; full diff details remain available from the inspector/detail rendering path using the same bounded `FileChangeOutput` renderer.
+- File-change transcript items render the full bounded diff/result in the transcript widget; the inspector should stay an overview surface (turn/mode/running tools/recent file changes) rather than the primary place to read edit/write/delete results.
 
 ## TUI Architecture
 

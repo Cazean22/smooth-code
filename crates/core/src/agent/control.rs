@@ -52,7 +52,7 @@ pub(crate) type InlineChildCompletionReceiver = oneshot::Receiver<InlineChildCom
 #[derive(Clone)]
 struct AgentControlRuntime {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
-    ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
+    ask_user_client_factory: Option<AskUserClientFactory>,
     model_factory: Option<Arc<dyn SessionModelFactory>>,
     state_db: StateDbHandle,
 }
@@ -72,7 +72,7 @@ impl AgentControl {
     pub(crate) fn attach_runtime(
         &self,
         threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
-        ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
+        ask_user_client_factory: Option<AskUserClientFactory>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         state_db: StateDbHandle,
     ) -> CoreResult<()> {
@@ -716,7 +716,7 @@ mod tests {
             &self,
             _cwd: PathBuf,
             thread_id: ThreadId,
-            _ask_user_client: Option<Arc<dyn AskUserClient>>,
+            _ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
@@ -765,7 +765,7 @@ mod tests {
             &self,
             _cwd: PathBuf,
             thread_id: ThreadId,
-            _ask_user_client: Option<Arc<dyn AskUserClient>>,
+            _ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,
@@ -790,7 +790,7 @@ mod tests {
             &self,
             _cwd: PathBuf,
             thread_id: ThreadId,
-            _ask_user_client: Option<Arc<dyn AskUserClient>>,
+            _ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,

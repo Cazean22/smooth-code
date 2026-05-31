@@ -5,7 +5,6 @@ use app_server_protocol::{
     ServerRequestPayload, SetPlanModeResponse, ThreadListItem, ThreadListResponse,
     ThreadResumeResponse, ThreadStartResponse, TurnStartResponse,
 };
-use futures_util::future::BoxFuture;
 use smooth_core::{AskUserClient, AskUserClientFactory, ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
@@ -24,59 +23,46 @@ pub(crate) struct CoreMessageProcessor {
     subscribed_threads: Mutex<HashSet<ThreadId>>,
 }
 
-struct InProcessAskUserClientFactory {
-    outgoing: Arc<OutgoingMessageSender>,
-}
-
-struct InProcessAskUserClient {
-    outgoing: ThreadScopedOutgoingMessageSender,
-}
-
-impl AskUserClientFactory for InProcessAskUserClientFactory {
-    fn build(&self, thread_id: ThreadId) -> Arc<dyn AskUserClient> {
-        Arc::new(InProcessAskUserClient {
-            outgoing: ThreadScopedOutgoingMessageSender::new(Arc::clone(&self.outgoing), thread_id),
-        })
-    }
-}
-
-impl AskUserClient for InProcessAskUserClient {
-    fn ask(
-        &self,
-        params: AskUserQuestionParams,
-    ) -> BoxFuture<'static, Result<AskUserQuestionResponse, JsonRpcError>> {
-        let outgoing = self.outgoing.clone();
-        Box::pin(async move {
-            let (_, response_rx) = outgoing
-                .send_request(ServerRequestPayload::AskUserQuestion(params))
-                .await;
-            let value = match response_rx.await {
-                Ok(Ok(value)) => value,
-                Ok(Err(err)) => return Err(err),
-                Err(err) => {
-                    return Err(JsonRpcError::message_only(
-                        SERVER_ERROR_CODE,
-                        "server_request_waiter_closed",
-                        err.to_string(),
-                    ));
+fn ask_user_client_factory(outgoing: Arc<OutgoingMessageSender>) -> AskUserClientFactory {
+    AskUserClientFactory::new(move |thread_id| {
+        let outgoing = ThreadScopedOutgoingMessageSender::new(Arc::clone(&outgoing), thread_id);
+        let ask_outgoing = outgoing.clone();
+        let abort_outgoing = outgoing;
+        AskUserClient::new(
+            move |params: AskUserQuestionParams| {
+                let outgoing = ask_outgoing.clone();
+                async move {
+                    let (_, response_rx) = outgoing
+                        .send_request(ServerRequestPayload::AskUserQuestion(params))
+                        .await;
+                    let value = match response_rx.await {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(err)) => return Err(err),
+                        Err(err) => {
+                            return Err(JsonRpcError::message_only(
+                                SERVER_ERROR_CODE,
+                                "server_request_waiter_closed",
+                                err.to_string(),
+                            ));
+                        }
+                    };
+                    serde_json::from_value::<AskUserQuestionResponse>(value).map_err(|err| {
+                        JsonRpcError::message_only(
+                            INTERNAL_ERROR_CODE,
+                            "invalid_ask_user_question_response",
+                            format!("invalid ask_user_question response: {err}"),
+                        )
+                    })
                 }
-            };
-            serde_json::from_value::<AskUserQuestionResponse>(value).map_err(|err| {
-                JsonRpcError::message_only(
-                    INTERNAL_ERROR_CODE,
-                    "invalid_ask_user_question_response",
-                    format!("invalid ask_user_question response: {err}"),
-                )
-            })
-        })
-    }
-
-    fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()> {
-        let outgoing = self.outgoing.clone();
-        Box::pin(async move {
-            outgoing.abort_pending_server_requests().await;
-        })
-    }
+            },
+            move || {
+                let outgoing = abort_outgoing.clone();
+                async move {
+                    outgoing.abort_pending_server_requests().await;
+                }
+            },
+        )
+    })
 }
 
 impl CoreMessageProcessor {
@@ -84,10 +70,8 @@ impl CoreMessageProcessor {
         event_tx: mpsc::Sender<InProcessServerEvent>,
         outgoing: Arc<OutgoingMessageSender>,
     ) -> AppServerResult<Self> {
-        let ask_user_client_factory: Arc<dyn AskUserClientFactory> =
-            Arc::new(InProcessAskUserClientFactory { outgoing });
         Ok(Self {
-            threads: ThreadManagerState::new(Some(ask_user_client_factory), None).await?,
+            threads: ThreadManagerState::new(Some(ask_user_client_factory(outgoing)), None).await?,
             event_tx,
             subscribed_threads: Mutex::new(HashSet::new()),
         })

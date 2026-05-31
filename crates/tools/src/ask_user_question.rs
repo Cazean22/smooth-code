@@ -63,14 +63,14 @@ pub struct AskUserQuestionOptionInput {
 #[derive(Clone)]
 pub struct AskUserQuestionTool {
     thread_id: smooth_protocol::ThreadId,
-    client: Arc<dyn AskUserClient>,
+    client: AskUserClient,
     current_turn_id: Arc<RwLock<Option<String>>>,
 }
 
 impl AskUserQuestionTool {
     pub fn new(
         thread_id: smooth_protocol::ThreadId,
-        client: Arc<dyn AskUserClient>,
+        client: AskUserClient,
         current_turn_id: Arc<RwLock<Option<String>>>,
     ) -> Self {
         Self {
@@ -190,53 +190,43 @@ fn format_tool_result(response: &AskUserQuestionResponse) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use app_server_protocol::{AskUserQuestionAnswer, JsonRpcError};
-    use futures_util::future::BoxFuture;
     use smooth_protocol::ErrorInfo;
 
     use super::*;
 
-    struct StubAskUserClient {
-        last_params: Mutex<Option<AskUserQuestionParams>>,
+    fn stub_client(
         result: Result<AskUserQuestionResponse, JsonRpcError>,
+    ) -> (AskUserClient, Arc<Mutex<Option<AskUserQuestionParams>>>) {
+        let last_params = Arc::new(Mutex::new(None));
+        let recorded_params = Arc::clone(&last_params);
+        let client = AskUserClient::new(
+            move |params| {
+                if let Ok(mut last_params) = recorded_params.lock() {
+                    *last_params = Some(params);
+                }
+                let result = result.clone();
+                async move { result }
+            },
+            || async {},
+        );
+        (client, last_params)
     }
 
-    impl StubAskUserClient {
-        fn ok(response: AskUserQuestionResponse) -> Self {
-            Self {
-                last_params: Mutex::new(None),
-                result: Ok(response),
-            }
-        }
-
-        fn err(message: &str) -> Self {
-            Self {
-                last_params: Mutex::new(None),
-                result: Err(JsonRpcError::new(
-                    -32001,
-                    ErrorInfo::new("client_error", message).with_source("test"),
-                )),
-            }
-        }
+    fn ok_client(
+        response: AskUserQuestionResponse,
+    ) -> (AskUserClient, Arc<Mutex<Option<AskUserQuestionParams>>>) {
+        stub_client(Ok(response))
     }
 
-    impl AskUserClient for StubAskUserClient {
-        fn ask(
-            &self,
-            params: AskUserQuestionParams,
-        ) -> BoxFuture<'static, Result<AskUserQuestionResponse, JsonRpcError>> {
-            if let Ok(mut last_params) = self.last_params.lock() {
-                *last_params = Some(params);
-            }
-            let result = self.result.clone();
-            Box::pin(async move { result })
-        }
-
-        fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()> {
-            Box::pin(async {})
-        }
+    fn err_client(message: &str) -> AskUserClient {
+        stub_client(Err(JsonRpcError::new(
+            -32001,
+            ErrorInfo::new("client_error", message).with_source("test"),
+        )))
+        .0
     }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -265,16 +255,16 @@ mod tests {
 
     #[tokio::test]
     async fn formats_single_select_answer() -> TestResult {
-        let stub = Arc::new(StubAskUserClient::ok(AskUserQuestionResponse {
+        let (client, last_params) = ok_client(AskUserQuestionResponse {
             answers: vec![AskUserQuestionAnswer {
                 question: "Which database?".to_string(),
                 selected: vec!["Postgres".to_string()],
                 preview: None,
             }],
-        }));
+        });
         let tool = AskUserQuestionTool::new(
             smooth_protocol::ThreadId::new(),
-            stub.clone(),
+            client,
             Arc::new(RwLock::new(Some("turn-1".to_string()))),
         );
 
@@ -283,8 +273,7 @@ mod tests {
             out,
             "User has answered your questions: \"Which database?\"=\"Postgres\", . You can now continue with the user's answers in mind."
         );
-        let params = stub
-            .last_params
+        let params = last_params
             .lock()
             .map_err(|_| std::io::Error::other("stub params mutex should lock"))?
             .clone()
@@ -296,16 +285,16 @@ mod tests {
 
     #[tokio::test]
     async fn formats_multi_select_answer_with_preview() -> TestResult {
-        let stub = Arc::new(StubAskUserClient::ok(AskUserQuestionResponse {
+        let (client, _) = ok_client(AskUserQuestionResponse {
             answers: vec![AskUserQuestionAnswer {
                 question: "Pick frameworks".to_string(),
                 selected: vec!["React".to_string(), "Vue".to_string()],
                 preview: Some("<App/>".to_string()),
             }],
-        }));
+        });
         let tool = AskUserQuestionTool::new(
             smooth_protocol::ThreadId::new(),
-            stub,
+            client,
             Arc::new(RwLock::new(Some("turn-2".to_string()))),
         );
 
@@ -319,12 +308,10 @@ mod tests {
 
     #[tokio::test]
     async fn fails_without_active_turn() -> TestResult {
-        let stub = Arc::new(StubAskUserClient::ok(AskUserQuestionResponse {
-            answers: vec![],
-        }));
+        let (client, _) = ok_client(AskUserQuestionResponse { answers: vec![] });
         let tool = AskUserQuestionTool::new(
             smooth_protocol::ThreadId::new(),
-            stub,
+            client,
             Arc::new(RwLock::new(None)),
         );
 
@@ -337,10 +324,10 @@ mod tests {
 
     #[tokio::test]
     async fn surfaces_client_error_as_tool_failure() -> TestResult {
-        let stub = Arc::new(StubAskUserClient::err("user declined to answer"));
+        let client = err_client("user declined to answer");
         let tool = AskUserQuestionTool::new(
             smooth_protocol::ThreadId::new(),
-            stub,
+            client,
             Arc::new(RwLock::new(Some("turn-3".to_string()))),
         );
 

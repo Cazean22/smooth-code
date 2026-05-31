@@ -35,7 +35,7 @@ pub struct ResumedThread {
 
 pub struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
-    ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
+    ask_user_client_factory: Option<AskUserClientFactory>,
     model_factory: Option<Arc<dyn SessionModelFactory>>,
     agent_control: AgentControl,
     state_db: StateDbHandle,
@@ -43,7 +43,7 @@ pub struct ThreadManagerState {
 
 impl ThreadManagerState {
     pub async fn new(
-        ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
+        ask_user_client_factory: Option<AskUserClientFactory>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
     ) -> CoreResult<Self> {
         let threads = Arc::new(RwLock::new(HashMap::new()));
@@ -251,7 +251,7 @@ impl ThreadManagerState {
             .ok_or(CoreError::UnknownThread { thread_id })
     }
 
-    fn ask_user_client(&self, thread_id: ThreadId) -> Option<Arc<dyn AskUserClient>> {
+    fn ask_user_client(&self, thread_id: ThreadId) -> Option<AskUserClient> {
         self.ask_user_client_factory
             .as_ref()
             .map(|factory| factory.build(thread_id))
@@ -502,7 +502,7 @@ mod tests {
             &self,
             _cwd: PathBuf,
             _thread_id: ThreadId,
-            _ask_user_client: Option<Arc<dyn AskUserClient>>,
+            _ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: RoleOverride,
             _agent_control: AgentControl,

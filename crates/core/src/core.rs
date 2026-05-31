@@ -43,7 +43,7 @@ pub(crate) struct Session {
     pub(crate) agent_control: AgentControl,
     current_turn_id: Arc<RwLock<Option<String>>>,
     #[allow(dead_code)]
-    ask_user_client: Option<Arc<dyn AskUserClient>>,
+    ask_user_client: Option<AskUserClient>,
     next_internal_sub_id: AtomicU64,
     model: Mutex<SessionModel>,
     plan_mode: AtomicBool,
@@ -69,7 +69,7 @@ impl Core {
         next_internal_sub_id: u64,
         rollout: RolloutRecorder,
         current_turn_id: Arc<RwLock<Option<String>>>,
-        ask_user_client: Option<Arc<dyn AskUserClient>>,
+        ask_user_client: Option<AskUserClient>,
         session_source: SessionSource,
         agent_control: AgentControl,
         plan_mode: bool,
@@ -453,7 +453,7 @@ impl Session {
     pub(crate) async fn apply_plan_mode(
         self: &Arc<Self>,
         enabled: bool,
-        ask_user_client: Option<Arc<dyn AskUserClient>>,
+        ask_user_client: Option<AskUserClient>,
     ) -> CoreResult<bool> {
         if self.active_turn.lock().await.is_some() {
             return Err(CoreError::invariant(
@@ -470,7 +470,7 @@ impl Session {
     pub(crate) async fn apply_plan_mode_unchecked(
         self: &Arc<Self>,
         enabled: bool,
-        ask_user_client: Option<Arc<dyn AskUserClient>>,
+        ask_user_client: Option<AskUserClient>,
     ) -> CoreResult<bool> {
         if self.plan_mode() == enabled {
             return Ok(enabled);
@@ -530,8 +530,6 @@ mod tests {
     };
 
     use anyhow::Result;
-    use app_server_protocol::{AskUserQuestionParams, AskUserQuestionResponse, JsonRpcError};
-    use futures_util::future::BoxFuture;
     use rig::message::Message;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
@@ -565,7 +563,7 @@ mod tests {
             &self,
             _cwd: PathBuf,
             _thread_id: smooth_protocol::ThreadId,
-            ask_user_client: Option<Arc<dyn AskUserClient>>,
+            ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
             _role_override: crate::agent::role::RoleOverride,
             _agent_control: AgentControl,
@@ -579,24 +577,15 @@ mod tests {
         }
     }
 
-    struct StubAskUserClient;
-
-    impl AskUserClient for StubAskUserClient {
-        fn ask(
-            &self,
-            _params: AskUserQuestionParams,
-        ) -> BoxFuture<'static, std::result::Result<AskUserQuestionResponse, JsonRpcError>>
-        {
-            Box::pin(async {
-                Ok(AskUserQuestionResponse {
+    fn stub_ask_user_client() -> AskUserClient {
+        AskUserClient::new(
+            |_params| async {
+                Ok(app_server_protocol::AskUserQuestionResponse {
                     answers: Vec::new(),
                 })
-            })
-        }
-
-        fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()> {
-            Box::pin(async {})
-        }
+            },
+            || async {},
+        )
     }
 
     async fn test_core() -> Result<(
@@ -686,7 +675,7 @@ mod tests {
             0,
             rollout,
             current_turn_id,
-            Some(Arc::new(StubAskUserClient)),
+            Some(stub_ask_user_client()),
             SessionSource::Cli,
             AgentControl::new(),
             true,

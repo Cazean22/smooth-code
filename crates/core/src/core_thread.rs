@@ -18,7 +18,7 @@ use smooth_protocol::{Op, ThreadId};
 pub struct CoreThread {
     pub(crate) core: Core,
     rollout_path: PathBuf,
-    ask_user_client: Option<Arc<dyn AskUserClient>>,
+    ask_user_client: Option<AskUserClient>,
 }
 
 impl CoreThread {
@@ -29,7 +29,7 @@ impl CoreThread {
     )]
     pub(crate) async fn new(
         id: ThreadId,
-        ask_user_client: Option<Arc<dyn AskUserClient>>,
+        ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         agent_control: AgentControl,
@@ -57,7 +57,7 @@ impl CoreThread {
     )]
     pub(crate) async fn new_with_history(
         id: ThreadId,
-        ask_user_client: Option<Arc<dyn AskUserClient>>,
+        ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         agent_control: AgentControl,
@@ -127,7 +127,7 @@ impl CoreThread {
     pub(crate) async fn resume(
         path: PathBuf,
         state: ResumeState,
-        ask_user_client: Option<Arc<dyn AskUserClient>>,
+        ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         agent_control: AgentControl,

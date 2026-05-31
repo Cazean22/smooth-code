@@ -38,6 +38,7 @@ pub(crate) struct Session {
     event_tx: broadcast::Sender<Event>,
     state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    turn_closed: tokio::sync::Notify,
     #[allow(dead_code)]
     pub(crate) session_source: SessionSource,
     pub(crate) agent_control: AgentControl,
@@ -83,6 +84,7 @@ impl Core {
             event_tx,
             state: Mutex::new(SessionState::new(context_manager)),
             active_turn: Mutex::new(None),
+            turn_closed: tokio::sync::Notify::new(),
             session_source,
             agent_control,
             current_turn_id,
@@ -107,11 +109,14 @@ impl Core {
                 Ok(sub_id)
             }
             Op::Interrupt => {
-                self.session.abort_all_tasks("interrupted").await;
-                self.session
-                    .set_agent_status(AgentStatus::Interrupted, None)
-                    .await;
-                Ok("interrupted".to_string())
+                if self.session.abort_all_tasks("interrupted").await {
+                    self.session
+                        .set_agent_status(AgentStatus::Interrupted, None)
+                        .await;
+                    Ok("interrupted".to_string())
+                } else {
+                    Ok("idle".to_string())
+                }
             }
             Op::Shutdown => {
                 self.session.abort_all_tasks("shutdown").await;
@@ -174,7 +179,9 @@ impl Session {
         task_kind: crate::state::TaskKind,
     ) -> BoxFuture<'_, CoreResult<()>> {
         Box::pin(async move {
+            self.wait_for_finishing_turn().await;
             self.abort_all_tasks("replaced").await;
+            self.wait_for_finishing_turn().await;
             let cancellation_token = tokio_util::sync::CancellationToken::new();
             let done = Arc::new(tokio::sync::Notify::new());
             let sess = Arc::clone(self);
@@ -183,18 +190,8 @@ impl Session {
             let ctx_for_runner = Arc::clone(&turn_context);
             let done_for_runner = Arc::clone(&done);
             let cancellation_for_runner = cancellation_token.clone();
-
-            self.emit_event(
-                &turn_context,
-                EventMsg::TurnStarted(TurnStartedEvent {
-                    thread_id: self.id.to_string(),
-                    turn_id: turn_context.sub_id.clone(),
-                }),
-            )
-            .await;
-            *self.current_turn_id.write().await = Some(turn_context.sub_id.clone());
-            self.set_agent_status(AgentStatus::Running, Some(turn_context.as_ref()))
-                .await;
+            let start_gate = Arc::new(tokio::sync::Notify::new());
+            let start_gate_for_runner = Arc::clone(&start_gate);
 
             let task_span = tracing::info_span!(
                 "core.session_task",
@@ -207,6 +204,7 @@ impl Session {
                 .name(task_name)
                 .spawn(
                     async move {
+                        start_gate_for_runner.notified().await;
                         let result = task_for_runner
                             .run(
                                 Arc::clone(&sess),
@@ -216,21 +214,41 @@ impl Session {
                             )
                             .await;
 
+                        let (removed_task, active_turn_empty) = {
+                            let mut active_turn = sess.active_turn.lock().await;
+                            if let Some(turn) = active_turn.as_mut() {
+                                let removed_task = turn.take_task(&ctx_for_runner.sub_id);
+                                let active_turn_empty = turn.is_empty();
+                                (removed_task, active_turn_empty)
+                            } else {
+                                (None, false)
+                            }
+                        };
+                        let task_was_active = removed_task.is_some();
+
                         if cancellation_for_runner.is_cancelled() {
-                            sess.set_agent_status(
-                                AgentStatus::Interrupted,
-                                Some(ctx_for_runner.as_ref()),
-                            )
-                            .await;
-                            sess.emit_event(
-                                &ctx_for_runner,
-                                EventMsg::TurnInterrupted(TurnInterruptedEvent {
-                                    thread_id: sess.id.to_string(),
-                                    turn_id: ctx_for_runner.sub_id.clone(),
-                                    reason: "cancelled".to_string(),
-                                }),
-                            )
-                            .await;
+                            if task_was_active {
+                                sess.set_agent_status(
+                                    AgentStatus::Interrupted,
+                                    Some(ctx_for_runner.as_ref()),
+                                )
+                                .await;
+                                sess.emit_event(
+                                    &ctx_for_runner,
+                                    EventMsg::TurnInterrupted(TurnInterruptedEvent {
+                                        thread_id: sess.id.to_string(),
+                                        turn_id: ctx_for_runner.sub_id.clone(),
+                                        reason: "cancelled".to_string(),
+                                    }),
+                                )
+                                .await;
+                            } else {
+                                tracing::debug!(
+                                    thread_id = %sess.id,
+                                    turn_id = %ctx_for_runner.sub_id,
+                                    "cancelled task ended after active turn was already drained; suppressing duplicate interruption event"
+                                );
+                            }
                         } else if let Some(last_assistant_message) = result {
                             sess.set_agent_status(
                                 AgentStatus::Completed(Some(last_assistant_message.clone())),
@@ -288,16 +306,16 @@ impl Session {
                             }
                         }
 
-                        let mut active_turn = sess.active_turn.lock().await;
-                        if let Some(turn) = active_turn.as_mut()
-                            && turn.remove_task(&ctx_for_runner.sub_id)
-                        {
-                            *active_turn = None;
-                            *sess.current_turn_id.write().await = None;
+                        if active_turn_empty {
+                            let mut active_turn = sess.active_turn.lock().await;
+                            if active_turn.as_ref().is_some_and(ActiveTurn::is_empty) {
+                                *active_turn = None;
+                                *sess.current_turn_id.write().await = None;
+                                sess.turn_closed.notify_waiters();
+                            }
                         }
-                        drop(active_turn);
-
                         done_for_runner.notify_waiters();
+                        drop(removed_task);
                     }
                     .instrument(task_span),
                 ) {
@@ -331,18 +349,36 @@ impl Session {
             let mut active_turn = self.active_turn.lock().await;
             let turn = active_turn.get_or_insert_with(ActiveTurn::default);
             turn.add_task(running_task);
+            self.emit_event(
+                &turn_context,
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    thread_id: self.id.to_string(),
+                    turn_id: turn_context.sub_id.clone(),
+                }),
+            )
+            .await;
+            *self.current_turn_id.write().await = Some(turn_context.sub_id.clone());
+            self.set_agent_status(AgentStatus::Running, Some(turn_context.as_ref()))
+                .await;
+            drop(active_turn);
+            start_gate.notify_one();
             Ok(())
         })
     }
 
     #[tracing::instrument(name = "core.session.abort_all_tasks", skip(self), fields(thread_id = %self.id, reason))]
-    pub(crate) async fn abort_all_tasks(self: &Arc<Self>, reason: &str) {
+    pub(crate) async fn abort_all_tasks(self: &Arc<Self>, reason: &str) -> bool {
         let drained = {
             let mut active_turn = self.active_turn.lock().await;
-            active_turn.take().map(|mut turn| turn.drain_tasks())
+            if active_turn.as_ref().is_some_and(ActiveTurn::is_empty) {
+                None
+            } else {
+                active_turn.take().map(|mut turn| turn.drain_tasks())
+            }
         };
 
         if let Some(tasks) = drained {
+            let interrupted = !tasks.is_empty();
             *self.current_turn_id.write().await = None;
             for task in tasks {
                 task.cancellation_token.cancel();
@@ -359,6 +395,22 @@ impl Session {
                 )
                 .await;
             }
+            self.turn_closed.notify_waiters();
+            return interrupted;
+        }
+        false
+    }
+
+    async fn wait_for_finishing_turn(&self) {
+        loop {
+            let notified = self.turn_closed.notified();
+            {
+                let active_turn = self.active_turn.lock().await;
+                if !active_turn.as_ref().is_some_and(ActiveTurn::is_empty) {
+                    return;
+                }
+            }
+            notified.await;
         }
     }
 
@@ -533,16 +585,55 @@ mod tests {
         agent::AgentControl,
         provider::{SessionModelFactory, stub_session_model_factory},
         rollout::RolloutRecorder,
+        state::TaskKind,
+        tasks::SessionTask,
     };
 
-    use super::Core;
-    use smooth_protocol::{AgentStatusChangedEvent, EventMsg, SessionSource};
+    use super::{Core, Session, TurnContext};
+    use smooth_protocol::{AgentStatus, AgentStatusChangedEvent, EventMsg, SessionSource};
+    use tokio_util::sync::CancellationToken;
 
     struct EmptyDriver;
 
     impl SessionModelDriver for EmptyDriver {
         fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-            Ok(Box::pin(futures_util::stream::empty()))
+            Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                crate::provider::SessionStreamEvent::StreamAssistantItem(
+                    crate::SessionAssistantContent::Text(rig::message::Text {
+                        text: "done".to_string(),
+                    }),
+                ),
+            )])))
+        }
+    }
+
+    struct CancellationAwareTask;
+
+    impl SessionTask for CancellationAwareTask {
+        fn kind(&self) -> TaskKind {
+            TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "test.cancellation_aware_task"
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _session: Arc<Session>,
+            _ctx: Arc<TurnContext>,
+            _input: Vec<String>,
+            cancellation_token: CancellationToken,
+        ) -> Option<String> {
+            let _ = self;
+            cancellation_token.cancelled().await;
+            None
+        }
+
+        async fn abort(&self, _session: Arc<Session>, _ctx: Arc<TurnContext>) {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -611,22 +702,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_interrupt_emits_interrupted_status() -> Result<()> {
+    async fn submit_interrupt_without_active_turn_is_noop() -> Result<()> {
         let (core, mut rx) = test_core().await?;
 
         let result = core.submit(smooth_protocol::Op::Interrupt).await?;
-        assert_eq!(result, "interrupted");
-
-        let event = rx.recv().await?;
-        assert_eq!(
-            event.msg,
-            EventMsg::AgentStatusChanged(AgentStatusChangedEvent {
-                thread_id: core.session.id.to_string(),
-                turn_id: None,
-                status: smooth_protocol::AgentStatus::Interrupted,
-            })
-        );
+        assert_eq!(result, "idle");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupt_emits_one_turn_interrupted_when_runner_observes_cancel() -> Result<()> {
+        let (core, mut rx) = test_core().await?;
+        let turn_context = Arc::new(core.session.fresh_turn_context());
+        let turn_id = turn_context.sub_id.clone();
+        core.session
+            .start_task(
+                turn_context,
+                vec!["hello".to_string()],
+                Arc::new(CancellationAwareTask),
+                TaskKind::Regular,
+            )
+            .await?;
+
+        let result = core.submit(smooth_protocol::Op::Interrupt).await?;
+        assert_eq!(result, "interrupted");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut interrupted = 0;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => {
+                    if matches!(
+                        event.msg,
+                        EventMsg::TurnInterrupted(turn) if turn.turn_id == turn_id
+                    ) {
+                        interrupted += 1;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    panic!("test event receiver lagged by {skipped} events");
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+
+        assert_eq!(interrupted, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_turn_waits_for_previous_terminal_event_after_final_status() -> Result<()> {
+        let (core, mut rx) = test_core().await?;
+        let first_turn_id = core.start_user_input("first".to_string()).await?;
+
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await??;
+            if matches!(
+                event.msg,
+                EventMsg::AgentStatusChanged(AgentStatusChangedEvent {
+                    turn_id: Some(ref turn_id),
+                    status: AgentStatus::Completed(_),
+                    ..
+                }) if turn_id == &first_turn_id
+            ) {
+                break;
+            }
+        }
+
+        let second_turn_id = core.start_user_input("second".to_string()).await?;
+        let mut saw_first_completed = false;
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await??;
+            match event.msg {
+                EventMsg::TurnCompleted(turn) if turn.turn_id == first_turn_id => {
+                    saw_first_completed = true;
+                }
+                EventMsg::TurnStarted(turn) if turn.turn_id == second_turn_id => {
+                    assert!(
+                        saw_first_completed,
+                        "new turn started before previous terminal event was broadcast"
+                    );
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
     }
 
     #[tokio::test]

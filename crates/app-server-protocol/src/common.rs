@@ -69,6 +69,19 @@ pub struct TurnStartResponse {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct TurnCancelParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnCancelResponse {
+    pub thread_id: String,
+    pub cancelled_thread_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SetPlanModeParams {
     pub thread_id: String,
     pub enabled: bool,
@@ -151,6 +164,11 @@ pub enum ClientRequest {
         request_id: RequestId,
         params: TurnStartParams,
     },
+    TurnCancel {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: TurnCancelParams,
+    },
     ThreadResume {
         #[serde(rename = "id")]
         request_id: RequestId,
@@ -187,5 +205,62 @@ impl ServerRequest {
         match self {
             Self::AskUserQuestion { request_id, .. } => request_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn turn_cancel_request_round_trips_and_is_in_schema() -> TestResult {
+        let request = ClientRequest::TurnCancel {
+            request_id: RequestId(7),
+            params: TurnCancelParams {
+                thread_id: "018f6f32-7a31-7c22-8c95-3c3dfb63dce1".to_string(),
+            },
+        };
+
+        let value = serde_json::to_value(&request)?;
+        assert_eq!(
+            value,
+            json!({
+                "method": "turnCancel",
+                "id": 7,
+                "params": {
+                    "threadId": "018f6f32-7a31-7c22-8c95-3c3dfb63dce1",
+                },
+            })
+        );
+        let decoded: ClientRequest = serde_json::from_value(value)?;
+        assert_eq!(decoded, request);
+
+        let schema = serde_json::to_value(schemars::schema_for!(ClientRequest))?;
+        assert!(schema.to_string().contains("turnCancel"));
+        Ok(())
+    }
+
+    #[test]
+    fn turn_cancel_response_round_trips() -> TestResult {
+        let response = TurnCancelResponse {
+            thread_id: "root-thread".to_string(),
+            cancelled_thread_ids: vec!["root-thread".to_string(), "child-thread".to_string()],
+        };
+
+        let value = serde_json::to_value(&response)?;
+        assert_eq!(
+            value,
+            json!({
+                "threadId": "root-thread",
+                "cancelledThreadIds": ["root-thread", "child-thread"],
+            })
+        );
+        let decoded: TurnCancelResponse = serde_json::from_value(value)?;
+        assert_eq!(decoded, response);
+        Ok(())
     }
 }

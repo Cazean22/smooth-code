@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use app_server_protocol::{
     AskUserQuestionResponse, JsonRpcError, RequestId, ServerRequest, SetPlanModeResponse,
     ThreadListItem, ThreadListResponse, ThreadResumeResponse, ThreadStartResponse,
-    TurnStartResponse,
+    TurnCancelResponse, TurnStartResponse,
 };
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -127,6 +127,10 @@ impl App {
                     .turn_start(thread_id, input)
                     .await
                     .map(UiEffectResult::TurnStart),
+                UiEffectKind::TurnCancel { thread_id } => app_server
+                    .turn_cancel(thread_id)
+                    .await
+                    .map(UiEffectResult::TurnCancel),
                 UiEffectKind::SetPlanMode { thread_id, enabled } => app_server
                     .set_plan_mode(thread_id, enabled)
                     .await
@@ -214,6 +218,9 @@ enum UiEffectKind {
         thread_id: ThreadId,
         input: String,
     },
+    TurnCancel {
+        thread_id: ThreadId,
+    },
     SetPlanMode {
         thread_id: ThreadId,
         enabled: bool,
@@ -239,6 +246,7 @@ enum UiEffectResult {
     ThreadList(ThreadListResponse),
     ThreadResume(ThreadResumeResponse),
     TurnStart(TurnStartResponse),
+    TurnCancel(TurnCancelResponse),
     SetPlanMode(SetPlanModeResponse),
     ServerRequestAnswered,
 }
@@ -249,6 +257,7 @@ enum EffectContext {
     ThreadList,
     ThreadResume { thread_id: ThreadId },
     TurnStart { thread_id: ThreadId, input: String },
+    TurnCancel { thread_id: ThreadId },
     SetPlanMode { previous: bool, desired: bool },
     ServerRequest,
     Exit,
@@ -614,6 +623,7 @@ struct UiModel {
     scroll: u16,
     auto_scroll: bool,
     is_turn_running: bool,
+    is_turn_cancelling: bool,
     plan_mode: bool,
     inspector_visible: bool,
     terminal_width: u16,
@@ -669,6 +679,7 @@ impl UiModel {
             scroll: 0,
             auto_scroll: true,
             is_turn_running: false,
+            is_turn_cancelling: false,
             plan_mode: false,
             inspector_visible: true,
             terminal_width: 80,
@@ -806,6 +817,9 @@ impl UiModel {
         if matches!(key_event.code, KeyCode::Char('c'))
             && key_event.modifiers.contains(KeyModifiers::CONTROL)
         {
+            if self.is_turn_running {
+                return self.request_turn_cancel();
+            }
             return vec![self.effect(EffectContext::Exit, UiEffectKind::Exit)];
         }
 
@@ -1031,6 +1045,7 @@ impl UiModel {
         match parts.next().unwrap_or_default() {
             "" => Vec::new(),
             "send" => self.request_turn_start(),
+            "cancel" => self.request_turn_cancel(),
             "plan" => self.request_plan_toggle(),
             "quit" | "q" => vec![self.effect(EffectContext::Exit, UiEffectKind::Exit)],
             "clear" => {
@@ -1068,7 +1083,7 @@ impl UiModel {
                 Vec::new()
             }
             "help" => {
-                self.push_info(":send  :plan  :quit  :clear  :focus transcript|inspector|composer|dashboard  :inspector toggle|show|hide  I toggle inspector  :help");
+                self.push_info(":send  :cancel  :plan  :quit  :clear  :focus transcript|inspector|composer|dashboard  :inspector toggle|show|hide  I toggle inspector  :help");
                 Vec::new()
             }
             other => {
@@ -1147,6 +1162,29 @@ impl UiModel {
                 input: input.clone(),
             },
             UiEffectKind::TurnStart { thread_id, input },
+        )]
+    }
+
+    fn request_turn_cancel(&mut self) -> Vec<UiEffect> {
+        if !self.is_turn_running {
+            self.push_info("no running turn to cancel");
+            return Vec::new();
+        }
+        if self.is_turn_cancelling {
+            self.status_line = String::from("Cancelling turn");
+            return Vec::new();
+        }
+
+        let Some(thread_id) = self.current_thread_id else {
+            self.push_error("no active thread to cancel");
+            return Vec::new();
+        };
+
+        self.is_turn_cancelling = true;
+        self.status_line = String::from("Cancelling turn");
+        vec![self.effect(
+            EffectContext::TurnCancel { thread_id },
+            UiEffectKind::TurnCancel { thread_id },
         )]
     }
 
@@ -1247,8 +1285,18 @@ impl UiModel {
                 if self.current_turn_id.as_deref() != Some(response.turn_id.as_str()) {
                     self.current_turn_id = Some(response.turn_id.clone());
                     self.is_turn_running = true;
+                    self.is_turn_cancelling = false;
                     self.status_line = format!("Running turn {}", response.turn_id);
                 }
+            }
+            UiEffectResult::TurnCancel(response) => {
+                self.is_turn_cancelling = false;
+                let cancelled_count = response.cancelled_thread_ids.len();
+                self.status_line = if cancelled_count == 1 {
+                    String::from("Cancel requested for 1 thread")
+                } else {
+                    format!("Cancel requested for {cancelled_count} threads")
+                };
             }
             UiEffectResult::SetPlanMode(response) => {
                 self.plan_mode = response.enabled;
@@ -1274,12 +1322,22 @@ impl UiModel {
             }
             Some(EffectContext::TurnStart { thread_id, input }) => {
                 self.is_turn_running = false;
+                self.is_turn_cancelling = false;
                 if self.composer.is_empty() {
                     self.composer.set_text(input);
                     self.mode = UiMode::Insert;
                     self.focus = FocusTarget::Composer;
                 }
                 self.push_error(format!("could not start turn on {thread_id}: {error}"));
+            }
+            Some(EffectContext::TurnCancel { thread_id }) => {
+                self.is_turn_cancelling = false;
+                self.status_line = self
+                    .current_turn_id
+                    .as_deref()
+                    .map(|turn_id| format!("Running turn {turn_id}"))
+                    .unwrap_or_else(|| String::from("Running turn"));
+                self.push_error(format!("could not cancel turn on {thread_id}: {error}"));
             }
             Some(EffectContext::ThreadStart) => {
                 self.dashboard.loading = false;
@@ -1365,6 +1423,7 @@ impl UiModel {
             }
             EventMsg::TurnStarted(turn) => {
                 self.is_turn_running = true;
+                self.is_turn_cancelling = false;
                 self.tool_call_rows.clear();
                 self.subagent_tool_calls.clear();
                 self.running_tools.clear();
@@ -1379,6 +1438,7 @@ impl UiModel {
             EventMsg::TurnCompleted(turn) => {
                 let committed_from_stream = self.finalize_assistant_stream(None);
                 self.is_turn_running = false;
+                self.is_turn_cancelling = false;
                 self.running_tools.clear();
                 self.status_line = format!("Completed turn {}", turn.turn_id);
                 if let Some(message) = turn.last_assistant_message
@@ -1392,7 +1452,13 @@ impl UiModel {
             EventMsg::TurnInterrupted(turn) => {
                 self.finalize_assistant_stream(None);
                 self.is_turn_running = false;
+                self.is_turn_cancelling = false;
                 self.running_tools.clear();
+                self.question_picker = None;
+                if self.mode == UiMode::Overlay {
+                    self.mode = UiMode::Normal;
+                    self.focus = FocusTarget::Transcript;
+                }
                 self.push_info(format!(
                     "Turn {} interrupted: {}",
                     turn.turn_id, turn.reason
@@ -1529,6 +1595,7 @@ impl UiModel {
                 self.finalize_assistant_stream(None);
                 self.push_error(error.error.message);
                 self.is_turn_running = false;
+                self.is_turn_cancelling = false;
                 self.running_tools.clear();
                 self.status_line = String::from("Error");
             }
@@ -1818,6 +1885,7 @@ impl UiModel {
 
     fn reset_turn_tracking(&mut self) {
         self.is_turn_running = false;
+        self.is_turn_cancelling = false;
         self.current_turn_id = None;
         self.committed_assistant_item_id = None;
         self.committed_assistant_for_current_turn = false;
@@ -2217,7 +2285,9 @@ impl UiModel {
         spans.push(Span::raw(self.status_line.clone()));
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            if self.is_turn_running {
+            if self.is_turn_cancelling {
+                "agent cancelling"
+            } else if self.is_turn_running {
                 "agent running"
             } else {
                 "agent idle"
@@ -2542,7 +2612,8 @@ mod tests {
     use smooth_protocol::{
         AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
         AgentReasoningDeltaEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent, EventMsg,
-        ToolCallCompletedEvent, ToolCallStartedEvent, TurnCompletedEvent, TurnStartedEvent,
+        ToolCallCompletedEvent, ToolCallStartedEvent, TurnCompletedEvent, TurnInterruptedEvent,
+        TurnStartedEvent,
     };
 
     fn event(id: &str, msg: EventMsg) -> Event {
@@ -3867,6 +3938,130 @@ mod tests {
             assert_eq!(effects.len(), 1);
             assert!(matches!(effects[0].kind, UiEffectKind::Exit));
         }
+    }
+
+    #[test]
+    fn ctrl_c_cancels_running_turn_across_modes() {
+        for mode in [
+            UiMode::Normal,
+            UiMode::Insert,
+            UiMode::Command,
+            UiMode::Overlay,
+        ] {
+            let mut model = UiModel::new();
+            let thread_id = ThreadId::new();
+            model.current_thread_id = Some(thread_id);
+            model.screen = Screen::Workspace;
+            model.mode = mode;
+            model.is_turn_running = true;
+            model.current_turn_id = Some("turn-1".to_string());
+            if mode == UiMode::Overlay {
+                model.question_picker = Some(QuestionPicker::new(
+                    RequestId(1),
+                    AskUserQuestionParams {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "turn-1".into(),
+                        call_id: "c".into(),
+                        questions: Vec::new(),
+                    },
+                ));
+            }
+
+            let effects =
+                model.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+            assert_eq!(effects.len(), 1);
+            assert!(matches!(
+                effects[0].kind,
+                UiEffectKind::TurnCancel { thread_id: got } if got == thread_id
+            ));
+            assert!(model.is_turn_cancelling);
+            assert_eq!(model.status_line, "Cancelling turn");
+        }
+    }
+
+    #[test]
+    fn cancel_command_emits_turn_cancel_effect() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.screen = Screen::Workspace;
+        model.is_turn_running = true;
+
+        let effects = model.execute_command("cancel");
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0].kind,
+            UiEffectKind::TurnCancel { thread_id: got } if got == thread_id
+        ));
+        assert!(model.is_turn_cancelling);
+    }
+
+    #[test]
+    fn failed_cancel_restores_running_status_and_reports_error() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.screen = Screen::Workspace;
+        model.is_turn_running = true;
+        model.current_turn_id = Some("turn-1".to_string());
+
+        let effects = model.request_turn_cancel();
+        assert_eq!(effects.len(), 1);
+        assert!(model.is_turn_cancelling);
+
+        let _ = model.update(UiEvent::EffectFailed {
+            effect_id: effects[0].effect_id,
+            error: "server down".to_string(),
+            viewport_height: 20,
+        });
+
+        assert!(model.is_turn_running);
+        assert!(!model.is_turn_cancelling);
+        assert_eq!(model.status_line, "Running turn turn-1");
+        assert!(
+            model
+                .transcript_lines_uncached(80)
+                .join("\n")
+                .contains("could not cancel turn")
+        );
+    }
+
+    #[test]
+    fn turn_interrupted_closes_question_picker_overlay() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.screen = Screen::Workspace;
+        model.mode = UiMode::Overlay;
+        model.focus = FocusTarget::Overlay;
+        model.is_turn_running = true;
+        model.is_turn_cancelling = true;
+        model.question_picker = Some(QuestionPicker::new(
+            RequestId(1),
+            AskUserQuestionParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".into(),
+                call_id: "c".into(),
+                questions: Vec::new(),
+            },
+        ));
+
+        model.apply_protocol_event(event(
+            "interrupted",
+            EventMsg::TurnInterrupted(TurnInterruptedEvent {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                reason: "interrupted".to_string(),
+            }),
+        ));
+
+        assert!(model.question_picker.is_none());
+        assert_eq!(model.mode, UiMode::Normal);
+        assert_eq!(model.focus, FocusTarget::Transcript);
+        assert!(!model.is_turn_running);
+        assert!(!model.is_turn_cancelling);
     }
 
     trait JoinLines {

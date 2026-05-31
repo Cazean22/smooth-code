@@ -2,7 +2,7 @@ use app_server::in_process::InProcessServerEvent;
 use app_server_protocol::{
     ClientRequest, RequestId, SetPlanModeParams, SetPlanModeResponse, ThreadListParams,
     ThreadListResponse, ThreadResumeParams, ThreadResumeResponse, ThreadStartParams,
-    ThreadStartResponse, TurnStartParams, TurnStartResponse,
+    ThreadStartResponse, TurnCancelParams, TurnCancelResponse, TurnStartParams, TurnStartResponse,
 };
 use smooth_protocol::ThreadId;
 
@@ -48,6 +48,22 @@ impl AppServerSession {
             params: TurnStartParams {
                 thread_id: thread_id.to_string(),
                 input,
+            },
+        };
+        self.next_request_id += 1;
+        let value = self.client.request(request).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    #[tracing::instrument(name = "tui.turn_cancel", skip(self), fields(thread_id = %thread_id))]
+    pub(crate) async fn turn_cancel(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> TuiResult<TurnCancelResponse> {
+        let request = ClientRequest::TurnCancel {
+            request_id: RequestId(self.next_request_id as usize),
+            params: TurnCancelParams {
+                thread_id: thread_id.to_string(),
             },
         };
         self.next_request_id += 1;

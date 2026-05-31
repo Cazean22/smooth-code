@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use app_server_protocol::{
     AskUserQuestionParams, AskUserQuestionResponse, ClientRequest, JsonRpcError,
     ServerRequestPayload, SetPlanModeResponse, ThreadListItem, ThreadListResponse,
-    ThreadResumeResponse, ThreadStartResponse, TurnStartResponse,
+    ThreadResumeResponse, ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
 };
 use smooth_core::{AskUserClient, ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
@@ -129,6 +129,27 @@ impl CoreMessageProcessor {
                 Ok(serde_json::to_value(TurnStartResponse {
                     thread_id: thread_id.to_string(),
                     turn_id,
+                })?)
+            }
+            ClientRequest::TurnCancel { params, .. } => {
+                tracing::debug!(
+                    thread_id = %params.thread_id,
+                    "processing turn cancel request"
+                );
+                let thread_id = params
+                    .thread_id
+                    .parse::<ThreadId>()
+                    .map_err(AppServerError::invalid_thread_id)?;
+                let cancelled_thread_ids = self
+                    .threads
+                    .cancel_turn_subtree(thread_id)
+                    .await?
+                    .into_iter()
+                    .map(|thread_id| thread_id.to_string())
+                    .collect();
+                Ok(serde_json::to_value(TurnCancelResponse {
+                    thread_id: thread_id.to_string(),
+                    cancelled_thread_ids,
                 })?)
             }
             ClientRequest::ThreadResume { params, .. } => {
@@ -261,7 +282,10 @@ fn map_thread_summary(summary: ThreadSummary) -> ThreadListItem {
 mod tests {
     use std::{path::PathBuf, sync::Arc, sync::LazyLock};
 
-    use app_server_protocol::{AskUserQuestionParams, ClientRequest, RequestId, TurnStartParams};
+    use app_server_protocol::{
+        AskUserQuestionParams, ClientRequest, RequestId, ThreadStartParams, TurnCancelParams,
+        TurnCancelResponse, TurnStartParams,
+    };
     use tokio::sync::{Mutex as TokioMutex, mpsc, mpsc::error::TryRecvError};
 
     use super::{CoreMessageProcessor, ask_user_client};
@@ -309,6 +333,70 @@ mod tests {
         assert_eq!(info.kind, "invalid_thread_id");
         assert_eq!(info.source.as_deref(), Some("app-server"));
         assert_eq!(error.message, info.message);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_turn_cancel_thread_id_preserves_structured_error_info() -> TestResult {
+        let _cwd_guard = CWD_LOCK.lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+        let _cwd_restore = CwdRestore(original_cwd);
+
+        let (event_tx, _event_rx) = mpsc::channel::<InProcessServerEvent>(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
+        let processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        let request = ClientRequest::TurnCancel {
+            request_id: RequestId(1),
+            params: TurnCancelParams {
+                thread_id: "not-a-thread-id".to_string(),
+            },
+        };
+        let Err(error) = processor.process_request(request).await else {
+            panic!("invalid thread id should return an app-server error");
+        };
+
+        assert_eq!(error.code, INVALID_PARAMS_ERROR_CODE);
+        let info = error.data.as_ref().ok_or("missing error data")?;
+        assert_eq!(info.kind, "invalid_thread_id");
+        assert_eq!(info.source.as_deref(), Some("app-server"));
+        assert_eq!(error.message, info.message);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_cancel_returns_cancelled_thread_ids() -> TestResult {
+        let _cwd_guard = CWD_LOCK.lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+        let _cwd_restore = CwdRestore(original_cwd);
+
+        let (event_tx, _event_rx) = mpsc::channel::<InProcessServerEvent>(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
+        let processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        let started_value = processor
+            .process_request(ClientRequest::ThreadStart {
+                request_id: RequestId(1),
+                params: ThreadStartParams::default(),
+            })
+            .await?;
+        let started: app_server_protocol::ThreadStartResponse =
+            serde_json::from_value(started_value)?;
+
+        let value = processor
+            .process_request(ClientRequest::TurnCancel {
+                request_id: RequestId(2),
+                params: TurnCancelParams {
+                    thread_id: started.thread_id.clone(),
+                },
+            })
+            .await?;
+        let response: TurnCancelResponse = serde_json::from_value(value)?;
+
+        assert_eq!(response.thread_id, started.thread_id);
+        assert!(response.cancelled_thread_ids.is_empty());
         Ok(())
     }
 

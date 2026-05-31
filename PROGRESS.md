@@ -12,6 +12,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - Source changes should go through structured file tools (`edit`, `write`, `delete`) so the runtime can emit structured `FileChangeOutput`; keep `run_command` for inspection, validation, formatters, and project commands rather than Python/`sed -i`/`awk`/redirection rewrite scripts.
 - Plan-mode model rebuilds must preserve typed client-backed tools such as `ask_user_question`; the unchecked `exit_plan_mode` path runs in-turn and should reuse the `Session`'s stored client when no explicit client is passed.
 - `AskUserClient` is a concrete cloneable callback wrapper shared by root, resumed, and spawned child threads. `ask` routes from `AskUserQuestionParams.thread_id` to avoid duplicate thread identity at the call boundary; `abort_pending_server_requests` still takes `ThreadId` for cancellation. No separate ask-user client factory or thread-scoped outgoing sender wrapper is needed. Keep the stored client on `Core::Session`; `CoreThread` should not duplicate it.
+- `app-server-protocol` imports `tokio::sync::oneshot`, so it must enable Tokio `sync`; with this repo's `tokio_unstable`/Tokio tracing setup it also needs `rt` to compile as a standalone package.
 
 ## Error Handling
 
@@ -38,6 +39,13 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - `CollabAgentSpawnBegin` and `CollabAgentSpawnEnd` are transcript-silent in the TUI because the `spawn_agent` tool row already displays the prompt/arguments and running state; keep prompt/status text out of extra info rows unless adding a distinct subagent transcript surface.
 - `CollabAgentCompleted` is transcript-silent in the TUI; it only finalizes the correlated `spawn_agent` tool row. The detailed child result for the model is separate structured JSON returned by the manual tool loop.
 - Parent completion notifications should include every final child status, including `Shutdown` and `NotFound`, so retained inline waiters and TUI `spawn_agent` rows cannot remain running after a child reaches a terminal state.
+
+## Turn Cancellation
+
+- User-facing cancellation flows through `ClientRequest::TurnCancel`/`TurnCancelResponse`; `ThreadManagerState::cancel_turn_subtree` validates the requested thread, walks its live registered agent subtree, and returns only thread IDs whose active turn was actually interrupted. Idle/completed threads keep their existing `AgentStatus`.
+- In the TUI, Ctrl-C cancels only while `is_turn_running`; idle Ctrl-C still exits. `:cancel` uses the same effect path, and `TurnInterrupted` clears any ask-user overlay because core aborts pending server requests for the interrupted turn.
+- `Session::abort_all_tasks` is the immediate interruption feedback path. The task runner suppresses a second `TurnInterrupted` if it later observes a cancellation token after the active turn was already drained. When a runner finishes normally, remove its `RunningTask` from `active_turn` before terminal status publication so late cancellation cannot drain it, but leave an empty active-turn barrier until after the terminal event is emitted so the next turn cannot overtake it. Keep the removed `RunningTask` alive in a local until after terminal publication; dropping its `AbortOnDropHandle` too early can abort the task before `TurnCompleted`/`TurnInterrupted` is sent.
+- Cancellation tests that need a child to finish should wait on the child's status watcher until a final `AgentStatus` instead of sleeping for a fixed duration; otherwise slow CI can turn an idle-cancel assertion into a legitimate active interrupt.
 
 ## TUI File Change Display
 

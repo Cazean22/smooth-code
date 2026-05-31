@@ -162,6 +162,18 @@ impl ThreadManagerState {
         thread.submit(op).await
     }
 
+    pub async fn cancel_turn_subtree(&self, thread_id: ThreadId) -> CoreResult<Vec<ThreadId>> {
+        let _ = self.get(thread_id).await?;
+        let thread_ids = self.live_subtree_thread_ids(thread_id);
+        let mut interrupted_thread_ids = Vec::new();
+        for target_thread_id in &thread_ids {
+            if self.submit(*target_thread_id, Op::Interrupt).await? == "interrupted" {
+                interrupted_thread_ids.push(*target_thread_id);
+            }
+        }
+        Ok(interrupted_thread_ids)
+    }
+
     /// Toggle plan mode for the given thread. Returns the new effective state.
     pub async fn set_plan_mode(&self, thread_id: ThreadId, enabled: bool) -> CoreResult<bool> {
         let thread = self.get(thread_id).await?;
@@ -249,6 +261,26 @@ impl ThreadManagerState {
             .get(&thread_id)
             .cloned()
             .ok_or(CoreError::UnknownThread { thread_id })
+    }
+
+    fn live_subtree_thread_ids(&self, root_thread_id: ThreadId) -> Vec<ThreadId> {
+        let agents = self.agent_control.registry().live_agents();
+        let metadata_by_thread = agents
+            .iter()
+            .filter_map(|metadata| metadata.agent_id.map(|thread_id| (thread_id, metadata)))
+            .collect::<HashMap<_, _>>();
+        let mut thread_ids = agents
+            .iter()
+            .filter_map(|metadata| {
+                let thread_id = metadata.agent_id?;
+                is_metadata_in_subtree(&metadata_by_thread, thread_id, root_thread_id)
+                    .then_some(thread_id)
+            })
+            .collect::<Vec<_>>();
+        if !thread_ids.contains(&root_thread_id) {
+            thread_ids.insert(0, root_thread_id);
+        }
+        thread_ids
     }
 
     async fn resume_child_subtree(&self, root_thread_id: ThreadId) -> CoreResult<Vec<EventMsg>> {
@@ -427,6 +459,23 @@ impl ThreadManagerState {
     }
 }
 
+fn is_metadata_in_subtree(
+    metadata_by_thread: &HashMap<ThreadId, &AgentMetadata>,
+    thread_id: ThreadId,
+    root_thread_id: ThreadId,
+) -> bool {
+    let mut current = Some(thread_id);
+    while let Some(current_thread_id) = current {
+        if current_thread_id == root_thread_id {
+            return true;
+        }
+        current = metadata_by_thread
+            .get(&current_thread_id)
+            .and_then(|metadata| metadata.parent_thread_id);
+    }
+    false
+}
+
 fn agent_status_entry(
     control: &AgentControl,
     metadata: AgentMetadata,
@@ -447,7 +496,7 @@ fn agent_status_entry(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
     use anyhow::Result;
     use futures_util::stream;
@@ -462,7 +511,7 @@ mod tests {
     use super::ThreadManagerState;
     use crate::{
         SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
-        agent::{AgentControl, role::RoleOverride},
+        agent::{AgentControl, role::RoleOverride, status::is_final},
         provider::SessionStreamEvent,
         rollout::find_thread_path,
         test_support::cwd_test_lock,
@@ -504,6 +553,132 @@ mod tests {
         ) -> Result<SessionModel> {
             Ok(self.model.clone())
         }
+    }
+
+    struct PendingDriver;
+
+    impl SessionModelDriver for PendingDriver {
+        fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+            Ok(Box::pin(stream::pending::<Result<SessionStreamEvent>>()))
+        }
+    }
+
+    struct PendingFactory;
+
+    impl SessionModelFactory for PendingFactory {
+        fn build(
+            &self,
+            _cwd: PathBuf,
+            _thread_id: ThreadId,
+            _ask_user_client: Option<AskUserClient>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
+            _role_override: RoleOverride,
+            _agent_control: AgentControl,
+            _plan_mode: bool,
+        ) -> Result<SessionModel> {
+            Ok(SessionModel::Stub(Arc::new(PendingDriver)))
+        }
+    }
+
+    async fn wait_for_final_status(
+        control: &AgentControl,
+        thread_id: ThreadId,
+    ) -> Result<AgentStatus> {
+        let mut status_rx = control.subscribe_status(thread_id)?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = status_rx.borrow().clone();
+                if is_final(&status) {
+                    return Ok::<AgentStatus, tokio::sync::watch::error::RecvError>(status);
+                }
+                status_rx.changed().await?;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for final status for {thread_id}"))?
+        .map_err(|err| anyhow::anyhow!("status channel closed for {thread_id}: {err}"))
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_subtree_interrupts_target_and_live_descendants_only() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(None, Some(Arc::new(PendingFactory))).await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent(root_id, "child task".to_string())
+            .await?;
+        let child_id = child.agent_id.ok_or_else(|| anyhow::anyhow!("child id"))?;
+        let sibling = control
+            .spawn_agent(root_id, "sibling task".to_string())
+            .await?;
+        let sibling_id = sibling
+            .agent_id
+            .ok_or_else(|| anyhow::anyhow!("sibling id"))?;
+        let grandchild = control
+            .spawn_agent(child_id, "grandchild task".to_string())
+            .await?;
+        let grandchild_id = grandchild
+            .agent_id
+            .ok_or_else(|| anyhow::anyhow!("grandchild id"))?;
+
+        let cancelled = manager.cancel_turn_subtree(child_id).await?;
+        let cancelled = cancelled.into_iter().collect::<HashSet<_>>();
+
+        assert_eq!(
+            cancelled,
+            HashSet::from([child_id, grandchild_id]),
+            "only the selected child subtree should be cancelled"
+        );
+        assert_eq!(control.get_status(child_id), AgentStatus::Interrupted);
+        assert_eq!(control.get_status(grandchild_id), AgentStatus::Interrupted);
+        assert_ne!(control.get_status(root_id), AgentStatus::Interrupted);
+        assert_ne!(control.get_status(sibling_id), AgentStatus::Interrupted);
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_subtree_preserves_idle_statuses_and_returns_only_active_threads()
+    -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "done".to_string(),
+                })),
+            })),
+        )
+        .await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent(root_id, "child task".to_string())
+            .await?;
+        let child_id = child.agent_id.ok_or_else(|| anyhow::anyhow!("child id"))?;
+        let child_status = wait_for_final_status(&control, child_id).await?;
+
+        let cancelled = manager.cancel_turn_subtree(root_id).await?;
+
+        assert!(cancelled.is_empty());
+        assert_eq!(control.get_status(root_id), AgentStatus::PendingInit);
+        assert_eq!(control.get_status(child_id), child_status);
+        assert_ne!(control.get_status(child_id), AgentStatus::Interrupted);
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]

@@ -218,21 +218,19 @@ impl OutgoingMessageSender {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use app_server_protocol::DynamicToolCallParams;
-    use serde_json::json;
+    use app_server_protocol::AskUserQuestionParams;
     use smooth_protocol::ThreadId;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
 
     use super::*;
 
-    fn dynamic_tool_call(thread_id: ThreadId, tool: &str) -> ServerRequestPayload {
-        ServerRequestPayload::DynamicToolCall(DynamicToolCallParams {
+    fn ask_user_request(thread_id: ThreadId, call_id: &str) -> ServerRequestPayload {
+        ServerRequestPayload::AskUserQuestion(AskUserQuestionParams {
             thread_id: thread_id.to_string(),
             turn_id: "turn-1".to_string(),
-            call_id: "call-1".to_string(),
-            tool: tool.to_string(),
-            arguments: json!({ "tool": tool }),
+            call_id: call_id.to_string(),
+            questions: Vec::new(),
         })
     }
 
@@ -243,13 +241,13 @@ mod tests {
         let thread_id = ThreadId::new();
 
         let (request_id, _response_rx) = outgoing
-            .send_request(dynamic_tool_call(thread_id, "echo"))
+            .send_request(ask_user_request(thread_id, "call-1"))
             .await;
 
         let event = event_rx.recv().await.expect("expected outgoing event");
         match event {
             InProcessServerEvent::ServerRequest(
-                app_server_protocol::ServerRequest::DynamicToolCall {
+                app_server_protocol::ServerRequest::AskUserQuestion {
                     request_id: observed,
                     ..
                 },
@@ -264,10 +262,7 @@ mod tests {
         let outgoing = OutgoingMessageSender::new(event_tx);
         let thread_id = ThreadId::new();
         let (request_id, response_rx) = outgoing
-            .send_request_for_thread(
-                dynamic_tool_call(thread_id, "dynamic_echo"),
-                Some(thread_id),
-            )
+            .send_request_for_thread(ask_user_request(thread_id, "call-1"), Some(thread_id))
             .await;
         let error = JSONRPCErrorError {
             code: -32000,
@@ -294,7 +289,7 @@ mod tests {
         let thread_id = ThreadId::new();
 
         let (_request_id, response_rx) = outgoing
-            .send_request(dynamic_tool_call(thread_id, "echo"))
+            .send_request(ask_user_request(thread_id, "call-1"))
             .await;
 
         let response = timeout(Duration::from_secs(1), response_rx)
@@ -318,14 +313,14 @@ mod tests {
         let other_thread_id = ThreadId::new();
 
         let (_, first_rx) = outgoing
-            .send_request_for_thread(dynamic_tool_call(thread_id, "first"), Some(thread_id))
+            .send_request_for_thread(ask_user_request(thread_id, "first"), Some(thread_id))
             .await;
         let (_, second_rx) = outgoing
-            .send_request_for_thread(dynamic_tool_call(thread_id, "second"), Some(thread_id))
+            .send_request_for_thread(ask_user_request(thread_id, "second"), Some(thread_id))
             .await;
         let (_, other_rx) = outgoing
             .send_request_for_thread(
-                dynamic_tool_call(other_thread_id, "other"),
+                ask_user_request(other_thread_id, "other"),
                 Some(other_thread_id),
             )
             .await;

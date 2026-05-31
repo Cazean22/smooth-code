@@ -114,7 +114,7 @@ async fn start_internal(
 
 #[cfg(test)]
 mod tests {
-    use app_server_protocol::{DynamicToolCallParams, ServerRequestPayload};
+    use app_server_protocol::{AskUserQuestionParams, ServerRequestPayload};
     use serde_json::json;
     use smooth_protocol::ThreadId;
     use tokio::time::{Duration, timeout};
@@ -130,13 +130,12 @@ mod tests {
         .expect("in-process app-server should initialize");
         let thread_id = ThreadId::new();
         let (request_id, response_rx) = outgoing
-            .send_request(ServerRequestPayload::DynamicToolCall(
-                DynamicToolCallParams {
+            .send_request(ServerRequestPayload::AskUserQuestion(
+                AskUserQuestionParams {
                     thread_id: thread_id.to_string(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-1".to_string(),
-                    tool: "dynamic_echo".to_string(),
-                    arguments: json!({ "message": "hi" }),
+                    questions: Vec::new(),
                 },
             ))
             .await;
@@ -147,7 +146,7 @@ mod tests {
             .expect("runtime event stream should stay open");
         let observed_request_id = match event {
             InProcessServerEvent::ServerRequest(
-                app_server_protocol::ServerRequest::DynamicToolCall { request_id, .. },
+                app_server_protocol::ServerRequest::AskUserQuestion { request_id, .. },
             ) => request_id,
             other => panic!("unexpected event: {other:?}"),
         };

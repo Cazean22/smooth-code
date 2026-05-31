@@ -1,15 +1,12 @@
 use std::{collections::HashSet, sync::Arc};
 
 use app_server_protocol::{
-    AskUserQuestionParams, AskUserQuestionResponse, ClientRequest, DynamicToolCallParams,
-    JSONRPCErrorError, ServerRequestPayload, SetPlanModeResponse, ThreadListItem,
-    ThreadListResponse, ThreadResumeResponse, ThreadStartResponse, TurnStartResponse,
+    AskUserQuestionParams, AskUserQuestionResponse, ClientRequest, JSONRPCErrorError,
+    ServerRequestPayload, SetPlanModeResponse, ThreadListItem, ThreadListResponse,
+    ThreadResumeResponse, ThreadStartResponse, TurnStartResponse,
 };
 use futures_util::future::BoxFuture;
-use smooth_core::{
-    AskUserClient, AskUserClientFactory, DynamicToolClient, DynamicToolClientFactory,
-    ThreadManagerState, ThreadSummary,
-};
+use smooth_core::{AskUserClient, AskUserClientFactory, ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
@@ -26,57 +23,12 @@ pub(crate) struct CoreMessageProcessor {
     subscribed_threads: Mutex<HashSet<ThreadId>>,
 }
 
-struct InProcessDynamicToolClientFactory {
-    outgoing: Arc<OutgoingMessageSender>,
-}
-
-struct InProcessDynamicToolClient {
-    outgoing: ThreadScopedOutgoingMessageSender,
-}
-
 struct InProcessAskUserClientFactory {
     outgoing: Arc<OutgoingMessageSender>,
 }
 
 struct InProcessAskUserClient {
     outgoing: ThreadScopedOutgoingMessageSender,
-}
-
-impl DynamicToolClientFactory for InProcessDynamicToolClientFactory {
-    fn build(&self, thread_id: ThreadId) -> Arc<dyn DynamicToolClient> {
-        Arc::new(InProcessDynamicToolClient {
-            outgoing: ThreadScopedOutgoingMessageSender::new(Arc::clone(&self.outgoing), thread_id),
-        })
-    }
-}
-
-impl DynamicToolClient for InProcessDynamicToolClient {
-    fn call(
-        &self,
-        params: DynamicToolCallParams,
-    ) -> BoxFuture<'static, Result<serde_json::Value, JSONRPCErrorError>> {
-        let outgoing = self.outgoing.clone();
-        Box::pin(async move {
-            let (_, response_rx) = outgoing
-                .send_request(ServerRequestPayload::DynamicToolCall(params))
-                .await;
-            match response_rx.await {
-                Ok(result) => result,
-                Err(err) => Err(JSONRPCErrorError {
-                    code: SERVER_ERROR_CODE,
-                    data: None,
-                    message: err.to_string(),
-                }),
-            }
-        })
-    }
-
-    fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()> {
-        let outgoing = self.outgoing.clone();
-        Box::pin(async move {
-            outgoing.abort_pending_server_requests().await;
-        })
-    }
 }
 
 impl AskUserClientFactory for InProcessAskUserClientFactory {
@@ -131,19 +83,10 @@ impl CoreMessageProcessor {
         event_tx: mpsc::Sender<InProcessServerEvent>,
         outgoing: Arc<OutgoingMessageSender>,
     ) -> anyhow::Result<Self> {
-        let dynamic_tool_client_factory: Arc<dyn DynamicToolClientFactory> =
-            Arc::new(InProcessDynamicToolClientFactory {
-                outgoing: Arc::clone(&outgoing),
-            });
         let ask_user_client_factory: Arc<dyn AskUserClientFactory> =
             Arc::new(InProcessAskUserClientFactory { outgoing });
         Ok(Self {
-            threads: ThreadManagerState::new(
-                Some(dynamic_tool_client_factory),
-                Some(ask_user_client_factory),
-                None,
-            )
-            .await?,
+            threads: ThreadManagerState::new(Some(ask_user_client_factory), None).await?,
             event_tx,
             subscribed_threads: Mutex::new(HashSet::new()),
         })

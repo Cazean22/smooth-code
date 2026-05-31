@@ -14,7 +14,6 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use serde_json::json;
 use smooth_protocol::{
     AgentStatus, Event, EventMsg, FileChangeOutput, ThreadId, ToolCallResultKind,
 };
@@ -147,10 +146,6 @@ impl App {
                     .fail_server_request(request_id, error)
                     .await
                     .map(|_| UiEffectResult::ServerRequestAnswered),
-                UiEffectKind::RespondServerRequest { request_id, result } => app_server
-                    .respond_to_server_request(request_id, result)
-                    .await
-                    .map(|_| UiEffectResult::ServerRequestAnswered),
                 UiEffectKind::FailServerRequest { request_id, error } => app_server
                     .fail_server_request(request_id, error)
                     .await
@@ -231,10 +226,6 @@ enum UiEffectKind {
     FailQuestion {
         request_id: RequestId,
         error: JSONRPCErrorError,
-    },
-    RespondServerRequest {
-        request_id: RequestId,
-        result: serde_json::Value,
     },
     FailServerRequest {
         request_id: RequestId,
@@ -855,32 +846,6 @@ impl UiModel {
         }
 
         match request {
-            ServerRequest::DynamicToolCall { request_id, params } => {
-                if params.tool == "dynamic_error" {
-                    vec![self.effect(
-                        EffectContext::ServerRequest,
-                        UiEffectKind::FailServerRequest {
-                            request_id,
-                            error: JSONRPCErrorError {
-                                code: -32000,
-                                data: None,
-                                message: "stub dynamic tool failure".to_string(),
-                            },
-                        },
-                    )]
-                } else {
-                    vec![self.effect(
-                        EffectContext::ServerRequest,
-                        UiEffectKind::RespondServerRequest {
-                            request_id,
-                            result: json!({
-                                "stub": true,
-                                "tool": params.tool,
-                            }),
-                        },
-                    )]
-                }
-            }
             ServerRequest::AskUserQuestion { request_id, params } => {
                 self.question_picker = Some(QuestionPicker::new(request_id, params));
                 self.mode = UiMode::Overlay;
@@ -892,9 +857,6 @@ impl UiModel {
 
     fn reject_inactive_server_request(&mut self, request: &ServerRequest) -> Option<Vec<UiEffect>> {
         let (request_id, request_thread_id) = match request {
-            ServerRequest::DynamicToolCall { request_id, params } => {
-                (request_id.clone(), params.thread_id.as_str())
-            }
             ServerRequest::AskUserQuestion { request_id, params } => {
                 (request_id.clone(), params.thread_id.as_str())
             }
@@ -2204,9 +2166,7 @@ fn agent_status_label(status: &AgentStatus) -> String {
 mod tests {
     use super::*;
     use crate::streaming::StreamController;
-    use app_server_protocol::{
-        AskUserQuestion, AskUserQuestionOption, AskUserQuestionParams, DynamicToolCallParams,
-    };
+    use app_server_protocol::{AskUserQuestion, AskUserQuestionOption, AskUserQuestionParams};
     use ratatui::{Terminal, backend::TestBackend};
     use smooth_protocol::{
         AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
@@ -3139,33 +3099,6 @@ mod tests {
             &effects[0].kind,
             UiEffectKind::FailServerRequest { request_id, error }
                 if *request_id == RequestId(43)
-                    && error.message.contains("inactive thread")
-        ));
-    }
-
-    #[test]
-    fn dynamic_tool_request_from_inactive_thread_is_failed() {
-        let mut model = UiModel::new();
-        let active_thread = ThreadId::new();
-        let stale_thread = ThreadId::new();
-        model.current_thread_id = Some(active_thread);
-
-        let effects = model.update(UiEvent::ServerRequest(ServerRequest::DynamicToolCall {
-            request_id: RequestId(44),
-            params: DynamicToolCallParams {
-                thread_id: stale_thread.to_string(),
-                turn_id: "turn".to_string(),
-                call_id: "call".to_string(),
-                tool: "dynamic_ok".to_string(),
-                arguments: serde_json::json!({}),
-            },
-        }));
-
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(
-            &effects[0].kind,
-            UiEffectKind::FailServerRequest { request_id, error }
-                if *request_id == RequestId(44)
                     && error.message.contains("inactive thread")
         ));
     }

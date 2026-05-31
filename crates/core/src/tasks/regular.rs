@@ -256,9 +256,8 @@ impl SessionTask for RegularTask {
         result
     }
 
-    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
-        let _ = ctx;
-        session.abort_pending_dynamic_tool_requests().await;
+    async fn abort(&self, session: Arc<Session>, _ctx: Arc<TurnContext>) {
+        session.abort_pending_server_requests().await;
     }
 }
 
@@ -929,19 +928,18 @@ async fn execute_exit_plan_mode_call(
         internal_call_id,
     } = pending;
 
-    let (tool_output, success, error) =
-        match session.apply_plan_mode_unchecked(false, None, None).await {
-            Ok(_) => (
-                "Plan mode exited. Implement the approved plan now using the full tool set."
-                    .to_string(),
-                true,
-                None,
-            ),
-            Err(err) => {
-                let message = err.to_string();
-                (message.clone(), false, Some(message))
-            }
-        };
+    let (tool_output, success, error) = match session.apply_plan_mode_unchecked(false, None).await {
+        Ok(_) => (
+            "Plan mode exited. Implement the approved plan now using the full tool set."
+                .to_string(),
+            true,
+            None,
+        ),
+        Err(err) => {
+            let message = err.to_string();
+            (message.clone(), false, Some(message))
+        }
+    };
 
     complete_tool_call(
         session,

@@ -26,7 +26,7 @@ use smooth_protocol::{
 };
 use tempfile::TempDir;
 use tokio::sync::{RwLock, Semaphore};
-use tools::{AskUserClient, DynamicToolClient};
+use tools::AskUserClient;
 
 static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -74,7 +74,6 @@ impl SessionModelFactory for AnyThreadFactory {
         &self,
         _cwd: PathBuf,
         thread_id: ThreadId,
-        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
@@ -94,7 +93,7 @@ async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() {
     let original_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(workspace.path()).expect("set cwd");
 
-    let manager = ThreadManagerState::new(None, None, Some(Arc::new(AnyThreadFactory)))
+    let manager = ThreadManagerState::new(None, Some(Arc::new(AnyThreadFactory)))
         .await
         .expect("thread manager");
     let started = manager.start_thread().await.expect("start root");
@@ -572,7 +571,6 @@ impl SessionModelFactory for TwoRetainedFactory {
         &self,
         _cwd: PathBuf,
         thread_id: ThreadId,
-        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
@@ -600,7 +598,6 @@ impl SessionModelFactory for MixedBatchFactory {
         &self,
         _cwd: PathBuf,
         thread_id: ThreadId,
-        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
@@ -633,7 +630,6 @@ impl SessionModelFactory for ConcurrentSpawnFactory {
         &self,
         _cwd: PathBuf,
         thread_id: ThreadId,
-        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
@@ -664,7 +660,6 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
     std::env::set_current_dir(workspace.path()).expect("set cwd");
     let child_release = Arc::new(Semaphore::new(0));
     let manager = ThreadManagerState::new(
-        None,
         None,
         Some(Arc::new(ConcurrentSpawnFactory {
             build_count: Mutex::new(0),
@@ -855,7 +850,6 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
     let child_release = Arc::new(Semaphore::new(0));
     let manager = ThreadManagerState::new(
         None,
-        None,
         Some(Arc::new(MixedBatchFactory {
             build_count: Mutex::new(0),
             child_release: Arc::clone(&child_release),
@@ -1020,7 +1014,6 @@ async fn retained_subagents_all_finish_before_parent_continues() {
     std::env::set_current_dir(workspace.path()).expect("set cwd");
     let child_release = Arc::new(Semaphore::new(0));
     let manager = ThreadManagerState::new(
-        None,
         None,
         Some(Arc::new(TwoRetainedFactory {
             build_count: Mutex::new(0),
@@ -1354,7 +1347,6 @@ impl SessionModelFactory for ReasoningStreamFactory {
         &self,
         _cwd: PathBuf,
         _thread_id: ThreadId,
-        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
@@ -1374,7 +1366,6 @@ impl SessionModelFactory for ReasoningToolLoopFactory {
         &self,
         _cwd: PathBuf,
         _thread_id: ThreadId,
-        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
@@ -1500,7 +1491,6 @@ impl SessionModelFactory for IdlessReasoningCompletionFactory {
         &self,
         _cwd: PathBuf,
         _thread_id: ThreadId,
-        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
@@ -1618,7 +1608,6 @@ impl SessionModelFactory for EncryptedReasoningFactory {
         &self,
         _cwd: PathBuf,
         _thread_id: ThreadId,
-        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
@@ -1662,7 +1651,7 @@ async fn terminal_turn_preserves_multi_id_reasoning_in_history() {
     let original_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(workspace.path()).expect("set cwd");
 
-    let manager = ThreadManagerState::new(None, None, Some(Arc::new(ReasoningStreamFactory)))
+    let manager = ThreadManagerState::new(None, Some(Arc::new(ReasoningStreamFactory)))
         .await
         .expect("thread manager");
     let started = manager.start_thread().await.expect("start root");
@@ -1692,7 +1681,7 @@ async fn reasoning_persists_across_tool_call_iteration_and_terminal_turn() {
     let original_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(workspace.path()).expect("set cwd");
 
-    let manager = ThreadManagerState::new(None, None, Some(Arc::new(ReasoningToolLoopFactory)))
+    let manager = ThreadManagerState::new(None, Some(Arc::new(ReasoningToolLoopFactory)))
         .await
         .expect("thread manager");
     let started = manager.start_thread().await.expect("start root");
@@ -1721,10 +1710,9 @@ async fn idless_reasoning_completion_supersedes_pending_deltas_without_duplicati
     let original_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(workspace.path()).expect("set cwd");
 
-    let manager =
-        ThreadManagerState::new(None, None, Some(Arc::new(IdlessReasoningCompletionFactory)))
-            .await
-            .expect("thread manager");
+    let manager = ThreadManagerState::new(None, Some(Arc::new(IdlessReasoningCompletionFactory)))
+        .await
+        .expect("thread manager");
     let started = manager.start_thread().await.expect("start root");
     let root_id = started.thread_id;
     let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
@@ -1754,7 +1742,7 @@ async fn encrypted_reasoning_block_is_preserved_in_history() {
     let original_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(workspace.path()).expect("set cwd");
 
-    let manager = ThreadManagerState::new(None, None, Some(Arc::new(EncryptedReasoningFactory)))
+    let manager = ThreadManagerState::new(None, Some(Arc::new(EncryptedReasoningFactory)))
         .await
         .expect("thread manager");
     let started = manager.start_thread().await.expect("start root");

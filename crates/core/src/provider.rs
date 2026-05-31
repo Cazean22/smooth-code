@@ -44,8 +44,8 @@ use tokio_tungstenite::{
     tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
 };
 use tools::{
-    AskUserClient, AskUserQuestionTool, DynamicTool, DynamicToolClient, EditTool, ExitPlanModeTool,
-    PlanWriteTool, ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
+    AskUserClient, AskUserQuestionTool, EditTool, ExitPlanModeTool, PlanWriteTool, ReadTool,
+    RunCommandTool, SpawnAgentTool, WriteTool,
 };
 
 use crate::agent::{
@@ -63,7 +63,6 @@ pub trait SessionModelFactory: Send + Sync {
         &self,
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
-        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         ask_user_client: Option<Arc<dyn AskUserClient>>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
@@ -80,7 +79,6 @@ impl SessionModelFactory for EnvSessionModelFactory {
         &self,
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
-        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         ask_user_client: Option<Arc<dyn AskUserClient>>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
@@ -90,7 +88,6 @@ impl SessionModelFactory for EnvSessionModelFactory {
         SessionModel::from_env(
             cwd,
             thread_id,
-            dynamic_tool_client,
             ask_user_client,
             current_turn_id,
             role_override,
@@ -191,7 +188,6 @@ impl SessionModel {
     pub fn from_env(
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
-        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         ask_user_client: Option<Arc<dyn AskUserClient>>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         role_override: RoleOverride,
@@ -234,7 +230,6 @@ impl SessionModel {
                         .additional_params(additional_params.to_json()),
                     cwd,
                     thread_id,
-                    dynamic_tool_client.clone(),
                     ask_user_client.clone(),
                     Arc::clone(&current_turn_id),
                     agent_control.clone(),
@@ -252,7 +247,6 @@ impl SessionModel {
                     client.agent(&model).preamble(&preamble),
                     cwd,
                     thread_id,
-                    dynamic_tool_client.clone(),
                     ask_user_client.clone(),
                     Arc::clone(&current_turn_id),
                     agent_control.clone(),
@@ -265,7 +259,6 @@ impl SessionModel {
                     client.agent(&model).preamble(&preamble),
                     cwd,
                     thread_id,
-                    dynamic_tool_client.clone(),
                     ask_user_client.clone(),
                     Arc::clone(&current_turn_id),
                     agent_control.clone(),
@@ -278,7 +271,6 @@ impl SessionModel {
                     client.agent(&model).preamble(&preamble),
                     cwd,
                     thread_id,
-                    dynamic_tool_client,
                     ask_user_client,
                     current_turn_id,
                     agent_control,
@@ -358,7 +350,6 @@ impl SessionModelFactory for StubSessionModelFactory {
         &self,
         _cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
-        _dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         _ask_user_client: Option<Arc<dyn AskUserClient>>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _role_override: RoleOverride,
@@ -401,7 +392,6 @@ fn build_agent<M>(
     builder: rig::agent::AgentBuilder<M, (), rig::agent::NoToolConfig>,
     cwd: PathBuf,
     thread_id: smooth_protocol::ThreadId,
-    dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     ask_user_client: Option<Arc<dyn AskUserClient>>,
     current_turn_id: Arc<RwLock<Option<String>>>,
     _agent_control: AgentControl,
@@ -425,16 +415,6 @@ where
         builder
             .tool(EditTool::new(cwd.clone()))
             .tool(WriteTool::new(cwd))
-    };
-    let builder = if let Some(dynamic_tool_client) = dynamic_tool_client {
-        builder.tool(DynamicTool::new(
-            "dynamic_echo",
-            thread_id,
-            dynamic_tool_client,
-            Arc::clone(&current_turn_id),
-        ))
-    } else {
-        builder
     };
     let builder = if let Some(ask_user_client) = ask_user_client {
         builder.tool(AskUserQuestionTool::new(
@@ -1718,7 +1698,6 @@ mod tests {
             workspace.path().to_path_buf(),
             smooth_protocol::ThreadId::new(),
             None,
-            None,
             Arc::new(RwLock::new(None)),
             AgentControl::new(),
             false,
@@ -1750,7 +1729,6 @@ mod tests {
             AgentBuilder::new(DummyModel),
             workspace.path().to_path_buf(),
             smooth_protocol::ThreadId::new(),
-            None,
             None,
             Arc::new(RwLock::new(None)),
             AgentControl::new(),

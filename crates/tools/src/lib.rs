@@ -1,6 +1,5 @@
 mod ask_user_question;
 mod client;
-mod dynamic_tool;
 mod edit;
 mod error;
 mod exit_plan_mode;
@@ -15,10 +14,7 @@ mod write;
 pub use ask_user_question::{
     AskUserQuestionArgs, AskUserQuestionInput, AskUserQuestionOptionInput, AskUserQuestionTool,
 };
-pub use client::{
-    AskUserClient, AskUserClientFactory, DynamicToolClient, DynamicToolClientFactory,
-};
-pub use dynamic_tool::{DynamicTool, DynamicToolArgs};
+pub use client::{AskUserClient, AskUserClientFactory};
 pub use edit::{EditArgs, EditTool};
 pub use error::ToolFailure;
 pub use exit_plan_mode::{ExitPlanModeArgs, ExitPlanModeTool};

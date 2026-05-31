@@ -83,16 +83,6 @@ pub struct SetPlanModeResponse {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct DynamicToolCallParams {
-    pub thread_id: String,
-    pub turn_id: String,
-    pub call_id: String,
-    pub tool: String,
-    pub arguments: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct AskUserQuestionParams {
     pub thread_id: String,
     pub turn_id: String,
@@ -136,14 +126,12 @@ pub struct AskUserQuestionAnswer {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[allow(clippy::large_enum_variant)]
 pub enum ServerRequestPayload {
-    DynamicToolCall(DynamicToolCallParams),
     AskUserQuestion(AskUserQuestionParams),
 }
 
 impl ServerRequestPayload {
     pub fn request_with_id(self, request_id: RequestId) -> ServerRequest {
         match self {
-            Self::DynamicToolCall(params) => ServerRequest::DynamicToolCall { request_id, params },
             Self::AskUserQuestion(params) => ServerRequest::AskUserQuestion { request_id, params },
         }
     }
@@ -185,13 +173,6 @@ pub enum ClientRequest {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "method", rename_all = "camelCase")]
 pub enum ServerRequest {
-    #[doc = r" Execute a dynamic tool call on the client."]
-    #[serde(rename = "item/tool/call")]
-    DynamicToolCall {
-        #[serde(rename = "id")]
-        request_id: RequestId,
-        params: DynamicToolCallParams,
-    },
     #[doc = r" Ask the user one or more multiple-choice questions interactively."]
     #[serde(rename = "item/ask_user_question")]
     AskUserQuestion {
@@ -204,7 +185,6 @@ pub enum ServerRequest {
 impl ServerRequest {
     pub fn id(&self) -> &RequestId {
         match self {
-            Self::DynamicToolCall { request_id, .. } => request_id,
             Self::AskUserQuestion { request_id, .. } => request_id,
         }
     }

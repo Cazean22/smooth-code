@@ -14,7 +14,7 @@ use smooth_protocol::{
     ThreadId, TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tools::{AskUserClient, DynamicToolClient};
+use tools::AskUserClient;
 use tracing::Instrument;
 
 use crate::{
@@ -42,7 +42,6 @@ pub(crate) struct Session {
     pub(crate) session_source: SessionSource,
     pub(crate) agent_control: AgentControl,
     current_turn_id: Arc<RwLock<Option<String>>>,
-    dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
     #[allow(dead_code)]
     ask_user_client: Option<Arc<dyn AskUserClient>>,
     next_internal_sub_id: AtomicU64,
@@ -70,7 +69,6 @@ impl Core {
         next_internal_sub_id: u64,
         rollout: RolloutRecorder,
         current_turn_id: Arc<RwLock<Option<String>>>,
-        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         ask_user_client: Option<Arc<dyn AskUserClient>>,
         session_source: SessionSource,
         agent_control: AgentControl,
@@ -88,7 +86,6 @@ impl Core {
             session_source,
             agent_control,
             current_turn_id,
-            dynamic_tool_client,
             ask_user_client,
             next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
             model: Mutex::new(model),
@@ -431,7 +428,6 @@ impl Session {
     pub(crate) async fn apply_plan_mode(
         self: &Arc<Self>,
         enabled: bool,
-        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         ask_user_client: Option<Arc<dyn AskUserClient>>,
     ) -> Result<bool> {
         if self.active_turn.lock().await.is_some() {
@@ -439,7 +435,7 @@ impl Session {
                 "cannot toggle plan mode while a turn is in flight"
             ));
         }
-        self.apply_plan_mode_unchecked(enabled, dynamic_tool_client, ask_user_client)
+        self.apply_plan_mode_unchecked(enabled, ask_user_client)
             .await
     }
 
@@ -449,7 +445,6 @@ impl Session {
     pub(crate) async fn apply_plan_mode_unchecked(
         self: &Arc<Self>,
         enabled: bool,
-        dynamic_tool_client: Option<Arc<dyn DynamicToolClient>>,
         ask_user_client: Option<Arc<dyn AskUserClient>>,
     ) -> Result<bool> {
         if self.plan_mode() == enabled {
@@ -457,10 +452,10 @@ impl Session {
         }
         let cwd = std::env::current_dir()?;
         let role_override = crate::agent::role::role_override_from_source(&self.session_source);
+        let ask_user_client = ask_user_client.or_else(|| self.ask_user_client.clone());
         let new_model = self.model_factory.build(
             cwd,
             self.id,
-            dynamic_tool_client,
             ask_user_client,
             Arc::clone(&self.current_turn_id),
             role_override,
@@ -477,10 +472,9 @@ impl Session {
         Ok(enabled)
     }
 
-    pub(crate) async fn abort_pending_dynamic_tool_requests(&self) {
-        if let Some(dynamic_tool_client) = &self.dynamic_tool_client {
-            // The transport adapter currently tracks pending dynamic-tool requests by thread.
-            dynamic_tool_client.abort_pending_server_requests().await;
+    pub(crate) async fn abort_pending_server_requests(&self) {
+        if let Some(ask_user_client) = &self.ask_user_client {
+            ask_user_client.abort_pending_server_requests().await;
         }
     }
 
@@ -502,12 +496,18 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use anyhow::Result;
+    use app_server_protocol::{AskUserQuestionParams, AskUserQuestionResponse, JSONRPCErrorError};
+    use futures_util::future::BoxFuture;
     use rig::message::Message;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
+    use tools::AskUserClient;
 
     use crate::{
         SessionModel, SessionModelDriver, SessionStream,
@@ -524,6 +524,50 @@ mod tests {
     impl SessionModelDriver for EmptyDriver {
         fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
             Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
+
+    struct RecordingFactory {
+        calls: Arc<Mutex<Vec<(bool, bool)>>>,
+        model: SessionModel,
+    }
+
+    impl SessionModelFactory for RecordingFactory {
+        fn build(
+            &self,
+            _cwd: PathBuf,
+            _thread_id: smooth_protocol::ThreadId,
+            ask_user_client: Option<Arc<dyn AskUserClient>>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
+            _role_override: crate::agent::role::RoleOverride,
+            _agent_control: AgentControl,
+            plan_mode: bool,
+        ) -> Result<SessionModel> {
+            self.calls
+                .lock()
+                .expect("recording factory mutex should lock")
+                .push((ask_user_client.is_some(), plan_mode));
+            Ok(self.model.clone())
+        }
+    }
+
+    struct StubAskUserClient;
+
+    impl AskUserClient for StubAskUserClient {
+        fn ask(
+            &self,
+            _params: AskUserQuestionParams,
+        ) -> BoxFuture<'static, std::result::Result<AskUserQuestionResponse, JSONRPCErrorError>>
+        {
+            Box::pin(async {
+                Ok(AskUserQuestionResponse {
+                    answers: Vec::new(),
+                })
+            })
+        }
+
+        fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
         }
     }
 
@@ -548,7 +592,6 @@ mod tests {
             0,
             rollout,
             current_turn_id,
-            None,
             None,
             SessionSource::Cli,
             AgentControl::new(),
@@ -598,6 +641,46 @@ mod tests {
                 turn_id: None,
                 status: smooth_protocol::AgentStatus::Shutdown,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn unchecked_plan_mode_rebuild_reuses_stored_ask_user_client() {
+        let workspace = TempDir::new().expect("tempdir");
+        let cwd = PathBuf::from(workspace.path());
+        let thread_id = smooth_protocol::ThreadId::new();
+        let current_turn_id = Arc::new(RwLock::new(None));
+        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd)
+            .await
+            .expect("rollout");
+        let model = SessionModel::Stub(Arc::new(EmptyDriver));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let factory: Arc<dyn SessionModelFactory> = Arc::new(RecordingFactory {
+            calls: Arc::clone(&calls),
+            model: model.clone(),
+        });
+        let core = Core::new(
+            thread_id,
+            model,
+            Vec::new(),
+            0,
+            rollout,
+            current_turn_id,
+            Some(Arc::new(StubAskUserClient)),
+            SessionSource::Cli,
+            AgentControl::new(),
+            true,
+            factory,
+        );
+
+        core.session
+            .apply_plan_mode_unchecked(false, None)
+            .await
+            .expect("plan mode rebuild");
+
+        assert_eq!(
+            *calls.lock().expect("recording factory mutex should lock"),
+            vec![(true, false)]
         );
     }
 }

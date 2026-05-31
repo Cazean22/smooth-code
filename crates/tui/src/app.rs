@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use smooth_protocol::{
     AgentStatus, ErrorInfo, Event, EventMsg, FileChangeOutput, ThreadId, ToolCallResultKind,
@@ -782,9 +782,9 @@ impl UiModel {
             CrosstermEvent::Paste(text) => self.handle_paste_event(text),
             CrosstermEvent::Resize(width, height) => {
                 self.terminal_width = width;
-                self.viewport_height = height.saturating_sub(4).max(1);
+                self.viewport_height = self.transcript_viewport_height(width, height);
                 self.render_cache
-                    .evict_stale_widths(width.saturating_sub(2).max(1));
+                    .evict_stale_widths(self.transcript_cache_width_hint(width));
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2040,12 +2040,7 @@ impl UiModel {
             Style::default().fg(Color::DarkGray),
         )));
 
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().title("Dashboard").borders(Borders::ALL))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn render_workspace(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -2063,10 +2058,12 @@ impl UiModel {
             constraints.push(Constraint::Length(picker_height));
         }
         constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(composer_height));
         if command_height > 0 {
             constraints.push(Constraint::Length(command_height));
         }
-        constraints.push(Constraint::Length(composer_height));
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(1));
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -2082,13 +2079,22 @@ impl UiModel {
             }
             idx += 1;
         }
-        self.render_status(frame, chunks[idx]);
+        render_horizontal_separator(
+            frame,
+            chunks[idx],
+            self.composer_title(),
+            self.composer_accent_style(),
+        );
+        idx += 1;
+        self.render_composer(frame, chunks[idx]);
         idx += 1;
         if command_height > 0 {
             self.render_command(frame, chunks[idx]);
             idx += 1;
         }
-        self.render_composer(frame, chunks[idx]);
+        render_horizontal_separator(frame, chunks[idx], "Status", muted_separator_style());
+        idx += 1;
+        self.render_status(frame, chunks[idx]);
     }
 
     fn render_workspace_body(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -2096,10 +2102,15 @@ impl UiModel {
         if show_split {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                .constraints([
+                    Constraint::Percentage(70),
+                    Constraint::Length(1),
+                    Constraint::Percentage(30),
+                ])
                 .split(area);
             self.render_transcript(frame, chunks[0]);
-            self.render_inspector(frame, chunks[1]);
+            render_vertical_separator(frame, chunks[1]);
+            self.render_inspector(frame, chunks[2]);
         } else if self.inspector_visible && self.focus == FocusTarget::Inspector {
             self.render_inspector(frame, area);
         } else {
@@ -2108,8 +2119,8 @@ impl UiModel {
     }
 
     fn render_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let inner_width = area.width.saturating_sub(2).max(1);
-        let viewport_height = area.height.saturating_sub(2).max(1);
+        let inner_width = area.width.max(1);
+        let viewport_height = area.height.max(1);
         // Record the width we actually wrap/draw at so `max_scroll` (which also
         // runs from key handlers, before the next draw) counts the same rows.
         self.transcript_inner_width = inner_width;
@@ -2117,14 +2128,17 @@ impl UiModel {
             self.scroll_to_bottom(viewport_height);
         }
         let lines = self.visible_transcript_lines(inner_width, viewport_height);
-        let paragraph = Paragraph::new(Text::from(lines))
-            .block(Block::default().title("Transcript").borders(Borders::ALL))
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
     }
 
     fn render_inspector(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "Inspector",
+            Style::default().fg(Color::Cyan).bold(),
+        )));
+        lines.push(Line::default());
         lines.push(Line::from(vec![
             Span::styled("Turn ", Style::default().fg(Color::Yellow).bold()),
             Span::raw(
@@ -2191,12 +2205,7 @@ impl UiModel {
             }
         }
 
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().title("Inspector").borders(Borders::ALL))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -2241,22 +2250,8 @@ impl UiModel {
     }
 
     fn render_composer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let title = if self.plan_mode {
-            "Input (plan)"
-        } else {
-            "Input"
-        };
-        let border_style = if self.plan_mode {
-            Style::default().fg(Color::Magenta)
-        } else if self.is_turn_running {
-            Style::default().fg(Color::DarkGray)
-        } else if self.mode == UiMode::Insert {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let composer_width = area.width.saturating_sub(2).max(1);
-        let visible_height = area.height.saturating_sub(2).max(1);
+        let composer_width = area.width.max(1);
+        let visible_height = area.height.max(1);
         let rows = self.composer.visual_rows(usize::from(composer_width));
         let (cursor_row, cursor_col) = self.composer.cursor_visual_position_in_rows(&rows);
         let scroll_row = cursor_row
@@ -2269,13 +2264,7 @@ impl UiModel {
             .map(|row| Line::raw(self.composer.as_str()[row.start..row.end].to_owned()))
             .collect();
 
-        let paragraph = Paragraph::new(Text::from(visible_lines)).block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        );
-        frame.render_widget(paragraph, area);
+        frame.render_widget(Paragraph::new(Text::from(visible_lines)), area);
 
         if self.mode == UiMode::Insert && !self.is_turn_running {
             let inner_width = usize::from(composer_width);
@@ -2285,11 +2274,31 @@ impl UiModel {
                 .min(usize::from(visible_height.saturating_sub(1)));
             let x = area
                 .x
-                .saturating_add(1 + u16::try_from(x_offset).unwrap_or(u16::MAX));
+                .saturating_add(u16::try_from(x_offset).unwrap_or(u16::MAX));
             let y = area
                 .y
-                .saturating_add(1 + u16::try_from(y_offset).unwrap_or(u16::MAX));
+                .saturating_add(u16::try_from(y_offset).unwrap_or(u16::MAX));
             frame.set_cursor_position((x, y.min(area.y.saturating_add(area.height - 1))));
+        }
+    }
+
+    fn composer_title(&self) -> &'static str {
+        if self.plan_mode {
+            "Input (plan)"
+        } else {
+            "Input"
+        }
+    }
+
+    fn composer_accent_style(&self) -> Style {
+        if self.plan_mode {
+            Style::default().fg(Color::Magenta)
+        } else if self.is_turn_running {
+            Style::default().fg(Color::DarkGray)
+        } else if self.mode == UiMode::Insert {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
         }
     }
 
@@ -2299,14 +2308,20 @@ impl UiModel {
             .visual_rows(self.composer_inner_width())
             .len()
             .max(1);
-        u16::try_from(rows)
-            .unwrap_or(4)
-            .saturating_add(2)
-            .clamp(3, 6)
+        u16::try_from(rows).unwrap_or(4).clamp(1, 4)
     }
 
     fn composer_inner_width(&self) -> usize {
-        usize::from(self.terminal_width.saturating_sub(2).max(1))
+        usize::from(self.terminal_width.max(1))
+    }
+
+    fn transcript_cache_width_hint(&self, terminal_width: u16) -> u16 {
+        if self.screen == Screen::Workspace && terminal_width >= 110 && self.inspector_visible {
+            let available = u32::from(terminal_width.saturating_sub(1));
+            u16::try_from(available.saturating_mul(70) / 100).unwrap_or(u16::MAX)
+        } else {
+            terminal_width.max(1)
+        }
     }
 
     fn transcript_viewport_height(&self, width: u16, height: u16) -> u16 {
@@ -2323,9 +2338,10 @@ impl UiModel {
         height
             .saturating_sub(picker_height)
             .saturating_sub(1)
+            .saturating_sub(1)
             .saturating_sub(command_height)
+            .saturating_sub(1)
             .saturating_sub(self.composer_height())
-            .saturating_sub(2)
             .max(1)
     }
 
@@ -2383,6 +2399,50 @@ impl UiModel {
         let max_scroll = total_rows.saturating_sub(usize::from(viewport_height));
         u16::try_from(max_scroll).unwrap_or(u16::MAX)
     }
+}
+
+fn muted_separator_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn render_horizontal_separator(frame: &mut Frame<'_>, area: Rect, label: &str, style: Style) {
+    if area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(separator_line(area.width, label, style)),
+        area,
+    );
+}
+
+fn render_vertical_separator(frame: &mut Frame<'_>, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let lines = (0..area.height)
+        .map(|_| Line::from(Span::styled("│", muted_separator_style())))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn separator_line(width: u16, label: &str, style: Style) -> Line<'static> {
+    let width = usize::from(width);
+    if width == 0 {
+        return Line::default();
+    }
+
+    let text = if label.is_empty() {
+        "─".repeat(width)
+    } else {
+        let prefix = format!("─ {label} ");
+        let prefix_len = prefix.chars().count();
+        if prefix_len >= width {
+            prefix.chars().take(width).collect()
+        } else {
+            format!("{prefix}{}", "─".repeat(width - prefix_len))
+        }
+    };
+    Line::from(Span::styled(text, style))
 }
 
 fn append_visible_line(
@@ -3161,7 +3221,7 @@ mod tests {
     #[test]
     fn insert_mode_up_and_down_use_wrapped_visual_rows() {
         let mut model = workspace_insert_model();
-        model.terminal_width = 7;
+        model.terminal_width = 5;
         model.composer.set_text("abcdef".to_string());
 
         let _ = model.handle_key_event(key(KeyCode::Up));
@@ -3469,8 +3529,63 @@ mod tests {
         terminal.draw(|frame| model.render(frame))?;
 
         let rendered = rendered_buffer_text(&terminal);
-        assert!(rendered.contains("Transcript"), "{rendered}");
+        assert!(
+            rendered.contains("No transcript yet. Type a message and use :send."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("│"), "{rendered}");
         assert!(rendered.contains("Inspector"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_renders_input_above_status_footer() -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = workspace_insert_model();
+        model.composer.set_text("draft".to_string());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
+        terminal.draw(|frame| model.render(frame))?;
+
+        let rendered = rendered_buffer_text(&terminal);
+        let Some(input_idx) = rendered.find("─ Input ") else {
+            panic!("input separator missing:\n{rendered}");
+        };
+        let Some(status_idx) = rendered.find("─ Status ") else {
+            panic!("status separator missing:\n{rendered}");
+        };
+        assert!(input_idx < status_idx, "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn command_line_renders_above_status_footer() -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = workspace_normal_model();
+        model.mode = UiMode::Command;
+        model.command = "help".to_string();
+        model
+            .composer
+            .set_text("first input row\nsecond input row".to_string());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 18))?;
+        terminal.draw(|frame| model.render(frame))?;
+
+        let rendered = rendered_buffer_text(&terminal);
+        let Some(first_input_idx) = rendered.find("first input row") else {
+            panic!("composer text missing:\n{rendered}");
+        };
+        let Some(second_input_idx) = rendered.find("second input row") else {
+            panic!("multi-line composer text missing:\n{rendered}");
+        };
+        let Some(command_idx) = rendered.find(":help") else {
+            panic!("command line missing:\n{rendered}");
+        };
+        let Some(status_idx) = rendered.find("─ Status ") else {
+            panic!("status separator missing:\n{rendered}");
+        };
+
+        assert!(first_input_idx < second_input_idx, "{rendered}");
+        assert!(second_input_idx < command_idx, "{rendered}");
+        assert!(command_idx < status_idx, "{rendered}");
         Ok(())
     }
 
@@ -3485,10 +3600,9 @@ mod tests {
         terminal.draw(|frame| model.render(frame))?;
 
         let rendered = rendered_buffer_text(&terminal);
-        assert!(rendered.contains("Transcript"), "{rendered}");
         assert!(!rendered.contains("Inspector"), "{rendered}");
         assert!(rendered.contains("body marker"), "{rendered}");
-        assert_eq!(model.transcript_inner_width, 118);
+        assert_eq!(model.transcript_inner_width, 120);
         Ok(())
     }
 

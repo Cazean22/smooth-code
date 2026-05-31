@@ -10,7 +10,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 
 const OTHER_LABEL: &str = "Other (type your own answer)";
@@ -243,6 +243,11 @@ impl QuestionPicker {
         );
 
         let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(separator_line(
+            area.width,
+            &header,
+            Style::default().fg(Color::Cyan),
+        ));
         for (idx, option) in question.options.iter().enumerate() {
             let cursor_mark = if state.cursor == idx { "›" } else { " " };
             let select_mark = if multi && state.multi_selected.contains(&idx) {
@@ -325,23 +330,18 @@ impl QuestionPicker {
             )));
         }
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(header)
-            .border_style(Style::default().fg(Color::Cyan));
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
     }
 
     pub(crate) fn desired_height(&self, area_width: u16) -> u16 {
         let question = match self.questions.get(self.current) {
             Some(q) => q,
-            None => return 3,
+            None => return 1,
         };
-        // header line + 2 borders + N option lines (some have preview) + Other + 1 blank + footer + optional hint
+        // header separator + N option lines (some have preview) + Other + 1 blank + footer + optional hint
         let mut rows: u16 = 0;
+        rows += 1; // header separator
         for opt in &question.options {
             rows += 1;
             if opt.preview.is_some() {
@@ -353,10 +353,25 @@ impl QuestionPicker {
         if self.hint.is_some() {
             rows += 1;
         }
-        rows += 2; // borders
         let _ = area_width;
         rows
     }
+}
+
+fn separator_line(width: u16, label: &str, style: Style) -> Line<'static> {
+    let width = usize::from(width);
+    if width == 0 {
+        return Line::default();
+    }
+
+    let prefix = format!("─ {label} ");
+    let prefix_len = prefix.chars().count();
+    let text = if prefix_len >= width {
+        prefix.chars().take(width).collect()
+    } else {
+        format!("{prefix}{}", "─".repeat(width - prefix_len))
+    };
+    Line::from(Span::styled(text, style))
 }
 
 #[cfg(test)]

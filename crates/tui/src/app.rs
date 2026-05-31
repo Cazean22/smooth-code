@@ -615,6 +615,7 @@ struct UiModel {
     auto_scroll: bool,
     is_turn_running: bool,
     plan_mode: bool,
+    inspector_visible: bool,
     terminal_width: u16,
     viewport_height: u16,
     // Inner width of the transcript pane as last drawn by `render_transcript`.
@@ -669,6 +670,7 @@ impl UiModel {
             auto_scroll: true,
             is_turn_running: false,
             plan_mode: false,
+            inspector_visible: true,
             terminal_width: 80,
             viewport_height: 20,
             transcript_inner_width: 78,
@@ -881,6 +883,10 @@ impl UiModel {
                 self.focus = FocusTarget::Composer;
                 Vec::new()
             }
+            KeyCode::Char('I') => {
+                self.toggle_inspector_visible();
+                Vec::new()
+            }
             KeyCode::Char(':') => {
                 self.mode = UiMode::Command;
                 self.command.clear();
@@ -1035,7 +1041,10 @@ impl UiModel {
                 let target = parts.next().unwrap_or_default();
                 match target {
                     "transcript" | "main" => self.focus = FocusTarget::Transcript,
-                    "inspector" | "side" => self.focus = FocusTarget::Inspector,
+                    "inspector" | "side" => {
+                        self.inspector_visible = true;
+                        self.focus = FocusTarget::Inspector;
+                    }
                     "composer" | "input" => {
                         self.focus = FocusTarget::Composer;
                         self.mode = UiMode::Insert;
@@ -1048,8 +1057,18 @@ impl UiModel {
                 }
                 Vec::new()
             }
+            "inspector" => {
+                let action = parts.next().unwrap_or("toggle");
+                match action {
+                    "toggle" => self.toggle_inspector_visible(),
+                    "show" => self.set_inspector_visible(true),
+                    "hide" => self.set_inspector_visible(false),
+                    _ => self.push_info("usage: :inspector toggle|show|hide"),
+                }
+                Vec::new()
+            }
             "help" => {
-                self.push_info(":send  :plan  :quit  :clear  :focus transcript|inspector|composer|dashboard  :help");
+                self.push_info(":send  :plan  :quit  :clear  :focus transcript|inspector|composer|dashboard  :inspector toggle|show|hide  I toggle inspector  :help");
                 Vec::new()
             }
             other => {
@@ -2073,7 +2092,7 @@ impl UiModel {
     }
 
     fn render_workspace_body(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let show_split = area.width >= 110;
+        let show_split = area.width >= 110 && self.inspector_visible;
         if show_split {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
@@ -2081,7 +2100,7 @@ impl UiModel {
                 .split(area);
             self.render_transcript(frame, chunks[0]);
             self.render_inspector(frame, chunks[1]);
-        } else if self.focus == FocusTarget::Inspector {
+        } else if self.inspector_visible && self.focus == FocusTarget::Inspector {
             self.render_inspector(frame, area);
         } else {
             self.render_transcript(frame, area);
@@ -2313,7 +2332,8 @@ impl UiModel {
     fn focus_next(&mut self) {
         self.focus = match self.focus {
             FocusTarget::Dashboard => FocusTarget::Transcript,
-            FocusTarget::Transcript => FocusTarget::Inspector,
+            FocusTarget::Transcript if self.inspector_visible => FocusTarget::Inspector,
+            FocusTarget::Transcript => FocusTarget::Composer,
             FocusTarget::Inspector => FocusTarget::Composer,
             FocusTarget::Composer => FocusTarget::Transcript,
             FocusTarget::Overlay => FocusTarget::Transcript,
@@ -2325,9 +2345,21 @@ impl UiModel {
             FocusTarget::Dashboard => FocusTarget::Composer,
             FocusTarget::Transcript => FocusTarget::Composer,
             FocusTarget::Inspector => FocusTarget::Transcript,
-            FocusTarget::Composer => FocusTarget::Inspector,
+            FocusTarget::Composer if self.inspector_visible => FocusTarget::Inspector,
+            FocusTarget::Composer => FocusTarget::Transcript,
             FocusTarget::Overlay => FocusTarget::Transcript,
         };
+    }
+
+    fn set_inspector_visible(&mut self, visible: bool) {
+        self.inspector_visible = visible;
+        if !visible && self.focus == FocusTarget::Inspector {
+            self.focus = FocusTarget::Transcript;
+        }
+    }
+
+    fn toggle_inspector_visible(&mut self) {
+        self.set_inspector_visible(!self.inspector_visible);
     }
 
     fn scroll_up(&mut self, amount: u16) {
@@ -2473,6 +2505,14 @@ mod tests {
         model.screen = Screen::Workspace;
         model.mode = UiMode::Insert;
         model.focus = FocusTarget::Composer;
+        model
+    }
+
+    fn workspace_normal_model() -> UiModel {
+        let mut model = UiModel::new();
+        model.screen = Screen::Workspace;
+        model.mode = UiMode::Normal;
+        model.focus = FocusTarget::Transcript;
         model
     }
 
@@ -3352,6 +3392,124 @@ mod tests {
                 .join("\n")
                 .contains("could not enable plan mode")
         );
+    }
+
+    #[test]
+    fn inspector_commands_hide_show_and_toggle_visibility() {
+        let mut model = UiModel::new();
+
+        assert!(model.inspector_visible);
+
+        let effects = model.execute_command("inspector hide");
+        assert!(effects.is_empty());
+        assert!(!model.inspector_visible);
+
+        let effects = model.execute_command("inspector show");
+        assert!(effects.is_empty());
+        assert!(model.inspector_visible);
+
+        let effects = model.execute_command("inspector toggle");
+        assert!(effects.is_empty());
+        assert!(!model.inspector_visible);
+
+        let effects = model.execute_command("inspector");
+        assert!(effects.is_empty());
+        assert!(model.inspector_visible);
+    }
+
+    #[test]
+    fn normal_mode_uppercase_i_toggles_inspector_visibility() {
+        let mut model = workspace_normal_model();
+
+        let effects = model.handle_key_event(key(KeyCode::Char('I')));
+        assert!(effects.is_empty());
+        assert!(!model.inspector_visible);
+
+        let effects = model.handle_key_event(key(KeyCode::Char('I')));
+        assert!(effects.is_empty());
+        assert!(model.inspector_visible);
+    }
+
+    #[test]
+    fn hidden_inspector_is_skipped_by_tab_and_backtab() {
+        let mut model = workspace_normal_model();
+        model.inspector_visible = false;
+
+        let _ = model.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(model.focus, FocusTarget::Composer);
+
+        let _ = model.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(model.focus, FocusTarget::Transcript);
+
+        let _ = model.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(model.focus, FocusTarget::Composer);
+
+        let _ = model.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(model.focus, FocusTarget::Transcript);
+    }
+
+    #[test]
+    fn hiding_focused_inspector_falls_back_to_transcript() {
+        let mut model = workspace_normal_model();
+        model.focus = FocusTarget::Inspector;
+
+        let effects = model.execute_command("inspector hide");
+
+        assert!(effects.is_empty());
+        assert!(!model.inspector_visible);
+        assert_eq!(model.focus, FocusTarget::Transcript);
+    }
+
+    #[test]
+    fn wide_workspace_defaults_to_transcript_and_inspector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = workspace_normal_model();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 24))?;
+        terminal.draw(|frame| model.render(frame))?;
+
+        let rendered = rendered_buffer_text(&terminal);
+        assert!(rendered.contains("Transcript"), "{rendered}");
+        assert!(rendered.contains("Inspector"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_inspector_renders_transcript_across_full_workspace_body()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = workspace_normal_model();
+        model.inspector_visible = false;
+        model.push_info("body marker");
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 24))?;
+        terminal.draw(|frame| model.render(frame))?;
+
+        let rendered = rendered_buffer_text(&terminal);
+        assert!(rendered.contains("Transcript"), "{rendered}");
+        assert!(!rendered.contains("Inspector"), "{rendered}");
+        assert!(rendered.contains("body marker"), "{rendered}");
+        assert_eq!(model.transcript_inner_width, 118);
+        Ok(())
+    }
+
+    #[test]
+    fn focus_inspector_command_restores_inspector_visibility_on_wide_workspace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = workspace_normal_model();
+        let _ = model.execute_command("inspector hide");
+
+        let effects = model.execute_command("focus inspector");
+
+        assert!(effects.is_empty());
+        assert!(model.inspector_visible);
+        assert_eq!(model.focus, FocusTarget::Inspector);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 24))?;
+        terminal.draw(|frame| model.render(frame))?;
+
+        let rendered = rendered_buffer_text(&terminal);
+        assert!(rendered.contains("Inspector"), "{rendered}");
+        Ok(())
     }
 
     #[test]

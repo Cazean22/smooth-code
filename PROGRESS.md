@@ -53,6 +53,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - Transcript wrapping is policy-split, not one-size: prose word-wraps (`wrap::wrap_line` breaks at spaces, hard-breaking only a word wider than the line, so words like "like" are not split), while code must stay column-faithful (`wrap::wrap_line_char`). Code blocks live inside assistant/reasoning Markdown, so `markdown_render` marks fenced code at the line level and `history_cell` routes those raw (pre-prefix) lines to char wrapping; inline code only colors spans, so even inline-code-only prose stays word-wrapped. Tool-group rows and `wrap::wrap_text` (diff/code) are char-wrapped too.
 - Dashboard rendering reserves visible space for `QuestionPicker` when an ask-user server request arrives, so overlay key routing cannot capture input for an invisible picker. Inline file-change summaries wrap their header/path rows before truncation, keeping cached row counts aligned with rendered rows even for long paths.
 - The TUI has dashboard/workspace screens plus Normal, Insert, Command, and Overlay modes. Ctrl-C remains an always-exit shortcut before mode or overlay dispatch; Visual mode and slash search remain intentionally unimplemented.
+- The workspace composer is a cursor-aware `ComposerState`, not a raw `String`: Insert mode owns paste/editing keys, Normal mode keeps transcript scrolling, paste text is CRLF/CR-normalized into the composer, and composer cursor/render height use the same Unicode-width visual row calculation.
 
 ## TUI File Change Safety
 

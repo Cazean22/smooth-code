@@ -17,6 +17,7 @@ use ratatui::{
 use smooth_protocol::{
     AgentStatus, Event, EventMsg, FileChangeOutput, ThreadId, ToolCallResultKind,
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     AppTerminal,
@@ -318,6 +319,279 @@ struct RunningToolInfo {
     args_preview: String,
 }
 
+#[derive(Debug, Default)]
+struct ComposerState {
+    text: String,
+    cursor: usize,
+    visual_goal_col: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComposerVisualRow {
+    start: usize,
+    end: usize,
+    width: usize,
+}
+
+impl ComposerState {
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    #[cfg(test)]
+    fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    fn set_text(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = text;
+        self.visual_goal_col = None;
+    }
+
+    fn take_text(&mut self) -> String {
+        self.cursor = 0;
+        self.visual_goal_col = None;
+        std::mem::take(&mut self.text)
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.text.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+        self.visual_goal_col = None;
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.visual_goal_col = None;
+    }
+
+    fn insert_paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.insert_str(&normalized);
+    }
+
+    fn backspace(&mut self) {
+        let Some(prev) = self.prev_cursor_boundary() else {
+            return;
+        };
+        self.text.drain(prev..self.cursor);
+        self.cursor = prev;
+        self.visual_goal_col = None;
+    }
+
+    fn delete(&mut self) {
+        let Some(next) = self.next_cursor_boundary() else {
+            return;
+        };
+        self.text.drain(self.cursor..next);
+        self.visual_goal_col = None;
+    }
+
+    fn move_left(&mut self) {
+        if let Some(prev) = self.prev_cursor_boundary() {
+            self.cursor = prev;
+        }
+        self.visual_goal_col = None;
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = self.next_cursor_boundary() {
+            self.cursor = next;
+        }
+        self.visual_goal_col = None;
+    }
+
+    fn move_line_start(&mut self) {
+        self.cursor = self.current_line_start();
+        self.visual_goal_col = None;
+    }
+
+    fn move_line_end(&mut self) {
+        self.cursor = self.current_line_end();
+        self.visual_goal_col = None;
+    }
+
+    fn move_visual_up(&mut self, width: usize) {
+        let (row, col) = self.cursor_visual_position(width);
+        let goal_col = self.visual_goal_col.unwrap_or(col);
+        if row > 0 {
+            self.cursor = self.byte_offset_for_visual_position(row - 1, goal_col, width);
+        }
+        self.visual_goal_col = Some(goal_col);
+    }
+
+    fn move_visual_down(&mut self, width: usize) {
+        let rows = self.visual_rows(width);
+        let (row, col) = self.cursor_visual_position_in_rows(&rows);
+        let goal_col = self.visual_goal_col.unwrap_or(col);
+        if row + 1 < rows.len() {
+            self.cursor = self.byte_offset_for_visual_position_in_rows(&rows, row + 1, goal_col);
+        }
+        self.visual_goal_col = Some(goal_col);
+    }
+
+    fn visual_rows(&self, width: usize) -> Vec<ComposerVisualRow> {
+        let width = width.max(1);
+        let mut rows = Vec::new();
+        let mut row_start = 0;
+        let mut row_width = 0usize;
+
+        for (idx, ch) in self.text.char_indices() {
+            if ch == '\n' {
+                rows.push(ComposerVisualRow {
+                    start: row_start,
+                    end: idx,
+                    width: row_width,
+                });
+                row_start = idx + ch.len_utf8();
+                row_width = 0;
+                continue;
+            }
+
+            let ch_width = Self::char_width(ch);
+            if row_width > 0 && row_width.saturating_add(ch_width) > width {
+                rows.push(ComposerVisualRow {
+                    start: row_start,
+                    end: idx,
+                    width: row_width,
+                });
+                row_start = idx;
+                row_width = 0;
+            }
+            row_width = row_width.saturating_add(ch_width);
+        }
+
+        rows.push(ComposerVisualRow {
+            start: row_start,
+            end: self.text.len(),
+            width: row_width,
+        });
+
+        if !self.text.is_empty() && !self.text.ends_with('\n') && row_width >= width {
+            rows.push(ComposerVisualRow {
+                start: self.text.len(),
+                end: self.text.len(),
+                width: 0,
+            });
+        }
+
+        rows
+    }
+
+    fn cursor_visual_position(&self, width: usize) -> (usize, usize) {
+        let rows = self.visual_rows(width);
+        self.cursor_visual_position_in_rows(&rows)
+    }
+
+    fn cursor_visual_position_in_rows(&self, rows: &[ComposerVisualRow]) -> (usize, usize) {
+        for (idx, row) in rows.iter().enumerate() {
+            let next_starts_here = rows
+                .get(idx + 1)
+                .is_some_and(|next| next.start == self.cursor);
+            let cursor_is_on_row = self.cursor >= row.start
+                && (self.cursor < row.end
+                    || (self.cursor == row.end
+                        && !next_starts_here
+                        && (self.cursor == self.text.len()
+                            || self.text[self.cursor..].starts_with('\n')
+                            || row.start == row.end)));
+            if cursor_is_on_row {
+                return (idx, self.display_width(row.start, self.cursor));
+            }
+        }
+
+        let fallback_row = rows.len().saturating_sub(1);
+        (fallback_row, rows.last().map(|row| row.width).unwrap_or(0))
+    }
+
+    fn byte_offset_for_visual_position(
+        &self,
+        row: usize,
+        target_col: usize,
+        width: usize,
+    ) -> usize {
+        let rows = self.visual_rows(width);
+        self.byte_offset_for_visual_position_in_rows(&rows, row, target_col)
+    }
+
+    fn byte_offset_for_visual_position_in_rows(
+        &self,
+        rows: &[ComposerVisualRow],
+        row: usize,
+        target_col: usize,
+    ) -> usize {
+        let Some(row) = rows.get(row) else {
+            return self.text.len();
+        };
+        let mut cursor = row.start;
+        let mut col = 0usize;
+        for (idx, ch) in self.text[row.start..row.end].char_indices() {
+            let ch_width = Self::char_width(ch);
+            if col.saturating_add(ch_width) > target_col {
+                break;
+            }
+            col = col.saturating_add(ch_width);
+            cursor = row.start + idx + ch.len_utf8();
+        }
+        cursor
+    }
+
+    fn prev_cursor_boundary(&self) -> Option<usize> {
+        if self.cursor == 0 {
+            return None;
+        }
+        self.text[..self.cursor]
+            .char_indices()
+            .last()
+            .map(|(idx, _)| idx)
+    }
+
+    fn next_cursor_boundary(&self) -> Option<usize> {
+        if self.cursor >= self.text.len() {
+            return None;
+        }
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map(|ch| self.cursor + ch.len_utf8())
+    }
+
+    fn current_line_start(&self) -> usize {
+        self.text[..self.cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0)
+    }
+
+    fn current_line_end(&self) -> usize {
+        self.text[self.cursor..]
+            .find('\n')
+            .map(|idx| self.cursor + idx)
+            .unwrap_or(self.text.len())
+    }
+
+    fn display_width(&self, start: usize, end: usize) -> usize {
+        self.text[start..end].chars().map(Self::char_width).sum()
+    }
+
+    fn char_width(ch: char) -> usize {
+        if ch == '\t' {
+            4
+        } else {
+            UnicodeWidthChar::width(ch).unwrap_or(0)
+        }
+    }
+}
+
 struct UiModel {
     current_thread_id: Option<ThreadId>,
     transcript_items: Vec<TranscriptItem>,
@@ -334,7 +608,7 @@ struct UiModel {
     committed_assistant_for_current_turn: bool,
     committed_reasoning_item_id: Option<String>,
     in_flight_reasoning_item_id: Option<String>,
-    composer: String,
+    composer: ComposerState,
     command: String,
     status_line: String,
     scroll: u16,
@@ -388,7 +662,7 @@ impl UiModel {
             committed_assistant_for_current_turn: false,
             committed_reasoning_item_id: None,
             in_flight_reasoning_item_id: None,
-            composer: String::new(),
+            composer: ComposerState::default(),
             command: String::new(),
             status_line: String::from("Idle"),
             scroll: 0,
@@ -503,6 +777,7 @@ impl UiModel {
     fn handle_terminal_event(&mut self, event: CrosstermEvent) -> Vec<UiEffect> {
         match event {
             CrosstermEvent::Key(key_event) => self.handle_key_event(key_event),
+            CrosstermEvent::Paste(text) => self.handle_paste_event(text),
             CrosstermEvent::Resize(width, height) => {
                 self.terminal_width = width;
                 self.viewport_height = height.saturating_sub(4).max(1);
@@ -512,6 +787,13 @@ impl UiModel {
             }
             _ => Vec::new(),
         }
+    }
+
+    fn handle_paste_event(&mut self, text: String) -> Vec<UiEffect> {
+        if self.screen == Screen::Workspace && self.mode == UiMode::Insert {
+            self.composer.insert_paste(&text);
+        }
+        Vec::new()
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
@@ -659,21 +941,49 @@ impl UiModel {
                 self.request_turn_start()
             }
             KeyCode::Enter => {
-                self.composer.push('\n');
+                self.composer.insert_char('\n');
                 Vec::new()
             }
             KeyCode::Backspace => {
-                self.composer.pop();
+                self.composer.backspace();
+                Vec::new()
+            }
+            KeyCode::Delete => {
+                self.composer.delete();
                 Vec::new()
             }
             KeyCode::Tab => {
-                self.composer.push_str("    ");
+                self.composer.insert_str("    ");
+                Vec::new()
+            }
+            KeyCode::Left => {
+                self.composer.move_left();
+                Vec::new()
+            }
+            KeyCode::Right => {
+                self.composer.move_right();
+                Vec::new()
+            }
+            KeyCode::Up => {
+                self.composer.move_visual_up(self.composer_inner_width());
+                Vec::new()
+            }
+            KeyCode::Down => {
+                self.composer.move_visual_down(self.composer_inner_width());
+                Vec::new()
+            }
+            KeyCode::Home => {
+                self.composer.move_line_start();
+                Vec::new()
+            }
+            KeyCode::End => {
+                self.composer.move_line_end();
                 Vec::new()
             }
             KeyCode::Char(ch)
                 if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
             {
-                self.composer.push(ch);
+                self.composer.insert_char(ch);
                 Vec::new()
             }
             _ => Vec::new(),
@@ -798,14 +1108,14 @@ impl UiModel {
             return Vec::new();
         }
 
-        let input = std::mem::take(&mut self.composer);
+        let input = self.composer.take_text();
         if input.trim().is_empty() {
             return Vec::new();
         }
 
         let Some(thread_id) = self.current_thread_id else {
             self.push_error("no active thread; start or resume a session before sending");
-            self.composer = input;
+            self.composer.set_text(input);
             return Vec::new();
         };
 
@@ -945,7 +1255,7 @@ impl UiModel {
             Some(EffectContext::TurnStart { thread_id, input }) => {
                 self.is_turn_running = false;
                 if self.composer.is_empty() {
-                    self.composer = input;
+                    self.composer.set_text(input);
                     self.mode = UiMode::Insert;
                     self.focus = FocusTarget::Composer;
                 }
@@ -1916,43 +2226,58 @@ impl UiModel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let paragraph = Paragraph::new(self.composer.as_str())
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(border_style),
-            )
-            .wrap(Wrap { trim: false });
+        let composer_width = area.width.saturating_sub(2).max(1);
+        let visible_height = area.height.saturating_sub(2).max(1);
+        let rows = self.composer.visual_rows(usize::from(composer_width));
+        let (cursor_row, cursor_col) = self.composer.cursor_visual_position_in_rows(&rows);
+        let scroll_row = cursor_row
+            .saturating_add(1)
+            .saturating_sub(usize::from(visible_height));
+        let visible_lines: Vec<Line<'static>> = rows
+            .iter()
+            .skip(scroll_row)
+            .take(usize::from(visible_height))
+            .map(|row| Line::raw(self.composer.as_str()[row.start..row.end].to_owned()))
+            .collect();
+
+        let paragraph = Paragraph::new(Text::from(visible_lines)).block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        );
         frame.render_widget(paragraph, area);
 
         if self.mode == UiMode::Insert && !self.is_turn_running {
-            let composer_width = area.width.saturating_sub(2).max(1);
-            let last_line_len = self
-                .composer
-                .rsplit('\n')
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .count()
-                .min(usize::from(composer_width));
-            let line_count = self.composer.lines().count().max(1);
+            let inner_width = usize::from(composer_width);
+            let x_offset = cursor_col.min(inner_width.saturating_sub(1));
+            let y_offset = cursor_row
+                .saturating_sub(scroll_row)
+                .min(usize::from(visible_height.saturating_sub(1)));
             let x = area
                 .x
-                .saturating_add(1 + u16::try_from(last_line_len).unwrap_or(u16::MAX));
+                .saturating_add(1 + u16::try_from(x_offset).unwrap_or(u16::MAX));
             let y = area
                 .y
-                .saturating_add(1 + u16::try_from(line_count.saturating_sub(1)).unwrap_or(0));
+                .saturating_add(1 + u16::try_from(y_offset).unwrap_or(u16::MAX));
             frame.set_cursor_position((x, y.min(area.y.saturating_add(area.height - 1))));
         }
     }
 
     fn composer_height(&self) -> u16 {
-        let rows = self.composer.lines().count().max(1);
+        let rows = self
+            .composer
+            .visual_rows(self.composer_inner_width())
+            .len()
+            .max(1);
         u16::try_from(rows)
             .unwrap_or(4)
             .saturating_add(2)
             .clamp(3, 6)
+    }
+
+    fn composer_inner_width(&self) -> usize {
+        usize::from(self.terminal_width.saturating_sub(2).max(1))
     }
 
     fn transcript_viewport_height(&self, width: u16, height: u16) -> u16 {
@@ -2127,6 +2452,18 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn workspace_insert_model() -> UiModel {
+        let mut model = UiModel::new();
+        model.screen = Screen::Workspace;
+        model.mode = UiMode::Insert;
+        model.focus = FocusTarget::Composer;
+        model
     }
 
     fn transcript_strings(app: &App) -> Vec<String> {
@@ -2656,12 +2993,13 @@ mod tests {
         let thread_id = ThreadId::new();
         model.current_thread_id = Some(thread_id);
         model.screen = Screen::Workspace;
-        model.composer = "draft prompt".to_string();
+        model.composer.set_text("draft prompt".to_string());
 
         let effects = model.request_turn_start();
 
         assert_eq!(effects.len(), 1);
         assert!(model.composer.is_empty());
+        assert_eq!(model.composer.cursor(), 0);
 
         let _ = model.update(UiEvent::EffectFailed {
             effect_id: effects[0].effect_id,
@@ -2669,7 +3007,8 @@ mod tests {
             viewport_height: 20,
         });
 
-        assert_eq!(model.composer, "draft prompt");
+        assert_eq!(model.composer.as_str(), "draft prompt");
+        assert_eq!(model.composer.cursor(), "draft prompt".len());
         assert_eq!(model.mode, UiMode::Insert);
         assert_eq!(model.focus, FocusTarget::Composer);
     }
@@ -2680,17 +3019,121 @@ mod tests {
         let thread_id = ThreadId::new();
         model.current_thread_id = Some(thread_id);
         model.screen = Screen::Workspace;
-        model.composer = "old draft".to_string();
+        model.composer.set_text("old draft".to_string());
 
         let effects = model.request_turn_start();
-        model.composer = "new draft".to_string();
+        model.composer.set_text("new draft".to_string());
         let _ = model.update(UiEvent::EffectFailed {
             effect_id: effects[0].effect_id,
             error: "temporary failure".to_string(),
             viewport_height: 20,
         });
 
-        assert_eq!(model.composer, "new draft");
+        assert_eq!(model.composer.as_str(), "new draft");
+    }
+
+    #[test]
+    fn insert_mode_paste_inserts_at_cursor_and_normalizes_newlines() {
+        let mut model = workspace_insert_model();
+        model.composer.set_text("ab".to_string());
+
+        let _ = model.handle_key_event(key(KeyCode::Left));
+        let effects = model.handle_terminal_event(CrosstermEvent::Paste("X\r\nY\rZ".to_string()));
+
+        assert!(effects.is_empty());
+        assert_eq!(model.composer.as_str(), "aX\nY\nZb");
+        assert_eq!(model.composer.cursor(), "aX\nY\nZ".len());
+    }
+
+    #[test]
+    fn insert_mode_left_and_right_edit_inside_composer() {
+        let mut model = workspace_insert_model();
+        model.composer.set_text("helo".to_string());
+
+        let _ = model.handle_key_event(key(KeyCode::Left));
+        let _ = model.handle_key_event(key(KeyCode::Char('l')));
+        let _ = model.handle_key_event(key(KeyCode::Right));
+        let _ = model.handle_key_event(key(KeyCode::Char('!')));
+
+        assert_eq!(model.composer.as_str(), "hello!");
+        assert_eq!(model.composer.cursor(), "hello!".len());
+    }
+
+    #[test]
+    fn insert_mode_backspace_and_delete_edit_around_cursor() {
+        let mut model = workspace_insert_model();
+        model.composer.set_text("abc".to_string());
+
+        let _ = model.handle_key_event(key(KeyCode::Left));
+        let _ = model.handle_key_event(key(KeyCode::Backspace));
+        assert_eq!(model.composer.as_str(), "ac");
+        assert_eq!(model.composer.cursor(), "a".len());
+
+        let _ = model.handle_key_event(key(KeyCode::Delete));
+        assert_eq!(model.composer.as_str(), "a");
+        assert_eq!(model.composer.cursor(), "a".len());
+    }
+
+    #[test]
+    fn insert_mode_home_and_end_move_within_current_line() {
+        let mut model = workspace_insert_model();
+        model.composer.set_text("abc\ndef".to_string());
+
+        let _ = model.handle_key_event(key(KeyCode::Home));
+        assert_eq!(model.composer.cursor(), "abc\n".len());
+
+        let _ = model.handle_key_event(key(KeyCode::End));
+        assert_eq!(model.composer.cursor(), "abc\ndef".len());
+    }
+
+    #[test]
+    fn insert_mode_up_and_down_preserve_visual_column() {
+        let mut model = workspace_insert_model();
+        model.composer.set_text("abcdef\nx\nabcdef".to_string());
+
+        let _ = model.handle_key_event(key(KeyCode::Up));
+        assert_eq!(model.composer.cursor(), "abcdef\nx".len());
+
+        let _ = model.handle_key_event(key(KeyCode::Up));
+        assert_eq!(model.composer.cursor(), "abcdef".len());
+
+        let _ = model.handle_key_event(key(KeyCode::Down));
+        assert_eq!(model.composer.cursor(), "abcdef\nx".len());
+
+        let _ = model.handle_key_event(key(KeyCode::Down));
+        assert_eq!(model.composer.cursor(), "abcdef\nx\nabcdef".len());
+    }
+
+    #[test]
+    fn insert_mode_up_and_down_use_wrapped_visual_rows() {
+        let mut model = workspace_insert_model();
+        model.terminal_width = 7;
+        model.composer.set_text("abcdef".to_string());
+
+        let _ = model.handle_key_event(key(KeyCode::Up));
+
+        assert_eq!(model.composer.cursor(), "a".len());
+    }
+
+    #[test]
+    fn ctrl_enter_sends_full_composer_text_and_clears_cursor_state() {
+        let mut model = workspace_insert_model();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.composer.set_text("hello\nworld".to_string());
+
+        let effects = model.handle_key_event(modified_key(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::TurnStart {
+                thread_id: got,
+                input,
+            } if *got == thread_id && input == "hello\nworld"
+        ));
+        assert!(model.composer.is_empty());
+        assert_eq!(model.composer.cursor(), 0);
     }
 
     #[test]
@@ -3085,7 +3528,7 @@ mod tests {
         let thread_id = ThreadId::new();
         model.current_thread_id = Some(thread_id);
         model.screen = Screen::Workspace;
-        model.composer = "hello".to_string();
+        model.composer.set_text("hello".to_string());
 
         let _ = model.handle_key_event(key(KeyCode::Char(':')));
         for ch in "send".chars() {
@@ -3095,10 +3538,14 @@ mod tests {
 
         assert_eq!(effects.len(), 1);
         assert!(matches!(
-            effects[0].kind,
-            UiEffectKind::TurnStart { thread_id: got, .. } if got == thread_id
+            &effects[0].kind,
+            UiEffectKind::TurnStart {
+                thread_id: got,
+                input,
+            } if *got == thread_id && input == "hello"
         ));
         assert!(model.composer.is_empty());
+        assert_eq!(model.composer.cursor(), 0);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use smooth_protocol::ThreadId;
 
-use crate::ToolFailure;
+use crate::ToolError;
 
 const DESCRIPTION: &str = r#"Write or overwrite this thread's plan file.
 
@@ -47,7 +47,7 @@ pub struct PlanWriteArgs {
 impl Tool for PlanWriteTool {
     const NAME: &'static str = "plan_write";
 
-    type Error = ToolFailure;
+    type Error = ToolError;
     type Args = PlanWriteArgs;
     type Output = String;
 
@@ -63,14 +63,14 @@ impl Tool for PlanWriteTool {
         let path = self.plan_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
-                ToolFailure::new(format!(
+                ToolError::io(format!(
                     "failed to create plans directory {}: {err}",
                     parent.display()
                 ))
             })?;
         }
         std::fs::write(&path, &args.content).map_err(|err| {
-            ToolFailure::new(format!("failed to write plan {}: {err}", path.display()))
+            ToolError::io(format!("failed to write plan {}: {err}", path.display()))
         })?;
         Ok(format!("wrote plan to {}", path.display()))
     }
@@ -85,9 +85,11 @@ mod tests {
 
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[tokio::test]
-    async fn writes_plan_file_under_smooth_code_plans() {
-        let tmp = TempDir::new().expect("tempdir");
+    async fn writes_plan_file_under_smooth_code_plans() -> TestResult {
+        let tmp = TempDir::new()?;
         let thread_id = ThreadId::new();
         let tool = PlanWriteTool::new(tmp.path().to_path_buf(), thread_id);
 
@@ -95,8 +97,7 @@ mod tests {
             .call(PlanWriteArgs {
                 content: "# Plan\n\nstep 1".to_string(),
             })
-            .await
-            .expect("plan_write should succeed");
+            .await?;
 
         let path = tmp
             .path()
@@ -104,33 +105,33 @@ mod tests {
             .join("plans")
             .join(format!("{thread_id}.md"));
         assert!(output.contains(&path.display().to_string()));
-        let written = fs::read_to_string(&path).expect("plan file should exist");
+        let written = fs::read_to_string(&path)?;
         assert_eq!(written, "# Plan\n\nstep 1");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn second_call_overwrites_previous_plan() {
-        let tmp = TempDir::new().expect("tempdir");
+    async fn second_call_overwrites_previous_plan() -> TestResult {
+        let tmp = TempDir::new()?;
         let thread_id = ThreadId::new();
         let tool = PlanWriteTool::new(tmp.path().to_path_buf(), thread_id);
 
         tool.call(PlanWriteArgs {
             content: "first".to_string(),
         })
-        .await
-        .expect("first write");
+        .await?;
         tool.call(PlanWriteArgs {
             content: "second".to_string(),
         })
-        .await
-        .expect("second write");
+        .await?;
 
         let path = tmp
             .path()
             .join(".smooth-code")
             .join("plans")
             .join(format!("{thread_id}.md"));
-        let written = fs::read_to_string(&path).expect("plan file should exist");
+        let written = fs::read_to_string(&path)?;
         assert_eq!(written, "second");
+        Ok(())
     }
 }

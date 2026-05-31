@@ -5,9 +5,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 
-use crate::{
-    MAX_FILE_CHANGE_BYTES, ToolFailure, encode_tool_output, shared::resolve_path_for_write,
-};
+use crate::{MAX_FILE_CHANGE_BYTES, ToolError, encode_tool_output, shared::resolve_path_for_write};
 
 const DESCRIPTION: &str = r#"Delete an existing file from the local filesystem.
 
@@ -37,7 +35,7 @@ pub struct DeleteArgs {
 impl Tool for DeleteTool {
     const NAME: &'static str = "delete";
 
-    type Error = ToolFailure;
+    type Error = ToolError;
     type Args = DeleteArgs;
     type Output = String;
 
@@ -53,13 +51,13 @@ impl Tool for DeleteTool {
         let path = resolve_path_for_write(&self.cwd, &args.file_path)?;
         let metadata = fs::metadata(&path).map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
-                ToolFailure::new(format!("file {} does not exist", path.display()))
+                ToolError::io(format!("file {} does not exist", path.display()))
             } else {
-                ToolFailure::new(format!("failed to inspect {}: {err}", path.display()))
+                ToolError::io(format!("failed to inspect {}: {err}", path.display()))
             }
         })?;
         if metadata.is_dir() {
-            return Err(ToolFailure::new(format!(
+            return Err(ToolError::invalid_arguments(format!(
                 "{} is a directory; delete only removes files",
                 path.display()
             )));
@@ -71,9 +69,8 @@ impl Tool for DeleteTool {
         };
         let bytes = metadata.len() as usize;
 
-        fs::remove_file(&path).map_err(|err| {
-            ToolFailure::new(format!("failed to delete {}: {err}", path.display()))
-        })?;
+        fs::remove_file(&path)
+            .map_err(|err| ToolError::io(format!("failed to delete {}: {err}", path.display())))?;
 
         let change = match previous_content {
             PreviousContent::Utf8(content) => {
@@ -121,10 +118,12 @@ mod tests {
 
     use super::*;
 
-    fn fixture() -> (DeleteTool, TempDir) {
-        let tmp = TempDir::new().expect("create tempdir");
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn fixture() -> Result<(DeleteTool, TempDir), std::io::Error> {
+        let tmp = TempDir::new()?;
         let tool = DeleteTool::new(tmp.path().to_path_buf());
-        (tool, tmp)
+        Ok((tool, tmp))
     }
 
     fn args(file_path: impl Into<String>) -> DeleteArgs {
@@ -134,24 +133,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deletes_existing_utf8_file() {
-        let (tool, tmp) = fixture();
+    async fn deletes_existing_utf8_file() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
-        fs::write(&path, "hello\nworld\n").unwrap();
+        fs::write(&path, "hello\nworld\n")?;
 
-        let output = tool
-            .call(args("foo.txt"))
-            .await
-            .expect("delete should succeed");
+        let output = tool.call(args("foo.txt")).await?;
 
-        let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
+        let resolved_path = fs::canonicalize(tmp.path())?.join("foo.txt");
         assert!(!path.exists());
         let decoded = decode_tool_output_for_tool("delete", output, true);
         assert_eq!(
             decoded.model_output,
             format!("deleted {} (12 bytes)", resolved_path.display())
         );
-        let file_change = decoded.file_change.expect("file change metadata");
+        let file_change = decoded
+            .file_change
+            .ok_or_else(|| std::io::Error::other("file change metadata"))?;
         assert_eq!(file_change.path, resolved_path);
         assert_eq!(
             file_change.change,
@@ -159,63 +157,64 @@ mod tests {
                 content: "hello\nworld\n".to_string(),
             }
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn errors_when_file_is_missing() {
-        let (tool, _tmp) = fixture();
+    async fn errors_when_file_is_missing() -> TestResult {
+        let (tool, _tmp) = fixture()?;
 
-        let err = tool
-            .call(args("missing.txt"))
-            .await
-            .expect_err("delete should fail");
+        let Err(err) = tool.call(args("missing.txt")).await else {
+            panic!("delete should fail");
+        };
 
         assert!(err.to_string().contains("does not exist"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn errors_when_path_is_directory() {
-        let (tool, tmp) = fixture();
-        fs::create_dir(tmp.path().join("dir")).unwrap();
+    async fn errors_when_path_is_directory() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::create_dir(tmp.path().join("dir"))?;
 
-        let err = tool
-            .call(args("dir"))
-            .await
-            .expect_err("delete should fail");
+        let Err(err) = tool.call(args("dir")).await else {
+            panic!("delete should fail");
+        };
 
         assert!(err.to_string().contains("is a directory"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_path_outside_workspace() {
-        let (tool, _tmp) = fixture();
-        let other = TempDir::new().expect("create second tempdir");
+    async fn rejects_path_outside_workspace() -> TestResult {
+        let (tool, _tmp) = fixture()?;
+        let other = TempDir::new()?;
         let path = other.path().join("file.txt");
-        fs::write(&path, "hello\n").unwrap();
+        fs::write(&path, "hello\n")?;
 
-        let err = tool
-            .call(args(path.display().to_string()))
-            .await
-            .expect_err("delete should fail");
+        let Err(err) = tool.call(args(path.display().to_string())).await else {
+            panic!("delete should fail");
+        };
 
         assert!(err.to_string().contains("escapes the workspace"));
         assert!(path.exists());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn non_utf8_file_emits_omitted_delete_metadata() {
-        let (tool, tmp) = fixture();
+    async fn non_utf8_file_emits_omitted_delete_metadata() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("binary.dat");
-        fs::write(&path, [0xff, 0xfe]).unwrap();
+        fs::write(&path, [0xff, 0xfe])?;
 
-        let output = tool
-            .call(args("binary.dat"))
-            .await
-            .expect("delete should succeed");
+        let output = tool.call(args("binary.dat")).await?;
 
         assert!(!path.exists());
         let decoded = decode_tool_output_for_tool("delete", output, true);
-        match decoded.file_change.expect("file change metadata").change {
+        let file_change = decoded
+            .file_change
+            .ok_or_else(|| std::io::Error::other("file change metadata"))?;
+        match file_change.change {
             FileChange::Omitted {
                 operation,
                 reason,
@@ -231,5 +230,6 @@ mod tests {
             }
             _ => panic!("expected omitted file change"),
         }
+        Ok(())
     }
 }

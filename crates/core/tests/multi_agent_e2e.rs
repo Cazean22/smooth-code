@@ -87,18 +87,16 @@ impl SessionModelFactory for AnyThreadFactory {
 }
 
 #[tokio::test]
-async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() {
-    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-    let workspace = TempDir::new().expect("tempdir");
-    let original_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(workspace.path()).expect("set cwd");
+async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
 
-    let manager = ThreadManagerState::new(None, Some(Arc::new(AnyThreadFactory)))
-        .await
-        .expect("thread manager");
-    let started = manager.start_thread().await.expect("start root");
+    let manager = ThreadManagerState::new(None, Some(Arc::new(AnyThreadFactory))).await?;
+    let started = manager.start_thread().await?;
     let root_id = started.thread_id;
-    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+    let mut root_events = manager.subscribe(root_id).await?;
 
     let spawned = manager
         .spawn_agent_with_role(
@@ -108,8 +106,7 @@ async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() {
             None,
             false,
         )
-        .await
-        .expect("spawn should succeed");
+        .await?;
     assert!(spawned.agent_path.as_str().starts_with("/root/"));
     assert_eq!(spawned.agent_role.as_deref(), Some("explorer"));
 
@@ -146,9 +143,7 @@ async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() {
         "expected child completion event on parent thread"
     );
 
-    let listed = manager
-        .list_agents(root_id, Some("/root"))
-        .expect("list should succeed");
+    let listed = manager.list_agents(root_id, Some("/root"))?;
     assert_eq!(listed.len(), 2);
     assert!(
         listed
@@ -158,11 +153,11 @@ async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() {
 
     let closed = manager
         .close_agent(root_id, spawned.agent_path.as_str())
-        .await
-        .expect("close should succeed");
+        .await?;
     assert_eq!(closed, AgentStatus::Shutdown);
 
-    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
 }
 
 struct ConcurrentSpawnDriver {
@@ -183,7 +178,10 @@ impl SessionModelDriver for ConcurrentSpawnDriver {
         prompt: Message,
         history: Vec<Message>,
     ) -> Result<SessionCompletionStream> {
-        let mut calls = self.calls.lock().expect("calls mutex");
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
         let call_idx = *calls;
         *calls += 1;
         drop(calls);
@@ -282,7 +280,7 @@ impl SessionModelDriver for DeferredChildDriver {
         let release = Arc::clone(&self.release);
         Ok(Box::pin(
             stream::once(async move {
-                release.acquire().await.expect("release permit").forget();
+                release.acquire().await?.forget();
                 Ok(SessionStreamEvent::StreamAssistantItem(
                     SessionAssistantContent::Text(Text { text }),
                 ))
@@ -312,7 +310,10 @@ impl SessionModelDriver for MixedBatchDriver {
         prompt: Message,
         history: Vec<Message>,
     ) -> Result<SessionCompletionStream> {
-        let mut calls = self.calls.lock().expect("calls mutex");
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
         let call_idx = *calls;
         *calls += 1;
         drop(calls);
@@ -441,7 +442,10 @@ impl SessionModelDriver for TwoRetainedDriver {
         prompt: Message,
         history: Vec<Message>,
     ) -> Result<SessionCompletionStream> {
-        let mut calls = self.calls.lock().expect("calls mutex");
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
         let call_idx = *calls;
         *calls += 1;
         drop(calls);
@@ -577,7 +581,10 @@ impl SessionModelFactory for TwoRetainedFactory {
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
-        let mut build_count = self.build_count.lock().expect("build count mutex");
+        let mut build_count = self
+            .build_count
+            .lock()
+            .map_err(|_| anyhow::anyhow!("build count mutex"))?;
         let model = if *build_count == 0 {
             SessionModel::Stub(Arc::new(TwoRetainedDriver {
                 calls: Mutex::new(0),
@@ -604,7 +611,10 @@ impl SessionModelFactory for MixedBatchFactory {
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
-        let mut build_count = self.build_count.lock().expect("build count mutex");
+        let mut build_count = self
+            .build_count
+            .lock()
+            .map_err(|_| anyhow::anyhow!("build count mutex"))?;
         let model = if *build_count == 0 {
             SessionModel::Stub(Arc::new(MixedBatchDriver {
                 calls: Mutex::new(0),
@@ -636,7 +646,10 @@ impl SessionModelFactory for ConcurrentSpawnFactory {
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
-        let mut build_count = self.build_count.lock().expect("build count mutex");
+        let mut build_count = self
+            .build_count
+            .lock()
+            .map_err(|_| anyhow::anyhow!("build count mutex"))?;
         let model = if *build_count == 0 {
             SessionModel::Stub(Arc::new(ConcurrentSpawnDriver {
                 calls: Mutex::new(0),
@@ -653,11 +666,11 @@ impl SessionModelFactory for ConcurrentSpawnFactory {
 }
 
 #[tokio::test]
-async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
-    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-    let workspace = TempDir::new().expect("tempdir");
-    let original_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(workspace.path()).expect("set cwd");
+async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
     let child_release = Arc::new(Semaphore::new(0));
     let manager = ThreadManagerState::new(
         None,
@@ -666,15 +679,13 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
             child_release: Arc::clone(&child_release),
         })),
     )
-    .await
-    .expect("thread manager");
-    let started = manager.start_thread().await.expect("start root");
+    .await?;
+    let started = manager.start_thread().await?;
     let root_id = started.thread_id;
-    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+    let mut root_events = manager.subscribe(root_id).await?;
     let initial_turn_id = manager
         .start_user_input(root_id, "delegate children".to_string())
-        .await
-        .expect("start root turn");
+        .await?;
 
     let mut turn_started = 0;
     let mut spawn_tool_calls_started = 0;
@@ -737,8 +748,7 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let spawned_agents = loop {
         let listed = manager
-            .list_agents(root_id, Some("/root"))
-            .expect("list agents while children run")
+            .list_agents(root_id, Some("/root"))?
             .into_iter()
             .filter(|agent| agent.thread_id != root_id)
             .collect::<Vec<_>>();
@@ -792,9 +802,8 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
                         event
                             .output_preview
                             .as_deref()
-                            .expect("spawn_agent output preview"),
-                    )
-                    .expect("spawn_agent result json");
+                            .ok_or_else(|| anyhow::anyhow!("spawn_agent output preview"))?,
+                    )?;
                     assert_completed_spawn_result(&parsed);
                     completed_tool_results.insert(parsed.thread_id);
                 }
@@ -838,15 +847,16 @@ async fn spawn_agent_waits_for_two_children_and_finishes_in_same_parent_turn() {
         "expected initial turn to finish after both children"
     );
 
-    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
-    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-    let workspace = TempDir::new().expect("tempdir");
-    let original_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(workspace.path()).expect("set cwd");
+async fn mixed_spawn_and_normal_tool_results_preserve_model_order() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
     let child_release = Arc::new(Semaphore::new(0));
     let manager = ThreadManagerState::new(
         None,
@@ -855,15 +865,13 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
             child_release: Arc::clone(&child_release),
         })),
     )
-    .await
-    .expect("thread manager");
-    let started = manager.start_thread().await.expect("start root");
+    .await?;
+    let started = manager.start_thread().await?;
     let root_id = started.thread_id;
-    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+    let mut root_events = manager.subscribe(root_id).await?;
     let initial_turn_id = manager
         .start_user_input(root_id, "mixed batch".to_string())
-        .await
-        .expect("start root turn");
+        .await?;
 
     let mut tool_calls_started = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -902,9 +910,8 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
                         event
                             .output_preview
                             .as_deref()
-                            .expect("spawn_agent output preview"),
-                    )
-                    .expect("spawn_agent result json");
+                            .ok_or_else(|| anyhow::anyhow!("spawn_agent output preview"))?,
+                    )?;
                     assert_live_spawn_result(&parsed);
                     assert_eq!(
                         event
@@ -1003,15 +1010,16 @@ async fn mixed_spawn_and_normal_tool_results_preserve_model_order() {
 
     assert!(turn_completed, "expected mixed batch turn to complete");
 
-    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn retained_subagents_all_finish_before_parent_continues() {
-    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-    let workspace = TempDir::new().expect("tempdir");
-    let original_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(workspace.path()).expect("set cwd");
+async fn retained_subagents_all_finish_before_parent_continues() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
     let child_release = Arc::new(Semaphore::new(0));
     let manager = ThreadManagerState::new(
         None,
@@ -1020,15 +1028,13 @@ async fn retained_subagents_all_finish_before_parent_continues() {
             child_release: Arc::clone(&child_release),
         })),
     )
-    .await
-    .expect("thread manager");
-    let started = manager.start_thread().await.expect("start root");
+    .await?;
+    let started = manager.start_thread().await?;
     let root_id = started.thread_id;
-    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+    let mut root_events = manager.subscribe(root_id).await?;
     let initial_turn_id = manager
         .start_user_input(root_id, "two retained".to_string())
-        .await
-        .expect("start root turn");
+        .await?;
 
     let mut tool_calls_completed = HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1119,7 +1125,8 @@ async fn retained_subagents_all_finish_before_parent_continues() {
         "expected parent to finish after both children"
     );
 
-    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
 }
 
 struct ReasoningStreamDriver {
@@ -1140,7 +1147,10 @@ impl SessionModelDriver for ReasoningStreamDriver {
         prompt: Message,
         history: Vec<Message>,
     ) -> Result<SessionCompletionStream> {
-        let mut calls = self.calls.lock().expect("calls mutex");
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
         let call_idx = *calls;
         *calls += 1;
         drop(calls);
@@ -1240,7 +1250,10 @@ impl SessionModelDriver for ReasoningToolLoopDriver {
         prompt: Message,
         history: Vec<Message>,
     ) -> Result<SessionCompletionStream> {
-        let mut calls = self.calls.lock().expect("calls mutex");
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
         let call_idx = *calls;
         *calls += 1;
         drop(calls);
@@ -1403,7 +1416,10 @@ impl SessionModelDriver for IdlessReasoningCompletionDriver {
         prompt: Message,
         history: Vec<Message>,
     ) -> Result<SessionCompletionStream> {
-        let mut calls = self.calls.lock().expect("calls mutex");
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
         let call_idx = *calls;
         *calls += 1;
         drop(calls);
@@ -1527,7 +1543,10 @@ impl SessionModelDriver for EncryptedReasoningDriver {
         prompt: Message,
         history: Vec<Message>,
     ) -> Result<SessionCompletionStream> {
-        let mut calls = self.calls.lock().expect("calls mutex");
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
         let call_idx = *calls;
         *calls += 1;
         drop(calls);
@@ -1645,82 +1664,74 @@ async fn wait_for_turn_completion(
 }
 
 #[tokio::test]
-async fn terminal_turn_preserves_multi_id_reasoning_in_history() {
-    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-    let workspace = TempDir::new().expect("tempdir");
-    let original_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(workspace.path()).expect("set cwd");
+async fn terminal_turn_preserves_multi_id_reasoning_in_history() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
 
-    let manager = ThreadManagerState::new(None, Some(Arc::new(ReasoningStreamFactory)))
-        .await
-        .expect("thread manager");
-    let started = manager.start_thread().await.expect("start root");
+    let manager = ThreadManagerState::new(None, Some(Arc::new(ReasoningStreamFactory))).await?;
+    let started = manager.start_thread().await?;
     let root_id = started.thread_id;
-    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+    let mut root_events = manager.subscribe(root_id).await?;
 
     let first_turn = manager
         .start_user_input(root_id, "first input".to_string())
-        .await
-        .expect("start first turn");
+        .await?;
     wait_for_turn_completion(&mut root_events, &first_turn).await;
 
     // Second turn triggers the driver's assertions on the persisted history.
     let second_turn = manager
         .start_user_input(root_id, "follow up".to_string())
-        .await
-        .expect("start second turn");
+        .await?;
     wait_for_turn_completion(&mut root_events, &second_turn).await;
 
-    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn reasoning_persists_across_tool_call_iteration_and_terminal_turn() {
-    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-    let workspace = TempDir::new().expect("tempdir");
-    let original_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(workspace.path()).expect("set cwd");
+async fn reasoning_persists_across_tool_call_iteration_and_terminal_turn() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
 
-    let manager = ThreadManagerState::new(None, Some(Arc::new(ReasoningToolLoopFactory)))
-        .await
-        .expect("thread manager");
-    let started = manager.start_thread().await.expect("start root");
+    let manager = ThreadManagerState::new(None, Some(Arc::new(ReasoningToolLoopFactory))).await?;
+    let started = manager.start_thread().await?;
     let root_id = started.thread_id;
-    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+    let mut root_events = manager.subscribe(root_id).await?;
 
     let first_turn = manager
         .start_user_input(root_id, "tool loop".to_string())
-        .await
-        .expect("start first turn");
+        .await?;
     wait_for_turn_completion(&mut root_events, &first_turn).await;
 
     let second_turn = manager
         .start_user_input(root_id, "verify".to_string())
-        .await
-        .expect("start verification turn");
+        .await?;
     wait_for_turn_completion(&mut root_events, &second_turn).await;
 
-    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn idless_reasoning_completion_supersedes_pending_deltas_without_duplicating() {
-    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-    let workspace = TempDir::new().expect("tempdir");
-    let original_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(workspace.path()).expect("set cwd");
+async fn idless_reasoning_completion_supersedes_pending_deltas_without_duplicating() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
 
-    let manager = ThreadManagerState::new(None, Some(Arc::new(IdlessReasoningCompletionFactory)))
-        .await
-        .expect("thread manager");
-    let started = manager.start_thread().await.expect("start root");
+    let manager =
+        ThreadManagerState::new(None, Some(Arc::new(IdlessReasoningCompletionFactory))).await?;
+    let started = manager.start_thread().await?;
     let root_id = started.thread_id;
-    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+    let mut root_events = manager.subscribe(root_id).await?;
 
     let first_turn = manager
         .start_user_input(root_id, "anthropic shape".to_string())
-        .await
-        .expect("start first turn");
+        .await?;
     wait_for_turn_completion(&mut root_events, &first_turn).await;
 
     // The driver's call-1 arm asserts the persisted history contains exactly
@@ -1728,31 +1739,28 @@ async fn idless_reasoning_completion_supersedes_pending_deltas_without_duplicati
     // duplicate from the pending delta bucket.
     let second_turn = manager
         .start_user_input(root_id, "follow up".to_string())
-        .await
-        .expect("start follow-up turn");
+        .await?;
     wait_for_turn_completion(&mut root_events, &second_turn).await;
 
-    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn encrypted_reasoning_block_is_preserved_in_history() {
-    let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-    let workspace = TempDir::new().expect("tempdir");
-    let original_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(workspace.path()).expect("set cwd");
+async fn encrypted_reasoning_block_is_preserved_in_history() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
 
-    let manager = ThreadManagerState::new(None, Some(Arc::new(EncryptedReasoningFactory)))
-        .await
-        .expect("thread manager");
-    let started = manager.start_thread().await.expect("start root");
+    let manager = ThreadManagerState::new(None, Some(Arc::new(EncryptedReasoningFactory))).await?;
+    let started = manager.start_thread().await?;
     let root_id = started.thread_id;
-    let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+    let mut root_events = manager.subscribe(root_id).await?;
 
     let first_turn = manager
         .start_user_input(root_id, "encrypted shape".to_string())
-        .await
-        .expect("start first turn");
+        .await?;
     wait_for_turn_completion(&mut root_events, &first_turn).await;
 
     // The driver's call-1 arm asserts the persisted history retained the
@@ -1762,11 +1770,11 @@ async fn encrypted_reasoning_block_is_preserved_in_history() {
     // dropped because its human-readable text was empty.
     let second_turn = manager
         .start_user_input(root_id, "follow up".to_string())
-        .await
-        .expect("start follow-up turn");
+        .await?;
     wait_for_turn_completion(&mut root_events, &second_turn).await;
 
-    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
 }
 
 fn assert_live_status_entry(agent: &CollabAgentStatusEntry) {
@@ -1829,12 +1837,16 @@ fn tool_result_agent_infos(message: &Message) -> Vec<TestAgentInfo> {
 }
 
 fn parse_agent_info(text: &str) -> TestAgentInfo {
-    serde_json::from_str(text)
-        .unwrap_or_else(|err| panic!("spawn_agent output json: {err}; payload={text}"))
+    match serde_json::from_str(text) {
+        Ok(info) => info,
+        Err(err) => panic!("spawn_agent output json: {err}; payload={text}"),
+    }
 }
 
 fn user_text_agent_info(message: &Message) -> TestAgentInfo {
-    let text = first_user_text(message).expect("user text spawn result");
+    let Some(text) = first_user_text(message) else {
+        panic!("user text spawn result");
+    };
     parse_agent_info(&text)
 }
 

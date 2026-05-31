@@ -358,7 +358,7 @@ impl SessionModelFactory for StubSessionModelFactory {
     ) -> Result<SessionModel> {
         self.models
             .lock()
-            .expect("stub session model factory mutex should lock")
+            .map_err(|_| anyhow::anyhow!("stub session model factory mutex was poisoned"))?
             .get(&thread_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("missing stub session model for thread {thread_id}"))
@@ -1555,6 +1555,7 @@ where
 mod tests {
     use std::{collections::HashSet, sync::Arc};
 
+    use anyhow::{Context, Result};
     use rig::{
         OneOrMany,
         agent::AgentBuilder,
@@ -1692,8 +1693,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_agent_registers_only_spawn_agent_agent_tool() {
-        let workspace = tempfile::TempDir::new().expect("tempdir");
+    async fn build_agent_registers_only_spawn_agent_agent_tool() -> Result<()> {
+        let workspace = tempfile::TempDir::new()?;
         let agent = build_agent(
             AgentBuilder::new(DummyModel),
             workspace.path().to_path_buf(),
@@ -1707,8 +1708,7 @@ mod tests {
         let tool_names = agent
             .tool_server_handle
             .get_tool_defs(None)
-            .await
-            .expect("tool definitions")
+            .await?
             .into_iter()
             .map(|definition| definition.name)
             .collect::<HashSet<_>>();
@@ -1722,11 +1722,12 @@ mod tests {
         // Plan-mode-only tools must not be present in the default agent.
         assert!(!tool_names.contains("plan_write"));
         assert!(!tool_names.contains("exit_plan_mode"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn build_agent_in_plan_mode_swaps_mutating_for_planning_tools() {
-        let workspace = tempfile::TempDir::new().expect("tempdir");
+    async fn build_agent_in_plan_mode_swaps_mutating_for_planning_tools() -> Result<()> {
+        let workspace = tempfile::TempDir::new()?;
         let agent = build_agent(
             AgentBuilder::new(DummyModel),
             workspace.path().to_path_buf(),
@@ -1740,8 +1741,7 @@ mod tests {
         let tool_names = agent
             .tool_server_handle
             .get_tool_defs(None)
-            .await
-            .expect("tool definitions")
+            .await?
             .into_iter()
             .map(|definition| definition.name)
             .collect::<HashSet<_>>();
@@ -1758,10 +1758,11 @@ mod tests {
         assert!(!tool_names.contains("edit"));
         assert!(!tool_names.contains("delete"));
         assert!(!tool_names.contains("write"));
+        Ok(())
     }
 
     #[test]
-    fn openai_websocket_payload_moves_system_inputs_to_instructions() {
+    fn openai_websocket_payload_moves_system_inputs_to_instructions() -> Result<()> {
         let request = CompletionRequest {
             model: None,
             preamble: Some("Use concise answers.".to_string()),
@@ -1769,7 +1770,7 @@ mod tests {
                 Message::system("Follow repo instructions."),
                 Message::user("Inspect the workspace."),
             ])
-            .expect("chat history"),
+            .context("chat history")?,
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,
@@ -1779,8 +1780,8 @@ mod tests {
             output_schema: None,
         };
 
-        let payload = super::openai_websocket_create_payload("gpt-test", request).expect("payload");
-        let value: serde_json::Value = serde_json::from_str(&payload).expect("json payload");
+        let payload = super::openai_websocket_create_payload("gpt-test", request)?;
+        let value: serde_json::Value = serde_json::from_str(&payload)?;
 
         assert_eq!(
             value
@@ -1791,7 +1792,7 @@ mod tests {
         let input = value
             .get("input")
             .and_then(serde_json::Value::as_array)
-            .expect("input array");
+            .context("input array")?;
         assert!(input.iter().all(|item| {
             !item
                 .get("role")
@@ -1804,10 +1805,11 @@ mod tests {
                 .is_some_and(|role| role == "user")
         }));
         assert!(!payload.contains("System instructions:"));
+        Ok(())
     }
 
     #[test]
-    fn openai_websocket_accumulator_preserves_tool_delta_identity() {
+    fn openai_websocket_accumulator_preserves_tool_delta_identity() -> Result<()> {
         let mut accumulator = super::OpenAiWebSocketAccumulator::new();
 
         let name_delta = accumulator.decode_item_chunk(ItemChunk {
@@ -1891,7 +1893,7 @@ mod tests {
             RawStreamingChoice::ToolCall(tool_call) => Some(tool_call),
             _ => None,
         });
-        let tool_call = tool_call.expect("completed tool call should be emitted at finish");
+        let tool_call = tool_call.context("completed tool call should be emitted at finish")?;
         assert_eq!(tool_call.id, "fc_1");
         assert_eq!(tool_call.internal_call_id, internal_call_id);
         assert_eq!(tool_call.call_id.as_deref(), Some("call_1"));
@@ -1900,6 +1902,7 @@ mod tests {
             tool_call.arguments,
             serde_json::json!({"path": "src/lib.rs"})
         );
+        Ok(())
     }
 
     #[test]
@@ -1926,44 +1929,43 @@ mod tests {
     }
 
     #[test]
-    fn openai_websocket_parser_skips_provider_telemetry_events() {
+    fn openai_websocket_parser_skips_provider_telemetry_events() -> Result<()> {
         let mut accumulator = super::OpenAiWebSocketAccumulator::new();
 
         let outcome = super::parse_openai_websocket_payload(
             r#"{"type":"codex.rate_limits","rate_limits":{"allowed":true}}"#,
             &mut accumulator,
-        )
-        .expect("telemetry event should be skipped");
+        )?;
 
         assert!(outcome.choices.is_empty());
         assert!(!outcome.terminal);
         assert!(!accumulator.can_finish_after_disconnect());
+        Ok(())
     }
 
     #[test]
-    fn openai_websocket_parser_tolerates_reasoning_text_done_shape() {
+    fn openai_websocket_parser_tolerates_reasoning_text_done_shape() -> Result<()> {
         let mut accumulator = super::OpenAiWebSocketAccumulator::new();
 
         let outcome = super::parse_openai_websocket_payload(
             r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":0,"sequence_number":1,"text":"done"}"#,
             &mut accumulator,
-        )
-        .expect("reasoning done event should not require Rig's delta-shaped struct");
+        )?;
 
         assert!(outcome.choices.is_empty());
         assert!(!outcome.terminal);
         assert!(!accumulator.can_finish_after_disconnect());
+        Ok(())
     }
 
     #[test]
-    fn openai_websocket_parser_tolerates_completed_response_without_output() {
+    fn openai_websocket_parser_tolerates_completed_response_without_output() -> Result<()> {
         let mut accumulator = super::OpenAiWebSocketAccumulator::new();
 
         let outcome = super::parse_openai_websocket_payload(
             r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":3}}}"#,
             &mut accumulator,
-        )
-        .expect("completed response without output should be accepted");
+        )?;
 
         assert!(outcome.choices.is_empty());
         assert!(outcome.terminal);
@@ -1973,6 +1975,7 @@ mod tests {
             finished.last(),
             Some(RawStreamingChoice::FinalResponse(response)) if response.usage.total_tokens == 3
         ));
+        Ok(())
     }
 
     #[test]
@@ -2017,7 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_websocket_function_args_done_allows_tool_call_finish() {
+    fn openai_websocket_function_args_done_allows_tool_call_finish() -> Result<()> {
         let mut accumulator = super::OpenAiWebSocketAccumulator::new();
 
         let name_delta = accumulator.decode_item_chunk(ItemChunk {
@@ -2071,7 +2074,7 @@ mod tests {
             RawStreamingChoice::ToolCall(tool_call) => Some(tool_call),
             _ => None,
         });
-        let tool_call = tool_call.expect("tool call should be emitted from args.done fallback");
+        let tool_call = tool_call.context("tool call should be emitted from args.done fallback")?;
         assert_eq!(tool_call.id, "fc_1");
         assert_eq!(tool_call.internal_call_id, internal_call_id);
         assert_eq!(tool_call.call_id.as_deref(), Some("call_1"));
@@ -2080,6 +2083,7 @@ mod tests {
             tool_call.arguments,
             serde_json::json!({"path": "Cargo.toml"})
         );
+        Ok(())
     }
 
     #[test]
@@ -2167,14 +2171,13 @@ mod tests {
     }
 
     #[test]
-    fn openai_websocket_response_done_without_status_completes() {
+    fn openai_websocket_response_done_without_status_completes() -> Result<()> {
         let mut accumulator = super::OpenAiWebSocketAccumulator::new();
 
         let outcome = super::parse_openai_websocket_payload(
             r#"{"type":"response.done","response":{"id":"resp_1","usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":3}}}"#,
             &mut accumulator,
-        )
-        .expect("response.done without status should be treated as completed");
+        )?;
 
         assert!(outcome.choices.is_empty());
         assert!(outcome.terminal);
@@ -2184,5 +2187,6 @@ mod tests {
             finished.last(),
             Some(RawStreamingChoice::FinalResponse(response)) if response.usage.total_tokens == 3
         ));
+        Ok(())
     }
 }

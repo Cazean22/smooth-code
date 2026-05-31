@@ -12,8 +12,8 @@ use rig::{
 use serde::{Deserialize, Serialize};
 use smooth_protocol::{
     AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
-    AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, EventMsg, ThreadId, ToolCallCompletedEvent,
-    ToolCallResultKind, ToolCallStartedEvent,
+    AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, ErrorInfo, EventMsg, ThreadId,
+    ToolCallCompletedEvent, ToolCallResultKind, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
 use tools::{DecodedToolOutput, decode_tool_output_for_tool};
@@ -58,6 +58,8 @@ async fn fail_turn(
     err: anyhow::Error,
 ) {
     let message = err.to_string();
+    let error_info =
+        ErrorInfo::new("turn_failed", message.clone()).with_source(format!("smooth-core::{site}"));
     tracing::error!(
         thread_id = %session.id,
         turn_id = %ctx.sub_id,
@@ -69,13 +71,12 @@ async fn fail_turn(
         .emit_event(
             ctx,
             EventMsg::Error(ErrorEvent {
-                message: message.clone(),
-                codex_error_info: None,
+                error: error_info.clone(),
             }),
         )
         .await;
     session
-        .set_agent_status(AgentStatus::Errored(message), Some(ctx))
+        .set_agent_status(AgentStatus::Errored(error_info), Some(ctx))
         .await;
 }
 
@@ -1140,14 +1141,30 @@ async fn start_spawn_tool_call(
         .await
     {
         Ok((metadata, initial_status, waiter)) => {
+            let Some(child_thread_id) = metadata.agent_id else {
+                let message = "spawned agent metadata should have a thread id".to_string();
+                return SpawnToolStart::Completed(Box::new(
+                    complete_tool_call(
+                        session,
+                        ctx,
+                        index,
+                        tool_call.id,
+                        tool_call.call_id,
+                        internal_call_id,
+                        "spawn_agent".to_string(),
+                        message.clone(),
+                        false,
+                        Some(message),
+                    )
+                    .await,
+                ));
+            };
             SpawnToolStart::Started(Box::new(StartedSpawnToolCall {
                 index,
                 tool_call_id: tool_call.id,
                 tool_call_call_id: tool_call.call_id,
                 internal_call_id,
-                child_thread_id: metadata
-                    .agent_id
-                    .expect("spawned agent metadata should have a thread id"),
+                child_thread_id,
                 metadata,
                 initial_status,
                 waiter: Some(waiter),
@@ -1337,7 +1354,13 @@ fn retained_completion_text(
 ) -> String {
     let (status, last_assistant_message) = match completion {
         Ok(completion) => (completion.status, completion.last_assistant_message),
-        Err(message) => (AgentStatus::Errored(message), None),
+        Err(message) => (
+            AgentStatus::Errored(
+                ErrorInfo::new("spawn_agent_inline_wait_failed", message)
+                    .with_source("smooth-core"),
+            ),
+            None,
+        ),
     };
     encode_spawn_agent_result(&metadata, &status, last_assistant_message)
         .unwrap_or_else(|message| message)
@@ -1381,7 +1404,7 @@ fn build_assistant_text_reasoning_message(
     }
     Some(Message::Assistant {
         id: turn_summary.assistant_message_id.clone(),
-        content: OneOrMany::many(content_items).expect("assistant content should not be empty"),
+        content: OneOrMany::many(content_items).ok()?,
     })
 }
 
@@ -1502,8 +1525,7 @@ fn build_assistant_tool_message(
     }
     Some(Message::Assistant {
         id: turn_summary.assistant_message_id.clone(),
-        content: OneOrMany::many(content_items)
-            .expect("tool phase assistant content should not be empty"),
+        content: OneOrMany::many(content_items).ok()?,
     })
 }
 

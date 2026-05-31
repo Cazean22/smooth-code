@@ -1,15 +1,18 @@
 use app_server::in_process::{
     self, InProcessClientHandle, InProcessServerEvent, InProcessStartArgs,
 };
-use app_server_protocol::{ClientCommand, ClientRequest, JSONRPCErrorError};
+use app_server_protocol::{ClientCommand, ClientRequest, JsonRpcError};
+use smooth_protocol::ErrorInfo;
 use tokio::sync::oneshot;
+
+use crate::error::TuiResult;
 
 pub(crate) struct AppServerClient {
     handle: InProcessClientHandle,
 }
 
 impl AppServerClient {
-    pub(crate) async fn start(channel_capacity: usize) -> anyhow::Result<Self> {
+    pub(crate) async fn start(channel_capacity: usize) -> TuiResult<Self> {
         Ok(Self {
             handle: in_process::start(InProcessStartArgs { channel_capacity }).await?,
         })
@@ -23,7 +26,7 @@ impl AppServerClient {
     pub(crate) async fn request(
         &self,
         request: ClientRequest,
-    ) -> std::result::Result<serde_json::Value, JSONRPCErrorError> {
+    ) -> std::result::Result<serde_json::Value, JsonRpcError> {
         let request_name = match &request {
             ClientRequest::ThreadStart { .. } => "thread_start",
             ClientRequest::TurnStart { .. } => "turn_start",
@@ -38,19 +41,18 @@ impl AppServerClient {
             request: Box::new(request),
             response_tx,
         };
-        self.handle
-            .client_tx
-            .send(command)
-            .await
-            .map_err(|err| JSONRPCErrorError {
-                code: -32000,
-                data: None,
-                message: err.to_string(),
-            })?;
-        response_rx.await.map_err(|err| JSONRPCErrorError {
-            code: -32000,
-            data: None,
-            message: err.to_string(),
+        self.handle.client_tx.send(command).await.map_err(|err| {
+            JsonRpcError::new(
+                -32000,
+                ErrorInfo::new("request_channel_closed", err.to_string()).with_source("smooth-tui"),
+            )
+        })?;
+        response_rx.await.map_err(|err| {
+            JsonRpcError::new(
+                -32000,
+                ErrorInfo::new("response_channel_closed", err.to_string())
+                    .with_source("smooth-tui"),
+            )
         })?
     }
 
@@ -62,23 +64,37 @@ impl AppServerClient {
         &self,
         request_id: app_server_protocol::RequestId,
         result: serde_json::Value,
-    ) -> anyhow::Result<()> {
+    ) -> TuiResult<()> {
         self.handle
             .client_tx
             .send(ClientCommand::ServerRequestResponse { request_id, result })
-            .await?;
+            .await
+            .map_err(|err| {
+                JsonRpcError::new(
+                    -32000,
+                    ErrorInfo::new("request_channel_closed", err.to_string())
+                        .with_source("smooth-tui"),
+                )
+            })?;
         Ok(())
     }
 
     pub(crate) async fn fail_server_request(
         &self,
         request_id: app_server_protocol::RequestId,
-        error: JSONRPCErrorError,
-    ) -> anyhow::Result<()> {
+        error: JsonRpcError,
+    ) -> TuiResult<()> {
         self.handle
             .client_tx
             .send(ClientCommand::ServerRequestError { request_id, error })
-            .await?;
+            .await
+            .map_err(|err| {
+                JsonRpcError::new(
+                    -32000,
+                    ErrorInfo::new("request_channel_closed", err.to_string())
+                        .with_source("smooth-tui"),
+                )
+            })?;
         Ok(())
     }
 }

@@ -2,7 +2,7 @@ use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
-use crate::ToolFailure;
+use crate::ToolError;
 
 const DESCRIPTION: &str = r#"Leave plan mode now that the plan is ready.
 
@@ -31,7 +31,7 @@ pub struct ExitPlanModeArgs {
 impl Tool for ExitPlanModeTool {
     const NAME: &'static str = "exit_plan_mode";
 
-    type Error = ToolFailure;
+    type Error = ToolError;
     type Args = ExitPlanModeArgs;
     type Output = String;
 
@@ -44,7 +44,7 @@ impl Tool for ExitPlanModeTool {
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-        Err(ToolFailure::new(
+        Err(ToolError::unsupported(
             "exit_plan_mode must be intercepted by the core tool loop",
         ))
     }

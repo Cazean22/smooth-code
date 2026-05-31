@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
-use anyhow::{Result, anyhow};
 use smooth_protocol::{
     AgentStatus, CollabAgentCompletedEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
-    EventMsg, Op, SessionSource, SubAgentSource, ThreadId,
+    ErrorInfo, EventMsg, Op, SessionSource, SubAgentSource, ThreadId,
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, oneshot, watch};
@@ -22,6 +21,7 @@ use crate::{
         status::{agent_status_from_event, is_final, last_assistant_message},
     },
     core_thread::CoreThread,
+    error::{CoreError, CoreResult},
     provider::SessionModelFactory,
     rollout::read_persisted_items,
 };
@@ -75,29 +75,23 @@ impl AgentControl {
         ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         state_db: StateDbHandle,
-    ) {
-        *self
-            .state
-            .runtime
-            .lock()
-            .expect("agent control runtime mutex should lock") = Some(AgentControlRuntime {
+    ) -> CoreResult<()> {
+        *lock_mutex(&self.state.runtime, "agent_control.runtime")? = Some(AgentControlRuntime {
             threads,
             ask_user_client_factory,
             model_factory,
             state_db,
         });
+        Ok(())
     }
 
-    pub(crate) fn register_session_root(
-        &self,
-        thread_id: ThreadId,
-    ) -> Result<AgentMetadata, String> {
-        let metadata = self.state.registry.register_root_thread(thread_id)?;
-        let mut statuses = self
+    pub(crate) fn register_session_root(&self, thread_id: ThreadId) -> CoreResult<AgentMetadata> {
+        let metadata = self
             .state
-            .statuses
-            .lock()
-            .expect("agent control status mutex should lock");
+            .registry
+            .register_root_thread(thread_id)
+            .map_err(CoreError::registry)?;
+        let mut statuses = lock_mutex(&self.state.statuses, "agent_control.statuses")?;
         statuses
             .entry(thread_id)
             .or_insert_with(|| watch::channel(AgentStatus::PendingInit).0);
@@ -108,12 +102,12 @@ impl AgentControl {
         &self,
         metadata: AgentMetadata,
         initial_events: &[EventMsg],
-    ) -> Result<AgentMetadata> {
+    ) -> CoreResult<AgentMetadata> {
         let registered = self
             .state
             .registry
             .register_existing_thread(metadata.clone(), AGENT_MAX_THREADS)
-            .map_err(anyhow::Error::msg)?;
+            .map_err(CoreError::registry)?;
         let status = initial_events
             .iter()
             .filter_map(agent_status_from_event)
@@ -122,46 +116,45 @@ impl AgentControl {
         self.ensure_status_sender(
             registered
                 .agent_id
-                .ok_or_else(|| anyhow!("registered agent is missing thread id"))?,
+                .ok_or_else(|| CoreError::invariant("registered agent is missing thread id"))?,
             status,
-        );
+        )?;
         self.maybe_start_completion_watcher(registered.clone(), false);
         Ok(registered)
     }
 
     pub(crate) fn get_status(&self, thread_id: ThreadId) -> AgentStatus {
-        self.state
-            .statuses
-            .lock()
-            .expect("agent control status mutex should lock")
+        let Ok(statuses) = self.state.statuses.lock() else {
+            return AgentStatus::Errored(
+                ErrorInfo::new("mutex_poisoned", "agent control status mutex was poisoned")
+                    .with_source("smooth-core"),
+            );
+        };
+        statuses
             .get(&thread_id)
             .map(|status| status.borrow().clone())
             .unwrap_or(AgentStatus::NotFound)
     }
 
-    pub(crate) fn subscribe_status(&self, thread_id: ThreadId) -> watch::Receiver<AgentStatus> {
-        let mut statuses = self
-            .state
-            .statuses
-            .lock()
-            .expect("agent control status mutex should lock");
-        statuses
+    pub(crate) fn subscribe_status(
+        &self,
+        thread_id: ThreadId,
+    ) -> CoreResult<watch::Receiver<AgentStatus>> {
+        let mut statuses = lock_mutex(&self.state.statuses, "agent_control.statuses")?;
+        Ok(statuses
             .entry(thread_id)
             .or_insert_with(|| watch::channel(AgentStatus::NotFound).0)
-            .subscribe()
+            .subscribe())
     }
 
-    pub(crate) fn set_status(&self, thread_id: ThreadId, status: AgentStatus) {
-        if let Some(sender) = self
-            .state
-            .statuses
-            .lock()
-            .expect("agent control status mutex should lock")
+    pub(crate) fn set_status(&self, thread_id: ThreadId, status: AgentStatus) -> CoreResult<()> {
+        if let Some(sender) = lock_mutex(&self.state.statuses, "agent_control.statuses")?
             .get(&thread_id)
             .cloned()
         {
             sender.send_replace(status);
         }
+        Ok(())
     }
 
     pub(crate) fn registry(&self) -> AgentRegistry {
@@ -172,27 +165,27 @@ impl AgentControl {
         &self,
         author_thread_id: ThreadId,
         target: &str,
-    ) -> Result<ThreadId> {
+    ) -> CoreResult<ThreadId> {
         let session_source = self.session_source_for_thread(author_thread_id)?;
         agent_resolver::resolve_agent_reference(&self.state.registry, &session_source, target)
-            .map_err(anyhow::Error::msg)
+            .map_err(CoreError::control)
     }
 
     pub(crate) fn list_agents(
         &self,
         author_thread_id: ThreadId,
         path_prefix: Option<&str>,
-    ) -> Result<Vec<AgentMetadata>> {
+    ) -> CoreResult<Vec<AgentMetadata>> {
         let session_source = self.session_source_for_thread(author_thread_id)?;
         agent_resolver::list_agents(&self.state.registry, &session_source, path_prefix)
-            .map_err(anyhow::Error::msg)
+            .map_err(CoreError::control)
     }
 
     pub(crate) async fn spawn_agent(
         &self,
         parent_thread_id: ThreadId,
         message: String,
-    ) -> Result<AgentMetadata> {
+    ) -> CoreResult<AgentMetadata> {
         self.spawn_agent_with_role(parent_thread_id, message, None, None, false)
             .await
     }
@@ -204,7 +197,7 @@ impl AgentControl {
         agent_role: Option<String>,
         model: Option<String>,
         fork_context: bool,
-    ) -> Result<AgentMetadata> {
+    ) -> CoreResult<AgentMetadata> {
         self.spawn_agent_with_role_internal(
             parent_thread_id,
             message,
@@ -224,7 +217,7 @@ impl AgentControl {
         agent_role: Option<String>,
         model: Option<String>,
         fork_context: bool,
-    ) -> Result<(AgentMetadata, InlineChildCompletionReceiver)> {
+    ) -> CoreResult<(AgentMetadata, InlineChildCompletionReceiver)> {
         let (metadata, _child_thread_id, waiter) = self
             .spawn_agent_with_role_internal(
                 parent_thread_id,
@@ -235,7 +228,8 @@ impl AgentControl {
                 true,
             )
             .await?;
-        let waiter = waiter.expect("inline waiter should be registered");
+        let waiter =
+            waiter.ok_or_else(|| CoreError::invariant("inline waiter should be registered"))?;
         Ok((metadata, waiter))
     }
 
@@ -246,7 +240,7 @@ impl AgentControl {
         agent_role: Option<String>,
         model: Option<String>,
         fork_context: bool,
-    ) -> Result<(AgentMetadata, AgentStatus, InlineChildCompletionReceiver)> {
+    ) -> CoreResult<(AgentMetadata, AgentStatus, InlineChildCompletionReceiver)> {
         let call_id = Uuid::now_v7().to_string();
         self.emit_collab_event(
             parent_thread_id,
@@ -272,7 +266,7 @@ impl AgentControl {
             Ok((metadata, waiter)) => {
                 let thread_id = metadata
                     .agent_id
-                    .ok_or_else(|| anyhow!("spawned agent is missing thread id"))?;
+                    .ok_or_else(|| CoreError::invariant("spawned agent is missing thread id"))?;
                 let status = self.get_status(thread_id);
                 self.emit_collab_event(
                     parent_thread_id,
@@ -301,7 +295,7 @@ impl AgentControl {
                         new_agent_role: agent_role,
                         prompt: message,
                         model,
-                        status: AgentStatus::Errored(err.to_string()),
+                        status: AgentStatus::Errored(err.to_error_info()),
                     }),
                 )
                 .await;
@@ -318,7 +312,7 @@ impl AgentControl {
         model: Option<String>,
         fork_context: bool,
         inline_wait: bool,
-    ) -> Result<(
+    ) -> CoreResult<(
         AgentMetadata,
         ThreadId,
         Option<InlineChildCompletionReceiver>,
@@ -326,24 +320,20 @@ impl AgentControl {
         if let Some(role) = agent_role.as_deref()
             && resolve_role(role).is_none()
         {
-            return Err(anyhow!("unknown agent role `{role}`"));
+            return Err(CoreError::control(format!("unknown agent role `{role}`")));
         }
         if model.is_some() {
-            return Err(anyhow!("spawn_agent model override is not implemented yet"));
+            return Err(CoreError::control(
+                "spawn_agent model override is not implemented yet",
+            ));
         }
 
-        let runtime = self
-            .state
-            .runtime
-            .lock()
-            .expect("agent control runtime mutex should lock")
-            .clone()
-            .ok_or_else(|| anyhow!("agent control runtime is not attached"))?;
+        let runtime = self.runtime()?;
         let reservation = self
             .state
             .registry
             .reserve_spawn_slot(parent_thread_id, AGENT_MAX_DEPTH, AGENT_MAX_THREADS)
-            .map_err(anyhow::Error::msg)?;
+            .map_err(CoreError::registry)?;
 
         let child_thread_id = ThreadId::new();
         let child_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -379,15 +369,18 @@ impl AgentControl {
             let mut threads = runtime.threads.write().await;
             threads.insert(child_thread_id, Arc::clone(&child_thread));
         }
-        self.ensure_status_sender(child_thread_id, AgentStatus::PendingInit);
-        let inline_waiter =
-            inline_wait.then(|| self.register_inline_child_completion_waiter(child_thread_id));
+        self.ensure_status_sender(child_thread_id, AgentStatus::PendingInit)?;
+        let inline_waiter = if inline_wait {
+            Some(self.register_inline_child_completion_waiter(child_thread_id)?)
+        } else {
+            None
+        };
 
         if let Err(err) = child_thread.submit(Op::UserInput(message)).await {
             runtime.threads.write().await.remove(&child_thread_id);
-            self.remove_status_sender(child_thread_id);
+            self.remove_status_sender(child_thread_id)?;
             if inline_wait {
-                self.unregister_inline_child_completion_waiter(child_thread_id);
+                self.unregister_inline_child_completion_waiter(child_thread_id)?;
             }
             return Err(err);
         }
@@ -404,7 +397,7 @@ impl AgentControl {
                 parent_thread_id: Some(parent_thread_id),
                 depth,
             })
-            .map_err(anyhow::Error::msg)?;
+            .map_err(CoreError::registry)?;
         runtime
             .state_db
             .upsert_thread(
@@ -426,7 +419,7 @@ impl AgentControl {
         &self,
         author_thread_id: ThreadId,
         target: &str,
-    ) -> Result<AgentStatus> {
+    ) -> CoreResult<AgentStatus> {
         let target_thread_id = self.resolve_agent_reference(author_thread_id, target)?;
         let runtime = self.runtime()?;
         if let Some(metadata) = self
@@ -444,66 +437,61 @@ impl AgentControl {
         let thread = threads
             .get(&target_thread_id)
             .cloned()
-            .ok_or_else(|| anyhow!("unknown live agent thread id: {target_thread_id}"))?;
+            .ok_or(CoreError::UnknownThread {
+                thread_id: target_thread_id,
+            })?;
         drop(threads);
 
         let _ = thread.submit(Op::Shutdown).await?;
         thread.core.session.abort_all_tasks("closed").await;
         runtime.threads.write().await.remove(&target_thread_id);
         self.state.registry.unregister_thread(target_thread_id);
-        self.remove_status_sender(target_thread_id);
+        self.remove_status_sender(target_thread_id)?;
         Ok(AgentStatus::Shutdown)
     }
 
-    fn ensure_status_sender(&self, thread_id: ThreadId, status: AgentStatus) {
-        self.state
-            .statuses
-            .lock()
-            .expect("agent control status mutex should lock")
+    fn ensure_status_sender(&self, thread_id: ThreadId, status: AgentStatus) -> CoreResult<()> {
+        lock_mutex(&self.state.statuses, "agent_control.statuses")?
             .entry(thread_id)
             .or_insert_with(|| watch::channel(status).0);
+        Ok(())
     }
 
-    fn remove_status_sender(&self, thread_id: ThreadId) {
-        self.state
-            .statuses
-            .lock()
-            .expect("agent control status mutex should lock")
-            .remove(&thread_id);
+    fn remove_status_sender(&self, thread_id: ThreadId) -> CoreResult<()> {
+        lock_mutex(&self.state.statuses, "agent_control.statuses")?.remove(&thread_id);
+        Ok(())
     }
 
     pub(crate) fn register_inline_child_completion_waiter(
         &self,
         child_thread_id: ThreadId,
-    ) -> InlineChildCompletionReceiver {
+    ) -> CoreResult<InlineChildCompletionReceiver> {
         let (tx, rx) = oneshot::channel();
-        self.state
-            .inline_waiters
-            .lock()
-            .expect("agent control inline waiter mutex should lock")
+        lock_mutex(&self.state.inline_waiters, "agent_control.inline_waiters")?
             .insert(child_thread_id, tx);
-        rx
+        Ok(rx)
     }
 
-    pub(crate) fn unregister_inline_child_completion_waiter(&self, child_thread_id: ThreadId) {
-        self.state
-            .inline_waiters
-            .lock()
-            .expect("agent control inline waiter mutex should lock")
+    pub(crate) fn unregister_inline_child_completion_waiter(
+        &self,
+        child_thread_id: ThreadId,
+    ) -> CoreResult<()> {
+        lock_mutex(&self.state.inline_waiters, "agent_control.inline_waiters")?
             .remove(&child_thread_id);
+        Ok(())
     }
 
-    fn session_source_for_thread(&self, thread_id: ThreadId) -> Result<SessionSource> {
+    fn session_source_for_thread(&self, thread_id: ThreadId) -> CoreResult<SessionSource> {
         let Some(metadata) = self.state.registry.agent_metadata_for_thread(thread_id) else {
-            return Err(anyhow!("unknown thread id: {thread_id}"));
+            return Err(CoreError::UnknownThread { thread_id });
         };
         if metadata.parent_thread_id.is_none() || metadata.depth == 0 {
             return Ok(SessionSource::Cli);
         }
         Ok(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: metadata
-                .parent_thread_id
-                .ok_or_else(|| anyhow!("missing parent thread id for {thread_id}"))?,
+            parent_thread_id: metadata.parent_thread_id.ok_or_else(|| {
+                CoreError::invariant(format!("missing parent thread id for {thread_id}"))
+            })?,
             depth: metadata.depth,
             agent_path: Some(metadata.agent_path),
             agent_nickname: metadata.agent_nickname,
@@ -511,13 +499,10 @@ impl AgentControl {
         }))
     }
 
-    fn runtime(&self) -> Result<AgentControlRuntime> {
-        self.state
-            .runtime
-            .lock()
-            .expect("agent control runtime mutex should lock")
+    fn runtime(&self) -> CoreResult<AgentControlRuntime> {
+        lock_mutex(&self.state.runtime, "agent_control.runtime")?
             .clone()
-            .ok_or_else(|| anyhow!("agent control runtime is not attached"))
+            .ok_or(CoreError::RuntimeNotAttached)
     }
 
     fn maybe_start_completion_watcher(&self, child: AgentMetadata, notify_if_already_final: bool) {
@@ -527,7 +512,9 @@ impl AgentControl {
         let Some(child_thread_id) = child.agent_id else {
             return;
         };
-        let mut status_rx = self.subscribe_status(child_thread_id);
+        let Ok(mut status_rx) = self.subscribe_status(child_thread_id) else {
+            return;
+        };
         let control = self.clone();
         tokio::spawn(async move {
             let mut first_poll = true;
@@ -570,18 +557,23 @@ impl AgentControl {
         &self,
         parent_thread_id: ThreadId,
         _fork_mode: SpawnAgentForkMode,
-    ) -> Result<Vec<rig::message::Message>> {
+    ) -> CoreResult<Vec<rig::message::Message>> {
         let parent_status = self.get_status(parent_thread_id);
         let runtime = self.runtime()?;
         let threads = runtime.threads.read().await;
-        let parent_thread = threads
-            .get(&parent_thread_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown parent thread id: {parent_thread_id}"))?;
+        let parent_thread =
+            threads
+                .get(&parent_thread_id)
+                .cloned()
+                .ok_or(CoreError::UnknownThread {
+                    thread_id: parent_thread_id,
+                })?;
         drop(threads);
 
         parent_thread.flush_rollout().await?;
-        let items = read_persisted_items(parent_thread.rollout_path()).await?;
+        let items = read_persisted_items(parent_thread.rollout_path())
+            .await
+            .map_err(CoreError::rollout)?;
         let mut history = persisted_items_to_messages(items);
         if matches!(parent_status, AgentStatus::Running) {
             Self::trim_active_prompt_from_fork_history(&mut history);
@@ -621,12 +613,8 @@ impl AgentControl {
         .await;
 
         let last_assistant_message = last_assistant_message(&status);
-        if let Some(waiter) = self
-            .state
-            .inline_waiters
-            .lock()
-            .expect("agent control inline waiter mutex should lock")
-            .remove(&child_thread_id)
+        if let Ok(mut waiters) = self.state.inline_waiters.lock()
+            && let Some(waiter) = waiters.remove(&child_thread_id)
         {
             let _ = waiter.send(InlineChildCompletion {
                 status,
@@ -634,6 +622,10 @@ impl AgentControl {
             });
         }
     }
+}
+
+fn lock_mutex<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> CoreResult<MutexGuard<'a, T>> {
+    mutex.lock().map_err(|_| CoreError::MutexPoisoned { name })
 }
 
 fn should_notify_parent_on_completion(status: &AgentStatus) -> bool {
@@ -652,10 +644,10 @@ mod tests {
     use std::{
         collections::HashMap,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, MutexGuard},
     };
 
-    use anyhow::Result;
+    use anyhow::{Context, Result, anyhow};
     use futures_util::{StreamExt, stream};
     use rig::{
         agent::FinalResponse,
@@ -674,19 +666,27 @@ mod tests {
     use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
     use tools::AskUserClient;
 
+    fn lock_test_mutex<'a, T>(
+        mutex: &'a Mutex<T>,
+        name: &'static str,
+    ) -> Result<MutexGuard<'a, T>> {
+        mutex
+            .lock()
+            .map_err(|_| anyhow!("test mutex `{name}` was poisoned"))
+    }
+
     #[test]
-    fn clones_share_registry_and_status_state() {
+    fn clones_share_registry_and_status_state() -> Result<()> {
         let control = AgentControl::new();
         let clone = control.clone();
         let root_id = ThreadId::new();
 
-        control
-            .register_session_root(root_id)
-            .expect("root registration");
-        clone.set_status(root_id, AgentStatus::Running);
+        control.register_session_root(root_id)?;
+        clone.set_status(root_id, AgentStatus::Running)?;
 
         assert_eq!(control.get_status(root_id), AgentStatus::Running);
         assert_eq!(clone.registry().live_agents().len(), 1);
+        Ok(())
     }
 
     struct StubDriver {
@@ -740,10 +740,7 @@ mod tests {
 
     impl SessionModelDriver for RecordingDriver {
         fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
-            self.state
-                .calls
-                .lock()
-                .expect("calls mutex should lock")
+            lock_test_mutex(&self.state.calls, "calls")?
                 .entry(self.thread_id)
                 .or_default()
                 .push(history.clone());
@@ -799,7 +796,7 @@ mod tests {
             _agent_control: AgentControl,
             _plan_mode: bool,
         ) -> Result<SessionModel> {
-            let mut build_count = self.build_count.lock().expect("build count mutex");
+            let mut build_count = lock_test_mutex(&self.build_count, "build_count")?;
             let build_index = *build_count;
             *build_count += 1;
             if build_index == 0 {
@@ -829,7 +826,10 @@ mod tests {
             let text = self.text.clone();
             Ok(Box::pin(
                 stream::once(async move {
-                    let _permit = release.acquire_owned().await.expect("release permit");
+                    let _permit = release
+                        .acquire_owned()
+                        .await
+                        .map_err(|err| anyhow!("release permit: {err}"))?;
                     Ok(SessionStreamEvent::StreamAssistantItem(
                         crate::SessionAssistantContent::Text(Text { text }),
                     ))
@@ -842,13 +842,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_creates_child_and_tracks_it_live() {
-        let _cwd_guard = crate::test_support::cwd_test_lock()
-            .lock()
-            .expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn spawn_agent_creates_child_and_tracks_it_live() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let manager = ThreadManagerState::new(
             None,
@@ -858,34 +856,28 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
 
         let control = manager.agent_control();
         let child = control
             .spawn_agent(root_id, "hello child".to_string())
-            .await
-            .expect("spawn child");
+            .await?;
 
         assert!(child.agent_path.as_str().starts_with("/root/"));
         assert_eq!(control.registry().live_agents().len(), 2);
-        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db"))
-            .await
-            .expect("open state db");
+        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db")).await?;
         let root_row = state_db
             .get_thread(&root_id.to_string())
-            .await
-            .expect("get root row")
-            .expect("root row");
+            .await?
+            .context("root row")?;
         assert_eq!(root_row.agent_path, None);
-        let child_id = child.agent_id.expect("child id");
+        let child_id = child.agent_id.context("child id")?;
         let child_row = state_db
             .get_thread(&child_id.to_string())
-            .await
-            .expect("get child row")
-            .expect("child row");
+            .await?
+            .context("child row")?;
         assert_eq!(
             child_row.agent_path.as_deref(),
             Some(child.agent_path.as_str())
@@ -893,23 +885,21 @@ mod tests {
         assert_eq!(
             state_db
                 .list_open_children(&root_id.to_string())
-                .await
-                .expect("list open children")
+                .await?
                 .len(),
             1
         );
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_agents_resolves_relative_agent_target() {
-        let _cwd_guard = crate::test_support::cwd_test_lock()
-            .lock()
-            .expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn list_agents_resolves_relative_agent_target() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let manager = ThreadManagerState::new(
             None,
@@ -919,38 +909,33 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
         let control = manager.agent_control();
         let child = control
             .spawn_agent(root_id, "hello child".to_string())
-            .await
-            .expect("spawn child");
-        let child_id = child.agent_id.expect("child id");
+            .await?;
+        let child_id = child.agent_id.context("child id")?;
         let child_name = child.agent_path.name().to_string();
 
-        let listed = control
-            .list_agents(child_id, Some(".."))
-            .expect_err("invalid relative");
+        let Err(listed) = control.list_agents(child_id, Some("..")) else {
+            panic!("relative parent traversal should be rejected");
+        };
         assert!(listed.to_string().contains("`..` is reserved"));
-        let listed = control
-            .list_agents(root_id, Some(&child_name))
-            .expect("list child");
+        let listed = control.list_agents(root_id, Some(&child_name))?;
         assert_eq!(listed.len(), 1);
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn close_agent_removes_live_child() {
-        let _cwd_guard = crate::test_support::cwd_test_lock()
-            .lock()
-            .expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn close_agent_removes_live_child() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let manager = ThreadManagerState::new(
             None,
@@ -960,44 +945,37 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
         let control = manager.agent_control();
         let child = control
             .spawn_agent(root_id, "hello child".to_string())
-            .await
-            .expect("spawn child");
+            .await?;
 
         let status = control
             .close_agent(root_id, child.agent_path.as_str())
-            .await
-            .expect("close child");
+            .await?;
         assert_eq!(status, AgentStatus::Shutdown);
         assert_eq!(control.registry().live_agents().len(), 1);
-        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db"))
-            .await
-            .expect("open state db");
+        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db")).await?;
         assert!(
             state_db
                 .list_open_children(&root_id.to_string())
-                .await
-                .expect("list open children")
+                .await?
                 .is_empty()
         );
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn completion_watcher_emits_parent_event_for_shutdown_child() {
-        let _cwd_guard = crate::test_support::cwd_test_lock()
-            .lock()
-            .expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn completion_watcher_emits_parent_event_for_shutdown_child() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let release = Arc::new(Semaphore::new(0));
         let manager = ThreadManagerState::new(
@@ -1009,22 +987,19 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
-        let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+        let mut root_events = manager.subscribe(root_id).await?;
         let control = manager.agent_control();
         let child = control
             .spawn_agent(root_id, "hello child".to_string())
-            .await
-            .expect("spawn child");
-        let child_id = child.agent_id.expect("child id");
+            .await?;
+        let child_id = child.agent_id.context("child id")?;
 
         let status = control
             .close_agent(root_id, child.agent_path.as_str())
-            .await
-            .expect("close child");
+            .await?;
         assert_eq!(status, AgentStatus::Shutdown);
 
         let mut saw_shutdown_completion = false;
@@ -1052,17 +1027,16 @@ mod tests {
             "expected shutdown child completion event on parent thread"
         );
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn completion_watcher_emits_parent_completion_event() {
-        let _cwd_guard = crate::test_support::cwd_test_lock()
-            .lock()
-            .expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn completion_watcher_emits_parent_completion_event() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let manager = ThreadManagerState::new(
             None,
@@ -1072,17 +1046,15 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
-        let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+        let mut root_events = manager.subscribe(root_id).await?;
         let control = manager.agent_control();
         let child = control
             .spawn_agent(root_id, "hello child".to_string())
-            .await
-            .expect("spawn child");
-        let child_id = child.agent_id.expect("child id");
+            .await?;
+        let child_id = child.agent_id.context("child id")?;
         let mut saw_completion = false;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         while tokio::time::Instant::now() < deadline {
@@ -1123,17 +1095,16 @@ mod tests {
             "expected completion watcher to emit collab event"
         );
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn completion_watcher_resolves_inline_waiter() {
-        let _cwd_guard = crate::test_support::cwd_test_lock()
-            .lock()
-            .expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn completion_watcher_resolves_inline_waiter() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let manager = ThreadManagerState::new(
             None,
@@ -1143,11 +1114,10 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
-        let mut root_events = manager.subscribe(root_id).await.expect("subscribe root");
+        let mut root_events = manager.subscribe(root_id).await?;
         let control = manager.agent_control();
         let (child, waiter) = control
             .spawn_agent_with_role_inline_wait(
@@ -1157,10 +1127,9 @@ mod tests {
                 None,
                 false,
             )
-            .await
-            .expect("spawn child");
-        let child_id = child.agent_id.expect("child id");
-        let completion = waiter.await.expect("inline waiter result");
+            .await?;
+        let child_id = child.agent_id.context("child id")?;
+        let completion = waiter.await?;
 
         assert_eq!(
             completion.status,
@@ -1199,17 +1168,16 @@ mod tests {
             "expected child completion event on parent thread"
         );
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn spawn_agent_with_fork_context_seeds_child_history() {
-        let _cwd_guard = crate::test_support::cwd_test_lock()
-            .lock()
-            .expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn spawn_agent_with_fork_context_seeds_child_history() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let recording_state = Arc::new(RecordingState::default());
         let manager = ThreadManagerState::new(
@@ -1218,14 +1186,12 @@ mod tests {
                 state: Arc::clone(&recording_state),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
         manager
             .start_user_input(root_id, "parent asks".to_string())
-            .await
-            .expect("parent turn");
+            .await?;
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         let control = manager.agent_control();
@@ -1237,19 +1203,15 @@ mod tests {
                 None,
                 true,
             )
-            .await
-            .expect("spawn child");
+            .await?;
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-        let child_id = child.agent_id.expect("child id");
-        let calls = recording_state
-            .calls
-            .lock()
-            .expect("calls mutex should lock");
+        let child_id = child.agent_id.context("child id")?;
+        let calls = lock_test_mutex(&recording_state.calls, "calls")?;
         let child_history = calls
             .get(&child_id)
             .and_then(|calls| calls.first())
-            .expect("child first call history");
+            .context("child first call history")?;
         assert_eq!(child_history.len(), 1);
         assert!(matches!(
             &child_history[0],
@@ -1260,17 +1222,16 @@ mod tests {
                 )
         ));
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn spawn_agent_with_fork_context_excludes_live_parent_prompt() {
-        let _cwd_guard = crate::test_support::cwd_test_lock()
-            .lock()
-            .expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn spawn_agent_with_fork_context_excludes_live_parent_prompt() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let recording_state = Arc::new(RecordingState::default());
         let release = Arc::new(Semaphore::new(0));
@@ -1282,9 +1243,8 @@ mod tests {
                 release: Arc::clone(&release),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
 
         manager
@@ -1293,8 +1253,7 @@ mod tests {
                 "list crates, spawn two subagents to explore crates/protocol and crates/state-db"
                     .to_string(),
             )
-            .await
-            .expect("parent turn");
+            .await?;
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         let control = manager.agent_control();
@@ -1306,19 +1265,15 @@ mod tests {
                 None,
                 true,
             )
-            .await
-            .expect("spawn child");
+            .await?;
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-        let child_id = child.agent_id.expect("child id");
-        let calls = recording_state
-            .calls
-            .lock()
-            .expect("calls mutex should lock");
+        let child_id = child.agent_id.context("child id")?;
+        let calls = lock_test_mutex(&recording_state.calls, "calls")?;
         let child_history = calls
             .get(&child_id)
             .and_then(|calls| calls.first())
-            .expect("child first call history");
+            .context("child first call history")?;
         assert!(
             child_history.is_empty(),
             "forked child should not inherit the live parent prompt"
@@ -1327,6 +1282,7 @@ mod tests {
         release.add_permits(1);
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 }

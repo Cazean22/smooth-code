@@ -3,7 +3,6 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use anyhow::Result;
 use futures_util::future::BoxFuture;
 use rig::{
     OneOrMany,
@@ -20,6 +19,7 @@ use tracing::Instrument;
 use crate::{
     agent::AgentControl,
     context_manager::ContextManager,
+    error::{CoreError, CoreResult},
     provider::{SessionModel, SessionModelFactory},
     rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persist_event},
     state::{ActiveTurn, RunningTask, SessionState},
@@ -96,14 +96,14 @@ impl Core {
         Self { session }
     }
 
-    pub async fn start_user_input(&self, input: String) -> Result<String> {
+    pub async fn start_user_input(&self, input: String) -> CoreResult<String> {
         self.submit(Op::UserInput(input)).await
     }
 
-    pub async fn submit(&self, op: Op) -> Result<String> {
+    pub async fn submit(&self, op: Op) -> CoreResult<String> {
         match op {
             Op::UserInput(input) => {
-                let sub_id = self.session.start_regular_turn(vec![input]).await;
+                let sub_id = self.session.start_regular_turn(vec![input]).await?;
                 Ok(sub_id)
             }
             Op::Interrupt => {
@@ -131,13 +131,20 @@ impl Core {
         self.session.emit_session_event(msg).await;
     }
 
-    pub(crate) async fn flush_rollout(&self) -> Result<()> {
-        self.session.rollout.flush().await
+    pub(crate) async fn flush_rollout(&self) -> CoreResult<()> {
+        self.session
+            .rollout
+            .flush()
+            .await
+            .map_err(CoreError::rollout)
     }
 }
 
 impl Session {
-    fn start_regular_turn(self: &Arc<Self>, input: Vec<String>) -> BoxFuture<'_, String> {
+    fn start_regular_turn(
+        self: &Arc<Self>,
+        input: Vec<String>,
+    ) -> BoxFuture<'_, CoreResult<String>> {
         Box::pin(async move {
             let turn_context = Arc::new(self.fresh_turn_context());
             let sub_id = turn_context.sub_id.clone();
@@ -154,8 +161,8 @@ impl Session {
                 Arc::new(RegularTask::new()),
                 crate::state::TaskKind::Regular,
             )
-            .await;
-            sub_id
+            .await?;
+            Ok(sub_id)
         })
     }
 
@@ -165,13 +172,14 @@ impl Session {
         input: Vec<String>,
         task: Arc<dyn AnySessionTask>,
         task_kind: crate::state::TaskKind,
-    ) -> BoxFuture<'_, ()> {
+    ) -> BoxFuture<'_, CoreResult<()>> {
         Box::pin(async move {
             self.abort_all_tasks("replaced").await;
             let cancellation_token = tokio_util::sync::CancellationToken::new();
             let done = Arc::new(tokio::sync::Notify::new());
             let sess = Arc::clone(self);
             let task_for_runner = Arc::clone(&task);
+            let task_name = task_for_runner.span_name();
             let ctx_for_runner = Arc::clone(&turn_context);
             let done_for_runner = Arc::clone(&done);
             let cancellation_for_runner = cancellation_token.clone();
@@ -192,11 +200,11 @@ impl Session {
                 "core.session_task",
                 thread_id = %self.id,
                 turn_id = %turn_context.sub_id,
-                task_name = task_for_runner.span_name(),
+                task_name,
                 task_kind = ?task_for_runner.kind(),
             );
-            let handle = tokio::task::Builder::new()
-                .name(task_for_runner.span_name())
+            let handle = match tokio::task::Builder::new()
+                .name(task_name)
                 .spawn(
                     async move {
                         let result = task_for_runner
@@ -292,8 +300,24 @@ impl Session {
                         done_for_runner.notify_waiters();
                     }
                     .instrument(task_span),
-                )
-                .expect("failed to spawn session task");
+                ) {
+                Ok(handle) => handle,
+                Err(source) => {
+                    let error = CoreError::TaskSpawn {
+                        task_name,
+                        source,
+                    };
+                    let info = error.to_error_info();
+                    self.set_agent_status(AgentStatus::Errored(info.clone()), Some(&turn_context))
+                        .await;
+                    self.emit_event(
+                        &turn_context,
+                        EventMsg::Error(smooth_protocol::ErrorEvent { error: info }),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
 
             let running_task = RunningTask {
                 done,
@@ -307,6 +331,7 @@ impl Session {
             let mut active_turn = self.active_turn.lock().await;
             let turn = active_turn.get_or_insert_with(ActiveTurn::default);
             turn.add_task(running_task);
+            Ok(())
         })
     }
 
@@ -391,7 +416,7 @@ impl Session {
     }
 
     pub(crate) async fn set_agent_status(&self, status: AgentStatus, ctx: Option<&TurnContext>) {
-        self.agent_control.set_status(self.id, status.clone());
+        let _ = self.agent_control.set_status(self.id, status.clone());
         let _ = self.event_tx.send(Event {
             id: ctx
                 .map(|ctx| ctx.sub_id.clone())
@@ -429,10 +454,10 @@ impl Session {
         self: &Arc<Self>,
         enabled: bool,
         ask_user_client: Option<Arc<dyn AskUserClient>>,
-    ) -> Result<bool> {
+    ) -> CoreResult<bool> {
         if self.active_turn.lock().await.is_some() {
-            return Err(anyhow::anyhow!(
-                "cannot toggle plan mode while a turn is in flight"
+            return Err(CoreError::invariant(
+                "cannot toggle plan mode while a turn is in flight",
             ));
         }
         self.apply_plan_mode_unchecked(enabled, ask_user_client)
@@ -446,22 +471,25 @@ impl Session {
         self: &Arc<Self>,
         enabled: bool,
         ask_user_client: Option<Arc<dyn AskUserClient>>,
-    ) -> Result<bool> {
+    ) -> CoreResult<bool> {
         if self.plan_mode() == enabled {
             return Ok(enabled);
         }
         let cwd = std::env::current_dir()?;
         let role_override = crate::agent::role::role_override_from_source(&self.session_source);
         let ask_user_client = ask_user_client.or_else(|| self.ask_user_client.clone());
-        let new_model = self.model_factory.build(
-            cwd,
-            self.id,
-            ask_user_client,
-            Arc::clone(&self.current_turn_id),
-            role_override,
-            self.agent_control.clone(),
-            enabled,
-        )?;
+        let new_model = self
+            .model_factory
+            .build(
+                cwd,
+                self.id,
+                ask_user_client,
+                Arc::clone(&self.current_turn_id),
+                role_override,
+                self.agent_control.clone(),
+                enabled,
+            )
+            .map_err(CoreError::provider)?;
         self.set_model(new_model).await;
         self.set_plan_mode_flag(enabled);
         self.emit_session_event(EventMsg::PlanModeChanged(PlanModeChangedEvent {
@@ -502,7 +530,7 @@ mod tests {
     };
 
     use anyhow::Result;
-    use app_server_protocol::{AskUserQuestionParams, AskUserQuestionResponse, JSONRPCErrorError};
+    use app_server_protocol::{AskUserQuestionParams, AskUserQuestionResponse, JsonRpcError};
     use futures_util::future::BoxFuture;
     use rig::message::Message;
     use tempfile::TempDir;
@@ -545,7 +573,7 @@ mod tests {
         ) -> Result<SessionModel> {
             self.calls
                 .lock()
-                .expect("recording factory mutex should lock")
+                .map_err(|_| anyhow::anyhow!("recording factory mutex should lock"))?
                 .push((ask_user_client.is_some(), plan_mode));
             Ok(self.model.clone())
         }
@@ -557,7 +585,7 @@ mod tests {
         fn ask(
             &self,
             _params: AskUserQuestionParams,
-        ) -> BoxFuture<'static, std::result::Result<AskUserQuestionResponse, JSONRPCErrorError>>
+        ) -> BoxFuture<'static, std::result::Result<AskUserQuestionResponse, JsonRpcError>>
         {
             Box::pin(async {
                 Ok(AskUserQuestionResponse {
@@ -571,17 +599,15 @@ mod tests {
         }
     }
 
-    async fn test_core() -> (
+    async fn test_core() -> Result<(
         Core,
         tokio::sync::broadcast::Receiver<smooth_protocol::Event>,
-    ) {
-        let workspace = TempDir::new().expect("tempdir");
+    )> {
+        let workspace = TempDir::new()?;
         let cwd = PathBuf::from(workspace.path());
         let thread_id = smooth_protocol::ThreadId::new();
         let current_turn_id = Arc::new(RwLock::new(None));
-        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd)
-            .await
-            .expect("rollout");
+        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let model = SessionModel::Stub(Arc::new(EmptyDriver));
         let factory: Arc<dyn SessionModelFactory> =
             stub_session_model_factory(std::iter::once((thread_id, model.clone())).collect());
@@ -599,20 +625,17 @@ mod tests {
             factory,
         );
         let rx = core.subscribe();
-        (core, rx)
+        Ok((core, rx))
     }
 
     #[tokio::test]
-    async fn submit_interrupt_emits_interrupted_status() {
-        let (core, mut rx) = test_core().await;
+    async fn submit_interrupt_emits_interrupted_status() -> Result<()> {
+        let (core, mut rx) = test_core().await?;
 
-        let result = core
-            .submit(smooth_protocol::Op::Interrupt)
-            .await
-            .expect("interrupt submit");
+        let result = core.submit(smooth_protocol::Op::Interrupt).await?;
         assert_eq!(result, "interrupted");
 
-        let event = rx.recv().await.expect("status event");
+        let event = rx.recv().await?;
         assert_eq!(
             event.msg,
             EventMsg::AgentStatusChanged(AgentStatusChangedEvent {
@@ -621,19 +644,17 @@ mod tests {
                 status: smooth_protocol::AgentStatus::Interrupted,
             })
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn submit_shutdown_emits_shutdown_status() {
-        let (core, mut rx) = test_core().await;
+    async fn submit_shutdown_emits_shutdown_status() -> Result<()> {
+        let (core, mut rx) = test_core().await?;
 
-        let result = core
-            .submit(smooth_protocol::Op::Shutdown)
-            .await
-            .expect("shutdown submit");
+        let result = core.submit(smooth_protocol::Op::Shutdown).await?;
         assert_eq!(result, "shutdown");
 
-        let event = rx.recv().await.expect("status event");
+        let event = rx.recv().await?;
         assert_eq!(
             event.msg,
             EventMsg::AgentStatusChanged(AgentStatusChangedEvent {
@@ -642,17 +663,16 @@ mod tests {
                 status: smooth_protocol::AgentStatus::Shutdown,
             })
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unchecked_plan_mode_rebuild_reuses_stored_ask_user_client() {
-        let workspace = TempDir::new().expect("tempdir");
+    async fn unchecked_plan_mode_rebuild_reuses_stored_ask_user_client() -> Result<()> {
+        let workspace = TempDir::new()?;
         let cwd = PathBuf::from(workspace.path());
         let thread_id = smooth_protocol::ThreadId::new();
         let current_turn_id = Arc::new(RwLock::new(None));
-        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd)
-            .await
-            .expect("rollout");
+        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let model = SessionModel::Stub(Arc::new(EmptyDriver));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let factory: Arc<dyn SessionModelFactory> = Arc::new(RecordingFactory {
@@ -673,14 +693,14 @@ mod tests {
             factory,
         );
 
-        core.session
-            .apply_plan_mode_unchecked(false, None)
-            .await
-            .expect("plan mode rebuild");
+        core.session.apply_plan_mode_unchecked(false, None).await?;
 
         assert_eq!(
-            *calls.lock().expect("recording factory mutex should lock"),
+            *calls
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording factory mutex should lock"))?,
             vec![(true, false)]
         );
+        Ok(())
     }
 }

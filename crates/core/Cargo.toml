@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 smooth-protocol = { path = "../protocol" }
 smooth-state-db = { path = "../state-db" }
+thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt"] }
 tokio-tungstenite.workspace = true

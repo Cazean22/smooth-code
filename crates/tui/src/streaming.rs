@@ -58,39 +58,44 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_includes_pending_tail_before_newline() {
+    fn snapshot_includes_pending_tail_before_newline() -> Result<(), Box<dyn std::error::Error>> {
         let mut controller = StreamController::new(None);
         let _ = controller.push("hello");
 
         let lines = controller
             .snapshot_lines()
-            .expect("pending tail should render");
+            .ok_or_else(|| std::io::Error::other("pending tail should render"))?;
         assert_eq!(lines_to_strings(&lines), vec![String::from("hello")]);
+        Ok(())
     }
 
     #[test]
-    fn snapshot_replaces_pending_tail_after_newline_commit() {
+    fn snapshot_replaces_pending_tail_after_newline_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut controller = StreamController::new(None);
         let _ = controller.push("hello");
         let _ = controller.push(" world\n");
 
         let lines = controller
             .snapshot_lines()
-            .expect("committed markdown line should render");
+            .ok_or_else(|| std::io::Error::other("committed markdown line should render"))?;
         assert_eq!(lines_to_strings(&lines), vec![String::from("hello world")]);
+        Ok(())
     }
 
     #[test]
-    fn snapshot_includes_committed_lines_and_pending_tail() {
+    fn snapshot_includes_committed_lines_and_pending_tail() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut controller = StreamController::new(None);
         let _ = controller.push("hello\nwor");
 
-        let lines = controller
-            .snapshot_lines()
-            .expect("committed line and pending tail should render");
+        let lines = controller.snapshot_lines().ok_or_else(|| {
+            std::io::Error::other("committed line and pending tail should render")
+        })?;
         assert_eq!(
             lines_to_strings(&lines),
             vec![String::from("hello"), String::from("wor")]
         );
+        Ok(())
     }
 }

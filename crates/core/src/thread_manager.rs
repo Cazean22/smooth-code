@@ -4,10 +4,9 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
 use smooth_protocol::{
     AgentPath, AgentStatus, CollabAgentStatusEntry, CollabResumeBeginEvent, CollabResumeEndEvent,
-    Event, EventMsg, Op, SessionSource, SubAgentSource, ThreadId,
+    ErrorInfo, Event, EventMsg, Op, SessionSource, SubAgentSource, ThreadId,
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, broadcast};
@@ -18,6 +17,7 @@ use crate::{
     ThreadSummary,
     agent::{AgentControl, registry::AgentMetadata, status::last_assistant_message},
     core_thread::CoreThread,
+    error::{CoreError, CoreResult},
     provider::SessionModelFactory,
     rollout::{find_thread_path, list_threads, load_resume_state, workspace_root},
 };
@@ -45,9 +45,9 @@ impl ThreadManagerState {
     pub async fn new(
         ask_user_client_factory: Option<Arc<dyn AskUserClientFactory>>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
-    ) -> Result<Self> {
+    ) -> CoreResult<Self> {
         let threads = Arc::new(RwLock::new(HashMap::new()));
-        let workspace_root = workspace_root()?;
+        let workspace_root = workspace_root().map_err(CoreError::rollout)?;
         let state_db =
             StateDbHandle::open(workspace_root.join(".smooth-code").join("state.db")).await?;
         let agent_control = AgentControl::new();
@@ -56,7 +56,7 @@ impl ThreadManagerState {
             ask_user_client_factory.clone(),
             model_factory.clone(),
             state_db.clone(),
-        );
+        )?;
         Ok(Self {
             threads,
             ask_user_client_factory,
@@ -67,7 +67,7 @@ impl ThreadManagerState {
     }
 
     #[tracing::instrument(name = "core.thread_manager.start_thread", skip(self))]
-    pub async fn start_thread(&self) -> Result<StartedThread> {
+    pub async fn start_thread(&self) -> CoreResult<StartedThread> {
         let thread_id = ThreadId::new();
         let thread = Arc::new(
             CoreThread::new(
@@ -83,7 +83,7 @@ impl ThreadManagerState {
 
         let mut threads = self.threads.write().await;
         threads.insert(thread_id, thread);
-        let _ = self.agent_control.register_session_root(thread_id);
+        self.agent_control.register_session_root(thread_id)?;
         self.state_db
             .upsert_thread(&thread_id.to_string(), None, None, None)
             .await?;
@@ -94,7 +94,7 @@ impl ThreadManagerState {
     }
 
     #[tracing::instrument(name = "core.thread_manager.resume_thread", skip(self), fields(thread_id = %thread_id))]
-    pub async fn resume_thread(&self, thread_id: ThreadId) -> Result<ResumedThread> {
+    pub async fn resume_thread(&self, thread_id: ThreadId) -> CoreResult<ResumedThread> {
         if let Some(thread) = self.threads.read().await.get(&thread_id).cloned() {
             return Ok(ResumedThread {
                 thread_id,
@@ -103,9 +103,13 @@ impl ThreadManagerState {
             });
         }
 
-        let workspace_root = workspace_root()?;
-        let rollout_path = find_thread_path(&workspace_root, thread_id).await?;
-        let resume_state = load_resume_state(&rollout_path).await?;
+        let workspace_root = workspace_root().map_err(CoreError::rollout)?;
+        let rollout_path = find_thread_path(&workspace_root, thread_id)
+            .await
+            .map_err(CoreError::rollout)?;
+        let resume_state = load_resume_state(&rollout_path)
+            .await
+            .map_err(CoreError::rollout)?;
         let mut initial_messages = resume_state.initial_messages.clone();
         let thread = Arc::new(
             CoreThread::resume(
@@ -121,7 +125,7 @@ impl ThreadManagerState {
 
         let mut threads = self.threads.write().await;
         threads.insert(thread_id, thread);
-        let _ = self.agent_control.register_session_root(thread_id);
+        self.agent_control.register_session_root(thread_id)?;
         drop(threads);
         self.state_db
             .upsert_thread(&thread_id.to_string(), None, None, None)
@@ -135,39 +139,41 @@ impl ThreadManagerState {
     }
 
     #[tracing::instrument(name = "core.thread_manager.list_threads", skip(self))]
-    pub async fn list_threads(&self) -> Result<Vec<ThreadSummary>> {
-        let workspace_root = workspace_root()?;
-        list_threads(&workspace_root).await
+    pub async fn list_threads(&self) -> CoreResult<Vec<ThreadSummary>> {
+        let workspace_root = workspace_root().map_err(CoreError::rollout)?;
+        list_threads(&workspace_root)
+            .await
+            .map_err(CoreError::rollout)
     }
 
     #[tracing::instrument(name = "core.thread_manager.emit_session_configured", skip(self), fields(thread_id = %thread_id))]
-    pub async fn emit_session_configured(&self, thread_id: ThreadId) -> Result<()> {
+    pub async fn emit_session_configured(&self, thread_id: ThreadId) -> CoreResult<()> {
         self.get(thread_id).await?.emit_session_configured().await;
         Ok(())
     }
 
-    pub async fn start_user_input(&self, thread_id: ThreadId, input: String) -> Result<String> {
+    pub async fn start_user_input(&self, thread_id: ThreadId, input: String) -> CoreResult<String> {
         let thread = self.get(thread_id).await?;
         thread.start_user_input(input).await
     }
 
-    pub async fn submit(&self, thread_id: ThreadId, op: Op) -> Result<String> {
+    pub async fn submit(&self, thread_id: ThreadId, op: Op) -> CoreResult<String> {
         let thread = self.get(thread_id).await?;
         thread.submit(op).await
     }
 
     /// Toggle plan mode for the given thread. Returns the new effective state.
-    pub async fn set_plan_mode(&self, thread_id: ThreadId, enabled: bool) -> Result<bool> {
+    pub async fn set_plan_mode(&self, thread_id: ThreadId, enabled: bool) -> CoreResult<bool> {
         let thread = self.get(thread_id).await?;
         thread.set_plan_mode(enabled).await
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn send_op(&self, thread_id: ThreadId, op: Op) -> Result<String> {
+    pub(crate) async fn send_op(&self, thread_id: ThreadId, op: Op) -> CoreResult<String> {
         self.submit(thread_id, op).await
     }
 
-    pub async fn subscribe(&self, thread_id: ThreadId) -> Result<broadcast::Receiver<Event>> {
+    pub async fn subscribe(&self, thread_id: ThreadId) -> CoreResult<broadcast::Receiver<Event>> {
         let thread = self.get(thread_id).await?;
         Ok(thread.subscribe())
     }
@@ -184,26 +190,26 @@ impl ThreadManagerState {
         agent_role: Option<String>,
         model: Option<String>,
         fork_context: bool,
-    ) -> Result<CollabAgentStatusEntry> {
+    ) -> CoreResult<CollabAgentStatusEntry> {
         let metadata = self
             .agent_control
             .spawn_agent_with_role(parent_thread_id, message, agent_role, model, fork_context)
             .await?;
-        Ok(agent_status_entry(&self.agent_control, metadata))
+        agent_status_entry(&self.agent_control, metadata)
     }
 
     pub fn list_agents(
         &self,
         author_thread_id: ThreadId,
         path_prefix: Option<&str>,
-    ) -> Result<Vec<CollabAgentStatusEntry>> {
+    ) -> CoreResult<Vec<CollabAgentStatusEntry>> {
         self.agent_control
             .list_agents(author_thread_id, path_prefix)
-            .map(|agents| {
+            .and_then(|agents| {
                 agents
                     .into_iter()
                     .map(|agent| agent_status_entry(&self.agent_control, agent))
-                    .collect()
+                    .collect::<CoreResult<Vec<_>>>()
             })
     }
 
@@ -211,7 +217,7 @@ impl ThreadManagerState {
         &self,
         author_thread_id: ThreadId,
         target: &str,
-    ) -> Result<AgentStatus> {
+    ) -> CoreResult<AgentStatus> {
         self.agent_control
             .close_agent(author_thread_id, target)
             .await
@@ -227,7 +233,7 @@ impl ThreadManagerState {
         &self,
         thread_id: ThreadId,
         reason: &str,
-    ) -> Result<()> {
+    ) -> CoreResult<()> {
         if let Ok(thread) = self.get(thread_id).await {
             let _ = thread.submit(Op::Shutdown).await;
             thread.core.session.abort_all_tasks(reason).await;
@@ -236,13 +242,13 @@ impl ThreadManagerState {
         Ok(())
     }
 
-    async fn get(&self, thread_id: ThreadId) -> Result<Arc<CoreThread>> {
+    async fn get(&self, thread_id: ThreadId) -> CoreResult<Arc<CoreThread>> {
         self.threads
             .read()
             .await
             .get(&thread_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown thread id: {thread_id}"))
+            .ok_or(CoreError::UnknownThread { thread_id })
     }
 
     fn ask_user_client(&self, thread_id: ThreadId) -> Option<Arc<dyn AskUserClient>> {
@@ -251,9 +257,9 @@ impl ThreadManagerState {
             .map(|factory| factory.build(thread_id))
     }
 
-    async fn resume_child_subtree(&self, root_thread_id: ThreadId) -> Result<Vec<EventMsg>> {
+    async fn resume_child_subtree(&self, root_thread_id: ThreadId) -> CoreResult<Vec<EventMsg>> {
         let mut queue = VecDeque::from([root_thread_id]);
-        let workspace_root = workspace_root()?;
+        let workspace_root = workspace_root().map_err(CoreError::rollout)?;
         let mut events = Vec::new();
 
         while let Some(parent_thread_id) = queue.pop_front() {
@@ -262,13 +268,7 @@ impl ThreadManagerState {
                 .list_open_children(&parent_thread_id.to_string())
                 .await?;
             for edge in child_edges {
-                let child_thread_id =
-                    edge.child_thread_id.parse::<ThreadId>().with_context(|| {
-                        format!(
-                            "invalid child thread id `{}` in state db",
-                            edge.child_thread_id
-                        )
-                    })?;
+                let child_thread_id = edge.child_thread_id.parse::<ThreadId>()?;
                 let call_id = Uuid::now_v7().to_string();
                 let thread_row = match self.state_db.get_thread(&edge.child_thread_id).await {
                     Ok(Some(row)) => row,
@@ -284,7 +284,13 @@ impl ThreadManagerState {
                             receiver_thread_id: child_thread_id,
                             receiver_agent_nickname: None,
                             receiver_agent_role: None,
-                            status: AgentStatus::Errored("missing thread metadata".to_string()),
+                            status: AgentStatus::Errored(
+                                ErrorInfo::new(
+                                    "missing_thread_metadata",
+                                    "missing thread metadata",
+                                )
+                                .with_source("smooth-core"),
+                            ),
                         }));
                         continue;
                     }
@@ -341,7 +347,7 @@ impl ThreadManagerState {
                             receiver_thread_id: child_thread_id,
                             receiver_agent_nickname: thread_row.agent_nickname,
                             receiver_agent_role: thread_row.agent_role,
-                            status: AgentStatus::Errored(err.to_string()),
+                            status: AgentStatus::Errored(err.to_error_info()),
                         }));
                     }
                 }
@@ -359,7 +365,7 @@ impl ThreadManagerState {
         agent_path: Option<&str>,
         agent_nickname: Option<String>,
         agent_role: Option<String>,
-    ) -> Result<()> {
+    ) -> CoreResult<()> {
         if self.threads.read().await.contains_key(&child_thread_id) {
             return Ok(());
         }
@@ -368,21 +374,31 @@ impl ThreadManagerState {
             .registry()
             .agent_metadata_for_thread(parent_thread_id)
             .map(|metadata| metadata.depth)
-            .ok_or_else(|| anyhow::anyhow!("parent thread not registered: {parent_thread_id}"))?;
+            .ok_or(CoreError::ParentThreadNotRegistered {
+                thread_id: parent_thread_id,
+            })?;
         let depth = parent_depth + 1;
         if depth > 8 {
-            anyhow::bail!("agent depth limit exceeded during resume: {depth} > 8");
+            return Err(CoreError::AgentDepthLimitExceeded {
+                depth,
+                max_depth: 8,
+            });
         }
-        let agent_path = agent_path.ok_or_else(|| {
-            anyhow::anyhow!("missing agent_path for child thread {child_thread_id}")
+        let agent_path = agent_path.ok_or(CoreError::MissingAgentPath {
+            thread_id: child_thread_id,
         })?;
-        let agent_path = AgentPath::try_from(agent_path)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| {
-                format!("invalid agent path `{agent_path}` for thread {child_thread_id}")
+        let agent_path =
+            AgentPath::try_from(agent_path).map_err(|source| CoreError::InvalidAgentPath {
+                thread_id: child_thread_id,
+                path: agent_path.to_string(),
+                source,
             })?;
-        let rollout_path = find_thread_path(workspace_root, child_thread_id).await?;
-        let resume_state = load_resume_state(&rollout_path).await?;
+        let rollout_path = find_thread_path(workspace_root, child_thread_id)
+            .await
+            .map_err(CoreError::rollout)?;
+        let resume_state = load_resume_state(&rollout_path)
+            .await
+            .map_err(CoreError::rollout)?;
         let initial_messages = resume_state.initial_messages.clone();
         let thread = Arc::new(
             CoreThread::resume(
@@ -417,19 +433,22 @@ impl ThreadManagerState {
     }
 }
 
-fn agent_status_entry(control: &AgentControl, metadata: AgentMetadata) -> CollabAgentStatusEntry {
+fn agent_status_entry(
+    control: &AgentControl,
+    metadata: AgentMetadata,
+) -> CoreResult<CollabAgentStatusEntry> {
     let thread_id = metadata
         .agent_id
-        .expect("listed agent metadata should include a thread id");
+        .ok_or_else(|| CoreError::invariant("listed agent metadata should include a thread id"))?;
     let status = control.get_status(thread_id);
-    CollabAgentStatusEntry {
+    Ok(CollabAgentStatusEntry {
         thread_id,
         agent_path: metadata.agent_path,
         agent_nickname: metadata.agent_nickname,
         agent_role: metadata.agent_role,
         last_assistant_message: last_assistant_message(&status),
         status,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -494,11 +513,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_thread_rehydrates_open_subtree() {
-        let _cwd_guard = cwd_test_lock().lock().expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn resume_thread_rehydrates_open_subtree() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let manager = ThreadManagerState::new(
             None,
@@ -508,20 +527,17 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
         let control = manager.agent_control();
         let child = control
             .spawn_agent(root_id, "child task".to_string())
-            .await
-            .expect("spawn child");
-        let child_id = child.agent_id.expect("child id");
+            .await?;
+        let child_id = child.agent_id.ok_or_else(|| anyhow::anyhow!("child id"))?;
         let _grandchild = control
             .spawn_agent(child_id, "grandchild task".to_string())
-            .await
-            .expect("spawn grandchild");
+            .await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(manager);
 
@@ -533,12 +549,8 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let resumed = resumed_manager
-            .resume_thread(root_id)
-            .await
-            .expect("resume root");
+        .await?;
+        let resumed = resumed_manager.resume_thread(root_id).await?;
         let resume_events = resumed
             .initial_messages
             .iter()
@@ -559,15 +571,16 @@ mod tests {
             3
         );
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resume_thread_skips_closed_edges() {
-        let _cwd_guard = cwd_test_lock().lock().expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn resume_thread_skips_closed_edges() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let manager = ThreadManagerState::new(
             None,
@@ -577,19 +590,16 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
         let control = manager.agent_control();
         let child = control
             .spawn_agent(root_id, "child task".to_string())
-            .await
-            .expect("spawn child");
+            .await?;
         control
             .close_agent(root_id, child.agent_path.as_str())
-            .await
-            .expect("close child");
+            .await?;
         drop(manager);
 
         let resumed_manager = ThreadManagerState::new(
@@ -600,12 +610,8 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let resumed = resumed_manager
-            .resume_thread(root_id)
-            .await
-            .expect("resume root");
+        .await?;
+        let resumed = resumed_manager.resume_thread(root_id).await?;
         assert!(
             resumed
                 .initial_messages
@@ -621,15 +627,17 @@ mod tests {
             1
         );
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resume_thread_warns_and_leaves_edge_open_when_child_rollout_is_missing() {
-        let _cwd_guard = cwd_test_lock().lock().expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn resume_thread_warns_and_leaves_edge_open_when_child_rollout_is_missing() -> Result<()>
+    {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let manager = ThreadManagerState::new(
             None,
@@ -639,23 +647,17 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
         let control = manager.agent_control();
         let child = control
             .spawn_agent(root_id, "child task".to_string())
-            .await
-            .expect("spawn child");
-        let child_id = child.agent_id.expect("child id");
+            .await?;
+        let child_id = child.agent_id.ok_or_else(|| anyhow::anyhow!("child id"))?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let rollout_path = find_thread_path(workspace.path(), child_id)
-            .await
-            .expect("find child rollout");
-        tokio::fs::remove_file(&rollout_path)
-            .await
-            .expect("remove child rollout");
+        let rollout_path = find_thread_path(workspace.path(), child_id).await?;
+        tokio::fs::remove_file(&rollout_path).await?;
         drop(manager);
 
         let resumed_manager = ThreadManagerState::new(
@@ -666,12 +668,8 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let resumed = resumed_manager
-            .resume_thread(root_id)
-            .await
-            .expect("resume root");
+        .await?;
+        let resumed = resumed_manager.resume_thread(root_id).await?;
         assert!(resumed.initial_messages.iter().any(|event| {
             matches!(
                 event,
@@ -692,21 +690,21 @@ mod tests {
             resumed_manager
                 .state_db
                 .list_open_children(&root_id.to_string())
-                .await
-                .expect("list open children")
+                .await?
                 .len(),
             1
         );
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resume_thread_does_not_replay_terminal_child_completion_notifications() {
-        let _cwd_guard = cwd_test_lock().lock().expect("cwd lock");
-        let workspace = TempDir::new().expect("tempdir");
-        let original_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(workspace.path()).expect("set cwd");
+    async fn resume_thread_does_not_replay_terminal_child_completion_notifications() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
 
         let manager = ThreadManagerState::new(
             None,
@@ -716,15 +714,13 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let started = manager.start_thread().await.expect("start root");
+        .await?;
+        let started = manager.start_thread().await?;
         let root_id = started.thread_id;
         let control = manager.agent_control();
         let _child = control
             .spawn_agent(root_id, "child task".to_string())
-            .await
-            .expect("spawn child");
+            .await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(manager);
 
@@ -736,16 +732,9 @@ mod tests {
                 })),
             })),
         )
-        .await
-        .expect("thread manager");
-        let _resumed = resumed_manager
-            .resume_thread(root_id)
-            .await
-            .expect("resume root");
-        let mut root_events = resumed_manager
-            .subscribe(root_id)
-            .await
-            .expect("subscribe root");
+        .await?;
+        let _resumed = resumed_manager.resume_thread(root_id).await?;
+        let mut root_events = resumed_manager.subscribe(root_id).await?;
 
         let replay =
             tokio::time::timeout(std::time::Duration::from_millis(150), root_events.recv()).await;
@@ -754,6 +743,7 @@ mod tests {
             "resuming a terminal child should not synthesize a fresh completion notification"
         );
 
-        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 }

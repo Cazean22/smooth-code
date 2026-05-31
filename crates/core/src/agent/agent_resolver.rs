@@ -15,9 +15,9 @@ pub(crate) fn resolve_agent_reference(
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
     let resolved_path = if target.starts_with('/') {
-        AgentPath::try_from(target)?
+        AgentPath::try_from(target).map_err(|err| err.to_string())?
     } else {
-        base_path.resolve(target)?
+        base_path.resolve(target).map_err(|err| err.to_string())?
     };
 
     registry
@@ -42,9 +42,11 @@ pub(crate) fn list_agents(
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
     let resolved_prefix = if path_prefix.starts_with('/') {
-        AgentPath::try_from(path_prefix)?
+        AgentPath::try_from(path_prefix).map_err(|err| err.to_string())?
     } else {
-        base_path.resolve(path_prefix)?
+        base_path
+            .resolve(path_prefix)
+            .map_err(|err| err.to_string())?
     };
 
     Ok(agents
@@ -67,34 +69,28 @@ mod tests {
 
     use super::{list_agents, resolve_agent_reference};
 
-    fn seed_registry() -> (AgentRegistry, ThreadId, ThreadId) {
+    fn seed_registry() -> Result<(AgentRegistry, ThreadId, ThreadId), String> {
         let registry = AgentRegistry::new();
         let root_id = ThreadId::new();
-        registry
-            .register_root_thread(root_id)
-            .expect("root registration");
-        let reservation = registry
-            .reserve_spawn_slot(root_id, 8, 16)
-            .expect("child reservation");
+        registry.register_root_thread(root_id)?;
+        let reservation = registry.reserve_spawn_slot(root_id, 8, 16)?;
         let child_path = reservation.agent_path().clone();
         let child_id = ThreadId::new();
-        reservation
-            .commit(AgentMetadata {
-                agent_id: Some(child_id),
-                agent_path: AgentPath::root(),
-                agent_nickname: Some("alpha".to_string()),
-                agent_role: Some("worker".to_string()),
-                parent_thread_id: None,
-                depth: 0,
-            })
-            .expect("commit child");
+        reservation.commit(AgentMetadata {
+            agent_id: Some(child_id),
+            agent_path: AgentPath::root(),
+            agent_nickname: Some("alpha".to_string()),
+            agent_role: Some("worker".to_string()),
+            parent_thread_id: None,
+            depth: 0,
+        })?;
         assert!(child_path.as_str().starts_with("/root/"));
-        (registry, root_id, child_id)
+        Ok((registry, root_id, child_id))
     }
 
     #[test]
-    fn resolves_thread_id_or_agent_path() {
-        let (registry, root_id, child_id) = seed_registry();
+    fn resolves_thread_id_or_agent_path() -> Result<(), String> {
+        let (registry, root_id, child_id) = seed_registry()?;
         let source = SessionSource::Cli;
 
         assert_eq!(
@@ -104,20 +100,21 @@ mod tests {
 
         let child = registry
             .agent_metadata_for_thread(child_id)
-            .expect("child metadata");
+            .ok_or_else(|| "child metadata".to_string())?;
         assert_eq!(
             resolve_agent_reference(&registry, &source, child.agent_path.as_str()),
             Ok(child_id)
         );
         assert_ne!(root_id, child_id);
+        Ok(())
     }
 
     #[test]
-    fn resolves_relative_paths_from_current_agent() {
-        let (registry, root_id, child_id) = seed_registry();
+    fn resolves_relative_paths_from_current_agent() -> Result<(), String> {
+        let (registry, root_id, child_id) = seed_registry()?;
         let child = registry
             .agent_metadata_for_thread(child_id)
-            .expect("child metadata");
+            .ok_or_else(|| "child metadata".to_string())?;
         let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: root_id,
             depth: 1,
@@ -126,18 +123,15 @@ mod tests {
             agent_role: child.agent_role.clone(),
         });
 
-        assert_eq!(
-            list_agents(&registry, &source, Some("/root"))
-                .expect("list")
-                .len(),
-            2
-        );
+        assert_eq!(list_agents(&registry, &source, Some("/root"))?.len(), 2);
         assert!(resolve_agent_reference(&registry, &source, "missing").is_err());
+        Ok(())
     }
 
     #[test]
-    fn empty_prefix_is_invalid() {
-        let (registry, _, _) = seed_registry();
+    fn empty_prefix_is_invalid() -> Result<(), String> {
+        let (registry, _, _) = seed_registry()?;
         assert!(list_agents(&registry, &SessionSource::Cli, Some("")).is_err());
+        Ok(())
     }
 }

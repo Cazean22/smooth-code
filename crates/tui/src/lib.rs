@@ -1,7 +1,10 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 mod app;
 mod app_server_client;
 mod app_server_session;
 mod diff_render;
+mod error;
 mod history_cell;
 mod markdown;
 mod markdown_render;
@@ -13,7 +16,6 @@ mod wrap;
 use std::io::{IsTerminal, Stdout};
 
 use crate::{app::App, app_server_client::AppServerClient, app_server_session::AppServerSession};
-use anyhow::Result;
 use app_server::in_process::InProcessServerEvent;
 use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste},
@@ -23,11 +25,13 @@ use crossterm::{
 use futures_util::StreamExt;
 use ratatui::{Terminal, prelude::CrosstermBackend};
 
+pub use error::{TuiError, TuiResult};
+
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 #[tracing::instrument(name = "tui.run", skip_all)]
-pub async fn run() -> Result<()> {
-    let mut terminal = init()?.ok_or_else(|| anyhow::anyhow!("smooth-tui requires a TTY"))?;
+pub async fn run() -> TuiResult<()> {
+    let mut terminal = init()?.ok_or(TuiError::TtyRequired)?;
     let mut app_server = AppServerSession::new(AppServerClient::start(512).await?);
     let mut app = App::new();
     let mut event_stream = crossterm::event::EventStream::new();
@@ -85,7 +89,7 @@ pub async fn run() -> Result<()> {
     restore(Some(&mut terminal))
 }
 
-fn init() -> Result<Option<AppTerminal>> {
+fn init() -> TuiResult<Option<AppTerminal>> {
     if !std::io::stdout().is_terminal() {
         return Ok(None);
     }
@@ -99,7 +103,7 @@ fn init() -> Result<Option<AppTerminal>> {
     Ok(Some(Terminal::new(backend)?))
 }
 
-fn restore(terminal: Option<&mut AppTerminal>) -> Result<()> {
+fn restore(terminal: Option<&mut AppTerminal>) -> TuiResult<()> {
     let Some(terminal) = terminal else {
         return Ok(());
     };

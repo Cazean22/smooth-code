@@ -6,8 +6,8 @@ use std::{
     },
 };
 
-use app_server_protocol::{JSONRPCErrorError, RequestId, ServerRequestPayload};
-use smooth_protocol::ThreadId;
+use app_server_protocol::{JsonRpcError, RequestId, ServerRequestPayload};
+use smooth_protocol::{ErrorInfo, ThreadId};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 
@@ -55,12 +55,14 @@ impl ThreadScopedOutgoingMessageSender {
         self.outgoing
             .cancel_requests_for_thread(
                 self.thread_id,
-                Some(JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: "client request resolved because the turn state was changed"
-                        .to_string(),
-                    data: Some(serde_json::json!({ "reason": "turn_transition_pending_request" })),
-                }),
+                Some(JsonRpcError::new(
+                    INTERNAL_ERROR_CODE,
+                    ErrorInfo::new(
+                        "turn_transition_pending_request",
+                        "client request resolved because the turn state was changed",
+                    )
+                    .with_source("app-server"),
+                )),
             )
             .await;
     }
@@ -107,16 +109,22 @@ impl OutgoingMessageSender {
             .try_send(InProcessServerEvent::ServerRequest(request))
         {
             let error = match send_error {
-                mpsc::error::TrySendError::Full(_) => JSONRPCErrorError {
-                    code: OVERLOADED_ERROR_CODE,
-                    data: None,
-                    message: "in-process server request queue is full".to_string(),
-                },
-                mpsc::error::TrySendError::Closed(_) => JSONRPCErrorError {
-                    code: SERVER_ERROR_CODE,
-                    data: None,
-                    message: "in-process server request consumer is closed".to_string(),
-                },
+                mpsc::error::TrySendError::Full(_) => JsonRpcError::new(
+                    OVERLOADED_ERROR_CODE,
+                    ErrorInfo::new(
+                        "server_request_queue_full",
+                        "in-process server request queue is full",
+                    )
+                    .with_source("app-server"),
+                ),
+                mpsc::error::TrySendError::Closed(_) => JsonRpcError::new(
+                    SERVER_ERROR_CODE,
+                    ErrorInfo::new(
+                        "server_request_consumer_closed",
+                        "in-process server request consumer is closed",
+                    )
+                    .with_source("app-server"),
+                ),
             };
 
             if let Some((request_id, entry)) = self.take_request_callback(&id).await {
@@ -141,7 +149,7 @@ impl OutgoingMessageSender {
         }
     }
 
-    pub(crate) async fn notify_client_error(&self, id: RequestId, error: JSONRPCErrorError) {
+    pub(crate) async fn notify_client_error(&self, id: RequestId, error: JsonRpcError) {
         match self.take_request_callback(&id).await {
             Some((id, entry)) => {
                 warn!("client responded with error for {id:?}: {error:?}");
@@ -155,7 +163,7 @@ impl OutgoingMessageSender {
         }
     }
 
-    pub(crate) async fn cancel_all_requests(&self, error: Option<JSONRPCErrorError>) {
+    pub(crate) async fn cancel_all_requests(&self, error: Option<JsonRpcError>) {
         let entries = {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
             request_id_to_callback
@@ -176,7 +184,7 @@ impl OutgoingMessageSender {
     pub(crate) async fn cancel_requests_for_thread(
         &self,
         thread_id: ThreadId,
-        error: Option<JSONRPCErrorError>,
+        error: Option<JsonRpcError>,
     ) {
         let entries = {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
@@ -219,11 +227,14 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use app_server_protocol::AskUserQuestionParams;
+    use smooth_protocol::ErrorInfo;
     use smooth_protocol::ThreadId;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
 
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn ask_user_request(thread_id: ThreadId, call_id: &str) -> ServerRequestPayload {
         ServerRequestPayload::AskUserQuestion(AskUserQuestionParams {
@@ -235,7 +246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_request_emits_server_request_event() {
+    async fn send_request_emits_server_request_event() -> TestResult {
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let outgoing = OutgoingMessageSender::new(event_tx);
         let thread_id = ThreadId::new();
@@ -244,7 +255,7 @@ mod tests {
             .send_request(ask_user_request(thread_id, "call-1"))
             .await;
 
-        let event = event_rx.recv().await.expect("expected outgoing event");
+        let event = event_rx.recv().await.ok_or("expected outgoing event")?;
         match event {
             InProcessServerEvent::ServerRequest(
                 app_server_protocol::ServerRequest::AskUserQuestion {
@@ -254,35 +265,33 @@ mod tests {
             ) => assert_eq!(observed, request_id),
             other => panic!("unexpected event: {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn notify_client_error_forwards_error_to_waiter() {
+    async fn notify_client_error_forwards_error_to_waiter() -> TestResult {
         let (event_tx, _event_rx) = mpsc::channel(1);
         let outgoing = OutgoingMessageSender::new(event_tx);
         let thread_id = ThreadId::new();
         let (request_id, response_rx) = outgoing
             .send_request_for_thread(ask_user_request(thread_id, "call-1"), Some(thread_id))
             .await;
-        let error = JSONRPCErrorError {
-            code: -32000,
-            data: None,
-            message: "client error".to_string(),
-        };
+        let error = JsonRpcError::new(
+            -32000,
+            ErrorInfo::new("client_error", "client error").with_source("test"),
+        );
 
         outgoing
             .notify_client_error(request_id, error.clone())
             .await;
 
-        let response = timeout(Duration::from_secs(1), response_rx)
-            .await
-            .expect("response should resolve")
-            .expect("response channel should stay open");
+        let response = timeout(Duration::from_secs(1), response_rx).await??;
         assert_eq!(response, Err(error));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn send_request_fails_when_event_consumer_is_closed() {
+    async fn send_request_fails_when_event_consumer_is_closed() -> TestResult {
         let (event_tx, event_rx) = mpsc::channel(1);
         drop(event_rx);
         let outgoing = OutgoingMessageSender::new(event_tx);
@@ -292,21 +301,19 @@ mod tests {
             .send_request(ask_user_request(thread_id, "call-1"))
             .await;
 
-        let response = timeout(Duration::from_secs(1), response_rx)
-            .await
-            .expect("response should resolve")
-            .expect("response channel should stay open");
+        let response = timeout(Duration::from_secs(1), response_rx).await??;
         assert!(matches!(
             response,
-            Err(JSONRPCErrorError {
+            Err(JsonRpcError {
                 code: SERVER_ERROR_CODE,
                 ..
             })
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cancel_requests_for_thread_cancels_all_thread_requests() {
+    async fn cancel_requests_for_thread_cancels_all_thread_requests() -> TestResult {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let outgoing = Arc::new(OutgoingMessageSender::new(event_tx));
         let thread_id = ThreadId::new();
@@ -324,27 +331,21 @@ mod tests {
                 Some(other_thread_id),
             )
             .await;
-        let error = JSONRPCErrorError {
-            code: -32002,
-            data: None,
-            message: "cancelled".to_string(),
-        };
+        let error = JsonRpcError::new(
+            -32002,
+            ErrorInfo::new("cancelled", "cancelled").with_source("test"),
+        );
 
         outgoing
             .cancel_requests_for_thread(thread_id, Some(error.clone()))
             .await;
 
-        let first = timeout(Duration::from_secs(1), first_rx)
-            .await
-            .expect("first response should resolve")
-            .expect("first channel should stay open");
-        let second = timeout(Duration::from_secs(1), second_rx)
-            .await
-            .expect("second response should resolve")
-            .expect("second channel should stay open");
+        let first = timeout(Duration::from_secs(1), first_rx).await??;
+        let second = timeout(Duration::from_secs(1), second_rx).await??;
 
         assert_eq!(first, Err(error.clone()));
         assert_eq!(second, Err(error));
         assert!(timeout(Duration::from_millis(50), other_rx).await.is_err());
+        Ok(())
     }
 }

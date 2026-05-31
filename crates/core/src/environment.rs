@@ -128,26 +128,27 @@ mod tests {
     }
 
     #[test]
-    fn gather_detects_git_repo() {
-        let workspace = tempfile::TempDir::new().expect("tempdir");
+    fn gather_detects_git_repo() -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = tempfile::TempDir::new()?;
         let status = Command::new("git")
             .arg("init")
             .arg(workspace.path())
-            .status()
-            .expect("git init should run");
+            .status()?;
         assert!(status.success(), "git init should succeed");
 
         let context = EnvironmentContext::gather(workspace.path());
 
         assert_eq!(context.is_git_repo, "yes");
+        Ok(())
     }
 
     #[test]
-    fn gather_detects_non_repo() {
-        let workspace = tempfile::TempDir::new().expect("tempdir");
+    fn gather_detects_non_repo() -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = tempfile::TempDir::new()?;
 
         let context = EnvironmentContext::gather(workspace.path());
 
         assert_eq!(context.is_git_repo, "no");
+        Ok(())
     }
 }

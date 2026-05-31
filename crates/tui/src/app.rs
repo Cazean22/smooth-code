@@ -1,8 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
-use anyhow::Result;
 use app_server_protocol::{
-    AskUserQuestionResponse, JSONRPCErrorError, RequestId, ServerRequest, SetPlanModeResponse,
+    AskUserQuestionResponse, JsonRpcError, RequestId, ServerRequest, SetPlanModeResponse,
     ThreadListItem, ThreadListResponse, ThreadResumeResponse, ThreadStartResponse,
     TurnStartResponse,
 };
@@ -15,13 +14,14 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use smooth_protocol::{
-    AgentStatus, Event, EventMsg, FileChangeOutput, ThreadId, ToolCallResultKind,
+    AgentStatus, ErrorInfo, Event, EventMsg, FileChangeOutput, ThreadId, ToolCallResultKind,
 };
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
     AppTerminal,
     app_server_session::AppServerSession,
+    error::TuiResult,
     history_cell::{ToolCallGroupCell, ToolCallState, TranscriptItem, TranscriptItemId},
     question_picker::{PickerOutcome, QuestionPicker},
     streaming::StreamController,
@@ -48,7 +48,7 @@ impl App {
         &mut self,
         app_server: &mut AppServerSession,
         viewport_height: u16,
-    ) -> Result<AppRunControl> {
+    ) -> TuiResult<AppRunControl> {
         let effects = self.model.update(UiEvent::Startup { viewport_height });
         self.run_effects(app_server, effects, viewport_height).await
     }
@@ -61,7 +61,7 @@ impl App {
     ) {
         let effects = self.model.update(UiEvent::Protocol {
             source_thread_id: Some(source_thread_id),
-            event,
+            event: Box::new(event),
             viewport_height,
         });
         debug_assert!(effects.is_empty());
@@ -71,7 +71,7 @@ impl App {
     fn handle_session_event(&mut self, event: Event, viewport_height: u16) {
         let effects = self.model.update(UiEvent::Protocol {
             source_thread_id: None,
-            event,
+            event: Box::new(event),
             viewport_height,
         });
         debug_assert!(effects.is_empty());
@@ -82,7 +82,7 @@ impl App {
         app_server: &mut AppServerSession,
         event: CrosstermEvent,
         viewport_height: u16,
-    ) -> Result<AppRunControl> {
+    ) -> TuiResult<AppRunControl> {
         let effects = self.model.update(UiEvent::Terminal {
             event,
             viewport_height,
@@ -95,7 +95,7 @@ impl App {
         app_server: &mut AppServerSession,
         request: ServerRequest,
         viewport_height: u16,
-    ) -> Result<AppRunControl> {
+    ) -> TuiResult<AppRunControl> {
         let effects = self.model.update(UiEvent::ServerRequest(request));
         self.run_effects(app_server, effects, viewport_height).await
     }
@@ -105,7 +105,7 @@ impl App {
         app_server: &mut AppServerSession,
         effects: Vec<UiEffect>,
         viewport_height: u16,
-    ) -> Result<AppRunControl> {
+    ) -> TuiResult<AppRunControl> {
         let mut queue = VecDeque::from(effects);
         while let Some(effect) = queue.pop_front() {
             let effect_id = effect.effect_id;
@@ -173,7 +173,7 @@ impl App {
         self.model.render(frame);
     }
 
-    pub(crate) fn viewport_height_for(&self, terminal: &AppTerminal) -> Result<u16> {
+    pub(crate) fn viewport_height_for(&self, terminal: &AppTerminal) -> TuiResult<u16> {
         let size = terminal.size()?;
         Ok(self
             .model
@@ -224,11 +224,11 @@ enum UiEffectKind {
     },
     FailQuestion {
         request_id: RequestId,
-        error: JSONRPCErrorError,
+        error: JsonRpcError,
     },
     FailServerRequest {
         request_id: RequestId,
-        error: JSONRPCErrorError,
+        error: JsonRpcError,
     },
     Exit,
 }
@@ -265,7 +265,7 @@ enum UiEvent {
     },
     Protocol {
         source_thread_id: Option<ThreadId>,
-        event: Event,
+        event: Box<Event>,
         viewport_height: u16,
     },
     ServerRequest(ServerRequest),
@@ -719,7 +719,7 @@ impl UiModel {
                     return Vec::new();
                 }
                 self.screen = Screen::Workspace;
-                self.apply_protocol_event(event);
+                self.apply_protocol_event(*event);
                 if self.auto_scroll {
                     self.scroll_to_bottom(viewport_height);
                 }
@@ -1087,17 +1087,19 @@ impl UiModel {
                 };
                 self.mode = UiMode::Normal;
                 self.focus = FocusTarget::Transcript;
-                vec![self.effect(
-                    EffectContext::ServerRequest,
-                    UiEffectKind::FailQuestion {
-                        request_id: picker.request_id,
-                        error: JSONRPCErrorError {
-                            code: -32001,
-                            data: None,
-                            message: "user declined to answer".to_string(),
+                vec![
+                    self.effect(
+                        EffectContext::ServerRequest,
+                        UiEffectKind::FailQuestion {
+                            request_id: picker.request_id,
+                            error: JsonRpcError::new(
+                                -32001,
+                                ErrorInfo::new("user_declined", "user declined to answer")
+                                    .with_source("smooth-tui"),
+                            ),
                         },
-                    },
-                )]
+                    ),
+                ]
             }
         }
     }
@@ -1191,11 +1193,10 @@ impl UiModel {
             EffectContext::ServerRequest,
             UiEffectKind::FailServerRequest {
                 request_id,
-                error: JSONRPCErrorError {
-                    code: -32000,
-                    data: None,
-                    message,
-                },
+                error: JsonRpcError::new(
+                    -32000,
+                    ErrorInfo::new("server_request_failed", message).with_source("smooth-tui"),
+                ),
             },
         )]
     }
@@ -1507,7 +1508,7 @@ impl UiModel {
             }
             EventMsg::Error(error) => {
                 self.finalize_assistant_stream(None);
-                self.push_error(error.message);
+                self.push_error(error.error.message);
                 self.is_turn_running = false;
                 self.running_tools.clear();
                 self.status_line = String::from("Error");
@@ -1705,9 +1706,14 @@ impl UiModel {
     }
 
     fn tool_group_mut(&mut self, cell_idx: usize) -> &mut ToolCallGroupCell {
-        self.transcript_items[cell_idx]
-            .tool_group_mut()
-            .expect("tracked tool row should be a ToolCallGroupCell")
+        match self
+            .transcript_items
+            .get_mut(cell_idx)
+            .and_then(TranscriptItem::tool_group_mut)
+        {
+            Some(group) => group,
+            None => panic!("tracked tool row should be a ToolCallGroupCell"),
+        }
     }
 
     fn mark_item_mutated(&mut self, cell_idx: usize) {
@@ -1763,7 +1769,7 @@ impl UiModel {
 
         let (state, error) = match status {
             AgentStatus::Completed(_) => (ToolCallState::Success, None),
-            AgentStatus::Errored(message) => (ToolCallState::Failure, Some(message.clone())),
+            AgentStatus::Errored(error) => (ToolCallState::Failure, Some(error.message.clone())),
             AgentStatus::Interrupted => (ToolCallState::Failure, Some(String::from("interrupted"))),
             AgentStatus::Shutdown => (ToolCallState::Failure, Some(String::from("shutdown"))),
             AgentStatus::NotFound => (ToolCallState::Failure, Some(String::from("not found"))),
@@ -1846,7 +1852,9 @@ impl UiModel {
         }
 
         self.refresh_active_wrap(width);
-        let active = self.active_wrap.as_ref().expect("active wrap refreshed");
+        let Some(active) = self.active_wrap.as_ref() else {
+            return lines;
+        };
         let has_reasoning = !active.reasoning.is_empty();
         let has_assistant = !active.assistant.is_empty();
         if (has_reasoning || has_assistant) && all_rows > 0 {
@@ -1912,7 +1920,9 @@ impl UiModel {
         }
 
         self.refresh_active_wrap(width);
-        let active = self.active_wrap.as_ref().expect("active wrap refreshed");
+        let Some(active) = self.active_wrap.as_ref() else {
+            return rows;
+        };
         if !active.reasoning.is_empty() {
             if rows > 0 {
                 rows += 1;
@@ -2425,7 +2435,7 @@ fn agent_status_label(status: &AgentStatus) -> String {
         AgentStatus::Interrupted => String::from("interrupted"),
         AgentStatus::Completed(Some(text)) => format!("completed ({text})"),
         AgentStatus::Completed(None) => String::from("completed"),
-        AgentStatus::Errored(message) => format!("errored ({message})"),
+        AgentStatus::Errored(error) => format!("errored ({})", error.message),
         AgentStatus::Shutdown => String::from("shutdown"),
         AgentStatus::NotFound => String::from("not_found"),
     }
@@ -2800,7 +2810,8 @@ mod tests {
     }
 
     #[test]
-    fn file_change_completion_renders_diff_in_transcript() {
+    fn file_change_completion_renders_diff_in_transcript() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut app = App::new();
 
         start_turn(&mut app);
@@ -2839,12 +2850,13 @@ mod tests {
 
         app.model.screen = Screen::Workspace;
         app.model.focus = FocusTarget::Transcript;
-        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
-        terminal.draw(|frame| app.render(frame)).expect("draw");
+        let mut terminal = Terminal::new(TestBackend::new(120, 24))?;
+        terminal.draw(|frame| app.render(frame))?;
         let rendered = rendered_buffer_text(&terminal);
         assert!(rendered.contains("1 - old"), "{rendered}");
         assert!(rendered.contains("1 + new"), "{rendered}");
         assert!(!rendered.contains("Selected Diff"), "{rendered}");
+        Ok(())
     }
 
     #[test]
@@ -2886,7 +2898,8 @@ mod tests {
     }
 
     #[test]
-    fn subagent_completion_finishes_status_update_tool_row() {
+    fn subagent_completion_finishes_status_update_tool_row()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut app = App::new();
         let child_thread_id = ThreadId::new();
 
@@ -2921,7 +2934,7 @@ mod tests {
                 EventMsg::CollabAgentCompleted(smooth_protocol::CollabAgentCompletedEvent {
                     parent_thread_id: ThreadId::new(),
                     child_thread_id,
-                    agent_path: smooth_protocol::AgentPath::try_from("/root/child").expect("path"),
+                    agent_path: smooth_protocol::AgentPath::try_from("/root/child")?,
                     agent_nickname: Some("child".to_string()),
                     agent_role: Some("worker".to_string()),
                     status: AgentStatus::Completed(Some("Done".to_string())),
@@ -2936,6 +2949,7 @@ mod tests {
         assert!(!joined.contains("⠋ spawn_agent {\"message\":\"inspect\"}"));
         assert!(!joined.contains("Sub-agent"));
         assert!(!joined.contains("Done"));
+        Ok(())
     }
 
     #[test]
@@ -3161,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_transcript_bottom_includes_newest_row() {
+    fn rendered_transcript_bottom_includes_newest_row() -> Result<(), Box<dyn std::error::Error>> {
         let mut model = UiModel::new();
         model.screen = Screen::Workspace;
         model.focus = FocusTarget::Transcript;
@@ -3173,15 +3187,16 @@ mod tests {
         model.scroll = model.max_scroll(viewport_height);
         model.auto_scroll = false;
 
-        let mut terminal = Terminal::new(TestBackend::new(50, 10)).expect("terminal");
-        terminal.draw(|frame| model.render(frame)).expect("draw");
+        let mut terminal = Terminal::new(TestBackend::new(50, 10))?;
+        terminal.draw(|frame| model.render(frame))?;
 
         let rendered = rendered_buffer_text(&terminal);
         assert!(rendered.contains("i line 12"), "{rendered}");
+        Ok(())
     }
 
     #[test]
-    fn split_view_auto_scroll_reaches_wrapping_bottom() {
+    fn split_view_auto_scroll_reaches_wrapping_bottom() -> Result<(), Box<dyn std::error::Error>> {
         let mut model = UiModel::new();
         model.screen = Screen::Workspace;
         model.focus = FocusTarget::Transcript;
@@ -3194,14 +3209,15 @@ mod tests {
         }
         model.auto_scroll = true;
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
-        terminal.draw(|frame| model.render(frame)).expect("draw");
+        let mut terminal = Terminal::new(TestBackend::new(120, 24))?;
+        terminal.draw(|frame| model.render(frame))?;
 
         let rendered = rendered_buffer_text(&terminal);
         assert!(
             rendered.contains("marker20"),
             "newest content missing:\n{rendered}"
         );
+        Ok(())
     }
 
     #[test]
@@ -3418,7 +3434,10 @@ mod tests {
 
         let effects = model.update(UiEvent::Protocol {
             source_thread_id: Some(stale_thread),
-            event: event("stale", EventMsg::UserMessage("old prompt".to_string())),
+            event: Box::new(event(
+                "stale",
+                EventMsg::UserMessage("old prompt".to_string()),
+            )),
             viewport_height: 20,
         });
 
@@ -3429,7 +3448,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_renders_question_picker_overlay() {
+    fn dashboard_renders_question_picker_overlay() -> Result<(), Box<dyn std::error::Error>> {
         let mut model = UiModel::new();
         let thread_id = ThreadId::new();
         model.current_thread_id = Some(thread_id);
@@ -3455,12 +3474,13 @@ mod tests {
         assert_eq!(model.screen, Screen::Dashboard);
         assert_eq!(model.mode, UiMode::Overlay);
 
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-        terminal.draw(|frame| model.render(frame)).expect("draw");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        terminal.draw(|frame| model.render(frame))?;
         let rendered = rendered_buffer_text(&terminal);
 
         assert!(rendered.contains("Pick a path?"), "{rendered}");
         assert!(rendered.contains("Use option A"), "{rendered}");
+        Ok(())
     }
 
     #[test]

@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use app_server_protocol::{ClientCommand, JSONRPCErrorError};
-use smooth_protocol::{Event, ThreadId};
+use app_server_protocol::{ClientCommand, JsonRpcError};
+use smooth_protocol::{ErrorInfo, Event, ThreadId};
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use crate::{
-    error_code::SERVER_ERROR_CODE, message_processor::MessageProcessor,
+    error::{AppServerError, AppServerResult},
+    error_code::SERVER_ERROR_CODE,
+    message_processor::MessageProcessor,
     outgoing_message::OutgoingMessageSender,
 };
 
@@ -35,13 +36,13 @@ impl InProcessClientHandle {
     }
 }
 
-pub async fn start(args: InProcessStartArgs) -> Result<InProcessClientHandle> {
+pub async fn start(args: InProcessStartArgs) -> AppServerResult<InProcessClientHandle> {
     Ok(start_internal(args).await?.0)
 }
 
 async fn start_internal(
     args: InProcessStartArgs,
-) -> Result<(InProcessClientHandle, Arc<OutgoingMessageSender>)> {
+) -> AppServerResult<(InProcessClientHandle, Arc<OutgoingMessageSender>)> {
     let channel_capacity = args.channel_capacity.max(1);
     let (client_tx, mut client_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
@@ -50,7 +51,9 @@ async fn start_internal(
     let processor = Arc::new(
         MessageProcessor::new(event_tx.clone(), Arc::clone(&runtime_outgoing))
             .await
-            .context("failed to initialize message processor")?,
+            .map_err(|err| {
+                AppServerError::Internal(format!("failed to initialize message processor: {err}"))
+            })?,
     );
 
     let runtime_span = tracing::info_span!("app_server.in_process_runtime", channel_capacity);
@@ -64,14 +67,11 @@ async fn start_internal(
                             match message {
                                 Some(ClientCommand::Request { request, response_tx }) => {
                                     let processor = Arc::clone(&processor);
-                                    tokio::task::Builder::new()
-                                        .name("app_server.process_request")
-                                        .spawn(async move {
-                                            processor
-                                                .process_client_request(*request, response_tx)
-                                                .await;
-                                        })
-                                        .expect("failed to spawn request processor task");
+                                    tokio::spawn(async move {
+                                        processor
+                                            .process_client_request(*request, response_tx)
+                                            .await;
+                                    });
                                 }
                                 Some(ClientCommand::ServerRequestResponse { request_id, result }) => {
                                     runtime_outgoing
@@ -90,17 +90,23 @@ async fn start_internal(
                 }
 
                 runtime_outgoing
-                    .cancel_all_requests(Some(JSONRPCErrorError {
-                        code: SERVER_ERROR_CODE,
-                        data: None,
-                        message: "in-process app-server runtime is shutting down".to_string(),
-                    }))
+                    .cancel_all_requests(Some(JsonRpcError::new(
+                        SERVER_ERROR_CODE,
+                        ErrorInfo::new(
+                            "runtime_shutdown",
+                            "in-process app-server runtime is shutting down",
+                        )
+                        .with_source("app-server"),
+                    )))
                     .await;
                 drop(runtime_outgoing);
             }
             .instrument(runtime_span),
         )
-        .context("failed to spawn app-server runtime")?;
+        .map_err(|source| AppServerError::TaskSpawn {
+            task_name: "app_server.in_process.runtime",
+            source,
+        })?;
 
     Ok((
         InProcessClientHandle {
@@ -121,13 +127,14 @@ mod tests {
 
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[tokio::test]
-    async fn server_request_round_trip_resolves_waiter() {
+    async fn server_request_round_trip_resolves_waiter() -> TestResult {
         let (mut handle, outgoing) = start_internal(InProcessStartArgs {
             channel_capacity: 8,
         })
-        .await
-        .expect("in-process app-server should initialize");
+        .await?;
         let thread_id = ThreadId::new();
         let (request_id, response_rx) = outgoing
             .send_request(ServerRequestPayload::AskUserQuestion(
@@ -141,9 +148,8 @@ mod tests {
             .await;
 
         let event = timeout(Duration::from_secs(1), handle.next_event())
-            .await
-            .expect("runtime should emit server request")
-            .expect("runtime event stream should stay open");
+            .await?
+            .ok_or("runtime event stream should stay open")?;
         let observed_request_id = match event {
             InProcessServerEvent::ServerRequest(
                 app_server_protocol::ServerRequest::AskUserQuestion { request_id, .. },
@@ -159,13 +165,10 @@ mod tests {
                 result: json!({ "ok": true }),
             })
             .await
-            .expect("client response should send");
+            .map_err(|err| err.to_string())?;
 
-        let result = timeout(Duration::from_secs(1), response_rx)
-            .await
-            .expect("server waiter should resolve")
-            .expect("waiter channel should stay open")
-            .expect("client should respond successfully");
+        let result = timeout(Duration::from_secs(1), response_rx).await???;
         assert_eq!(result, json!({ "ok": true }));
+        Ok(())
     }
 }

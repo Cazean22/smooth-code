@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
 use rig::message::Message;
 use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent, SessionSource};
 use tokio::sync::{RwLock, broadcast};
@@ -11,6 +10,7 @@ use crate::provider::{SessionModelFactory, default_session_model_factory};
 use crate::{
     agent::{AgentControl, role::role_override_from_source},
     core::Core,
+    error::{CoreError, CoreResult},
     rollout::{ResumeState, RolloutRecorder, workspace_root},
 };
 use smooth_protocol::{Op, ThreadId};
@@ -33,7 +33,7 @@ impl CoreThread {
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         agent_control: AgentControl,
-    ) -> Result<Self> {
+    ) -> CoreResult<Self> {
         Self::new_with_history(
             id,
             ask_user_client,
@@ -62,30 +62,35 @@ impl CoreThread {
         session_source: SessionSource,
         agent_control: AgentControl,
         initial_history: Vec<Message>,
-    ) -> Result<Self> {
+    ) -> CoreResult<Self> {
         let cwd = std::env::current_dir()?;
         let current_turn_id = Arc::new(RwLock::new(None));
         let role_override = role_override_from_source(&session_source);
         let resolved_factory = model_factory.unwrap_or_else(default_session_model_factory);
         let plan_mode = false;
-        let model = resolved_factory.build(
-            cwd.clone(),
-            id,
-            ask_user_client.clone(),
-            Arc::clone(&current_turn_id),
-            role_override,
-            agent_control.clone(),
-            plan_mode,
-        )?;
-        let workspace_root = workspace_root()?;
-        let rollout = RolloutRecorder::create(&workspace_root, id, &cwd).await?;
+        let model = resolved_factory
+            .build(
+                cwd.clone(),
+                id,
+                ask_user_client.clone(),
+                Arc::clone(&current_turn_id),
+                role_override,
+                agent_control.clone(),
+                plan_mode,
+            )
+            .map_err(CoreError::provider)?;
+        let workspace_root = workspace_root().map_err(CoreError::rollout)?;
+        let rollout = RolloutRecorder::create(&workspace_root, id, &cwd)
+            .await
+            .map_err(CoreError::rollout)?;
         for message in &initial_history {
             if let Some(history_message) = history_message_from_message(message) {
                 rollout
                     .append(crate::rollout::PersistedItem::HistoryMessage(
                         history_message,
                     ))
-                    .await?;
+                    .await
+                    .map_err(CoreError::rollout)?;
             }
         }
         let rollout_path = rollout.path().to_path_buf();
@@ -126,22 +131,26 @@ impl CoreThread {
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         agent_control: AgentControl,
-    ) -> Result<Self> {
+    ) -> CoreResult<Self> {
         let cwd = std::env::current_dir()?;
         let current_turn_id = Arc::new(RwLock::new(None));
         let role_override = role_override_from_source(&session_source);
         let resolved_factory = model_factory.unwrap_or_else(default_session_model_factory);
         let plan_mode = false;
-        let model = resolved_factory.build(
-            cwd,
-            state.thread_id,
-            ask_user_client.clone(),
-            Arc::clone(&current_turn_id),
-            role_override,
-            agent_control.clone(),
-            plan_mode,
-        )?;
-        let rollout = RolloutRecorder::resume(path.clone()).await?;
+        let model = resolved_factory
+            .build(
+                cwd,
+                state.thread_id,
+                ask_user_client.clone(),
+                Arc::clone(&current_turn_id),
+                role_override,
+                agent_control.clone(),
+                plan_mode,
+            )
+            .map_err(CoreError::provider)?;
+        let rollout = RolloutRecorder::resume(path.clone())
+            .await
+            .map_err(CoreError::rollout)?;
         Ok(Self {
             core: Core::new(
                 state.thread_id,
@@ -161,16 +170,16 @@ impl CoreThread {
         })
     }
 
-    pub(crate) async fn start_user_input(&self, input: String) -> Result<String> {
+    pub(crate) async fn start_user_input(&self, input: String) -> CoreResult<String> {
         self.core.start_user_input(input).await
     }
 
-    pub(crate) async fn submit(&self, op: Op) -> Result<String> {
+    pub(crate) async fn submit(&self, op: Op) -> CoreResult<String> {
         self.core.submit(op).await
     }
 
     /// Toggle plan mode for this thread. Returns the new effective plan-mode state.
-    pub(crate) async fn set_plan_mode(&self, enabled: bool) -> Result<bool> {
+    pub(crate) async fn set_plan_mode(&self, enabled: bool) -> CoreResult<bool> {
         self.core
             .session
             .apply_plan_mode(enabled, self.ask_user_client.clone())
@@ -195,7 +204,7 @@ impl CoreThread {
         &self.rollout_path
     }
 
-    pub(crate) async fn flush_rollout(&self) -> Result<()> {
+    pub(crate) async fn flush_rollout(&self) -> CoreResult<()> {
         self.core.flush_rollout().await
     }
 }

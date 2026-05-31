@@ -4,7 +4,7 @@ use std::process::Command;
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::Deserialize;
 
-use crate::{ToolFailure, shared::truncate_output};
+use crate::{ToolError, shared::truncate_output};
 
 #[derive(Clone)]
 pub struct RunCommandTool {
@@ -25,7 +25,7 @@ pub struct RunCommandArgs {
 impl Tool for RunCommandTool {
     const NAME: &'static str = "run_command";
 
-    type Error = ToolFailure;
+    type Error = ToolError;
     type Args = RunCommandArgs;
     type Output = String;
 
@@ -52,7 +52,7 @@ impl Tool for RunCommandTool {
             .arg(&args.command)
             .current_dir(&self.cwd)
             .output()
-            .map_err(|err| ToolFailure::new(format!("failed to run command: {err}")))?;
+            .map_err(|err| ToolError::io(format!("failed to run command: {err}")))?;
 
         let mut text = String::new();
         if !output.stdout.is_empty() {

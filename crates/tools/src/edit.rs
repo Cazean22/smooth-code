@@ -5,9 +5,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 
-use crate::{
-    MAX_FILE_CHANGE_BYTES, ToolFailure, encode_tool_output, shared::resolve_path_for_write,
-};
+use crate::{MAX_FILE_CHANGE_BYTES, ToolError, encode_tool_output, shared::resolve_path_for_write};
 
 const DESCRIPTION: &str = r#"Perform exact string replacements in a UTF-8 text file.
 
@@ -57,7 +55,7 @@ struct Replacement {
 impl Tool for EditTool {
     const NAME: &'static str = "edit";
 
-    type Error = ToolFailure;
+    type Error = ToolError;
     type Args = EditArgs;
     type Output = String;
 
@@ -76,13 +74,15 @@ impl Tool for EditTool {
         } = args;
 
         if replacements.is_empty() {
-            return Err(ToolFailure::new("replacements must not be empty"));
+            return Err(ToolError::invalid_arguments(
+                "replacements must not be empty",
+            ));
         }
 
         let path = resolve_path_for_write(&self.cwd, &file_path)?;
 
         let content = fs::read_to_string(&path)
-            .map_err(|err| ToolFailure::new(format!("failed to read {}: {err}", path.display())))?;
+            .map_err(|err| ToolError::io(format!("failed to read {}: {err}", path.display())))?;
 
         let mut new_content = content.clone();
         let mut replacement_count = 0;
@@ -92,9 +92,8 @@ impl Tool for EditTool {
             replacement_count += count;
         }
 
-        fs::write(&path, &new_content).map_err(|err| {
-            ToolFailure::new(format!("failed to write {}: {err}", path.display()))
-        })?;
+        fs::write(&path, &new_content)
+            .map_err(|err| ToolError::io(format!("failed to write {}: {err}", path.display())))?;
 
         let plural_suffix = if replacement_count == 1 { "" } else { "s" };
         let model_output = format!(
@@ -132,30 +131,32 @@ fn validate_replacement(
     replacement: &Replacement,
     index: usize,
     path: &Path,
-) -> Result<usize, ToolFailure> {
+) -> Result<usize, ToolError> {
     let old_label = replacement_field_label(index, "old_string");
     let new_label = replacement_field_label(index, "new_string");
 
     if replacement.old_string.is_empty() {
-        return Err(ToolFailure::new(format!("{old_label} must not be empty")));
+        return Err(ToolError::invalid_arguments(format!(
+            "{old_label} must not be empty"
+        )));
     }
 
     if replacement.old_string == replacement.new_string {
-        return Err(ToolFailure::new(format!(
+        return Err(ToolError::invalid_arguments(format!(
             "{old_label} and {new_label} must differ"
         )));
     }
 
     let replacement_count = content.matches(&replacement.old_string).count();
     if replacement_count == 0 {
-        return Err(ToolFailure::new(format!(
+        return Err(ToolError::invalid_arguments(format!(
             "{old_label} not found in {}",
             path.display()
         )));
     }
 
     if replacement_count > 1 && !replacement.replace_all {
-        return Err(ToolFailure::new(format!(
+        return Err(ToolError::invalid_arguments(format!(
             "{old_label} is not unique in {} ({} matches); set replace_all=true on that replacement or include more surrounding context",
             path.display(),
             replacement_count
@@ -200,10 +201,18 @@ mod tests {
 
     use super::*;
 
-    fn fixture() -> (EditTool, TempDir) {
-        let tmp = TempDir::new().expect("create tempdir");
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn fixture() -> Result<(EditTool, TempDir), std::io::Error> {
+        let tmp = TempDir::new()?;
         let tool = EditTool::new(tmp.path().to_path_buf());
-        (tool, tmp)
+        Ok((tool, tmp))
+    }
+
+    fn file_change(decoded: crate::DecodedToolOutput) -> Result<FileChangeOutput, std::io::Error> {
+        decoded
+            .file_change
+            .ok_or_else(|| std::io::Error::other("file change metadata"))
     }
 
     fn args(
@@ -236,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_replacements_array_args() {
+    fn deserializes_replacements_array_args() -> TestResult {
         let args: EditArgs = serde_json::from_value(serde_json::json!({
             "file_path": "foo.txt",
             "replacements": [
@@ -246,14 +255,14 @@ mod tests {
                     "replace_all": true
                 }
             ]
-        }))
-        .expect("deserialize edit args");
+        }))?;
 
         assert_eq!(args.file_path, "foo.txt");
         assert_eq!(args.replacements.len(), 1);
         assert_eq!(args.replacements[0].old_string, "world");
         assert_eq!(args.replacements[0].new_string, "there");
         assert!(args.replacements[0].replace_all);
+        Ok(())
     }
 
     #[test]
@@ -288,24 +297,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replaces_unique_match() {
-        let (tool, tmp) = fixture();
+    async fn replaces_unique_match() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
-        fs::write(&path, "hello world\n").unwrap();
+        fs::write(&path, "hello world\n")?;
 
-        let output = tool
-            .call(args("foo.txt", "world", "there"))
-            .await
-            .expect("edit should succeed");
+        let output = tool.call(args("foo.txt", "world", "there")).await?;
 
-        let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
-        assert_eq!(fs::read_to_string(path).unwrap(), "hello there\n");
+        let resolved_path = fs::canonicalize(tmp.path())?.join("foo.txt");
+        assert_eq!(fs::read_to_string(path)?, "hello there\n");
         let decoded = decode_tool_output_for_tool("edit", output, true);
         assert_eq!(
             decoded.model_output,
             format!("edited {} (1 replacement)", resolved_path.display())
         );
-        let file_change = decoded.file_change.expect("file change metadata");
+        let file_change = file_change(decoded)?;
         assert_eq!(file_change.path, resolved_path);
         match file_change.change {
             FileChange::Update { unified_diff, .. } => {
@@ -314,13 +320,14 @@ mod tests {
             }
             _ => panic!("expected update file change"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn replaces_all_when_replace_all_true() {
-        let (tool, tmp) = fixture();
+    async fn replaces_all_when_replace_all_true() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
-        fs::write(&path, "hello world\nworld\n").unwrap();
+        fs::write(&path, "hello world\nworld\n")?;
 
         let output = tool
             .call(EditArgs {
@@ -331,17 +338,16 @@ mod tests {
                     replace_all: true,
                 }],
             })
-            .await
-            .expect("edit should succeed");
+            .await?;
 
-        let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
-        assert_eq!(fs::read_to_string(path).unwrap(), "hello there\nthere\n");
+        let resolved_path = fs::canonicalize(tmp.path())?.join("foo.txt");
+        assert_eq!(fs::read_to_string(path)?, "hello there\nthere\n");
         let decoded = decode_tool_output_for_tool("edit", output, true);
         assert_eq!(
             decoded.model_output,
             format!("edited {} (2 replacements)", resolved_path.display())
         );
-        let file_change = decoded.file_change.expect("file change metadata");
+        let file_change = file_change(decoded)?;
         match file_change.change {
             FileChange::Update { unified_diff, .. } => {
                 assert!(unified_diff.contains("-hello world"));
@@ -350,13 +356,14 @@ mod tests {
             }
             _ => panic!("expected update file change"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn applies_ordered_multi_replacements_with_single_diff() {
-        let (tool, tmp) = fixture();
+    async fn applies_ordered_multi_replacements_with_single_diff() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
-        fs::write(&path, "red blue green\n").unwrap();
+        fs::write(&path, "red blue green\n")?;
 
         let output = tool
             .call(args_with_replacements(
@@ -366,17 +373,16 @@ mod tests {
                     replacement("blue red green", "done"),
                 ],
             ))
-            .await
-            .expect("edit should succeed");
+            .await?;
 
-        let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
-        assert_eq!(fs::read_to_string(path).unwrap(), "done\n");
+        let resolved_path = fs::canonicalize(tmp.path())?.join("foo.txt");
+        assert_eq!(fs::read_to_string(path)?, "done\n");
         let decoded = decode_tool_output_for_tool("edit", output, true);
         assert_eq!(
             decoded.model_output,
             format!("edited {} (2 replacements)", resolved_path.display())
         );
-        match decoded.file_change.expect("file change metadata").change {
+        match file_change(decoded)?.change {
             FileChange::Update { unified_diff, .. } => {
                 assert!(unified_diff.contains("-red blue green"));
                 assert!(unified_diff.contains("+done"));
@@ -384,34 +390,38 @@ mod tests {
             }
             _ => panic!("expected update file change"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rolls_back_multi_replacement_when_later_replacement_is_not_unique() {
-        let (tool, tmp) = fixture();
+    async fn rolls_back_multi_replacement_when_later_replacement_is_not_unique() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
-        fs::write(&path, "alpha beta beta\n").unwrap();
+        fs::write(&path, "alpha beta beta\n")?;
 
-        let err = tool
+        let Err(err) = tool
             .call(args_with_replacements(
                 "foo.txt",
                 vec![replacement("alpha", "done"), replacement("beta", "gamma")],
             ))
             .await
-            .expect_err("edit should fail");
+        else {
+            panic!("edit should fail");
+        };
 
         assert!(err.to_string().contains("replacement[1].old_string"));
         assert!(err.to_string().contains("is not unique"));
-        assert_eq!(fs::read_to_string(path).unwrap(), "alpha beta beta\n");
+        assert_eq!(fs::read_to_string(path)?, "alpha beta beta\n");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rolls_back_multi_replacement_when_later_replacement_is_missing() {
-        let (tool, tmp) = fixture();
+    async fn rolls_back_multi_replacement_when_later_replacement_is_missing() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
-        fs::write(&path, "alpha beta\n").unwrap();
+        fs::write(&path, "alpha beta\n")?;
 
-        let err = tool
+        let Err(err) = tool
             .call(args_with_replacements(
                 "foo.txt",
                 vec![
@@ -420,136 +430,144 @@ mod tests {
                 ],
             ))
             .await
-            .expect_err("edit should fail");
+        else {
+            panic!("edit should fail");
+        };
 
         assert!(err.to_string().contains("replacement[1].old_string"));
         assert!(err.to_string().contains("not found"));
-        assert_eq!(fs::read_to_string(path).unwrap(), "alpha beta\n");
+        assert_eq!(fs::read_to_string(path)?, "alpha beta\n");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn errors_when_replacements_array_is_empty() {
-        let (tool, tmp) = fixture();
-        fs::write(tmp.path().join("foo.txt"), "hello\n").unwrap();
+    async fn errors_when_replacements_array_is_empty() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::write(tmp.path().join("foo.txt"), "hello\n")?;
 
-        let err = tool
+        let Err(err) = tool
             .call(args_with_replacements("foo.txt", Vec::new()))
             .await
-            .expect_err("edit should fail");
+        else {
+            panic!("edit should fail");
+        };
 
         assert_eq!(err.to_string(), "replacements must not be empty");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn errors_when_old_string_not_unique() {
-        let (tool, tmp) = fixture();
-        fs::write(tmp.path().join("foo.txt"), "world\nworld\n").unwrap();
+    async fn errors_when_old_string_not_unique() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::write(tmp.path().join("foo.txt"), "world\nworld\n")?;
 
-        let err = tool
-            .call(args("foo.txt", "world", "there"))
-            .await
-            .expect_err("edit should fail");
+        let Err(err) = tool.call(args("foo.txt", "world", "there")).await else {
+            panic!("edit should fail");
+        };
 
         assert!(err.to_string().contains("old_string is not unique"));
         assert!(err.to_string().contains("set replace_all=true"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn errors_when_old_string_missing() {
-        let (tool, tmp) = fixture();
-        fs::write(tmp.path().join("foo.txt"), "hello\n").unwrap();
+    async fn errors_when_old_string_missing() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::write(tmp.path().join("foo.txt"), "hello\n")?;
 
-        let err = tool
-            .call(args("foo.txt", "world", "there"))
-            .await
-            .expect_err("edit should fail");
+        let Err(err) = tool.call(args("foo.txt", "world", "there")).await else {
+            panic!("edit should fail");
+        };
 
         assert!(err.to_string().contains("old_string not found"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn errors_when_old_equals_new() {
-        let (tool, tmp) = fixture();
-        fs::write(tmp.path().join("foo.txt"), "hello\n").unwrap();
+    async fn errors_when_old_equals_new() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::write(tmp.path().join("foo.txt"), "hello\n")?;
 
-        let err = tool
-            .call(args("foo.txt", "hello", "hello"))
-            .await
-            .expect_err("edit should fail");
+        let Err(err) = tool.call(args("foo.txt", "hello", "hello")).await else {
+            panic!("edit should fail");
+        };
 
         assert_eq!(
             err.to_string(),
             "replacement[0].old_string and replacement[0].new_string must differ"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn errors_when_old_string_empty() {
-        let (tool, tmp) = fixture();
-        fs::write(tmp.path().join("foo.txt"), "hello\n").unwrap();
+    async fn errors_when_old_string_empty() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::write(tmp.path().join("foo.txt"), "hello\n")?;
 
-        let err = tool
-            .call(args("foo.txt", "", "hello"))
-            .await
-            .expect_err("edit should fail");
+        let Err(err) = tool.call(args("foo.txt", "", "hello")).await else {
+            panic!("edit should fail");
+        };
 
         assert_eq!(
             err.to_string(),
             "replacement[0].old_string must not be empty"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn errors_when_file_missing() {
-        let (tool, _tmp) = fixture();
+    async fn errors_when_file_missing() -> TestResult {
+        let (tool, _tmp) = fixture()?;
 
-        let err = tool
-            .call(args("missing.txt", "hello", "hi"))
-            .await
-            .expect_err("edit should fail");
+        let Err(err) = tool.call(args("missing.txt", "hello", "hi")).await else {
+            panic!("edit should fail");
+        };
 
         assert!(err.to_string().contains("failed to read"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_path_outside_workspace() {
-        let (tool, _tmp) = fixture();
-        let other = TempDir::new().expect("create second tempdir");
+    async fn rejects_path_outside_workspace() -> TestResult {
+        let (tool, _tmp) = fixture()?;
+        let other = TempDir::new()?;
         let path = other.path().join("file.txt");
-        fs::write(&path, "hello\n").unwrap();
+        fs::write(&path, "hello\n")?;
 
-        let err = tool
+        let Err(err) = tool
             .call(args(path.display().to_string(), "hello", "hi"))
             .await
-            .expect_err("edit should fail");
+        else {
+            panic!("edit should fail");
+        };
 
         assert!(err.to_string().contains("escapes the workspace"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resolves_relative_path_against_cwd() {
-        let (tool, tmp) = fixture();
-        fs::create_dir(tmp.path().join("sub")).unwrap();
+    async fn resolves_relative_path_against_cwd() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::create_dir(tmp.path().join("sub"))?;
         let path = tmp.path().join("sub/file.txt");
-        fs::write(&path, "alpha beta\n").unwrap();
+        fs::write(&path, "alpha beta\n")?;
 
-        tool.call(args("sub/file.txt", "beta", "gamma"))
-            .await
-            .expect("edit should succeed");
+        tool.call(args("sub/file.txt", "beta", "gamma")).await?;
 
-        assert_eq!(fs::read_to_string(path).unwrap(), "alpha gamma\n");
+        assert_eq!(fs::read_to_string(path)?, "alpha gamma\n");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn accepts_absolute_path_inside_cwd() {
-        let (tool, tmp) = fixture();
+    async fn accepts_absolute_path_inside_cwd() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
-        fs::write(&path, "hello\n").unwrap();
+        fs::write(&path, "hello\n")?;
 
         tool.call(args(path.display().to_string(), "hello", "hi"))
-            .await
-            .expect("edit should succeed");
+            .await?;
 
-        assert_eq!(fs::read_to_string(path).unwrap(), "hi\n");
+        assert_eq!(fs::read_to_string(path)?, "hi\n");
+        Ok(())
     }
 }

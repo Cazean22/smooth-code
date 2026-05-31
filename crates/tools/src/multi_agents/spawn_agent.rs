@@ -2,7 +2,7 @@ use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
-use crate::ToolFailure;
+use crate::ToolError;
 
 #[derive(Clone)]
 pub struct SpawnAgentTool {
@@ -28,7 +28,7 @@ impl SpawnAgentTool {
 impl Tool for SpawnAgentTool {
     const NAME: &'static str = "spawn_agent";
 
-    type Error = ToolFailure;
+    type Error = ToolError;
     type Args = SpawnAgentArgs;
     type Output = String;
 
@@ -42,7 +42,7 @@ impl Tool for SpawnAgentTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let _ = args;
-        Err(ToolFailure::new(
+        Err(ToolError::unsupported(
             "spawn_agent is executed by the smooth-core manual tool loop",
         ))
     }

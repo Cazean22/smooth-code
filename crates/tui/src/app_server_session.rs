@@ -1,4 +1,3 @@
-use anyhow::Result;
 use app_server::in_process::InProcessServerEvent;
 use app_server_protocol::{
     ClientRequest, RequestId, SetPlanModeParams, SetPlanModeResponse, ThreadListParams,
@@ -8,6 +7,7 @@ use app_server_protocol::{
 use smooth_protocol::ThreadId;
 
 use crate::app_server_client::AppServerClient;
+use crate::error::TuiResult;
 
 pub(crate) struct AppServerSession {
     client: AppServerClient,
@@ -23,17 +23,13 @@ impl AppServerSession {
     }
 
     #[tracing::instrument(name = "tui.thread_start", skip(self))]
-    pub(crate) async fn start_thread(&mut self) -> Result<ThreadStartResponse> {
+    pub(crate) async fn start_thread(&mut self) -> TuiResult<ThreadStartResponse> {
         let request = ClientRequest::ThreadStart {
             request_id: RequestId(self.next_request_id as usize),
             params: ThreadStartParams::default(),
         };
         self.next_request_id += 1;
-        let value = self
-            .client
-            .request(request)
-            .await
-            .map_err(|err| anyhow::anyhow!(err.message))?;
+        let value = self.client.request(request).await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -46,7 +42,7 @@ impl AppServerSession {
         &mut self,
         thread_id: ThreadId,
         input: String,
-    ) -> Result<TurnStartResponse> {
+    ) -> TuiResult<TurnStartResponse> {
         let request = ClientRequest::TurnStart {
             request_id: RequestId(self.next_request_id as usize),
             params: TurnStartParams {
@@ -55,11 +51,7 @@ impl AppServerSession {
             },
         };
         self.next_request_id += 1;
-        let value = self
-            .client
-            .request(request)
-            .await
-            .map_err(|err| anyhow::anyhow!(err.message))?;
+        let value = self.client.request(request).await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -72,7 +64,7 @@ impl AppServerSession {
         &mut self,
         thread_id: ThreadId,
         enabled: bool,
-    ) -> Result<SetPlanModeResponse> {
+    ) -> TuiResult<SetPlanModeResponse> {
         let request = ClientRequest::SetPlanMode {
             request_id: RequestId(self.next_request_id as usize),
             params: SetPlanModeParams {
@@ -81,11 +73,7 @@ impl AppServerSession {
             },
         };
         self.next_request_id += 1;
-        let value = self
-            .client
-            .request(request)
-            .await
-            .map_err(|err| anyhow::anyhow!(err.message))?;
+        let value = self.client.request(request).await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -94,7 +82,7 @@ impl AppServerSession {
     pub(crate) async fn thread_resume(
         &mut self,
         thread_id: ThreadId,
-    ) -> Result<ThreadResumeResponse> {
+    ) -> TuiResult<ThreadResumeResponse> {
         let request = ClientRequest::ThreadResume {
             request_id: RequestId(self.next_request_id as usize),
             params: ThreadResumeParams {
@@ -102,11 +90,7 @@ impl AppServerSession {
             },
         };
         self.next_request_id += 1;
-        let value = self
-            .client
-            .request(request)
-            .await
-            .map_err(|err| anyhow::anyhow!(err.message))?;
+        let value = self.client.request(request).await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -116,17 +100,13 @@ impl AppServerSession {
         &mut self,
         cursor: Option<String>,
         limit: Option<u32>,
-    ) -> Result<ThreadListResponse> {
+    ) -> TuiResult<ThreadListResponse> {
         let request = ClientRequest::ThreadList {
             request_id: RequestId(self.next_request_id as usize),
             params: ThreadListParams { cursor, limit },
         };
         self.next_request_id += 1;
-        let value = self
-            .client
-            .request(request)
-            .await
-            .map_err(|err| anyhow::anyhow!(err.message))?;
+        let value = self.client.request(request).await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -138,7 +118,7 @@ impl AppServerSession {
         &self,
         request_id: RequestId,
         result: serde_json::Value,
-    ) -> Result<()> {
+    ) -> TuiResult<()> {
         self.client
             .respond_to_server_request(request_id, result)
             .await
@@ -147,8 +127,8 @@ impl AppServerSession {
     pub(crate) async fn fail_server_request(
         &self,
         request_id: RequestId,
-        error: app_server_protocol::JSONRPCErrorError,
-    ) -> Result<()> {
+        error: app_server_protocol::JsonRpcError,
+    ) -> TuiResult<()> {
         self.client.fail_server_request(request_id, error).await
     }
 }

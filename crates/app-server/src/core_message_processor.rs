@@ -1,7 +1,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use app_server_protocol::{
-    AskUserQuestionParams, AskUserQuestionResponse, ClientRequest, JSONRPCErrorError,
+    AskUserQuestionParams, AskUserQuestionResponse, ClientRequest, JsonRpcError,
     ServerRequestPayload, SetPlanModeResponse, ThreadListItem, ThreadListResponse,
     ThreadResumeResponse, ThreadStartResponse, TurnStartResponse,
 };
@@ -12,7 +12,8 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
 use crate::{
-    error_code::{INTERNAL_ERROR_CODE, INVALID_PARAMS_ERROR_CODE, SERVER_ERROR_CODE},
+    error::{AppServerError, AppServerResult},
+    error_code::{INTERNAL_ERROR_CODE, SERVER_ERROR_CODE},
     in_process::InProcessServerEvent,
     outgoing_message::{OutgoingMessageSender, ThreadScopedOutgoingMessageSender},
 };
@@ -43,7 +44,7 @@ impl AskUserClient for InProcessAskUserClient {
     fn ask(
         &self,
         params: AskUserQuestionParams,
-    ) -> BoxFuture<'static, Result<AskUserQuestionResponse, JSONRPCErrorError>> {
+    ) -> BoxFuture<'static, Result<AskUserQuestionResponse, JsonRpcError>> {
         let outgoing = self.outgoing.clone();
         Box::pin(async move {
             let (_, response_rx) = outgoing
@@ -53,19 +54,19 @@ impl AskUserClient for InProcessAskUserClient {
                 Ok(Ok(value)) => value,
                 Ok(Err(err)) => return Err(err),
                 Err(err) => {
-                    return Err(JSONRPCErrorError {
-                        code: SERVER_ERROR_CODE,
-                        data: None,
-                        message: err.to_string(),
-                    });
+                    return Err(JsonRpcError::message_only(
+                        SERVER_ERROR_CODE,
+                        "server_request_waiter_closed",
+                        err.to_string(),
+                    ));
                 }
             };
             serde_json::from_value::<AskUserQuestionResponse>(value).map_err(|err| {
-                JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    data: None,
-                    message: format!("invalid ask_user_question response: {err}"),
-                }
+                JsonRpcError::message_only(
+                    INTERNAL_ERROR_CODE,
+                    "invalid_ask_user_question_response",
+                    format!("invalid ask_user_question response: {err}"),
+                )
             })
         })
     }
@@ -82,7 +83,7 @@ impl CoreMessageProcessor {
     pub async fn new(
         event_tx: mpsc::Sender<InProcessServerEvent>,
         outgoing: Arc<OutgoingMessageSender>,
-    ) -> anyhow::Result<Self> {
+    ) -> AppServerResult<Self> {
         let ask_user_client_factory: Arc<dyn AskUserClientFactory> =
             Arc::new(InProcessAskUserClientFactory { outgoing });
         Ok(Self {
@@ -95,21 +96,28 @@ impl CoreMessageProcessor {
     pub async fn process_request(
         &self,
         request: ClientRequest,
-    ) -> Result<serde_json::Value, JSONRPCErrorError> {
+    ) -> Result<serde_json::Value, JsonRpcError> {
+        self.process_request_inner(request)
+            .await
+            .map_err(JsonRpcError::from)
+    }
+
+    async fn process_request_inner(
+        &self,
+        request: ClientRequest,
+    ) -> AppServerResult<serde_json::Value> {
         match request {
             ClientRequest::ThreadStart { .. } => {
                 tracing::debug!("processing thread start request");
-                let started = self.threads.start_thread().await.map_err(internal_error)?;
+                let started = self.threads.start_thread().await?;
                 self.ensure_thread_subscription(started.thread_id).await;
                 self.threads
                     .emit_session_configured(started.thread_id)
-                    .await
-                    .map_err(internal_error)?;
-                serde_json::to_value(ThreadStartResponse {
+                    .await?;
+                Ok(serde_json::to_value(ThreadStartResponse {
                     thread_id: started.thread_id.to_string(),
                     rollout_path: started.rollout_path.display().to_string(),
-                })
-                .map_err(internal_serde_error)
+                })?)
             }
             ClientRequest::TurnStart { params, .. } => {
                 tracing::debug!(
@@ -117,53 +125,36 @@ impl CoreMessageProcessor {
                     input_len = params.input.len(),
                     "processing turn start request"
                 );
-                let thread_id =
-                    params
-                        .thread_id
-                        .parse::<ThreadId>()
-                        .map_err(|err| JSONRPCErrorError {
-                            code: INVALID_PARAMS_ERROR_CODE,
-                            data: None,
-                            message: format!("invalid thread id: {err}"),
-                        })?;
+                let thread_id = params
+                    .thread_id
+                    .parse::<ThreadId>()
+                    .map_err(AppServerError::invalid_thread_id)?;
                 self.ensure_thread_subscription(thread_id).await;
                 let turn_id = self
                     .threads
                     .start_user_input(thread_id, params.input)
-                    .await
-                    .map_err(internal_error)?;
-                serde_json::to_value(TurnStartResponse {
+                    .await?;
+                Ok(serde_json::to_value(TurnStartResponse {
                     thread_id: thread_id.to_string(),
                     turn_id,
-                })
-                .map_err(internal_serde_error)
+                })?)
             }
             ClientRequest::ThreadResume { params, .. } => {
                 tracing::debug!(
                     thread_id = %params.thread_id,
                     "processing thread resume request"
                 );
-                let thread_id =
-                    params
-                        .thread_id
-                        .parse::<ThreadId>()
-                        .map_err(|err| JSONRPCErrorError {
-                            code: INVALID_PARAMS_ERROR_CODE,
-                            data: None,
-                            message: format!("invalid thread id: {err}"),
-                        })?;
-                let resumed = self
-                    .threads
-                    .resume_thread(thread_id)
-                    .await
-                    .map_err(internal_error)?;
+                let thread_id = params
+                    .thread_id
+                    .parse::<ThreadId>()
+                    .map_err(AppServerError::invalid_thread_id)?;
+                let resumed = self.threads.resume_thread(thread_id).await?;
                 self.ensure_thread_subscription(thread_id).await;
-                serde_json::to_value(ThreadResumeResponse {
+                Ok(serde_json::to_value(ThreadResumeResponse {
                     thread_id: resumed.thread_id.to_string(),
                     rollout_path: resumed.rollout_path.display().to_string(),
                     initial_messages: resumed.initial_messages,
-                })
-                .map_err(internal_serde_error)
+                })?)
             }
             ClientRequest::ThreadList { params, .. } => {
                 tracing::debug!(
@@ -171,7 +162,7 @@ impl CoreMessageProcessor {
                     limit = params.limit,
                     "processing thread list request"
                 );
-                let threads = self.threads.list_threads().await.map_err(internal_error)?;
+                let threads = self.threads.list_threads().await?;
                 let offset = params
                     .cursor
                     .as_deref()
@@ -185,11 +176,10 @@ impl CoreMessageProcessor {
                     .map(map_thread_summary)
                     .collect::<Vec<_>>();
                 let next_cursor = (page.len() == limit).then(|| (offset + limit).to_string());
-                serde_json::to_value(ThreadListResponse {
+                Ok(serde_json::to_value(ThreadListResponse {
                     data: page,
                     next_cursor,
-                })
-                .map_err(internal_serde_error)
+                })?)
             }
             ClientRequest::SetPlanMode { params, .. } => {
                 tracing::debug!(
@@ -197,25 +187,18 @@ impl CoreMessageProcessor {
                     enabled = params.enabled,
                     "processing set plan mode request"
                 );
-                let thread_id =
-                    params
-                        .thread_id
-                        .parse::<ThreadId>()
-                        .map_err(|err| JSONRPCErrorError {
-                            code: INVALID_PARAMS_ERROR_CODE,
-                            data: None,
-                            message: format!("invalid thread id: {err}"),
-                        })?;
+                let thread_id = params
+                    .thread_id
+                    .parse::<ThreadId>()
+                    .map_err(AppServerError::invalid_thread_id)?;
                 let enabled = self
                     .threads
                     .set_plan_mode(thread_id, params.enabled)
-                    .await
-                    .map_err(internal_error)?;
-                serde_json::to_value(SetPlanModeResponse {
+                    .await?;
+                Ok(serde_json::to_value(SetPlanModeResponse {
                     thread_id: thread_id.to_string(),
                     enabled,
-                })
-                .map_err(internal_serde_error)
+                })?)
             }
         }
     }
@@ -236,7 +219,7 @@ impl CoreMessageProcessor {
             "app_server.session_event_subscription",
             thread_id = %thread_id,
         );
-        tokio::task::Builder::new()
+        if let Err(err) = tokio::task::Builder::new()
             .name("app_server.session_subscription")
             .spawn(
                 async move {
@@ -261,23 +244,13 @@ impl CoreMessageProcessor {
                 }
                 .instrument(subscription_span),
             )
-            .expect("failed to spawn session event subscription task");
-    }
-}
-
-fn internal_error(err: anyhow::Error) -> JSONRPCErrorError {
-    JSONRPCErrorError {
-        code: SERVER_ERROR_CODE,
-        data: None,
-        message: err.to_string(),
-    }
-}
-
-fn internal_serde_error(err: serde_json::Error) -> JSONRPCErrorError {
-    JSONRPCErrorError {
-        code: INTERNAL_ERROR_CODE,
-        data: None,
-        message: err.to_string(),
+        {
+            tracing::error!(
+                thread_id = %thread_id,
+                error = %err,
+                "failed to spawn session event subscription task"
+            );
+        }
     }
 }
 
@@ -289,5 +262,61 @@ fn map_thread_summary(summary: ThreadSummary) -> ThreadListItem {
         updated_at: summary.updated_at,
         last_user_message: summary.last_user_message,
         last_assistant_message: summary.last_assistant_message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc, sync::LazyLock};
+
+    use app_server_protocol::{ClientRequest, RequestId, TurnStartParams};
+    use tokio::sync::{Mutex as TokioMutex, mpsc};
+
+    use super::CoreMessageProcessor;
+    use crate::{
+        error_code::INVALID_PARAMS_ERROR_CODE, in_process::InProcessServerEvent,
+        outgoing_message::OutgoingMessageSender,
+    };
+
+    static CWD_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    struct CwdRestore(PathBuf);
+
+    impl Drop for CwdRestore {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_thread_id_request_preserves_structured_error_info() -> TestResult {
+        let _cwd_guard = CWD_LOCK.lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+        let _cwd_restore = CwdRestore(original_cwd);
+
+        let (event_tx, _event_rx) = mpsc::channel::<InProcessServerEvent>(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
+        let processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        let request = ClientRequest::TurnStart {
+            request_id: RequestId(1),
+            params: TurnStartParams {
+                thread_id: "not-a-thread-id".to_string(),
+                input: "hello".to_string(),
+            },
+        };
+        let Err(error) = processor.process_request(request).await else {
+            panic!("invalid thread id should return an app-server error");
+        };
+
+        assert_eq!(error.code, INVALID_PARAMS_ERROR_CODE);
+        let info = error.data.as_ref().ok_or("missing error data")?;
+        assert_eq!(info.kind, "invalid_thread_id");
+        assert_eq!(info.source.as_deref(), Some("app-server"));
+        assert_eq!(error.message, info.message);
+        Ok(())
     }
 }

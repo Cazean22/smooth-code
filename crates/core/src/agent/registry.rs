@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
 use smooth_protocol::{AgentPath, ThreadId};
@@ -47,7 +47,7 @@ impl AgentRegistry {
         &self,
         thread_id: ThreadId,
     ) -> Result<AgentMetadata, String> {
-        let mut state = self.state.lock().expect("registry mutex should lock");
+        let mut state = lock_registry(&self.state)?;
         if state.agents_by_thread.contains_key(&thread_id) {
             return state
                 .agents_by_thread
@@ -80,7 +80,7 @@ impl AgentRegistry {
         max_depth: i32,
         max_threads: usize,
     ) -> Result<SpawnReservation, String> {
-        let mut state = self.state.lock().expect("registry mutex should lock");
+        let mut state = lock_registry(&self.state)?;
         let parent = state
             .agents_by_thread
             .get(&parent_thread_id)
@@ -96,7 +96,10 @@ impl AgentRegistry {
 
         let reserved_path = loop {
             let candidate_name = next_agent_name(&mut state);
-            let candidate_path = parent.agent_path.join(&candidate_name)?;
+            let candidate_path = parent
+                .agent_path
+                .join(&candidate_name)
+                .map_err(|err| err.to_string())?;
             if !state.thread_by_path.contains_key(&candidate_path)
                 && !state.reserved_paths.contains(&candidate_path)
             {
@@ -122,7 +125,7 @@ impl AgentRegistry {
         let Some(agent_id) = metadata.agent_id else {
             return Err("agent metadata must include an agent_id".to_string());
         };
-        let mut state = self.state.lock().expect("registry mutex should lock");
+        let mut state = lock_registry(&self.state)?;
         if let Some(existing) = state.agents_by_thread.get(&agent_id) {
             return Ok(existing.clone());
         }
@@ -155,32 +158,24 @@ impl AgentRegistry {
     }
 
     pub(crate) fn agent_id_for_path(&self, path: &AgentPath) -> Option<ThreadId> {
-        self.state
-            .lock()
-            .expect("registry mutex should lock")
-            .thread_by_path
-            .get(path)
-            .copied()
+        let Ok(state) = self.state.lock() else {
+            return None;
+        };
+        state.thread_by_path.get(path).copied()
     }
 
     pub(crate) fn agent_metadata_for_thread(&self, thread_id: ThreadId) -> Option<AgentMetadata> {
-        self.state
-            .lock()
-            .expect("registry mutex should lock")
-            .agents_by_thread
-            .get(&thread_id)
-            .cloned()
+        let Ok(state) = self.state.lock() else {
+            return None;
+        };
+        state.agents_by_thread.get(&thread_id).cloned()
     }
 
     pub(crate) fn live_agents(&self) -> Vec<AgentMetadata> {
-        let mut agents = self
-            .state
-            .lock()
-            .expect("registry mutex should lock")
-            .agents_by_thread
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let mut agents = state.agents_by_thread.values().cloned().collect::<Vec<_>>();
         agents.sort_by(|left, right| left.agent_path.cmp(&right.agent_path));
         agents
     }
@@ -191,7 +186,9 @@ impl AgentRegistry {
     }
 
     pub(crate) fn unregister_thread(&self, thread_id: ThreadId) -> Option<AgentMetadata> {
-        let mut state = self.state.lock().expect("registry mutex should lock");
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
         let metadata = state.agents_by_thread.remove(&thread_id)?;
         state.thread_by_path.remove(&metadata.agent_path);
         Some(metadata)
@@ -214,7 +211,7 @@ impl SpawnReservation {
         let Some(registry) = self.registry.upgrade() else {
             return Err("agent registry no longer exists".to_string());
         };
-        let mut state = registry.lock().expect("registry mutex should lock");
+        let mut state = lock_registry(&registry)?;
         state.reserved_paths.remove(&self.reserved_path);
         metadata.agent_path = self.reserved_path.clone();
         metadata.parent_thread_id = Some(self.parent_thread_id);
@@ -238,10 +235,15 @@ impl Drop for SpawnReservation {
         };
         registry
             .lock()
-            .expect("registry mutex should lock")
-            .reserved_paths
-            .remove(&self.reserved_path);
+            .map(|mut state| state.reserved_paths.remove(&self.reserved_path))
+            .ok();
     }
+}
+
+fn lock_registry(registry: &Mutex<RegistryState>) -> Result<MutexGuard<'_, RegistryState>, String> {
+    registry
+        .lock()
+        .map_err(|_| "registry mutex was poisoned".to_string())
 }
 
 fn next_agent_name(state: &mut RegistryState) -> String {
@@ -264,67 +266,56 @@ mod tests {
     use super::{AgentMetadata, AgentRegistry};
 
     #[test]
-    fn register_root_and_reserve_child() {
+    fn register_root_and_reserve_child() -> Result<(), String> {
         let registry = AgentRegistry::new();
         let root_id = ThreadId::new();
-        let root = registry
-            .register_root_thread(root_id)
-            .expect("root registration");
+        let root = registry.register_root_thread(root_id)?;
         assert_eq!(root.agent_path, AgentPath::root());
 
-        let reservation = registry
-            .reserve_spawn_slot(root_id, 8, 16)
-            .expect("reservation");
+        let reservation = registry.reserve_spawn_slot(root_id, 8, 16)?;
         assert!(reservation.agent_path().as_str().starts_with("/root/"));
         assert_eq!(reservation.depth(), 1);
+        Ok(())
     }
 
     #[test]
-    fn commit_makes_agent_live_and_resolvable() {
+    fn commit_makes_agent_live_and_resolvable() -> Result<(), String> {
         let registry = AgentRegistry::new();
         let root_id = ThreadId::new();
-        registry
-            .register_root_thread(root_id)
-            .expect("root registration");
-        let reservation = registry
-            .reserve_spawn_slot(root_id, 8, 16)
-            .expect("reservation");
+        registry.register_root_thread(root_id)?;
+        let reservation = registry.reserve_spawn_slot(root_id, 8, 16)?;
         let child_id = ThreadId::new();
         let path = reservation.agent_path().clone();
-        reservation
-            .commit(AgentMetadata {
-                agent_id: Some(child_id),
-                agent_path: AgentPath::root(),
-                agent_nickname: Some("alpha".to_string()),
-                agent_role: Some("worker".to_string()),
-                parent_thread_id: None,
-                depth: 0,
-            })
-            .expect("commit");
+        reservation.commit(AgentMetadata {
+            agent_id: Some(child_id),
+            agent_path: AgentPath::root(),
+            agent_nickname: Some("alpha".to_string()),
+            agent_role: Some("worker".to_string()),
+            parent_thread_id: None,
+            depth: 0,
+        })?;
 
         assert_eq!(registry.agent_id_for_path(&path), Some(child_id));
         assert_eq!(registry.next_thread_spawn_depth(child_id), Some(2));
         assert_eq!(registry.live_agents().len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn reservation_drop_releases_slot() {
+    fn reservation_drop_releases_slot() -> Result<(), String> {
         let registry = AgentRegistry::new();
         let root_id = ThreadId::new();
-        registry
-            .register_root_thread(root_id)
-            .expect("root registration");
+        registry.register_root_thread(root_id)?;
         let first_path = registry
-            .reserve_spawn_slot(root_id, 8, 16)
-            .expect("reservation")
+            .reserve_spawn_slot(root_id, 8, 16)?
             .agent_path()
             .clone();
         let second_path = registry
-            .reserve_spawn_slot(root_id, 8, 16)
-            .expect("reservation")
+            .reserve_spawn_slot(root_id, 8, 16)?
             .agent_path()
             .clone();
 
         assert_ne!(first_path, second_path);
+        Ok(())
     }
 }

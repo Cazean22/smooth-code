@@ -46,8 +46,9 @@ impl SessionModelFactory for StubSessionModelFactory {
 }
 
 #[cfg(test)]
-pub(crate) fn cwd_test_lock() -> &'static std::sync::Mutex<()> {
-    use std::sync::{LazyLock, Mutex};
+pub(crate) fn cwd_test_lock() -> &'static tokio::sync::Mutex<()> {
+    use std::sync::LazyLock;
+    use tokio::sync::Mutex;
 
     static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     &CWD_LOCK

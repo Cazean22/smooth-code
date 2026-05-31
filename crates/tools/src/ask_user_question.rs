@@ -9,7 +9,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::{AskUserClient, ToolFailure};
+use crate::{AskUserClient, ToolError};
 
 const MAX_QUESTIONS: usize = 4;
 const MIN_OPTIONS: usize = 2;
@@ -84,7 +84,7 @@ impl AskUserQuestionTool {
 impl Tool for AskUserQuestionTool {
     const NAME: &'static str = "ask_user_question";
 
-    type Error = ToolFailure;
+    type Error = ToolError;
     type Args = AskUserQuestionArgs;
     type Output = String;
 
@@ -104,7 +104,7 @@ impl Tool for AskUserQuestionTool {
             .read()
             .await
             .clone()
-            .ok_or_else(|| ToolFailure::new("no active turn id"))?;
+            .ok_or_else(|| ToolError::invalid_arguments("no active turn id"))?;
 
         let questions: Vec<AskUserQuestion> = args
             .questions
@@ -136,29 +136,29 @@ impl Tool for AskUserQuestionTool {
             .client
             .ask(params)
             .await
-            .map_err(|err| ToolFailure::new(err.message))?;
+            .map_err(|err| ToolError::client(err.message))?;
 
         Ok(format_tool_result(&response))
     }
 }
 
-fn validate_args(args: &AskUserQuestionArgs) -> Result<(), ToolFailure> {
+fn validate_args(args: &AskUserQuestionArgs) -> Result<(), ToolError> {
     if args.questions.is_empty() || args.questions.len() > MAX_QUESTIONS {
-        return Err(ToolFailure::new(format!(
+        return Err(ToolError::invalid_arguments(format!(
             "ask_user_question requires 1 to {MAX_QUESTIONS} questions, got {}",
             args.questions.len()
         )));
     }
     for q in &args.questions {
         if q.header.chars().count() > MAX_HEADER_CHARS {
-            return Err(ToolFailure::new(format!(
+            return Err(ToolError::invalid_arguments(format!(
                 "header must be at most {MAX_HEADER_CHARS} characters (\"{}\" is {})",
                 q.header,
                 q.header.chars().count()
             )));
         }
         if q.options.len() < MIN_OPTIONS || q.options.len() > MAX_OPTIONS {
-            return Err(ToolFailure::new(format!(
+            return Err(ToolError::invalid_arguments(format!(
                 "each question requires {MIN_OPTIONS} to {MAX_OPTIONS} options, question \"{}\" has {}",
                 q.question,
                 q.options.len()
@@ -192,14 +192,15 @@ fn format_tool_result(response: &AskUserQuestionResponse) -> String {
 mod tests {
     use std::sync::Mutex;
 
-    use app_server_protocol::{AskUserQuestionAnswer, JSONRPCErrorError};
+    use app_server_protocol::{AskUserQuestionAnswer, JsonRpcError};
     use futures_util::future::BoxFuture;
+    use smooth_protocol::ErrorInfo;
 
     use super::*;
 
     struct StubAskUserClient {
         last_params: Mutex<Option<AskUserQuestionParams>>,
-        result: Result<AskUserQuestionResponse, JSONRPCErrorError>,
+        result: Result<AskUserQuestionResponse, JsonRpcError>,
     }
 
     impl StubAskUserClient {
@@ -213,11 +214,10 @@ mod tests {
         fn err(message: &str) -> Self {
             Self {
                 last_params: Mutex::new(None),
-                result: Err(JSONRPCErrorError {
-                    code: -32001,
-                    data: None,
-                    message: message.to_string(),
-                }),
+                result: Err(JsonRpcError::new(
+                    -32001,
+                    ErrorInfo::new("client_error", message).with_source("test"),
+                )),
             }
         }
     }
@@ -226,11 +226,10 @@ mod tests {
         fn ask(
             &self,
             params: AskUserQuestionParams,
-        ) -> BoxFuture<'static, Result<AskUserQuestionResponse, JSONRPCErrorError>> {
-            *self
-                .last_params
-                .lock()
-                .expect("stub params mutex should lock") = Some(params);
+        ) -> BoxFuture<'static, Result<AskUserQuestionResponse, JsonRpcError>> {
+            if let Ok(mut last_params) = self.last_params.lock() {
+                *last_params = Some(params);
+            }
             let result = self.result.clone();
             Box::pin(async move { result })
         }
@@ -239,6 +238,8 @@ mod tests {
             Box::pin(async {})
         }
     }
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn simple_args() -> AskUserQuestionArgs {
         AskUserQuestionArgs {
@@ -263,7 +264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn formats_single_select_answer() {
+    async fn formats_single_select_answer() -> TestResult {
         let stub = Arc::new(StubAskUserClient::ok(AskUserQuestionResponse {
             answers: vec![AskUserQuestionAnswer {
                 question: "Which database?".to_string(),
@@ -277,7 +278,7 @@ mod tests {
             Arc::new(RwLock::new(Some("turn-1".to_string()))),
         );
 
-        let out = tool.call(simple_args()).await.expect("call should succeed");
+        let out = tool.call(simple_args()).await?;
         assert_eq!(
             out,
             "User has answered your questions: \"Which database?\"=\"Postgres\", . You can now continue with the user's answers in mind."
@@ -285,15 +286,16 @@ mod tests {
         let params = stub
             .last_params
             .lock()
-            .expect("stub params mutex should lock")
+            .map_err(|_| std::io::Error::other("stub params mutex should lock"))?
             .clone()
-            .expect("params should be recorded");
+            .ok_or_else(|| std::io::Error::other("params should be recorded"))?;
         assert_eq!(params.turn_id, "turn-1");
         assert_eq!(params.questions.len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn formats_multi_select_answer_with_preview() {
+    async fn formats_multi_select_answer_with_preview() -> TestResult {
         let stub = Arc::new(StubAskUserClient::ok(AskUserQuestionResponse {
             answers: vec![AskUserQuestionAnswer {
                 question: "Pick frameworks".to_string(),
@@ -307,15 +309,16 @@ mod tests {
             Arc::new(RwLock::new(Some("turn-2".to_string()))),
         );
 
-        let out = tool.call(simple_args()).await.expect("call should succeed");
+        let out = tool.call(simple_args()).await?;
         assert_eq!(
             out,
             "User has answered your questions: \"Pick frameworks\"=\"React, Vue\" (selected preview:\n<App/>), . You can now continue with the user's answers in mind."
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn fails_without_active_turn() {
+    async fn fails_without_active_turn() -> TestResult {
         let stub = Arc::new(StubAskUserClient::ok(AskUserQuestionResponse {
             answers: vec![],
         }));
@@ -325,15 +328,15 @@ mod tests {
             Arc::new(RwLock::new(None)),
         );
 
-        let err = tool
-            .call(simple_args())
-            .await
-            .expect_err("call should fail without an active turn");
+        let Err(err) = tool.call(simple_args()).await else {
+            panic!("call should fail without an active turn");
+        };
         assert_eq!(err.to_string(), "no active turn id");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn surfaces_client_error_as_tool_failure() {
+    async fn surfaces_client_error_as_tool_failure() -> TestResult {
         let stub = Arc::new(StubAskUserClient::err("user declined to answer"));
         let tool = AskUserQuestionTool::new(
             smooth_protocol::ThreadId::new(),
@@ -341,24 +344,31 @@ mod tests {
             Arc::new(RwLock::new(Some("turn-3".to_string()))),
         );
 
-        let err = tool
-            .call(simple_args())
-            .await
-            .expect_err("client error should surface as ToolFailure");
+        let Err(err) = tool.call(simple_args()).await else {
+            panic!("client error should surface as ToolError");
+        };
         assert_eq!(err.to_string(), "user declined to answer");
+        Ok(())
     }
 
     #[test]
     fn validates_question_count() {
         let mut args = simple_args();
         args.questions.clear();
-        let err = validate_args(&args).expect_err("zero questions should fail");
+        let Err(err) = validate_args(&args) else {
+            panic!("zero questions should fail");
+        };
         assert!(err.to_string().contains("1 to 4 questions"));
 
         args.questions = (0..5)
-            .map(|_| simple_args().questions.into_iter().next().unwrap())
+            .map(|_| {
+                let mut args = simple_args();
+                args.questions.remove(0)
+            })
             .collect();
-        let err = validate_args(&args).expect_err("5 questions should fail");
+        let Err(err) = validate_args(&args) else {
+            panic!("5 questions should fail");
+        };
         assert!(err.to_string().contains("1 to 4 questions"));
     }
 
@@ -366,7 +376,9 @@ mod tests {
     fn validates_option_count() {
         let mut args = simple_args();
         args.questions[0].options.pop();
-        let err = validate_args(&args).expect_err("1 option should fail");
+        let Err(err) = validate_args(&args) else {
+            panic!("1 option should fail");
+        };
         assert!(err.to_string().contains("2 to 4 options"));
 
         args.questions[0].options = (0..5)
@@ -376,7 +388,9 @@ mod tests {
                 preview: None,
             })
             .collect();
-        let err = validate_args(&args).expect_err("5 options should fail");
+        let Err(err) = validate_args(&args) else {
+            panic!("5 options should fail");
+        };
         assert!(err.to_string().contains("2 to 4 options"));
     }
 
@@ -384,7 +398,9 @@ mod tests {
     fn validates_header_length() {
         let mut args = simple_args();
         args.questions[0].header = "ThirteenChars".to_string();
-        let err = validate_args(&args).expect_err("13-char header should fail");
+        let Err(err) = validate_args(&args) else {
+            panic!("13-char header should fail");
+        };
         assert!(err.to_string().contains("at most 12 characters"));
     }
 }

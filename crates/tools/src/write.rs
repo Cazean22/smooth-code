@@ -5,9 +5,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 
-use crate::{
-    MAX_FILE_CHANGE_BYTES, ToolFailure, encode_tool_output, shared::resolve_path_for_write,
-};
+use crate::{MAX_FILE_CHANGE_BYTES, ToolError, encode_tool_output, shared::resolve_path_for_write};
 
 const DESCRIPTION: &str = r#"Write a UTF-8 text file to the local filesystem.
 
@@ -41,7 +39,7 @@ pub struct WriteArgs {
 impl Tool for WriteTool {
     const NAME: &'static str = "write";
 
-    type Error = ToolFailure;
+    type Error = ToolError;
     type Args = WriteArgs;
     type Output = String;
 
@@ -64,9 +62,8 @@ impl Tool for WriteTool {
             Err(err) => PreviousContent::Unreadable(err.to_string()),
         };
         let bytes = args.content.len();
-        fs::write(&path, &args.content).map_err(|err| {
-            ToolFailure::new(format!("failed to write {}: {err}", path.display()))
-        })?;
+        fs::write(&path, &args.content)
+            .map_err(|err| ToolError::io(format!("failed to write {}: {err}", path.display())))?;
         let model_output = format!("wrote {bytes} bytes to {}", path.display());
         let change = match previous_content {
             PreviousContent::Utf8(previous_content) => {
@@ -153,10 +150,12 @@ mod tests {
 
     use super::*;
 
-    fn fixture() -> (WriteTool, TempDir) {
-        let tmp = TempDir::new().expect("create tempdir");
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn fixture() -> Result<(WriteTool, TempDir), std::io::Error> {
+        let tmp = TempDir::new()?;
         let tool = WriteTool::new(tmp.path().to_path_buf());
-        (tool, tmp)
+        Ok((tool, tmp))
     }
 
     fn args(file_path: impl Into<String>, content: impl Into<String>) -> WriteArgs {
@@ -167,23 +166,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_new_file() {
-        let (tool, tmp) = fixture();
+    async fn writes_new_file() -> TestResult {
+        let (tool, tmp) = fixture()?;
 
-        let output = tool
-            .call(args("foo.txt", "hello"))
-            .await
-            .expect("write should succeed");
+        let output = tool.call(args("foo.txt", "hello")).await?;
 
         let path = tmp.path().join("foo.txt");
-        let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("foo.txt");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+        let resolved_path = fs::canonicalize(tmp.path())?.join("foo.txt");
+        assert_eq!(fs::read_to_string(&path)?, "hello");
         let decoded = decode_tool_output_for_tool("write", output, true);
         assert_eq!(
             decoded.model_output,
             format!("wrote 5 bytes to {}", resolved_path.display())
         );
-        let file_change = decoded.file_change.expect("file change metadata");
+        let file_change = decoded
+            .file_change
+            .ok_or_else(|| std::io::Error::other("file change metadata"))?;
         assert_eq!(file_change.path, resolved_path);
         assert_eq!(
             file_change.change,
@@ -191,42 +189,44 @@ mod tests {
                 content: "hello".to_string(),
             }
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn overwrites_existing_file() {
-        let (tool, tmp) = fixture();
+    async fn overwrites_existing_file() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
-        fs::write(&path, "before").unwrap();
+        fs::write(&path, "before")?;
 
-        let output = tool
-            .call(args("foo.txt", "after"))
-            .await
-            .expect("write should succeed");
+        let output = tool.call(args("foo.txt", "after")).await?;
 
-        assert_eq!(fs::read_to_string(path).unwrap(), "after");
+        assert_eq!(fs::read_to_string(path)?, "after");
         let decoded = decode_tool_output_for_tool("write", output, true);
-        match decoded.file_change.expect("file change metadata").change {
+        let file_change = decoded
+            .file_change
+            .ok_or_else(|| std::io::Error::other("file change metadata"))?;
+        match file_change.change {
             FileChange::Update { unified_diff, .. } => {
                 assert!(unified_diff.contains("-before"));
                 assert!(unified_diff.contains("+after"));
             }
             _ => panic!("expected update file change"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn large_new_file_omits_file_change_content() {
-        let (tool, _tmp) = fixture();
+    async fn large_new_file_omits_file_change_content() -> TestResult {
+        let (tool, _tmp) = fixture()?;
         let large_content = "x".repeat(MAX_FILE_CHANGE_BYTES + 1);
 
-        let output = tool
-            .call(args("large.txt", large_content.clone()))
-            .await
-            .expect("write should succeed");
+        let output = tool.call(args("large.txt", large_content.clone())).await?;
 
         let decoded = decode_tool_output_for_tool("write", output, true);
-        match decoded.file_change.expect("file change metadata").change {
+        let file_change = decoded
+            .file_change
+            .ok_or_else(|| std::io::Error::other("file change metadata"))?;
+        match file_change.change {
             FileChange::Omitted {
                 operation,
                 reason,
@@ -242,21 +242,22 @@ mod tests {
             }
             _ => panic!("expected omitted file change"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn non_utf8_existing_file_is_not_reported_as_added() {
-        let (tool, tmp) = fixture();
+    async fn non_utf8_existing_file_is_not_reported_as_added() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("binary.dat");
-        fs::write(&path, [0xff, 0xfe]).unwrap();
+        fs::write(&path, [0xff, 0xfe])?;
 
-        let output = tool
-            .call(args("binary.dat", "replacement"))
-            .await
-            .expect("write should succeed");
+        let output = tool.call(args("binary.dat", "replacement")).await?;
 
         let decoded = decode_tool_output_for_tool("write", output, true);
-        match decoded.file_change.expect("file change metadata").change {
+        let file_change = decoded
+            .file_change
+            .ok_or_else(|| std::io::Error::other("file change metadata"))?;
+        match file_change.change {
             FileChange::Omitted {
                 operation, reason, ..
             } => {
@@ -265,83 +266,83 @@ mod tests {
             }
             _ => panic!("expected omitted file change"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resolves_relative_path_against_cwd() {
-        let (tool, tmp) = fixture();
-        fs::create_dir(tmp.path().join("sub")).unwrap();
+    async fn resolves_relative_path_against_cwd() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::create_dir(tmp.path().join("sub"))?;
 
-        tool.call(args("sub/file.txt", "hello"))
-            .await
-            .expect("write should succeed");
+        tool.call(args("sub/file.txt", "hello")).await?;
 
         assert_eq!(
-            fs::read_to_string(tmp.path().join("sub/file.txt")).unwrap(),
+            fs::read_to_string(tmp.path().join("sub/file.txt"))?,
             "hello"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn accepts_absolute_path_inside_cwd() {
-        let (tool, tmp) = fixture();
+    async fn accepts_absolute_path_inside_cwd() -> TestResult {
+        let (tool, tmp) = fixture()?;
         let path = tmp.path().join("a.txt");
 
-        tool.call(args(path.display().to_string(), "hi"))
-            .await
-            .expect("write should succeed");
+        tool.call(args(path.display().to_string(), "hi")).await?;
 
-        assert_eq!(fs::read_to_string(path).unwrap(), "hi");
+        assert_eq!(fs::read_to_string(path)?, "hi");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_path_outside_cwd() {
-        let (tool, _tmp) = fixture();
-        let other = TempDir::new().expect("create second tempdir");
+    async fn rejects_path_outside_cwd() -> TestResult {
+        let (tool, _tmp) = fixture()?;
+        let other = TempDir::new()?;
         let path = other.path().join("file.txt");
 
-        let err = tool
-            .call(args(path.display().to_string(), "nope"))
-            .await
-            .expect_err("write should fail");
+        let Err(err) = tool.call(args(path.display().to_string(), "nope")).await else {
+            panic!("write should fail");
+        };
 
         assert!(err.to_string().contains("escapes the workspace"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn errors_when_parent_missing() {
-        let (tool, _tmp) = fixture();
+    async fn errors_when_parent_missing() -> TestResult {
+        let (tool, _tmp) = fixture()?;
 
-        let err = tool
-            .call(args("nope/x.txt", "hello"))
-            .await
-            .expect_err("write should fail");
+        let Err(err) = tool.call(args("nope/x.txt", "hello")).await else {
+            panic!("write should fail");
+        };
 
         assert!(err.to_string().contains("failed to resolve"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn writes_empty_content() {
-        let (tool, tmp) = fixture();
+    async fn writes_empty_content() -> TestResult {
+        let (tool, tmp) = fixture()?;
 
-        let output = tool
-            .call(args("empty.txt", ""))
-            .await
-            .expect("write should succeed");
+        let output = tool.call(args("empty.txt", "")).await?;
 
         let path = tmp.path().join("empty.txt");
-        let resolved_path = fs::canonicalize(tmp.path()).unwrap().join("empty.txt");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        let resolved_path = fs::canonicalize(tmp.path())?.join("empty.txt");
+        assert_eq!(fs::read_to_string(&path)?, "");
         let decoded = decode_tool_output_for_tool("write", output, true);
         assert_eq!(
             decoded.model_output,
             format!("wrote 0 bytes to {}", resolved_path.display())
         );
+        let file_change = decoded
+            .file_change
+            .ok_or_else(|| std::io::Error::other("file change metadata"))?;
         assert_eq!(
-            decoded.file_change.expect("file change metadata").change,
+            file_change.change,
             FileChange::Add {
                 content: String::new(),
             }
         );
+        Ok(())
     }
 }

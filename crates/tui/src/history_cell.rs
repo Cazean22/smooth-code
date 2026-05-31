@@ -243,12 +243,10 @@ impl ToolCallGroupCell {
         state: ToolCallState,
         error: Option<String>,
     ) {
-        let entry = self
-            .entries
-            .get_mut(entry_idx)
-            .expect("tool call entry index should be valid");
-        entry.state = state;
-        entry.error = error;
+        if let Some(entry) = self.entries.get_mut(entry_idx) {
+            entry.state = state;
+            entry.error = error;
+        }
     }
 
     pub(crate) fn display_lines(&self) -> Vec<Line<'static>> {

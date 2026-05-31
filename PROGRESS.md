@@ -12,6 +12,14 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - Source changes should go through structured file tools (`edit`, `write`, `delete`) so the runtime can emit structured `FileChangeOutput`; keep `run_command` for inspection, validation, formatters, and project commands rather than Python/`sed -i`/`awk`/redirection rewrite scripts.
 - Plan-mode model rebuilds must preserve typed client-backed tools such as `ask_user_question`; the unchecked `exit_plan_mode` path runs in-turn and should reuse the `Session`'s stored client when no explicit client is passed.
 
+## Error Handling
+
+- Workspace crates deny `clippy::unwrap_used` and `clippy::expect_used` across all targets, including tests. Use `Result`-returning tests, `?`, explicit `let Some/Ok ... else { panic!(...) }` assertions, or typed error conversion instead of `unwrap`/`expect`.
+- Wire-level errors are structured: `app-server-protocol::JsonRpcError` keeps JSON-RPC `code`/`message` and carries `smooth_protocol::ErrorInfo { kind, message, source, details }` in `data`. Protocol error events and errored agent statuses also carry `ErrorInfo` directly.
+- Crate boundaries use typed errors: `smooth_protocol::AgentPathError`, `smooth_core::CoreError`, `app_server::AppServerError`, `tools::ToolError`, and `smooth_tui::TuiError`. Keep `anyhow` at entrypoints/tests or provider-facing glue, but prefer crate result aliases for internal public APIs.
+- `AgentPath` parsing/join/resolve errors are typed and serde validation still uses the same string representation; path-bearing protocol structs should rely on `AgentPath` serde rather than accepting unchecked strings.
+- App-server JSON-RPC conversion is centralized through `AppServerError::to_json_rpc_error`; core errors preserve their `smooth-core` source and typed kind when surfaced to clients. Tool errors expose stable `kind()` values while preserving readable `Display` text for model/UI output.
+
 ## OpenAI Provider
 
 - The OpenAI provider uses Rig's Responses WebSocket session for the manual tool loop; keep OpenAI turn streaming on `stream_completion_turn` and do not route OpenAI through the generic `CompletionModel::stream()` SSE path.

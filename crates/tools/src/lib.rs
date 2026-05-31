@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 mod ask_user_question;
 mod client;
 mod delete;
@@ -18,7 +20,7 @@ pub use ask_user_question::{
 pub use client::{AskUserClient, AskUserClientFactory};
 pub use delete::{DeleteArgs, DeleteTool};
 pub use edit::{EditArgs, EditTool};
-pub use error::ToolFailure;
+pub use error::{ToolError, ToolResult};
 pub use exit_plan_mode::{ExitPlanModeArgs, ExitPlanModeTool};
 pub use multi_agents::SpawnAgentTool;
 pub use output::{

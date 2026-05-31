@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use app_server_protocol::{AskUserQuestionParams, AskUserQuestionResponse, JSONRPCErrorError};
+use app_server_protocol::{AskUserQuestionParams, AskUserQuestionResponse, JsonRpcError};
 use futures_util::future::BoxFuture;
 
 pub trait AskUserClient: Send + Sync {
     fn ask(
         &self,
         params: AskUserQuestionParams,
-    ) -> BoxFuture<'static, Result<AskUserQuestionResponse, JSONRPCErrorError>>;
+    ) -> BoxFuture<'static, Result<AskUserQuestionResponse, JsonRpcError>>;
 
     fn abort_pending_server_requests(&self) -> BoxFuture<'static, ()>;
 }

@@ -1,12 +1,52 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 mod agent_path;
 
-pub use agent_path::AgentPath;
+pub use agent_path::{AgentPath, AgentPathError};
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorInfo {
+    pub kind: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl ErrorInfo {
+    pub fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            message: message.into(),
+            source: None,
+            details: None,
+        }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+}
+
+impl fmt::Display for ErrorInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, JsonSchema)]
 #[schemars(with = "String")]
@@ -367,39 +407,7 @@ pub struct CollabResumeEndEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct ErrorEvent {
-    pub message: String,
-    #[serde(default)]
-    pub codex_error_info: Option<CoreErrorInfo>,
-}
-
-/// runtime errors that we expose to clients.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CoreErrorInfo {
-    ContextWindowExceeded,
-    UsageLimitExceeded,
-    ServerOverloaded,
-    HttpConnectionFailed {
-        http_status_code: Option<u16>,
-    },
-    /// Failed to connect to the response SSE stream.
-    ResponseStreamConnectionFailed {
-        http_status_code: Option<u16>,
-    },
-    InternalServerError,
-    Unauthorized,
-    BadRequest,
-    SandboxError,
-    /// The response SSE stream disconnected in the middle of a turnbefore completion.
-    ResponseStreamDisconnected {
-        http_status_code: Option<u16>,
-    },
-    /// Reached the retry limit for responses.
-    ResponseTooManyFailedAttempts {
-        http_status_code: Option<u16>,
-    },
-    ThreadRollbackFailed,
-    Other,
+    pub error: ErrorInfo,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, Default)]
@@ -415,7 +423,7 @@ pub enum AgentStatus {
     /// Agent is done. Contains the final assistant message.
     Completed(Option<String>),
     /// Agent encountered an error.
-    Errored(String),
+    Errored(ErrorInfo),
     /// Agent has been shutdown.
     Shutdown,
     /// Agent is not found.
@@ -425,56 +433,62 @@ pub enum AgentStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentPath, AgentStatus, EventMsg, FileChange, FileChangeOperation, FileChangeOutput, Op,
-        SessionSource, SubAgentSource, ThreadId, ToolCallCompletedEvent, ToolCallResultKind,
+        AgentPath, AgentStatus, ErrorEvent, ErrorInfo, EventMsg, FileChange, FileChangeOperation,
+        FileChangeOutput, Op, SessionSource, SubAgentSource, ThreadId, ToolCallCompletedEvent,
+        ToolCallResultKind,
     };
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn op_serde_round_trip_for_user_input() {
+    fn op_serde_round_trip_for_user_input() -> TestResult {
         let op = Op::UserInput("hello".to_string());
-        let value = serde_json::to_value(&op).expect("serialize op");
-        let decoded: Op = serde_json::from_value(value).expect("deserialize op");
+        let value = serde_json::to_value(&op)?;
+        let decoded: Op = serde_json::from_value(value)?;
         assert_eq!(decoded, op);
+        Ok(())
     }
 
     #[test]
-    fn session_source_accessors_return_thread_spawn_metadata() {
+    fn session_source_accessors_return_thread_spawn_metadata() -> TestResult {
         let thread_id = ThreadId::new();
         let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: thread_id,
             depth: 1,
-            agent_path: Some(AgentPath::try_from("/root/worker").expect("path")),
+            agent_path: Some(AgentPath::try_from("/root/worker")?),
             agent_nickname: Some("alpha".to_string()),
             agent_role: Some("explorer".to_string()),
         });
 
         assert_eq!(
             source.get_agent_path(),
-            Some(AgentPath::try_from("/root/worker").expect("path"))
+            Some(AgentPath::try_from("/root/worker")?)
         );
         assert_eq!(source.get_nickname(), Some("alpha".to_string()));
         assert_eq!(source.get_agent_role(), Some("explorer".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn collab_agent_completed_round_trip() {
+    fn collab_agent_completed_round_trip() -> TestResult {
         let msg = EventMsg::CollabAgentCompleted(super::CollabAgentCompletedEvent {
             parent_thread_id: ThreadId::new(),
             child_thread_id: ThreadId::new(),
-            agent_path: AgentPath::try_from("/root/child").expect("path"),
+            agent_path: AgentPath::try_from("/root/child")?,
             agent_nickname: Some("child".to_string()),
             agent_role: Some("worker".to_string()),
             status: AgentStatus::Completed(Some("done".to_string())),
             last_assistant_message: Some("done".to_string()),
         });
 
-        let value = serde_json::to_value(&msg).expect("serialize event");
-        let decoded: EventMsg = serde_json::from_value(value).expect("deserialize event");
+        let value = serde_json::to_value(&msg)?;
+        let decoded: EventMsg = serde_json::from_value(value)?;
         assert_eq!(decoded, msg);
+        Ok(())
     }
 
     #[test]
-    fn tool_call_completed_defaults_to_final_result_kind() {
+    fn tool_call_completed_defaults_to_final_result_kind() -> TestResult {
         let decoded: ToolCallCompletedEvent = serde_json::from_value(serde_json::json!({
             "threadId": "thread",
             "turnId": "turn",
@@ -482,16 +496,16 @@ mod tests {
             "success": true,
             "outputPreview": "done",
             "error": null
-        }))
-        .expect("deserialize tool completion");
+        }))?;
 
         assert_eq!(decoded.result_kind, ToolCallResultKind::Final);
         assert_eq!(decoded.related_thread_id, None);
         assert_eq!(decoded.file_change, None);
+        Ok(())
     }
 
     #[test]
-    fn tool_call_completed_status_update_round_trip() {
+    fn tool_call_completed_status_update_round_trip() -> TestResult {
         let related_thread_id = ThreadId::new();
         let event = ToolCallCompletedEvent {
             thread_id: String::from("thread"),
@@ -505,16 +519,16 @@ mod tests {
             file_change: None,
         };
 
-        let value = serde_json::to_value(&event).expect("serialize tool completion");
+        let value = serde_json::to_value(&event)?;
         assert_eq!(value["resultKind"], "status_update");
         assert_eq!(value["relatedThreadId"], related_thread_id.to_string());
-        let decoded: ToolCallCompletedEvent =
-            serde_json::from_value(value).expect("deserialize tool completion");
+        let decoded: ToolCallCompletedEvent = serde_json::from_value(value)?;
         assert_eq!(decoded, event);
+        Ok(())
     }
 
     #[test]
-    fn tool_call_completed_file_change_round_trip() {
+    fn tool_call_completed_file_change_round_trip() -> TestResult {
         let event = ToolCallCompletedEvent {
             thread_id: String::from("thread"),
             turn_id: String::from("turn"),
@@ -533,7 +547,7 @@ mod tests {
             }),
         };
 
-        let value = serde_json::to_value(&event).expect("serialize tool completion");
+        let value = serde_json::to_value(&event)?;
         assert_eq!(value["fileChange"]["path"], "file.txt");
         assert_eq!(
             value["fileChange"]["change"]["unifiedDiff"],
@@ -541,13 +555,13 @@ mod tests {
         );
         assert!(value["fileChange"]["change"].get("unified_diff").is_none());
         assert!(value["fileChange"]["change"].get("move_path").is_none());
-        let decoded: ToolCallCompletedEvent =
-            serde_json::from_value(value).expect("deserialize tool completion");
+        let decoded: ToolCallCompletedEvent = serde_json::from_value(value)?;
         assert_eq!(decoded, event);
+        Ok(())
     }
 
     #[test]
-    fn omitted_file_change_round_trip() {
+    fn omitted_file_change_round_trip() -> TestResult {
         let change = FileChange::Omitted {
             operation: FileChangeOperation::Add,
             reason: "too large".to_string(),
@@ -556,11 +570,33 @@ mod tests {
             bytes: 600_000,
         };
 
-        let value = serde_json::to_value(&change).expect("serialize omitted change");
+        let value = serde_json::to_value(&change)?;
         assert_eq!(value["type"], "omitted");
         assert_eq!(value["operation"], "add");
-        let decoded: FileChange =
-            serde_json::from_value(value).expect("deserialize omitted change");
+        let decoded: FileChange = serde_json::from_value(value)?;
         assert_eq!(decoded, change);
+        Ok(())
+    }
+
+    #[test]
+    fn structured_error_event_round_trip() -> TestResult {
+        let event = ErrorEvent {
+            error: ErrorInfo::new("provider", "model stream failed").with_source("smooth-core"),
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(value["error"]["kind"], "provider");
+        assert_eq!(value["error"]["message"], "model stream failed");
+        let decoded: ErrorEvent = serde_json::from_value(value)?;
+        assert_eq!(decoded, event);
+        Ok(())
+    }
+
+    #[test]
+    fn errored_agent_status_round_trip() -> TestResult {
+        let status = AgentStatus::Errored(ErrorInfo::new("agent_failed", "boom"));
+        let value = serde_json::to_value(&status)?;
+        let decoded: AgentStatus = serde_json::from_value(value)?;
+        assert_eq!(decoded, status);
+        Ok(())
     }
 }

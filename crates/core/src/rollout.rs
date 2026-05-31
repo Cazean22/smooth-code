@@ -382,88 +382,69 @@ mod tests {
         std::env::temp_dir().join(format!("smooth-code-rollout-{name}-{}", ThreadId::new()))
     }
 
-    #[test]
-    fn create_and_list_rollout_threads() {
-        runtime().block_on(async {
-            let root = test_root("list");
-            let cwd = root.join("workspace");
-            fs::create_dir_all(&cwd).await.expect("create cwd");
+    #[tokio::test]
+    async fn create_and_list_rollout_threads() -> Result<()> {
+        let root = test_root("list");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
 
-            let thread_id = ThreadId::new();
-            let recorder = RolloutRecorder::create(&root, thread_id, &cwd)
-                .await
-                .expect("create recorder");
-            recorder
-                .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
-                    text: "hello".to_string(),
-                }))
-                .await
-                .expect("append user");
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
+                text: "hello".to_string(),
+            }))
+            .await?;
 
-            let threads = list_threads(&root).await.expect("list threads");
-            assert_eq!(threads.len(), 1);
-            assert_eq!(threads[0].thread_id, thread_id);
-            assert_eq!(threads[0].last_user_message.as_deref(), Some("hello"));
+        let threads = list_threads(&root).await?;
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, thread_id);
+        assert_eq!(threads[0].last_user_message.as_deref(), Some("hello"));
 
-            let _ = fs::remove_dir_all(&root).await;
-        });
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
     }
 
-    #[test]
-    fn resume_state_reconstructs_history_and_recovery_interrupt() {
-        runtime().block_on(async {
-            let root = test_root("resume");
-            let cwd = root.join("workspace");
-            fs::create_dir_all(&cwd).await.expect("create cwd");
+    #[tokio::test]
+    async fn resume_state_reconstructs_history_and_recovery_interrupt() -> Result<()> {
+        let root = test_root("resume");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
 
-            let thread_id = ThreadId::new();
-            let recorder = RolloutRecorder::create(&root, thread_id, &cwd)
-                .await
-                .expect("create recorder");
-            recorder
-                .append(PersistedItem::Event(EventMsg::SessionConfigured(
-                    SessionConfiguredEvent {
-                        thread_id: thread_id.to_string(),
-                        rollout_path: Some(recorder.path().display().to_string()),
-                    },
-                )))
-                .await
-                .expect("append configured");
-            recorder
-                .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
-                    text: "hello".to_string(),
-                }))
-                .await
-                .expect("append user");
-            recorder
-                .append(PersistedItem::Event(EventMsg::TurnStarted(
-                    TurnStartedEvent {
-                        thread_id: thread_id.to_string(),
-                        turn_id: "4".to_string(),
-                    },
-                )))
-                .await
-                .expect("append turn started");
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::SessionConfigured(
+                SessionConfiguredEvent {
+                    thread_id: thread_id.to_string(),
+                    rollout_path: Some(recorder.path().display().to_string()),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
+                text: "hello".to_string(),
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "4".to_string(),
+                },
+            )))
+            .await?;
 
-            let state = load_resume_state(recorder.path())
-                .await
-                .expect("load resume state");
-            assert_eq!(state.thread_id, thread_id);
-            assert_eq!(state.next_turn_index, 5);
-            assert_eq!(state.history.len(), 1);
-            assert!(matches!(
-                state.initial_messages.last(),
-                Some(EventMsg::TurnInterrupted(turn)) if turn.reason == "resume_recovery"
-            ));
+        let state = load_resume_state(recorder.path()).await?;
+        assert_eq!(state.thread_id, thread_id);
+        assert_eq!(state.next_turn_index, 5);
+        assert_eq!(state.history.len(), 1);
+        assert!(matches!(
+            state.initial_messages.last(),
+            Some(EventMsg::TurnInterrupted(turn)) if turn.reason == "resume_recovery"
+        ));
 
-            let _ = fs::remove_dir_all(&root).await;
-        });
-    }
-
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build runtime")
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
     }
 }

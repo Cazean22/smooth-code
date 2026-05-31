@@ -14,7 +14,7 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smooth-protocol = { path = "../protocol" }
-thiserror = "2.0.18"
+thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 uuid = { workspace = true, features = ["v4"] }
 

@@ -32,7 +32,7 @@ impl Tool for RunCommandTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Run a shell command inside the current workspace and return combined stdout/stderr.".to_string(),
+            description: "Run a shell command inside the current workspace and return combined stdout/stderr. Use this for inspection, validation, formatters, and project commands; use structured file tools such as edit, write, and delete for source changes instead of shell rewrite scripts.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

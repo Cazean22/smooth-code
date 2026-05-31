@@ -8,7 +8,8 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - Organize `PROGRESS.md` by topic or subsystem instead of chronological task history.
 - `docs/system_prompt.md` is the runtime default base prompt via `include_str!` in `crates/core/src/provider.rs`; `SMOOTH_CODE_LLM_PREAMBLE` still replaces that default, while role-specific preambles from `crates/core/src/agent/role.rs` layer on top of the selected base.
 - Environment context placeholders in the selected base preamble are filled by `crates/core/src/environment.rs` before role-specific and plan-mode text is appended. Keep this context cache-stable: working directory, git-repo yes/no, platform, OS version, shell, and preferred CLI availability (`rg`, `fd`, `eza`).
-- The model-facing `list_dir` and `dynamic_echo` tools were removed; directory listings should go through shell commands such as `eza`, and client-mediated interaction should use the typed `ask_user_question` tool/server request. Plan mode includes `run_command` for read-only exploration/validation, but still withholds file-mutating `edit` and `write`.
+- The model-facing `list_dir` and `dynamic_echo` tools were removed; directory listings should go through shell commands such as `eza`, and client-mediated interaction should use the typed `ask_user_question` tool/server request. Plan mode includes `run_command` for read-only exploration/validation, but still withholds file-mutating `delete`, `edit`, and `write`.
+- Source changes should go through structured file tools (`edit`, `write`, `delete`) so the runtime can emit structured `FileChangeOutput`; keep `run_command` for inspection, validation, formatters, and project commands rather than Python/`sed -i`/`awk`/redirection rewrite scripts.
 - Plan-mode model rebuilds must preserve typed client-backed tools such as `ask_user_question`; the unchecked `exit_plan_mode` path runs in-turn and should reuse the `Session`'s stored client when no explicit client is passed.
 
 ## OpenAI Provider
@@ -31,7 +32,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 
 ## TUI File Change Display
 
-- Successful `edit` and `write` tools can carry structured `FileChangeOutput` metadata through `ToolCallCompletedEvent.file_change`; core decodes this metadata before sending tool results back to the model so model-visible output remains the concise success message.
+- Successful `delete`, `edit`, and `write` tools can carry structured `FileChangeOutput` metadata through `ToolCallCompletedEvent.file_change`; core decodes this metadata before sending tool results back to the model so model-visible output remains the concise success message.
 - The TUI replaces a single completed file-mutating tool row with a patch transcript item and Codex-style diff summary; grouped file tool calls keep their group row and append the diff item so other entries are not lost.
 - The first Smooth diff renderer intentionally omits Codex's syntax-highlighting/theme stack and uses `diffy` plus ratatui styles for line counts, gutters, hunk separators, and red/green insert/delete cues.
 - After the reducer rewrite, committed file changes render as concise inline transcript summaries; full diff details remain available from the inspector/detail rendering path using the same bounded `FileChangeOutput` renderer.
@@ -55,7 +56,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 
 ## TUI File Change Safety
 
-- Structured file-change tool output is a private transport and must only be decoded for successful final built-in `edit`/`write` completions; arbitrary tool stdout and opaque stream outputs stay plain text to avoid spoofed diffs.
+- Structured file-change tool output is a private transport and must only be decoded for successful final built-in `delete`/`edit`/`write` completions; arbitrary tool stdout and opaque stream outputs stay plain text to avoid spoofed diffs.
 - File-change metadata is capped at 512 KiB; oversized diffs/new-file contents and unreadable/non-UTF8 existing files use `FileChange::Omitted` so the TUI can show counts/reason without carrying or rendering large/unavailable content.
 - The TUI diff renderer caps rendered diff body lines at 1,000 and appends a truncation marker, protecting transcript recalculation and scroll performance.
 - Omitted file changes must preserve the original operation (`add`, `delete`, or `update`) so large added files still render as Added and external JSON clients receive operation-aware metadata.

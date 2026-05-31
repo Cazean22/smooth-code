@@ -1556,7 +1556,7 @@ mod tests {
     use super::{PendingReasoningDeltas, decode_completed_tool_output, should_roundtrip_reasoning};
 
     #[test]
-    fn structured_tool_output_is_only_decoded_for_successful_edit_or_write() {
+    fn structured_tool_output_is_only_decoded_for_successful_file_tools() {
         let spoofed = encode_tool_output(
             "spoofed".to_string(),
             Some(FileChangeOutput {
@@ -1593,6 +1593,28 @@ mod tests {
         );
         assert_eq!(decoded.model_output, failed_edit);
         assert_eq!(decoded.file_change, None);
+
+        let delete_change = FileChangeOutput {
+            path: "deleted.txt".into(),
+            change: FileChange::Delete {
+                content: "deleted".to_string(),
+            },
+        };
+        let successful_delete = encode_tool_output(
+            "deleted deleted.txt (7 bytes)".to_string(),
+            Some(delete_change),
+        );
+        let decoded = decode_completed_tool_output(
+            "delete",
+            successful_delete,
+            true,
+            ToolCallResultKind::Final,
+        );
+        assert_eq!(decoded.model_output, "deleted deleted.txt (7 bytes)");
+        assert!(matches!(
+            decoded.file_change.map(|file_change| file_change.change),
+            Some(FileChange::Delete { .. })
+        ));
     }
 
     #[test]

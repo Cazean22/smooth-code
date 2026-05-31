@@ -44,8 +44,8 @@ use tokio_tungstenite::{
     tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
 };
 use tools::{
-    AskUserClient, AskUserQuestionTool, EditTool, ExitPlanModeTool, PlanWriteTool, ReadTool,
-    RunCommandTool, SpawnAgentTool, WriteTool,
+    AskUserClient, AskUserQuestionTool, DeleteTool, EditTool, ExitPlanModeTool, PlanWriteTool,
+    ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
 };
 
 use crate::agent::{
@@ -413,6 +413,7 @@ where
             .tool(ExitPlanModeTool::new())
     } else {
         builder
+            .tool(DeleteTool::new(cwd.clone()))
             .tool(EditTool::new(cwd.clone()))
             .tool(WriteTool::new(cwd))
     };
@@ -1713,6 +1714,7 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert!(tool_names.contains("spawn_agent"));
+        assert!(tool_names.contains("delete"));
         assert!(!tool_names.contains("list_dir"));
         assert!(!tool_names.contains("send_message"));
         assert!(!tool_names.contains("list_agents"));
@@ -1754,6 +1756,7 @@ mod tests {
         assert!(tool_names.contains("exit_plan_mode"));
         // Mutating tools must be stripped.
         assert!(!tool_names.contains("edit"));
+        assert!(!tool_names.contains("delete"));
         assert!(!tool_names.contains("write"));
     }
 

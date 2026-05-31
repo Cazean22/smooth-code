@@ -37,7 +37,7 @@ pub fn decode_tool_output_for_tool(
     raw_output: String,
     success: bool,
 ) -> DecodedToolOutput {
-    if success && matches!(tool_name, "edit" | "write") {
+    if success && matches!(tool_name, "delete" | "edit" | "write") {
         return decode_tool_output(raw_output);
     }
 
@@ -101,6 +101,28 @@ mod tests {
             decode_tool_output_for_tool("write", encoded, true),
             DecodedToolOutput {
                 model_output: "wrote 5 bytes to a.txt".to_string(),
+                file_change: Some(file_change),
+            }
+        );
+    }
+
+    #[test]
+    fn delete_structured_output_round_trips_file_change() {
+        let file_change = FileChangeOutput {
+            path: "a.txt".into(),
+            change: FileChange::Delete {
+                content: "hello".to_string(),
+            },
+        };
+        let encoded = encode_tool_output(
+            "deleted a.txt (5 bytes)".to_string(),
+            Some(file_change.clone()),
+        );
+
+        assert_eq!(
+            decode_tool_output_for_tool("delete", encoded, true),
+            DecodedToolOutput {
+                model_output: "deleted a.txt (5 bytes)".to_string(),
                 file_change: Some(file_change),
             }
         );

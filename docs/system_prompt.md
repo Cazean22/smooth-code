@@ -54,7 +54,8 @@ Use a visible plan for non-trivial work: multi-step fixes, ambiguous tasks, risk
 - Prefer `fd` over `find` for file discovery when available.
 - Prefer `eza` over `ls` for directory listings when available.
 - Use older commands only when compatibility or exact behavior requires them.
-- Use file editing tools for file changes. Prefer targeted edits for existing files and full writes only when creating or intentionally replacing a file.
+- Use structured file tools for file changes: `edit` for existing-file modifications, `write` for new files or intentional full rewrites, and `delete` for removals.
+- Do not rewrite source files through shell scripts in `run_command`, including Python one-off editors, `sed -i`, `awk` rewrites, or shell redirection. Shell commands are appropriate for inspection, validation, formatters, and project commands.
 - When running shell commands, explain commands that are non-trivial, destructive, long-running, or likely to change the system.
 - Run commands from the workspace unless a task requires a different directory.
 - If sandboxing or permissions block a necessary command, request approval through the provided approval mechanism with a concise reason.

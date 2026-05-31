@@ -15,7 +15,7 @@ Usage:
 - `file_path` may be an absolute path, or a path relative to the current working directory, but must resolve inside the workspace.
 - If a file already exists at that path, it is overwritten.
 - The parent directory must already exist; this tool does not create missing directories.
-- Prefer using `read` plus a future edit tool to modify existing files; use `write` for new files or full rewrites."#;
+- Prefer using `read` plus `edit` to modify existing files, `delete` to remove files, and `write` for new files or intentional full rewrites."#;
 
 #[derive(Clone)]
 pub struct WriteTool {

@@ -317,6 +317,7 @@ enum FocusTarget {
 struct DashboardState {
     items: Vec<ThreadListItem>,
     selected: usize,
+    scroll_offset: usize,
     loading: bool,
     error: Option<String>,
     next_cursor: Option<String>,
@@ -868,11 +869,40 @@ impl UiModel {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.dashboard.selected = self.dashboard.selected.saturating_sub(1);
+                self.dashboard_ensure_selected_visible(self.viewport_height);
                 Vec::new()
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let max = self.dashboard.items.len().saturating_sub(1);
                 self.dashboard.selected = self.dashboard.selected.saturating_add(1).min(max);
+                self.dashboard_ensure_selected_visible(self.viewport_height);
+                Vec::new()
+            }
+            KeyCode::PageUp => {
+                let amount = self
+                    .dashboard_visible_item_count(self.viewport_height)
+                    .max(1);
+                self.dashboard.selected = self.dashboard.selected.saturating_sub(amount);
+                self.dashboard_ensure_selected_visible(self.viewport_height);
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                let amount = self
+                    .dashboard_visible_item_count(self.viewport_height)
+                    .max(1);
+                let max = self.dashboard.items.len().saturating_sub(1);
+                self.dashboard.selected = self.dashboard.selected.saturating_add(amount).min(max);
+                self.dashboard_ensure_selected_visible(self.viewport_height);
+                Vec::new()
+            }
+            KeyCode::Home => {
+                self.dashboard.selected = 0;
+                self.dashboard_ensure_selected_visible(self.viewport_height);
+                Vec::new()
+            }
+            KeyCode::End => {
+                self.dashboard.selected = self.dashboard.items.len().saturating_sub(1);
+                self.dashboard_ensure_selected_visible(self.viewport_height);
                 Vec::new()
             }
             KeyCode::Char('q') | KeyCode::Esc => {
@@ -1273,6 +1303,7 @@ impl UiModel {
                     .dashboard
                     .selected
                     .min(self.dashboard.items.len().saturating_sub(1));
+                self.dashboard_ensure_selected_visible(self.viewport_height);
                 self.status_line = if self.dashboard.items.is_empty() {
                     String::from("No saved threads")
                 } else {
@@ -2059,8 +2090,15 @@ impl UiModel {
         } else if self.dashboard.items.is_empty() {
             lines.push(Line::from("No saved sessions."));
         } else {
-            for (idx, item) in self.dashboard.items.iter().enumerate() {
-                let selected = idx == self.dashboard.selected;
+            let visible_count = self.dashboard_visible_item_count(area.height);
+            let max_offset = self.dashboard_max_scroll_offset(visible_count);
+            let start = self.dashboard.scroll_offset.min(max_offset);
+            let end = start
+                .saturating_add(visible_count)
+                .min(self.dashboard.items.len());
+            for (idx, item) in self.dashboard.items[start..end].iter().enumerate() {
+                let item_idx = start + idx;
+                let selected = item_idx == self.dashboard.selected;
                 let prefix = if selected { "› " } else { "  " };
                 let style = if selected {
                     Style::default()
@@ -2088,7 +2126,7 @@ impl UiModel {
         }
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            "n new  Enter resume  j/k move  : command  Ctrl-C quit",
+            "n new  Enter resume  j/k move  PgUp/PgDn scroll  : command  Ctrl-C quit",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -2432,6 +2470,49 @@ impl UiModel {
         self.set_inspector_visible(!self.inspector_visible);
     }
 
+    fn dashboard_visible_item_count(&self, height: u16) -> usize {
+        usize::from(height.saturating_sub(4) / 2).max(1)
+    }
+
+    fn dashboard_max_scroll_offset(&self, visible_count: usize) -> usize {
+        self.dashboard
+            .items
+            .len()
+            .saturating_sub(visible_count.max(1))
+    }
+
+    fn dashboard_ensure_selected_visible(&mut self, height: u16) {
+        if self.dashboard.items.is_empty() {
+            self.dashboard.selected = 0;
+            self.dashboard.scroll_offset = 0;
+            return;
+        }
+
+        self.dashboard.selected = self
+            .dashboard
+            .selected
+            .min(self.dashboard.items.len().saturating_sub(1));
+
+        let visible_count = self.dashboard_visible_item_count(height);
+        if self.dashboard.selected < self.dashboard.scroll_offset {
+            self.dashboard.scroll_offset = self.dashboard.selected;
+        } else {
+            let visible_end = self.dashboard.scroll_offset.saturating_add(visible_count);
+            if self.dashboard.selected >= visible_end {
+                self.dashboard.scroll_offset = self
+                    .dashboard
+                    .selected
+                    .saturating_add(1)
+                    .saturating_sub(visible_count);
+            }
+        }
+
+        self.dashboard.scroll_offset = self
+            .dashboard
+            .scroll_offset
+            .min(self.dashboard_max_scroll_offset(visible_count));
+    }
+
     fn scroll_up(&mut self, amount: u16) {
         self.scroll = self.scroll.saturating_sub(amount);
         self.auto_scroll = false;
@@ -2651,6 +2732,17 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn dashboard_thread(idx: usize) -> ThreadListItem {
+        ThreadListItem {
+            thread_id: format!("thread-{idx}"),
+            rollout_path: format!("session-{idx}.jsonl"),
+            created_at: "2026-05-31T00:00:00Z".to_string(),
+            updated_at: format!("2026-05-31T00:{idx:02}:00Z"),
+            last_user_message: Some(format!("message-{idx}")),
+            last_assistant_message: None,
+        }
     }
 
     fn start_turn(app: &mut App) {
@@ -3922,6 +4014,78 @@ mod tests {
                 if *request_id == RequestId(43)
                     && error.message.contains("inactive thread")
         ));
+    }
+
+    #[test]
+    fn dashboard_down_keeps_selected_item_visible_by_scrolling() {
+        let mut model = UiModel::new();
+        model.viewport_height = 10;
+        model.dashboard.items = (0..8).map(dashboard_thread).collect();
+
+        for _ in 0..3 {
+            let _ = model.handle_key_event(key(KeyCode::Down));
+        }
+
+        assert_eq!(model.dashboard.selected, 3);
+        assert_eq!(model.dashboard.scroll_offset, 1);
+
+        let _ = model.handle_key_event(key(KeyCode::Up));
+        assert_eq!(model.dashboard.selected, 2);
+        assert_eq!(model.dashboard.scroll_offset, 1);
+
+        let _ = model.handle_key_event(key(KeyCode::Up));
+        assert_eq!(model.dashboard.selected, 1);
+        assert_eq!(model.dashboard.scroll_offset, 1);
+
+        let _ = model.handle_key_event(key(KeyCode::Up));
+        assert_eq!(model.dashboard.selected, 0);
+        assert_eq!(model.dashboard.scroll_offset, 0);
+    }
+
+    #[test]
+    fn dashboard_page_home_end_update_scroll_offset() {
+        let mut model = UiModel::new();
+        model.viewport_height = 8;
+        model.dashboard.items = (0..10).map(dashboard_thread).collect();
+
+        let _ = model.handle_key_event(key(KeyCode::PageDown));
+        assert_eq!(model.dashboard.selected, 2);
+        assert_eq!(model.dashboard.scroll_offset, 1);
+
+        let _ = model.handle_key_event(key(KeyCode::End));
+        assert_eq!(model.dashboard.selected, 9);
+        assert_eq!(model.dashboard.scroll_offset, 8);
+
+        let _ = model.handle_key_event(key(KeyCode::PageUp));
+        assert_eq!(model.dashboard.selected, 7);
+        assert_eq!(model.dashboard.scroll_offset, 7);
+
+        let _ = model.handle_key_event(key(KeyCode::Home));
+        assert_eq!(model.dashboard.selected, 0);
+        assert_eq!(model.dashboard.scroll_offset, 0);
+    }
+
+    #[test]
+    fn dashboard_render_shows_only_visible_scrolled_sessions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = UiModel::new();
+        model.viewport_height = 8;
+        model.dashboard.items = (0..8).map(dashboard_thread).collect();
+        model.dashboard.selected = 3;
+        model.dashboard_ensure_selected_visible(8);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 8))?;
+        terminal.draw(|frame| model.render(frame))?;
+        let rendered = rendered_buffer_text(&terminal);
+
+        assert!(!rendered.contains("message-0"), "{rendered}");
+        assert!(rendered.contains("message-2"), "{rendered}");
+        assert!(
+            rendered.contains("› 2026-05-31T00:03:00Z  message-3"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("message-4"), "{rendered}");
+        Ok(())
     }
 
     #[test]

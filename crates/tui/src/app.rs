@@ -823,7 +823,7 @@ impl UiModel {
             return vec![self.effect(EffectContext::Exit, UiEffectKind::Exit)];
         }
 
-        if self.question_picker.is_some() {
+        if self.screen == Screen::Workspace && self.question_picker.is_some() {
             return self.dispatch_picker_key(key_event);
         }
 
@@ -1014,7 +1014,7 @@ impl UiModel {
         match key_event.code {
             KeyCode::Esc => {
                 self.command.clear();
-                self.mode = if self.question_picker.is_some() {
+                self.mode = if self.screen == Screen::Workspace && self.question_picker.is_some() {
                     UiMode::Overlay
                 } else {
                     UiMode::Normal
@@ -1212,6 +1212,7 @@ impl UiModel {
 
         match request {
             ServerRequest::AskUserQuestion { request_id, params } => {
+                self.screen = Screen::Workspace;
                 self.question_picker = Some(QuestionPicker::new(request_id, params));
                 self.mode = UiMode::Overlay;
                 self.focus = FocusTarget::Overlay;
@@ -2034,23 +2035,6 @@ impl UiModel {
     }
 
     fn render_dashboard(&self, frame: &mut Frame<'_>, area: Rect) {
-        let picker_height = self
-            .question_picker
-            .as_ref()
-            .map(|picker| picker.desired_height(area.width).min(20).min(area.height))
-            .unwrap_or(0);
-        if picker_height > 0 {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(picker_height)])
-                .split(area);
-            self.render_dashboard_body(frame, chunks[0]);
-            if let Some(picker) = &self.question_picker {
-                picker.render(frame, chunks[1]);
-            }
-            return;
-        }
-
         self.render_dashboard_body(frame, area);
     }
 
@@ -3791,7 +3775,8 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_renders_question_picker_overlay() -> Result<(), Box<dyn std::error::Error>> {
+    fn active_ask_user_request_switches_to_workspace_overlay()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut model = UiModel::new();
         let thread_id = ThreadId::new();
         model.current_thread_id = Some(thread_id);
@@ -3814,7 +3799,7 @@ mod tests {
             },
         }));
 
-        assert_eq!(model.screen, Screen::Dashboard);
+        assert_eq!(model.screen, Screen::Workspace);
         assert_eq!(model.mode, UiMode::Overlay);
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
@@ -3824,6 +3809,82 @@ mod tests {
         assert!(rendered.contains("Pick a path?"), "{rendered}");
         assert!(rendered.contains("Use option A"), "{rendered}");
         Ok(())
+    }
+
+    #[test]
+    fn dashboard_does_not_render_question_picker_overlay() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut model = UiModel::new();
+        model.question_picker = Some(QuestionPicker::new(
+            RequestId(42),
+            AskUserQuestionParams {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                call_id: "call".to_string(),
+                questions: vec![AskUserQuestion {
+                    question: "Pick a path?".to_string(),
+                    header: "Choice".to_string(),
+                    options: vec![AskUserQuestionOption {
+                        label: "A".to_string(),
+                        description: "Use option A".to_string(),
+                        preview: None,
+                    }],
+                    multi_select: false,
+                }],
+            },
+        ));
+        model.screen = Screen::Dashboard;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        terminal.draw(|frame| model.render(frame))?;
+        let rendered = rendered_buffer_text(&terminal);
+
+        assert!(!rendered.contains("Pick a path?"), "{rendered}");
+        assert!(!rendered.contains("Use option A"), "{rendered}");
+        assert!(rendered.contains("smooth-code"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_keys_do_not_dispatch_hidden_question_picker() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.dashboard.items = vec![ThreadListItem {
+            thread_id: thread_id.to_string(),
+            rollout_path: "session.jsonl".to_string(),
+            created_at: "2026-05-31T00:00:00Z".to_string(),
+            updated_at: "2026-05-31T00:01:00Z".to_string(),
+            last_user_message: Some("hello".to_string()),
+            last_assistant_message: None,
+        }];
+        model.question_picker = Some(QuestionPicker::new(
+            RequestId(42),
+            AskUserQuestionParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn".to_string(),
+                call_id: "call".to_string(),
+                questions: vec![AskUserQuestion {
+                    question: "Pick a path?".to_string(),
+                    header: "Choice".to_string(),
+                    options: vec![AskUserQuestionOption {
+                        label: "A".to_string(),
+                        description: "Use option A".to_string(),
+                        preview: None,
+                    }],
+                    multi_select: false,
+                }],
+            },
+        ));
+        model.screen = Screen::Dashboard;
+
+        let effects = model.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0].kind,
+            UiEffectKind::ThreadResume { thread_id: got } if got == thread_id
+        ));
+        assert!(model.question_picker.is_some());
     }
 
     #[test]

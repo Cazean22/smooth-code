@@ -12,8 +12,8 @@ use rig::{
 use serde::{Deserialize, Serialize};
 use smooth_protocol::{
     AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
-    AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, ErrorInfo, EventMsg, ThreadId,
-    ToolCallCompletedEvent, ToolCallResultKind, ToolCallStartedEvent,
+    AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, ErrorInfo, EventMsg, ProjectInstructions,
+    ThreadId, ToolCallCompletedEvent, ToolCallResultKind, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
 use tools::{DecodedToolOutput, SubagentArgs, decode_tool_output_for_tool};
@@ -261,8 +261,11 @@ async fn run_manual_turn(
             return None;
         }
 
-        let (pending_prompt, request_history) =
-            build_request_parts(&history_before_turn, &new_messages)?;
+        let (pending_prompt, request_history) = build_request_parts(
+            &history_before_turn,
+            session.project_instructions.as_ref(),
+            &new_messages,
+        )?;
         let model_for_stream = session.model().await;
         let mut stream = match model_for_stream
             .stream_completion_turn(pending_prompt, &request_history)
@@ -1281,12 +1284,36 @@ fn spawn_agent_result_from_metadata(
 
 fn build_request_parts(
     history_before_turn: &[Message],
+    project_instructions: Option<&ProjectInstructions>,
     new_messages: &[Message],
 ) -> Option<(Message, Vec<Message>)> {
     let (pending_prompt, new_history) = new_messages.split_last()?;
     let mut request_history = history_before_turn.to_vec();
+    if let Some(message) = project_instructions_message(project_instructions) {
+        request_history.push(message);
+    }
     request_history.extend_from_slice(new_history);
     Some((pending_prompt.clone(), request_history))
+}
+
+fn project_instructions_message(
+    project_instructions: Option<&ProjectInstructions>,
+) -> Option<Message> {
+    let instructions = project_instructions?;
+    let text = instructions
+        .entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+                entry.directory, entry.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(Message::User {
+        content: OneOrMany::one(UserContent::Text(Text { text })),
+    })
 }
 
 fn merge_reasoning_blocks(

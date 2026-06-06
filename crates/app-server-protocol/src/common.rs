@@ -1,11 +1,15 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use smooth_protocol::ProjectInstructions;
 
 use crate::RequestId;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct ThreadStartParams {}
+pub struct ThreadStartParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_instructions: Option<ProjectInstructions>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -211,6 +215,7 @@ impl ServerRequest {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use smooth_protocol::{ProjectInstructionEntry, ProjectInstructions};
 
     use super::*;
 
@@ -242,6 +247,45 @@ mod tests {
         );
         let decoded: ThreadResumeResponse = serde_json::from_value(value)?;
         assert_eq!(decoded, response);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_start_params_serializes_project_instructions_camel_case() -> TestResult {
+        let params = ThreadStartParams {
+            project_instructions: Some(ProjectInstructions {
+                entries: vec![ProjectInstructionEntry {
+                    source_path: "/repo/AGENTS.md".to_string(),
+                    directory: "/repo".to_string(),
+                    text: "Use repo conventions.".to_string(),
+                }],
+            }),
+        };
+
+        let value = serde_json::to_value(&params)?;
+        assert_eq!(
+            value,
+            json!({
+                "projectInstructions": {
+                    "entries": [
+                        {
+                            "sourcePath": "/repo/AGENTS.md",
+                            "directory": "/repo",
+                            "text": "Use repo conventions.",
+                        },
+                    ],
+                },
+            })
+        );
+        let decoded: ThreadStartParams = serde_json::from_value(value)?;
+        assert_eq!(decoded, params);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_start_params_omits_missing_project_instructions() -> TestResult {
+        let value = serde_json::to_value(ThreadStartParams::default())?;
+        assert_eq!(value, json!({}));
         Ok(())
     }
 

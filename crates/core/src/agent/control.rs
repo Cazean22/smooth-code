@@ -316,6 +316,7 @@ impl AgentControl {
                 runtime.model_factory.clone(),
                 child_source,
                 system_prompt_kind,
+                None,
                 self.clone(),
                 initial_history,
             )

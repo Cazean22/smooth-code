@@ -48,6 +48,20 @@ impl fmt::Display for ErrorInfo {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInstructions {
+    pub entries: Vec<ProjectInstructionEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInstructionEntry {
+    pub source_path: String,
+    pub directory: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, JsonSchema)]
 #[schemars(with = "String")]
 pub struct ThreadId(Uuid);

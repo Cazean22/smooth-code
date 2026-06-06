@@ -9,6 +9,7 @@ mod history_cell;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
+mod project_instructions;
 mod question_picker;
 mod streaming;
 mod wrap;

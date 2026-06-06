@@ -99,9 +99,12 @@ impl CoreMessageProcessor {
         request: ClientRequest,
     ) -> AppServerResult<serde_json::Value> {
         match request {
-            ClientRequest::ThreadStart { .. } => {
+            ClientRequest::ThreadStart { params, .. } => {
                 tracing::debug!("processing thread start request");
-                let started = self.threads.start_thread().await?;
+                let started = self
+                    .threads
+                    .start_thread_with_project_instructions(params.project_instructions)
+                    .await?;
                 self.ensure_thread_subscription(started.thread_id).await;
                 self.threads
                     .emit_session_configured(started.thread_id)

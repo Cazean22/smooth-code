@@ -3123,6 +3123,7 @@ dependencies = [
  "serde_json",
  "smooth-core",
  "smooth-protocol",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

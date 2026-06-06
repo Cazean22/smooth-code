@@ -9,8 +9,9 @@ use rig::{
     message::{Message, Text, UserContent},
 };
 use smooth_protocol::{
-    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, PlanModeChangedEvent, SessionSource,
-    ThreadId, TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
+    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, PlanModeChangedEvent,
+    ProjectInstructions, SessionSource, ThreadId, TurnCompletedEvent, TurnInterruptedEvent,
+    TurnStartedEvent,
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tools::AskUserClient;
@@ -42,6 +43,7 @@ pub(crate) struct Session {
     #[allow(dead_code)]
     pub(crate) session_source: SessionSource,
     pub(crate) system_prompt_kind: SystemPromptKind,
+    pub(crate) project_instructions: Option<ProjectInstructions>,
     pub(crate) agent_control: AgentControl,
     current_turn_id: Arc<RwLock<Option<String>>>,
     #[allow(dead_code)]
@@ -74,6 +76,7 @@ impl Core {
         ask_user_client: Option<AskUserClient>,
         session_source: SessionSource,
         system_prompt_kind: SystemPromptKind,
+        project_instructions: Option<ProjectInstructions>,
         agent_control: AgentControl,
         plan_mode: bool,
         model_factory: Arc<dyn SessionModelFactory>,
@@ -93,6 +96,7 @@ impl Core {
             ask_user_client,
             next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
             system_prompt_kind,
+            project_instructions,
             model: Mutex::new(model),
             plan_mode: AtomicBool::new(plan_mode),
             model_factory,
@@ -700,6 +704,7 @@ mod tests {
             None,
             SessionSource::Cli,
             crate::agent::SystemPromptKind::Root,
+            None,
             AgentControl::new(),
             false,
             factory,
@@ -847,6 +852,7 @@ mod tests {
             Some(stub_ask_user_client()),
             SessionSource::Cli,
             crate::agent::SystemPromptKind::Root,
+            None,
             AgentControl::new(),
             true,
             factory,

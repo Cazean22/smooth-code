@@ -6,7 +6,7 @@ use std::{
 
 use smooth_protocol::{
     AgentPath, AgentStatus, CollabAgentStatusEntry, CollabResumeBeginEvent, CollabResumeEndEvent,
-    ErrorInfo, Event, EventMsg, Op, SessionSource, SubAgentSource, ThreadId,
+    ErrorInfo, Event, EventMsg, Op, ProjectInstructions, SessionSource, SubAgentSource, ThreadId,
 };
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, broadcast};
@@ -70,6 +70,17 @@ impl ThreadManagerState {
 
     #[tracing::instrument(name = "core.thread_manager.start_thread", skip(self))]
     pub async fn start_thread(&self) -> CoreResult<StartedThread> {
+        self.start_thread_with_project_instructions(None).await
+    }
+
+    #[tracing::instrument(
+        name = "core.thread_manager.start_thread_with_project_instructions",
+        skip(self, project_instructions)
+    )]
+    pub async fn start_thread_with_project_instructions(
+        &self,
+        project_instructions: Option<ProjectInstructions>,
+    ) -> CoreResult<StartedThread> {
         let thread_id = ThreadId::new();
         let thread = Arc::new(
             CoreThread::new(
@@ -78,6 +89,7 @@ impl ThreadManagerState {
                 self.model_factory.clone(),
                 SessionSource::Cli,
                 SystemPromptKind::Root,
+                project_instructions,
                 self.agent_control.clone(),
             )
             .await?,
@@ -509,13 +521,13 @@ fn agent_status_entry(
 mod tests {
     use std::{
         collections::HashSet,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex, MutexGuard},
     };
 
     use anyhow::Result;
     use futures_util::stream;
-    use rig::message::{Message, Text};
+    use rig::message::{AssistantContent, Message, Text, UserContent};
     use tempfile::TempDir;
     use tokio::sync::RwLock;
     use tools::AskUserClient;
@@ -525,10 +537,12 @@ mod tests {
         SessionCompletionEvent, SessionCompletionStream, SessionModel, SessionModelDriver,
         SessionModelFactory, SessionTurnSummary,
         agent::{AgentControl, SystemPromptKind, status::is_final},
-        rollout::find_thread_path,
+        rollout::{find_thread_path, load_resume_state},
         test_support::cwd_test_lock,
     };
-    use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
+    use smooth_protocol::{
+        AgentStatus, EventMsg, ProjectInstructionEntry, ProjectInstructions, ThreadId,
+    };
 
     fn lock_test_mutex<'a, T>(
         mutex: &'a Mutex<T>,
@@ -581,6 +595,98 @@ mod tests {
             _plan_mode: bool,
         ) -> Result<SessionModel> {
             Ok(self.model.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturedTurn {
+        prompt: Message,
+        history: Vec<Message>,
+    }
+
+    struct CapturingDriver {
+        calls: Arc<Mutex<Vec<CapturedTurn>>>,
+    }
+
+    impl SessionModelDriver for CapturingDriver {
+        fn stream_completion_turn(
+            &self,
+            prompt: Message,
+            history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
+            lock_test_mutex(&self.calls, "captured_turns")?.push(CapturedTurn { prompt, history });
+            Ok(Box::pin(stream::iter(vec![
+                Ok(SessionCompletionEvent::AssistantItem(
+                    crate::SessionAssistantContent::Text(Text {
+                        text: "captured response".to_string(),
+                    }),
+                )),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-captured".to_string()),
+                    response: "captured response".to_string(),
+                })),
+            ])))
+        }
+    }
+
+    struct CapturingFactory {
+        calls: Arc<Mutex<Vec<CapturedTurn>>>,
+    }
+
+    impl SessionModelFactory for CapturingFactory {
+        fn build(
+            &self,
+            _cwd: PathBuf,
+            _thread_id: ThreadId,
+            _ask_user_client: Option<AskUserClient>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
+            _system_prompt_kind: SystemPromptKind,
+            _agent_control: AgentControl,
+            _plan_mode: bool,
+        ) -> Result<SessionModel> {
+            Ok(SessionModel::Stub(Arc::new(CapturingDriver {
+                calls: Arc::clone(&self.calls),
+            })))
+        }
+    }
+
+    fn project_instructions_for(root: &Path, text: &str) -> ProjectInstructions {
+        ProjectInstructions {
+            entries: vec![ProjectInstructionEntry {
+                source_path: root.join("AGENTS.md").display().to_string(),
+                directory: root.display().to_string(),
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn user_message_text(message: &Message) -> Option<String> {
+        match message {
+            Message::User { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|content| match content {
+                        UserContent::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            Message::Assistant { .. } | Message::System { .. } => None,
+        }
+    }
+
+    fn assistant_message_text(message: &Message) -> Option<String> {
+        match message {
+            Message::Assistant { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|content| match content {
+                        AssistantContent::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            Message::User { .. } | Message::System { .. } => None,
         }
     }
 
@@ -658,6 +764,164 @@ mod tests {
         .await
         .map_err(|_| anyhow::anyhow!("timed out waiting for final status for {thread_id}"))?
         .map_err(|err| anyhow::anyhow!("status channel closed for {thread_id}: {err}"))
+    }
+
+    #[tokio::test]
+    async fn project_instructions_are_contextual_request_history_only() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(CapturingFactory {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await?;
+        let instructions =
+            project_instructions_for(workspace.path(), "Original AGENTS instructions");
+        let started = manager
+            .start_thread_with_project_instructions(Some(instructions))
+            .await?;
+        let control = manager.agent_control();
+
+        manager
+            .start_user_input(started.thread_id, "first prompt".to_string())
+            .await?;
+        let _ = wait_for_final_status(&control, started.thread_id).await?;
+        manager
+            .start_user_input(started.thread_id, "second prompt".to_string())
+            .await?;
+        let _ = wait_for_final_status(&control, started.thread_id).await?;
+
+        {
+            let calls = lock_test_mutex(&calls, "captured_turns")?;
+            let first = calls
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("missing first captured turn"))?;
+            assert_eq!(first.history.len(), 1);
+            assert!(
+                user_message_text(&first.history[0])
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Original AGENTS instructions"))
+            );
+            assert_eq!(
+                user_message_text(&first.prompt).as_deref(),
+                Some("first prompt")
+            );
+
+            let second = calls
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("missing second captured turn"))?;
+            assert_eq!(second.history.len(), 3);
+            assert_eq!(
+                user_message_text(&second.history[0]).as_deref(),
+                Some("first prompt")
+            );
+            assert_eq!(
+                assistant_message_text(&second.history[1]).as_deref(),
+                Some("captured response")
+            );
+            assert!(
+                user_message_text(&second.history[2])
+                    .as_deref()
+                    .is_some_and(|text| {
+                        text.contains("# AGENTS.md instructions for")
+                            && text.contains("<INSTRUCTIONS>")
+                            && text.contains("Original AGENTS instructions")
+                    })
+            );
+            assert_eq!(
+                user_message_text(&second.prompt).as_deref(),
+                Some("second prompt")
+            );
+        }
+
+        let state = load_resume_state(&started.rollout_path).await?;
+        assert!(
+            state
+                .history
+                .iter()
+                .filter_map(user_message_text)
+                .all(|text| !text.contains("Original AGENTS instructions"))
+        );
+        assert!(state.initial_messages.iter().all(|event| {
+            !matches!(
+                event,
+                EventMsg::UserMessage { text }
+                    if text.contains("Original AGENTS instructions")
+            )
+        }));
+
+        let threads = manager.list_threads().await?;
+        let summary = threads
+            .iter()
+            .find(|summary| summary.thread_id == started.thread_id)
+            .ok_or_else(|| anyhow::anyhow!("started thread should be listed"))?;
+        assert_eq!(summary.last_user_message.as_deref(), Some("second prompt"));
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_uses_project_instructions_from_rollout_metadata() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "done".to_string(),
+                })),
+            })),
+        )
+        .await?;
+        let started = manager
+            .start_thread_with_project_instructions(Some(project_instructions_for(
+                workspace.path(),
+                "Original metadata instructions",
+            )))
+            .await?;
+        drop(manager);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let resumed_manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(CapturingFactory {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await?;
+        let _resumed = resumed_manager.resume_thread(started.thread_id).await?;
+        resumed_manager
+            .start_user_input(started.thread_id, "after resume".to_string())
+            .await?;
+        let _ = wait_for_final_status(&resumed_manager.agent_control(), started.thread_id).await?;
+
+        let calls = lock_test_mutex(&calls, "captured_turns")?;
+        let turn = calls
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing resumed captured turn"))?;
+        assert_eq!(
+            user_message_text(&turn.prompt).as_deref(),
+            Some("after resume")
+        );
+        assert!(
+            turn.history
+                .iter()
+                .filter_map(user_message_text)
+                .any(|text| text.contains("Original metadata instructions"))
+        );
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
     }
 
     #[tokio::test]

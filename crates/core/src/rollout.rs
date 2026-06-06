@@ -7,7 +7,7 @@ use rig::{
     message::{AssistantContent, Message, Text, UserContent},
 };
 use serde::{Deserialize, Serialize};
-use smooth_protocol::{EventMsg, ThreadId, TurnInterruptedEvent};
+use smooth_protocol::{EventMsg, ProjectInstructions, ThreadId, TurnInterruptedEvent};
 use time::{
     OffsetDateTime, format_description::FormatItem, format_description::well_known::Rfc3339,
     macros::format_description,
@@ -40,6 +40,7 @@ pub struct ResumeState {
     pub history: Vec<Message>,
     pub initial_messages: Vec<EventMsg>,
     pub next_turn_index: u64,
+    pub project_instructions: Option<ProjectInstructions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +57,8 @@ pub(crate) struct SessionMeta {
     pub thread_id: ThreadId,
     pub cwd: PathBuf,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_instructions: Option<ProjectInstructions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,10 +78,20 @@ struct RolloutEnvelope {
 }
 
 impl RolloutRecorder {
+    #[cfg(test)]
     pub(crate) async fn create(
         workspace_root: &Path,
         thread_id: ThreadId,
         cwd: &Path,
+    ) -> Result<Self> {
+        Self::create_with_project_instructions(workspace_root, thread_id, cwd, None).await
+    }
+
+    pub(crate) async fn create_with_project_instructions(
+        workspace_root: &Path,
+        thread_id: ThreadId,
+        cwd: &Path,
+        project_instructions: Option<ProjectInstructions>,
     ) -> Result<Self> {
         let path = create_rollout_path(workspace_root, thread_id)?;
         if let Some(parent) = path.parent() {
@@ -98,6 +111,7 @@ impl RolloutRecorder {
                 thread_id,
                 cwd: cwd.to_path_buf(),
                 created_at: now_rfc3339()?,
+                project_instructions,
             }))
             .await?;
         Ok(recorder)
@@ -222,6 +236,7 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
         history,
         initial_messages,
         next_turn_index: max_turn_index.map_or(0, |value| value.saturating_add(1)),
+        project_instructions: meta.project_instructions,
     })
 }
 
@@ -399,7 +414,9 @@ pub(crate) fn workspace_root() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smooth_protocol::{SessionConfiguredEvent, TurnStartedEvent};
+    use smooth_protocol::{
+        ProjectInstructionEntry, ProjectInstructions, SessionConfiguredEvent, TurnStartedEvent,
+    };
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("smooth-code-rollout-{name}-{}", ThreadId::new()))
@@ -522,6 +539,65 @@ mod tests {
             state.initial_messages.last(),
             Some(EventMsg::TurnInterrupted(turn)) if turn.reason == "resume_recovery"
         ));
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn old_session_meta_without_project_instructions_resumes() -> Result<()> {
+        let root = test_root("old-meta");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let path = root.join("old-session.jsonl");
+        let envelope = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "item": {
+                "kind": "session_meta",
+                "threadId": thread_id,
+                "cwd": cwd,
+                "createdAt": "2026-01-01T00:00:00Z",
+            },
+        });
+        fs::write(&path, format!("{envelope}\n")).await?;
+
+        let state = load_resume_state(&path).await?;
+        assert_eq!(state.thread_id, thread_id);
+        assert_eq!(state.project_instructions, None);
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_instructions_persist_and_restore_from_session_meta() -> Result<()> {
+        let root = test_root("project-instructions");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let instructions = ProjectInstructions {
+            entries: vec![ProjectInstructionEntry {
+                source_path: cwd.join("AGENTS.md").display().to_string(),
+                directory: cwd.display().to_string(),
+                text: "Persisted instructions".to_string(),
+            }],
+        };
+        let recorder = RolloutRecorder::create_with_project_instructions(
+            &root,
+            thread_id,
+            &cwd,
+            Some(instructions.clone()),
+        )
+        .await?;
+
+        let contents = fs::read_to_string(recorder.path()).await?;
+        assert!(contents.contains("projectInstructions"));
+
+        let state = load_resume_state(recorder.path()).await?;
+        assert_eq!(state.project_instructions, Some(instructions));
 
         let _ = fs::remove_dir_all(&root).await;
         Ok(())

@@ -8,6 +8,7 @@ use smooth_protocol::ThreadId;
 
 use crate::app_server_client::AppServerClient;
 use crate::error::TuiResult;
+use crate::project_instructions::load_project_instructions;
 
 pub(crate) struct AppServerSession {
     client: AppServerClient,
@@ -24,9 +25,12 @@ impl AppServerSession {
 
     #[tracing::instrument(name = "tui.thread_start", skip(self))]
     pub(crate) async fn start_thread(&mut self) -> TuiResult<ThreadStartResponse> {
+        let project_instructions = load_project_instructions()?;
         let request = ClientRequest::ThreadStart {
             request_id: RequestId(self.next_request_id as usize),
-            params: ThreadStartParams::default(),
+            params: ThreadStartParams {
+                project_instructions,
+            },
         };
         self.next_request_id += 1;
         let value = self.client.request(request).await?;

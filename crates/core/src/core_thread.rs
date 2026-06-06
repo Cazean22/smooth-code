@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rig::message::Message;
-use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent, SessionSource};
+use smooth_protocol::{
+    Event, EventMsg, ProjectInstructions, SessionConfiguredEvent, SessionSource,
+};
 use tokio::sync::{RwLock, broadcast};
 use tools::AskUserClient;
 
@@ -32,6 +34,7 @@ impl CoreThread {
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         system_prompt_kind: SystemPromptKind,
+        project_instructions: Option<ProjectInstructions>,
         agent_control: AgentControl,
     ) -> CoreResult<Self> {
         Self::new_with_history(
@@ -40,6 +43,7 @@ impl CoreThread {
             model_factory,
             session_source,
             system_prompt_kind,
+            project_instructions,
             agent_control,
             Vec::new(),
         )
@@ -56,12 +60,14 @@ impl CoreThread {
         ),
         fields(thread_id = %id, history_items = initial_history.len())
     )]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new_with_history(
         id: ThreadId,
         ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
         system_prompt_kind: SystemPromptKind,
+        project_instructions: Option<ProjectInstructions>,
         agent_control: AgentControl,
         initial_history: Vec<Message>,
     ) -> CoreResult<Self> {
@@ -81,9 +87,14 @@ impl CoreThread {
             )
             .map_err(CoreError::provider)?;
         let workspace_root = workspace_root().map_err(CoreError::rollout)?;
-        let rollout = RolloutRecorder::create(&workspace_root, id, &cwd)
-            .await
-            .map_err(CoreError::rollout)?;
+        let rollout = RolloutRecorder::create_with_project_instructions(
+            &workspace_root,
+            id,
+            &cwd,
+            project_instructions.clone(),
+        )
+        .await
+        .map_err(CoreError::rollout)?;
         for message in &initial_history {
             rollout
                 .append(crate::rollout::PersistedItem::HistoryMessage(
@@ -106,6 +117,7 @@ impl CoreThread {
                 ask_user_client.clone(),
                 session_source,
                 system_prompt_kind,
+                project_instructions,
                 agent_control,
                 plan_mode,
                 resolved_factory.clone(),
@@ -163,6 +175,7 @@ impl CoreThread {
                 ask_user_client.clone(),
                 session_source,
                 system_prompt_kind,
+                state.project_instructions,
                 agent_control,
                 plan_mode,
                 resolved_factory.clone(),

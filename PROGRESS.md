@@ -14,6 +14,12 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - `AskUserClient` is a concrete cloneable callback wrapper shared by root, resumed, and spawned child threads. `ask` routes from `AskUserQuestionParams.thread_id` to avoid duplicate thread identity at the call boundary; `abort_pending_server_requests` still takes `ThreadId` for cancellation. No separate ask-user client factory or thread-scoped outgoing sender wrapper is needed. Keep the stored client on `Core::Session`; `CoreThread` should not duplicate it.
 - `app-server-protocol` imports `tokio::sync::oneshot`, so it must enable Tokio `sync`; with this repo's `tokio_unstable`/Tokio tracing setup it also needs `rt` to compile as a standalone package.
 
+## Project Instructions
+
+- Root thread start loads project-local instructions in the TUI, scoped by the nearest upward `.git`; with no git root only the current directory is scanned. Directories are scanned root-to-cwd, `AGENTS.override.md` wins over `AGENTS.md` per directory, empty files are skipped, invalid UTF-8 is decoded lossily with a warning, and loaded text is capped at 32 KiB total on char boundaries.
+- Project instructions are injected Codex-style as a synthetic user-role context message on each provider request, after persisted history and before the live turn messages. This avoids the OpenAI WebSocket system-role input problem and keeps the context out of transcript events, `initial_messages`, persisted conversation history, and thread-list `last_user_message`.
+- The loaded instruction snapshot is stored in rollout `SessionMeta` as optional `projectInstructions` and restored into `ResumeState`, so resumed root threads keep the original AGENTS context without re-reading files. Spawned subagents start with no inherited project instructions unless a future explicit start path supplies them.
+
 ## Error Handling
 
 - Workspace crates deny `clippy::unwrap_used` and `clippy::expect_used` across all targets, including tests. Use `Result`-returning tests, `?`, explicit `let Some/Ok ... else { panic!(...) }` assertions, or typed error conversion instead of `unwrap`/`expect`.

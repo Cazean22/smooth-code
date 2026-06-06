@@ -5,6 +5,7 @@ mod app_server_client;
 mod app_server_session;
 mod diff_render;
 mod error;
+mod highlight;
 mod history_cell;
 mod markdown;
 mod markdown_render;

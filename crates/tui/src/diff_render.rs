@@ -1,12 +1,16 @@
 use diffy::{Hunk, Patch};
 use ratatui::{
-    style::{Color, Style, Stylize},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
 };
 use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
+use unicode_width::UnicodeWidthChar;
 
+use crate::highlight::{exceeds_highlight_limits, highlight_code_to_styled_spans};
 use crate::wrap;
 
+const ADD_LINE_BG: Color = Color::Indexed(22);
+const DELETE_LINE_BG: Color = Color::Indexed(52);
 const MAX_RENDERED_DIFF_LINES: usize = 1_000;
 
 pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<Line<'static>> {
@@ -52,7 +56,7 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
     ));
 
     let diff_width = usize::from(width.saturating_sub(4).max(1));
-    let rendered_change = render_change(&change.change, diff_width);
+    let rendered_change = render_change(change, diff_width);
     let rendered_len = rendered_change.len();
     for line in rendered_change.into_iter().take(MAX_RENDERED_DIFF_LINES) {
         let mut spans = vec![Span::raw("    ")];
@@ -107,11 +111,18 @@ fn line_counts(change: &FileChange) -> (usize, usize) {
     }
 }
 
-fn render_change(change: &FileChange, width: usize) -> Vec<Line<'static>> {
-    match change {
-        FileChange::Add { content } => render_whole_file(content, DiffLineKind::Insert, width),
-        FileChange::Delete { content } => render_whole_file(content, DiffLineKind::Delete, width),
-        FileChange::Update { unified_diff, .. } => render_unified_diff(unified_diff, width),
+fn render_change(change: &FileChangeOutput, width: usize) -> Vec<Line<'static>> {
+    let lang = detect_lang_for_change(change);
+    match &change.change {
+        FileChange::Add { content } => {
+            render_whole_file(content, DiffLineKind::Insert, width, lang.as_deref())
+        }
+        FileChange::Delete { content } => {
+            render_whole_file(content, DiffLineKind::Delete, width, lang.as_deref())
+        }
+        FileChange::Update { unified_diff, .. } => {
+            render_unified_diff(unified_diff, width, lang.as_deref())
+        }
         FileChange::Omitted { reason, bytes, .. } => wrap::wrap_line_char(
             Line::from(vec![
                 "⋮ ".dim(),
@@ -122,16 +133,44 @@ fn render_change(change: &FileChange, width: usize) -> Vec<Line<'static>> {
     }
 }
 
-fn render_whole_file(content: &str, kind: DiffLineKind, width: usize) -> Vec<Line<'static>> {
+fn detect_lang_for_change(change: &FileChangeOutput) -> Option<String> {
+    let path = match &change.change {
+        FileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } => move_path,
+        _ => &change.path,
+    };
+    path.extension()?.to_str().map(ToOwned::to_owned)
+}
+
+fn render_whole_file(
+    content: &str,
+    kind: DiffLineKind,
+    width: usize,
+    lang: Option<&str>,
+) -> Vec<Line<'static>> {
     let line_number_width = line_number_width(content.lines().count());
+    let syntax_lines = lang.and_then(|lang| highlight_code_to_styled_spans(content, lang));
     content
         .lines()
         .enumerate()
-        .flat_map(|(idx, line)| render_diff_line(idx + 1, kind, line, width, line_number_width))
+        .flat_map(|(idx, line)| {
+            render_diff_line(
+                idx + 1,
+                kind,
+                line,
+                width,
+                line_number_width,
+                syntax_lines
+                    .as_ref()
+                    .and_then(|lines| lines.get(idx).map(Vec::as_slice)),
+            )
+        })
         .collect()
 }
 
-fn render_unified_diff(unified_diff: &str, width: usize) -> Vec<Line<'static>> {
+fn render_unified_diff(unified_diff: &str, width: usize, lang: Option<&str>) -> Vec<Line<'static>> {
     let Ok(patch) = Patch::from_str(unified_diff) else {
         return unified_diff
             .lines()
@@ -147,6 +186,22 @@ fn render_unified_diff(unified_diff: &str, width: usize) -> Vec<Line<'static>> {
         .unwrap_or(1);
     let line_number_width = line_number_width(max_line_number);
     let mut lines = Vec::new();
+    let (total_diff_bytes, total_diff_lines) = patch.hunks().iter().flat_map(Hunk::lines).fold(
+        (0usize, 0usize),
+        |(bytes, lines), line| {
+            let text = match line {
+                diffy::Line::Insert(text)
+                | diffy::Line::Delete(text)
+                | diffy::Line::Context(text) => text,
+            };
+            (bytes + text.len(), lines + 1)
+        },
+    );
+    let diff_lang = if exceeds_highlight_limits(total_diff_bytes, total_diff_lines) {
+        None
+    } else {
+        lang
+    };
 
     for (hunk_idx, hunk) in patch.hunks().iter().enumerate() {
         if hunk_idx > 0 {
@@ -159,9 +214,30 @@ fn render_unified_diff(unified_diff: &str, width: usize) -> Vec<Line<'static>> {
             ]));
         }
 
+        // Highlight each displayed hunk as one synthetic source block, matching
+        // Codex's strategy. This preserves parser state across multiline
+        // strings/comments within the hunk; the diff gutter/background remains
+        // the authoritative add/delete cue when old/new sides affect each other.
+        let hunk_syntax_lines = diff_lang.and_then(|lang| {
+            let hunk_text: String = hunk
+                .lines()
+                .iter()
+                .map(|line| match line {
+                    diffy::Line::Insert(text)
+                    | diffy::Line::Delete(text)
+                    | diffy::Line::Context(text) => *text,
+                })
+                .collect();
+            let syntax_lines = highlight_code_to_styled_spans(&hunk_text, lang)?;
+            (syntax_lines.len() == hunk.lines().len()).then_some(syntax_lines)
+        });
+
         let mut old_line = hunk.old_range().start();
         let mut new_line = hunk.new_range().start();
-        for line in hunk.lines() {
+        for (line_idx, line) in hunk.lines().iter().enumerate() {
+            let syntax_spans = hunk_syntax_lines
+                .as_ref()
+                .and_then(|syntax_lines| syntax_lines.get(line_idx).map(Vec::as_slice));
             match line {
                 diffy::Line::Insert(text) => {
                     lines.extend(render_diff_line(
@@ -170,6 +246,7 @@ fn render_unified_diff(unified_diff: &str, width: usize) -> Vec<Line<'static>> {
                         text.trim_end_matches('\n'),
                         width,
                         line_number_width,
+                        syntax_spans,
                     ));
                     new_line += 1;
                 }
@@ -180,6 +257,7 @@ fn render_unified_diff(unified_diff: &str, width: usize) -> Vec<Line<'static>> {
                         text.trim_end_matches('\n'),
                         width,
                         line_number_width,
+                        syntax_spans,
                     ));
                     old_line += 1;
                 }
@@ -190,6 +268,7 @@ fn render_unified_diff(unified_diff: &str, width: usize) -> Vec<Line<'static>> {
                         text.trim_end_matches('\n'),
                         width,
                         line_number_width,
+                        syntax_spans,
                     ));
                     old_line += 1;
                     new_line += 1;
@@ -213,10 +292,19 @@ fn render_diff_line(
     text: &str,
     width: usize,
     line_number_width: usize,
+    syntax_spans: Option<&[Span<'static>]>,
 ) -> Vec<Line<'static>> {
     let gutter_width = line_number_width + 3;
     let available = width.saturating_sub(gutter_width).max(1);
-    let chunks = wrap::wrap_text(text, available);
+    let (sign, style) = match kind {
+        DiffLineKind::Insert => ('+', Style::default().fg(Color::Green)),
+        DiffLineKind::Delete => ('-', Style::default().fg(Color::Red)),
+        DiffLineKind::Context => (' ', Style::default().dim()),
+    };
+    let content_spans = syntax_spans
+        .map(|spans| syntax_diff_spans(spans, kind))
+        .unwrap_or_else(|| vec![Span::styled(text.to_string(), style)]);
+    let chunks = wrap_styled_spans(&content_spans, available);
     let mut out = Vec::with_capacity(chunks.len());
 
     for (idx, chunk) in chunks.into_iter().enumerate() {
@@ -225,18 +313,71 @@ fn render_diff_line(
         } else {
             format!("{:>line_number_width$} ", "")
         };
-        let (sign, style) = match kind {
-            DiffLineKind::Insert => ('+', Style::default().fg(Color::Green)),
-            DiffLineKind::Delete => ('-', Style::default().fg(Color::Red)),
-            DiffLineKind::Context => (' ', Style::default().dim()),
-        };
-        out.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(line_number_text, Style::default().dim()),
             Span::styled(format!("{sign} "), style),
-            Span::styled(chunk, style),
-        ]));
+        ];
+        spans.extend(chunk);
+        out.push(Line::from(spans).style(diff_line_style(kind)));
     }
     out
+}
+
+fn diff_line_style(kind: DiffLineKind) -> Style {
+    match kind {
+        DiffLineKind::Insert => Style::default().bg(ADD_LINE_BG),
+        DiffLineKind::Delete => Style::default().bg(DELETE_LINE_BG),
+        DiffLineKind::Context => Style::default().dim(),
+    }
+}
+
+fn syntax_diff_spans(spans: &[Span<'static>], kind: DiffLineKind) -> Vec<Span<'static>> {
+    spans
+        .iter()
+        .map(|span| {
+            let style = if matches!(kind, DiffLineKind::Delete | DiffLineKind::Context) {
+                span.style.add_modifier(Modifier::DIM)
+            } else {
+                span.style
+            };
+            Span::styled(span.content.clone().into_owned(), style)
+        })
+        .collect()
+}
+
+fn wrap_styled_spans(spans: &[Span<'static>], max_cols: usize) -> Vec<Vec<Span<'static>>> {
+    let max_cols = max_cols.max(1);
+    let mut rows = Vec::new();
+    let mut current_row: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+
+    for span in spans {
+        let style = span.style;
+        for ch in span.content.chars() {
+            let ch_width = if ch == '\t' {
+                4
+            } else {
+                ch.width().unwrap_or(0)
+            };
+            if current_width > 0 && current_width.saturating_add(ch_width) > max_cols {
+                rows.push(std::mem::take(&mut current_row));
+                current_width = 0;
+            }
+            if let Some(last) = current_row.last_mut()
+                && last.style == style
+            {
+                last.content.to_mut().push(ch);
+            } else {
+                current_row.push(Span::styled(ch.to_string(), style));
+            }
+            current_width = current_width.saturating_add(ch_width);
+        }
+    }
+
+    if !current_row.is_empty() || rows.is_empty() {
+        rows.push(current_row);
+    }
+    rows
 }
 
 fn line_number_width(max_line_number: usize) -> usize {
@@ -251,6 +392,13 @@ mod tests {
         lines
             .into_iter()
             .map(|line| line.spans.into_iter().map(|span| span.content).collect())
+            .collect()
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
             .collect()
     }
 
@@ -275,6 +423,33 @@ mod tests {
     }
 
     #[test]
+    fn syntax_highlights_added_rust_file() {
+        let output = FileChangeOutput {
+            path: "src/new.rs".into(),
+            change: FileChange::Add {
+                content: "fn main() {}\n".to_string(),
+            },
+        };
+
+        let rendered = create_diff_summary(&output, 80);
+        let fn_span = rendered
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "fn");
+        let Some(fn_span) = fn_span else {
+            panic!("expected a highlighted fn span in rendered diff");
+        };
+
+        assert!(fn_span.style.fg.is_some() || !fn_span.style.add_modifier.is_empty());
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line_text(line).contains("1 + fn main() {}")
+                    && line.style.bg == Some(ADD_LINE_BG))
+        );
+    }
+
+    #[test]
     fn renders_update_summary_and_diff_lines() {
         let diff = diffy::create_patch("old\n", "new\n").to_string();
         let output = FileChangeOutput {
@@ -290,6 +465,39 @@ mod tests {
         assert_eq!(rendered[0], "• Edited 1 file (+1 -1)");
         assert!(rendered.iter().any(|line| line.contains("1 - old")));
         assert!(rendered.iter().any(|line| line.contains("1 + new")));
+    }
+
+    #[test]
+    fn syntax_highlights_update_using_move_destination_extension() {
+        let diff = diffy::create_patch("plain\n", "fn main() {}\n").to_string();
+        let output = FileChangeOutput {
+            path: "scripts/generated.txt".into(),
+            change: FileChange::Update {
+                unified_diff: diff,
+                move_path: Some("src/generated.rs".into()),
+            },
+        };
+
+        let rendered = create_diff_summary(&output, 80);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line_text(line).contains("1 + fn main() {}"))
+        );
+        let fn_span = rendered
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "fn");
+        let Some(fn_span) = fn_span else {
+            panic!("expected moved Rust file to use destination extension for highlighting");
+        };
+        assert!(fn_span.style.fg.is_some() || !fn_span.style.add_modifier.is_empty());
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line_text(line).contains("1 + fn main() {}")
+                    && line.style.bg == Some(ADD_LINE_BG))
+        );
     }
 
     #[test]

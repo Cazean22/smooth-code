@@ -6,6 +6,7 @@ pub(crate) fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+#[allow(dead_code)]
 pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     if text.is_empty() {

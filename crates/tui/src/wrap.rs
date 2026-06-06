@@ -1,10 +1,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthChar;
-#[cfg(test)]
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-#[cfg(test)]
 pub(crate) fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
@@ -195,11 +192,222 @@ pub(crate) fn wrap_line_char(line: Line<'static>, width: usize) -> Vec<Line<'sta
     out.into_iter().map(|line| line.style(line_style)).collect()
 }
 
-pub(crate) fn wrap_lines_char(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .flat_map(|line| wrap_line_char(line, width))
+/// Number of usable content columns for a row: the first row gets the full
+/// `width`; continuation rows reserve `indent` columns for the hanging prefix.
+fn row_budget(completed_rows: usize, width: usize, indent: usize) -> usize {
+    if completed_rows == 0 {
+        width
+    } else {
+        width.saturating_sub(indent).max(1)
+    }
+}
+
+/// Build wrapped rows into lines, prefixing every continuation row with `indent`
+/// spaces so wrapped content hangs under the first row's content.
+fn build_hanging_lines(
+    rows: Vec<Vec<(char, Style)>>,
+    line_style: Style,
+    indent: usize,
+) -> Vec<Line<'static>> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if idx > 0 && indent > 0 {
+                spans.push(Span::raw(" ".repeat(indent)));
+            }
+            for (ch, style) in row {
+                if let Some(last) = spans.last_mut()
+                    && last.style == style
+                {
+                    last.content.to_mut().push(ch);
+                } else {
+                    spans.push(Span::styled(ch.to_string(), style));
+                }
+            }
+            Line::from(spans).style(line_style)
+        })
         .collect()
+}
+
+/// Character/column-faithful wrapping with a hanging indent. Like
+/// `wrap_line_char`, but continuation rows are prefixed with `indent` spaces so
+/// wrapped content (e.g. a long tool-args preview or diff summary) aligns under
+/// the first row's content instead of falling back to column 0.
+pub(crate) fn wrap_line_char_hanging(
+    line: Line<'static>,
+    width: usize,
+    indent: usize,
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let indent = indent.min(width.saturating_sub(1));
+    let line_style = line.style;
+
+    let mut rows: Vec<Vec<(char, Style)>> = vec![Vec::new()];
+    let mut current_width: usize = 0;
+    for span in line.spans {
+        let style = span.style;
+        for ch in span.content.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let budget = row_budget(rows.len() - 1, width, indent);
+            if current_width > 0 && current_width.saturating_add(ch_width) > budget {
+                rows.push(Vec::new());
+                current_width = 0;
+            }
+            if let Some(row) = rows.last_mut() {
+                row.push((ch, style));
+            }
+            current_width = current_width.saturating_add(ch_width);
+        }
+    }
+
+    build_hanging_lines(rows, line_style, indent)
+}
+
+/// Word-aware wrapping with a hanging indent: like `wrap_line`, but continuation
+/// rows are prefixed with `indent` spaces so wrapped prose (e.g. an option
+/// description or an info/error message) aligns under the first row's content.
+pub(crate) fn wrap_line_hanging(
+    line: Line<'static>,
+    width: usize,
+    indent: usize,
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let indent = indent.min(width.saturating_sub(1));
+    let line_style = line.style;
+
+    let chars: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| {
+            let style = span.style;
+            span.content.chars().map(move |ch| (ch, style))
+        })
+        .collect();
+    if chars.is_empty() {
+        return vec![Line::default().style(line_style)];
+    }
+
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut current: Vec<(char, Style)> = Vec::new();
+    let mut current_width = 0usize;
+    let mut word: Vec<(char, Style)> = Vec::new();
+    let mut word_width = 0usize;
+
+    for (ch, style) in chars {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if ch == ' ' {
+            place_word_hanging(
+                &mut rows,
+                &mut current,
+                &mut current_width,
+                &mut word,
+                &mut word_width,
+                width,
+                indent,
+            );
+            // Drop a leading space on a continuation row so wrapped content stays
+            // flush against the hanging indent; keep genuine indent on row one.
+            let dropping_leading = current_width == 0 && !rows.is_empty();
+            let budget = row_budget(rows.len(), width, indent);
+            if current_width.saturating_add(ch_width) > budget {
+                rows.push(std::mem::take(&mut current));
+                current_width = 0;
+            } else if !dropping_leading {
+                current.push((ch, style));
+                current_width += ch_width;
+            }
+        } else {
+            word.push((ch, style));
+            word_width += ch_width;
+        }
+    }
+    place_word_hanging(
+        &mut rows,
+        &mut current,
+        &mut current_width,
+        &mut word,
+        &mut word_width,
+        width,
+        indent,
+    );
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+
+    build_hanging_lines(rows, line_style, indent)
+}
+
+/// Place the accumulated `word` onto the current row, accounting for the hanging
+/// indent budget of continuation rows. A word wider than a continuation row is
+/// hard-broken so it still renders.
+fn place_word_hanging(
+    rows: &mut Vec<Vec<(char, Style)>>,
+    current: &mut Vec<(char, Style)>,
+    current_width: &mut usize,
+    word: &mut Vec<(char, Style)>,
+    word_width: &mut usize,
+    width: usize,
+    indent: usize,
+) {
+    if word.is_empty() {
+        return;
+    }
+    let word = std::mem::take(word);
+    let ww = std::mem::replace(word_width, 0);
+
+    let cur_budget = row_budget(rows.len(), width, indent);
+    let next_budget = row_budget(rows.len() + 1, width, indent);
+    // Move a whole word to a fresh row only when it actually fits there. A word
+    // too wide even for the next row is hard-broken starting in the current
+    // row's remaining space, so a prefix never lands alone on its own row.
+    if *current_width > 0 && *current_width + ww > cur_budget && ww <= next_budget {
+        rows.push(std::mem::take(current));
+        *current_width = 0;
+    }
+
+    let budget = row_budget(rows.len(), width, indent);
+    if *current_width + ww <= budget {
+        current.extend(word);
+        *current_width += ww;
+        return;
+    }
+
+    for (ch, style) in word {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let budget = row_budget(rows.len(), width, indent);
+        if *current_width > 0 && *current_width + ch_width > budget {
+            rows.push(std::mem::take(current));
+            *current_width = 0;
+        }
+        current.push((ch, style));
+        *current_width += ch_width;
+    }
+}
+
+/// Truncate `text` to at most `max_width` display columns, replacing the cut
+/// tail with a single-column ellipsis. Width-aware, so wide characters are never
+/// split across the boundary.
+pub(crate) fn truncate_display(text: &str, max_width: usize) -> String {
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let budget = max_width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -304,5 +512,96 @@ mod tests {
             .map(line_text)
             .collect();
         assert_ne!(texts, word);
+    }
+
+    #[test]
+    fn wrap_line_char_hanging_indents_continuation_rows() {
+        let wrapped = wrap_line_char_hanging(Line::from("abcdefghij"), 5, 2);
+        let texts: Vec<String> = wrapped.iter().map(line_text).collect();
+
+        assert_eq!(
+            texts,
+            vec!["abcde".to_string(), "  fgh".to_string(), "  ij".to_string()]
+        );
+        for line in &wrapped {
+            assert!(display_width(&line_text(line)) <= 5);
+        }
+    }
+
+    #[test]
+    fn wrap_line_hanging_aligns_continuations_under_content() {
+        // indent 2 mimics a "X " glyph prefix; continuations align under the text.
+        let wrapped = wrap_line_hanging(Line::from("X aaa bbb ccc ddd"), 7, 2);
+        let texts: Vec<String> = wrapped.iter().map(line_text).collect();
+
+        assert!(texts.len() > 1);
+        assert!(texts[0].starts_with("X "));
+        for cont in &texts[1..] {
+            assert!(
+                cont.starts_with("  "),
+                "continuation not indented: {cont:?}"
+            );
+        }
+        for line in &wrapped {
+            assert!(display_width(&line_text(line)) <= 7);
+        }
+    }
+
+    #[test]
+    fn wrap_line_hanging_preserves_styles_and_wide_chars() {
+        let line = Line::from(vec![
+            Span::styled("你好 ", Style::default().fg(Color::Green)),
+            Span::styled("world", Style::default().fg(Color::Red)),
+        ]);
+        let wrapped = wrap_line_hanging(line, 5, 2);
+
+        for line in &wrapped {
+            assert!(display_width(&line_text(line)) <= 5);
+        }
+        assert!(
+            wrapped
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.style.fg == Some(Color::Red)))
+        );
+    }
+
+    #[test]
+    fn wrap_line_hanging_with_zero_indent_is_flush_left() {
+        let wrapped = wrap_line_hanging(Line::from("alpha beta gamma"), 6, 0);
+        let texts: Vec<String> = wrapped.iter().map(line_text).collect();
+        for cont in &texts[1..] {
+            assert!(!cont.starts_with(' '), "unexpected indent: {cont:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_line_hanging_fills_first_row_before_breaking_long_token() {
+        // A long unbreakable token after a prefix must start filling the first
+        // row, not strand the prefix ("Thread ") alone with the value on row two.
+        let wrapped = wrap_line_hanging(Line::from("Thread 01234567890123456789"), 20, 7);
+        let texts: Vec<String> = wrapped.iter().map(line_text).collect();
+
+        assert!(texts.len() > 1, "expected wrapping: {texts:?}");
+        assert!(
+            texts[0].contains('0'),
+            "long token did not start on the first row: {texts:?}"
+        );
+        for line in &wrapped {
+            assert!(display_width(&line_text(line)) <= 20);
+        }
+    }
+
+    #[test]
+    fn truncate_display_adds_ellipsis_and_respects_width() {
+        assert_eq!(truncate_display("hello", 10), "hello");
+        assert_eq!(truncate_display("hello world", 5), "hell…");
+        assert_eq!(display_width(&truncate_display("hello world", 5)), 5);
+
+        // Wide characters are not split across the boundary.
+        let wide = truncate_display("你好世界", 5);
+        assert!(display_width(&wide) <= 5);
+        assert!(wide.ends_with('…'));
+
+        assert_eq!(truncate_display("anything", 0), "");
     }
 }

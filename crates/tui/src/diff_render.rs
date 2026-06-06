@@ -19,7 +19,7 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
     };
 
     let wrap_width = usize::from(width.max(1));
-    let mut lines = wrap::wrap_line_char(
+    let mut lines = wrap::wrap_line_char_hanging(
         Line::from(vec![
             "• ".dim(),
             Span::raw(format!("{verb} 1 file ")),
@@ -30,8 +30,9 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
             ")".into(),
         ]),
         wrap_width,
+        2,
     );
-    lines.extend(wrap::wrap_line_char(
+    lines.extend(wrap::wrap_line_char_hanging(
         Line::from(vec![
             "  ".into(),
             Span::raw(change.path.display().to_string()),
@@ -43,6 +44,7 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
             ")".into(),
         ]),
         wrap_width,
+        2,
     ));
 
     let diff_width = usize::from(width.saturating_sub(4).max(1));
@@ -318,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn wraps_long_summary_paths_to_requested_width() {
+    fn wraps_long_summary_paths_with_hanging_indent() {
         let output = FileChangeOutput {
             path: format!("src/{}{}", "very_long_path_segment_".repeat(4), "file.rs").into(),
             change: FileChange::Add {
@@ -328,8 +330,49 @@ mod tests {
 
         let rendered = line_texts(create_diff_summary(&output, 24));
 
-        assert!(rendered.len() > 3);
-        assert!(rendered.iter().all(|line| line.len() <= 24), "{rendered:?}");
+        assert!(
+            rendered
+                .iter()
+                .all(|line| crate::wrap::display_width(line) <= 24),
+            "{rendered:?}"
+        );
+        assert_eq!(rendered[0], "• Added 1 file (+1 -0)");
+
+        // Path rows follow the summary until the four-column diff body begins;
+        // every path row keeps the two-column hanging indent.
+        let mut path_rows = Vec::new();
+        for line in &rendered[1..] {
+            if line.starts_with("    ") {
+                break;
+            }
+            path_rows.push(line.clone());
+        }
+        assert!(path_rows.len() > 1, "path did not wrap: {path_rows:?}");
+        for row in &path_rows {
+            assert!(row.starts_with("  "), "path row not hung: {row:?}");
+        }
+    }
+
+    #[test]
+    fn wraps_long_summary_line_with_hanging_indent() {
+        let output = FileChangeOutput {
+            path: "f.rs".into(),
+            change: FileChange::Add {
+                content: "line\n".to_string(),
+            },
+        };
+
+        let rendered = line_texts(create_diff_summary(&output, 12));
+
+        assert!(rendered[0].starts_with("• "));
+        // The summary wraps at this width; its continuation hangs under "Added…".
+        assert!(rendered[1].starts_with("  "), "{rendered:?}");
+        assert!(
+            rendered
+                .iter()
+                .all(|line| crate::wrap::display_width(line) <= 12),
+            "{rendered:?}"
+        );
     }
 
     #[test]

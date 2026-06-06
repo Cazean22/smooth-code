@@ -54,31 +54,36 @@ impl TranscriptItem {
         }
     }
 
-    pub(crate) fn plain(id: TranscriptItemId, lines: Vec<Line<'static>>) -> Self {
+    /// Plain transcript rows whose continuation lines hang-indent by
+    /// `hang_indent` columns, so a glyph-prefixed message keeps its alignment
+    /// when it wraps.
+    fn plain_hanging(id: TranscriptItemId, lines: Vec<Line<'static>>, hang_indent: usize) -> Self {
         Self {
             id,
             version: 0,
-            kind: TranscriptItemKind::Plain { lines },
+            kind: TranscriptItemKind::Plain { lines, hang_indent },
         }
     }
 
     pub(crate) fn info(id: TranscriptItemId, message: impl Into<String>) -> Self {
-        Self::plain(
+        Self::plain_hanging(
             id,
             vec![Line::from(vec![
                 Span::styled("i ", Style::default().fg(Color::Yellow).bold()),
                 Span::styled(message.into(), Style::default().dim()),
             ])],
+            2,
         )
     }
 
     pub(crate) fn error(id: TranscriptItemId, message: impl Into<String>) -> Self {
-        Self::plain(
+        Self::plain_hanging(
             id,
             vec![Line::from(vec![
                 Span::styled("! ", Style::default().fg(Color::Red).bold()),
                 Span::styled(message.into(), Style::default().fg(Color::Red)),
             ])],
+            2,
         )
     }
 
@@ -140,10 +145,17 @@ impl TranscriptItem {
                     width,
                 )
             }
-            TranscriptItemKind::Plain { lines } => wrap_display(lines.clone(), width),
+            TranscriptItemKind::Plain { lines, hang_indent } => {
+                let wrap_width = usize::from(width.max(1));
+                lines
+                    .iter()
+                    .cloned()
+                    .flat_map(|line| wrap::wrap_line_hanging(line, wrap_width, *hang_indent))
+                    .collect()
+            }
             TranscriptItemKind::Patch { file_change } => create_diff_summary(file_change, width),
             TranscriptItemKind::ToolCallGroup(cell) => {
-                wrap::wrap_lines_char(cell.display_lines(), usize::from(width.max(1)))
+                cell.display_lines(usize::from(width.max(1)))
             }
         }
     }
@@ -180,6 +192,7 @@ enum TranscriptItemKind {
     },
     Plain {
         lines: Vec<Line<'static>>,
+        hang_indent: usize,
     },
     Patch {
         file_change: FileChangeOutput,
@@ -249,7 +262,7 @@ impl ToolCallGroupCell {
         }
     }
 
-    pub(crate) fn display_lines(&self) -> Vec<Line<'static>> {
+    pub(crate) fn display_lines(&self, width: usize) -> Vec<Line<'static>> {
         let header_state = if self
             .entries
             .iter()
@@ -266,64 +279,70 @@ impl ToolCallGroupCell {
             ToolCallState::Success
         };
 
+        let mut lines = Vec::new();
         if self.entries.len() == 1 {
             let entry = &self.entries[0];
-            let mut lines = vec![tool_call_line(
-                "",
-                entry.state,
-                Some(self.tool_name()),
-                &entry.args_preview,
-            )];
+            let (line, indent) =
+                tool_call_line("", entry.state, Some(self.tool_name()), &entry.args_preview);
+            lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
             if matches!(entry.state, ToolCallState::Failure)
                 && let Some(error) = entry.error.as_deref()
             {
-                lines.push(tool_error_line("      ", error));
+                let (line, indent) = tool_error_line("      ", error);
+                lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
             }
             return lines;
         }
 
-        let mut lines = vec![tool_call_line("", header_state, Some(self.tool_name()), "")];
+        let (header, indent) = tool_call_line("", header_state, Some(self.tool_name()), "");
+        lines.extend(wrap::wrap_line_char_hanging(header, width, indent));
         for entry in &self.entries {
-            lines.push(tool_call_line(
-                "      ",
-                entry.state,
-                None,
-                &entry.args_preview,
-            ));
+            let (line, indent) = tool_call_line("      ", entry.state, None, &entry.args_preview);
+            lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
             if matches!(entry.state, ToolCallState::Failure)
                 && let Some(error) = entry.error.as_deref()
             {
-                lines.push(tool_error_line("        ", error));
+                let (line, indent) = tool_error_line("        ", error);
+                lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
             }
         }
         lines
     }
 }
 
+/// Build a tool-call row and report the column at which its args content starts,
+/// so wrapped continuation rows can hang-indent under the args rather than the
+/// glyph or tool name.
 fn tool_call_line(
     indent: &'static str,
     state: ToolCallState,
     label: Option<&str>,
     args_preview: &str,
-) -> Line<'static> {
+) -> (Line<'static>, usize) {
     let mut spans = Vec::new();
+    let mut content_col = 0usize;
     if !indent.is_empty() {
         spans.push(Span::raw(indent));
+        content_col += wrap::display_width(indent);
     }
-    spans.push(tool_call_glyph(state));
+    let glyph = tool_call_glyph(state);
+    content_col += wrap::display_width(glyph.content.as_ref());
+    spans.push(glyph);
     if let Some(label) = label {
+        content_col += wrap::display_width(label);
         spans.push(Span::raw(label.to_owned()));
     }
     if !args_preview.is_empty() {
         if label.is_some() {
             spans.push(Span::raw(" "));
+            content_col += 1;
         }
         spans.push(Span::styled(
             args_preview.to_owned(),
             Style::default().dim(),
         ));
     }
-    Line::from(spans)
+    (Line::from(spans), content_col)
 }
 
 fn tool_call_glyph(state: ToolCallState) -> Span<'static> {
@@ -335,12 +354,16 @@ fn tool_call_glyph(state: ToolCallState) -> Span<'static> {
     Span::styled(glyph, glyph_style)
 }
 
-fn tool_error_line(indent: &'static str, error: &str) -> Line<'static> {
-    Line::from(vec![
+/// Build a tool failure row and report the column after the `! ` marker so
+/// wrapped continuation rows hang-indent under the error text.
+fn tool_error_line(indent: &'static str, error: &str) -> (Line<'static>, usize) {
+    let content_col = wrap::display_width(indent) + 2;
+    let line = Line::from(vec![
         Span::raw(indent),
         Span::styled("! ", Style::default().fg(Color::Red).bold()),
         Span::styled(error.to_owned(), Style::default().fg(Color::Red).dim()),
-    ])
+    ]);
+    (line, content_col)
 }
 
 pub(crate) fn prefix_lines(
@@ -466,5 +489,119 @@ mod tests {
     #[test]
     fn blank_line_is_not_preformatted() {
         assert!(!is_preformatted_line(&Line::default()));
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn within_width(lines: &[Line<'static>], width: usize) {
+        for line in lines {
+            assert!(
+                crate::wrap::display_width(&line_text(line)) <= width,
+                "line exceeds width {width}: {:?}",
+                line_text(line)
+            );
+        }
+    }
+
+    #[test]
+    fn single_tool_args_hang_indent_under_args() {
+        let cell = ToolCallGroupCell::new(
+            "run_command".to_string(),
+            "echo hello world this is a long command line".to_string(),
+        );
+        let lines = cell.display_lines(20);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(texts.len() > 1, "expected wrapping: {texts:?}");
+        // glyph (2) + "run_command" (11) + space (1) = 14.
+        let indent = " ".repeat(14);
+        for cont in &texts[1..] {
+            assert!(cont.starts_with(&indent), "continuation not hung: {cont:?}");
+        }
+        within_width(&lines, 20);
+    }
+
+    #[test]
+    fn grouped_tool_entries_hang_indent_under_nested_args() {
+        let mut cell = ToolCallGroupCell::new(
+            "run".to_string(),
+            "first command that is quite long indeed yes".to_string(),
+        );
+        cell.push_entry("second command also long enough to wrap nicely".to_string());
+        let lines = cell.display_lines(24);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        // entry indent "      " (6) + glyph (2) = 8.
+        let indent = " ".repeat(8);
+        assert!(
+            texts.iter().skip(1).any(|t| t.starts_with(&indent)),
+            "no nested continuation found: {texts:?}"
+        );
+        within_width(&lines, 24);
+    }
+
+    #[test]
+    fn failed_tool_error_hangs_indent_under_message() {
+        let mut cell = ToolCallGroupCell::new("run".to_string(), "do thing".to_string());
+        cell.set_entry_outcome(
+            0,
+            ToolCallState::Failure,
+            Some("a long failure explanation that needs to wrap across rows".to_string()),
+        );
+        let lines = cell.display_lines(20);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        // error indent "      " (6) + "! " (2) = 8.
+        let indent = " ".repeat(8);
+        assert!(
+            texts.iter().any(|t| t.starts_with(&indent)),
+            "error not hung: {texts:?}"
+        );
+        within_width(&lines, 20);
+    }
+
+    #[test]
+    fn info_row_hangs_indent_under_message() {
+        let item = TranscriptItem::info(
+            1,
+            "this is a fairly long informational message that should wrap",
+        );
+        let lines = item.display_lines(20);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(texts.len() > 1, "expected wrapping: {texts:?}");
+        assert!(texts[0].starts_with("i "));
+        for cont in &texts[1..] {
+            assert!(
+                cont.starts_with("  "),
+                "info continuation not hung: {cont:?}"
+            );
+        }
+        within_width(&lines, 20);
+    }
+
+    #[test]
+    fn error_row_hangs_indent_under_message() {
+        let item = TranscriptItem::error(
+            1,
+            "this is a fairly long error message that should certainly wrap",
+        );
+        let lines = item.display_lines(20);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(texts.len() > 1, "expected wrapping: {texts:?}");
+        assert!(texts[0].starts_with("! "));
+        for cont in &texts[1..] {
+            assert!(
+                cont.starts_with("  "),
+                "error continuation not hung: {cont:?}"
+            );
+        }
+        within_width(&lines, 20);
     }
 }

@@ -25,6 +25,7 @@ use crate::{
     history_cell::{ToolCallGroupCell, ToolCallState, TranscriptItem, TranscriptItemId},
     question_picker::{PickerOutcome, QuestionPicker},
     streaming::StreamController,
+    wrap,
 };
 
 #[derive(Debug)]
@@ -2090,10 +2091,14 @@ impl UiModel {
                 Style::default().dim(),
             )));
         } else if let Some(error) = &self.dashboard.error {
-            lines.push(Line::from(vec![
-                Span::styled("! ", Style::default().fg(Color::Red).bold()),
-                Span::styled(error.clone(), Style::default().fg(Color::Red)),
-            ]));
+            lines.extend(wrap::wrap_line_hanging(
+                Line::from(vec![
+                    Span::styled("! ", Style::default().fg(Color::Red).bold()),
+                    Span::styled(error.clone(), Style::default().fg(Color::Red)),
+                ]),
+                usize::from(area.width.max(1)),
+                2,
+            ));
         } else if self.dashboard.items.is_empty() {
             lines.push(Line::from("No saved sessions."));
         } else {
@@ -2119,11 +2124,19 @@ impl UiModel {
                     .as_deref()
                     .or(item.last_assistant_message.as_deref())
                     .unwrap_or("(no messages)");
+                // Keep each session two rows tall: truncate the preview to the
+                // space left after the selection prefix, date, and gap so it
+                // never wraps and breaks the dashboard scroll math.
+                let used = wrap::display_width(prefix) + wrap::display_width(&item.updated_at) + 2;
+                let preview = wrap::truncate_display(
+                    preview,
+                    usize::from(area.width.max(1)).saturating_sub(used),
+                );
                 lines.push(Line::from(vec![
                     Span::styled(prefix, style),
                     Span::styled(item.updated_at.clone(), Style::default().fg(Color::Yellow)),
                     Span::raw("  "),
-                    Span::styled(preview.to_string(), style),
+                    Span::styled(preview, style),
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("    "),
@@ -2137,7 +2150,7 @@ impl UiModel {
             Style::default().fg(Color::DarkGray),
         )));
 
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_workspace(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -2230,42 +2243,56 @@ impl UiModel {
     }
 
     fn render_inspector(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let wrap_width = usize::from(area.width.max(1));
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
             "Inspector",
             Style::default().fg(Color::Cyan).bold(),
         )));
         lines.push(Line::default());
-        lines.push(Line::from(vec![
-            Span::styled("Turn ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(
-                self.current_turn_id
-                    .as_deref()
-                    .unwrap_or(if self.is_turn_running {
-                        "running"
+        lines.extend(wrap::wrap_line_hanging(
+            Line::from(vec![
+                Span::styled("Turn ", Style::default().fg(Color::Yellow).bold()),
+                Span::raw(
+                    self.current_turn_id
+                        .as_deref()
+                        .unwrap_or(if self.is_turn_running {
+                            "running"
+                        } else {
+                            "idle"
+                        })
+                        .to_string(),
+                ),
+            ]),
+            wrap_width,
+            wrap::display_width("Turn "),
+        ));
+        lines.extend(wrap::wrap_line_hanging(
+            Line::from(vec![
+                Span::styled("Mode ", Style::default().fg(Color::Yellow).bold()),
+                Span::raw(format!("{:?}", self.mode)),
+                Span::raw("  "),
+                Span::styled(
+                    if self.plan_mode { "PLAN" } else { "FULL" },
+                    if self.plan_mode {
+                        Style::default().fg(Color::Magenta).bold()
                     } else {
-                        "idle"
-                    }),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Mode ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(format!("{:?}", self.mode)),
-            Span::raw("  "),
-            Span::styled(
-                if self.plan_mode { "PLAN" } else { "FULL" },
-                if self.plan_mode {
-                    Style::default().fg(Color::Magenta).bold()
-                } else {
-                    Style::default().dim()
-                },
-            ),
-        ]));
+                        Style::default().dim()
+                    },
+                ),
+            ]),
+            wrap_width,
+            wrap::display_width("Mode "),
+        ));
         if let Some(thread_id) = self.current_thread_id {
-            lines.push(Line::from(vec![
-                Span::styled("Thread ", Style::default().fg(Color::Yellow).bold()),
-                Span::styled(thread_id.to_string(), Style::default().fg(Color::DarkGray)),
-            ]));
+            lines.extend(wrap::wrap_line_hanging(
+                Line::from(vec![
+                    Span::styled("Thread ", Style::default().fg(Color::Yellow).bold()),
+                    Span::styled(thread_id.to_string(), Style::default().fg(Color::DarkGray)),
+                ]),
+                wrap_width,
+                wrap::display_width("Thread "),
+            ));
         }
 
         lines.push(Line::default());
@@ -2277,12 +2304,18 @@ impl UiModel {
             lines.push(Line::from(Span::styled("none", Style::default().dim())));
         } else {
             for tool in self.running_tools.values() {
-                lines.push(Line::from(vec![
-                    Span::styled("⠋ ", Style::default().fg(Color::Yellow).bold()),
-                    Span::raw(tool.tool_name.clone()),
-                    Span::raw(" "),
-                    Span::styled(tool.args_preview.clone(), Style::default().dim()),
-                ]));
+                // Align continuation rows under the args text (glyph + name + space).
+                let indent = 2 + wrap::display_width(&tool.tool_name) + 1;
+                lines.extend(wrap::wrap_line_hanging(
+                    Line::from(vec![
+                        Span::styled("⠋ ", Style::default().fg(Color::Yellow).bold()),
+                        Span::raw(tool.tool_name.clone()),
+                        Span::raw(" "),
+                        Span::styled(tool.args_preview.clone(), Style::default().dim()),
+                    ]),
+                    wrap_width,
+                    indent,
+                ));
             }
         }
 
@@ -2295,14 +2328,18 @@ impl UiModel {
             lines.push(Line::from(Span::styled("none", Style::default().dim())));
         } else {
             for change in self.recent_file_changes.iter().rev().take(4) {
-                lines.push(Line::from(vec![
-                    Span::raw("• "),
-                    Span::raw(change.path.display().to_string()),
-                ]));
+                lines.extend(wrap::wrap_line_hanging(
+                    Line::from(vec![
+                        Span::raw("• "),
+                        Span::raw(change.path.display().to_string()),
+                    ]),
+                    wrap_width,
+                    2,
+                ));
             }
         }
 
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -2738,6 +2775,19 @@ mod tests {
             .content()
             .iter()
             .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn buffer_rows(terminal: &Terminal<TestBackend>, width: usize) -> Vec<String> {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .chunks(width)
+            .map(|row| row.concat())
             .collect()
     }
 
@@ -4128,6 +4178,73 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("message-4"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_truncates_long_previews_and_keeps_footer_visible()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = UiModel::new();
+        let items: Vec<ThreadListItem> = (0..3)
+            .map(|idx| {
+                let mut item = dashboard_thread(idx);
+                item.last_user_message = Some(format!("preview-{idx} ").repeat(40));
+                item
+            })
+            .collect();
+        model.dashboard.items = items;
+
+        // header (2) + 3 sessions * 2 + footer (2) == 10 rows: only fits if the
+        // long previews are truncated to one row each rather than wrapped.
+        let width = 50usize;
+        let mut terminal = Terminal::new(TestBackend::new(width as u16, 10))?;
+        terminal.draw(|frame| model.render(frame))?;
+        let rows = buffer_rows(&terminal, width);
+
+        assert!(
+            rows.iter().any(|r| r.contains("n new")),
+            "footer clipped by wrapped previews: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains('…')),
+            "preview was not truncated: {rows:?}"
+        );
+        let id_rows = rows.iter().filter(|r| r.contains("thread-")).count();
+        assert_eq!(id_rows, 3, "each session should stay two rows: {rows:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn inspector_wraps_long_running_tool_args_with_hanging_indent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = workspace_normal_model();
+        model.inspector_visible = true;
+        model.focus = FocusTarget::Inspector;
+        model.running_tools.insert(
+            "call-1".to_string(),
+            RunningToolInfo {
+                tool_name: "run_command".to_string(),
+                args_preview: "echo this is a really long command preview that must wrap"
+                    .to_string(),
+            },
+        );
+
+        let width = 40usize;
+        let mut terminal = Terminal::new(TestBackend::new(width as u16, 20))?;
+        terminal.draw(|frame| model.render(frame))?;
+        let rows = buffer_rows(&terminal, width);
+
+        assert!(
+            rows.iter().any(|r| r.contains("run_command")),
+            "tool name missing: {rows:?}"
+        );
+        // glyph (2) + "run_command" (11) + space (1) = 14-column hanging indent.
+        let indent = " ".repeat(14);
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with(&indent) && !r.trim().is_empty()),
+            "args did not hang-indent on continuation: {rows:?}"
+        );
         Ok(())
     }
 

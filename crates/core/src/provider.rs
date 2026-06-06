@@ -1174,10 +1174,10 @@ fn openai_websocket_stream_error(error: CompletionError) -> CompletionError {
 }
 
 fn is_openai_websocket_connection_reset(error: &CompletionError) -> bool {
-    let message = error.to_string();
-    message.contains("Connection reset without closing handshake")
-        || message.contains("connection reset without closing handshake")
-        || message.contains("OpenAI WebSocket connection reset before response.completed")
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("connection reset without closing handshake")
+        || message.contains("connection reset by peer")
+        || message.contains("openai websocket connection reset before response.completed")
 }
 
 /// Structured proxy error codes/types (`error.code` / `error.type` / top-level `code`) that
@@ -2560,22 +2560,26 @@ mod tests {
 
     #[test]
     fn openai_websocket_reset_error_is_rewritten() {
-        let error = CompletionError::ProviderError(
-            "WebSocket protocol error: Connection reset without closing handshake".to_string(),
-        );
+        for message in [
+            "WebSocket protocol error: Connection reset without closing handshake",
+            "IO error: Connection reset by peer (os error 54)",
+        ] {
+            let error = CompletionError::ProviderError(message.to_string());
 
-        assert!(super::is_openai_websocket_connection_reset(&error));
-        assert!(super::is_openai_websocket_transient_start_error(&error));
-        assert_eq!(
-            super::openai_websocket_stream_error(error).to_string(),
-            "ProviderError: OpenAI WebSocket connection reset before response.completed"
-        );
+            assert!(super::is_openai_websocket_connection_reset(&error));
+            assert!(super::is_openai_websocket_transient_start_error(&error));
+            assert_eq!(
+                super::openai_websocket_stream_error(error).to_string(),
+                "ProviderError: OpenAI WebSocket connection reset before response.completed"
+            );
+        }
     }
 
     #[test]
     fn openai_websocket_transient_start_errors_are_retryable() {
         let retryable = [
             "websocket_connection_limit_reached",
+            "IO error: Connection reset by peer (os error 54)",
             "OpenAI WebSocket connection reset before response.completed",
             "The OpenAI WebSocket connection closed before the turn finished",
             "The OpenAI WebSocket connection closed without a close reason",

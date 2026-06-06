@@ -11,12 +11,16 @@ const MAX_RENDERED_DIFF_LINES: usize = 1_000;
 
 pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<Line<'static>> {
     let (added, removed) = line_counts(&change.change);
-    let verb = match change.change {
+    let verb = match &change.change {
         FileChange::Add { .. } => "Added",
         FileChange::Delete { .. } => "Deleted",
+        FileChange::Update {
+            move_path: Some(_), ..
+        } => "Moved",
         FileChange::Update { .. } => "Edited",
         FileChange::Omitted { operation, .. } => operation_verb(&operation),
     };
+    let path_label = file_change_path_label(change);
 
     let wrap_width = usize::from(width.max(1));
     let mut lines = wrap::wrap_line_char_hanging(
@@ -35,7 +39,7 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
     lines.extend(wrap::wrap_line_char_hanging(
         Line::from(vec![
             "  ".into(),
-            Span::raw(change.path.display().to_string()),
+            Span::raw(path_label),
             " ".into(),
             "(".into(),
             format!("+{added}").green(),
@@ -62,6 +66,16 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
         ]));
     }
     lines
+}
+
+pub(crate) fn file_change_path_label(change: &FileChangeOutput) -> String {
+    match &change.change {
+        FileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } => format!("{} -> {}", change.path.display(), move_path.display()),
+        _ => change.path.display().to_string(),
+    }
 }
 
 fn operation_verb(operation: &FileChangeOperation) -> &'static str {
@@ -276,6 +290,22 @@ mod tests {
         assert_eq!(rendered[0], "• Edited 1 file (+1 -1)");
         assert!(rendered.iter().any(|line| line.contains("1 - old")));
         assert!(rendered.iter().any(|line| line.contains("1 + new")));
+    }
+
+    #[test]
+    fn renders_move_summary_and_destination() {
+        let output = FileChangeOutput {
+            path: "src/old.rs".into(),
+            change: FileChange::Update {
+                unified_diff: String::new(),
+                move_path: Some("src/new.rs".into()),
+            },
+        };
+
+        let rendered = line_texts(create_diff_summary(&output, 80));
+
+        assert_eq!(rendered[0], "• Moved 1 file (+0 -0)");
+        assert_eq!(rendered[1], "  src/old.rs -> src/new.rs (+0 -0)");
     }
 
     #[test]

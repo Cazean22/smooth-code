@@ -21,6 +21,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     AppTerminal,
     app_server_session::AppServerSession,
+    diff_render::file_change_path_label,
     error::TuiResult,
     history_cell::{ToolCallGroupCell, ToolCallState, TranscriptItem, TranscriptItemId},
     question_picker::{PickerOutcome, QuestionPicker},
@@ -2352,7 +2353,7 @@ impl UiModel {
                 lines.extend(wrap::wrap_line_hanging(
                     Line::from(vec![
                         Span::raw("• "),
-                        Span::raw(change.path.display().to_string()),
+                        Span::raw(file_change_path_label(change)),
                     ]),
                     wrap_width,
                     2,
@@ -3191,6 +3192,50 @@ mod tests {
         assert!(rendered.contains("1 - old"), "{rendered}");
         assert!(rendered.contains("1 + new"), "{rendered}");
         assert!(!rendered.contains("Selected Diff"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn move_file_change_renders_destination() -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "edit", "src/old.rs");
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("applied edits (1 file changed)")),
+                    error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
+                    file_change: Some(smooth_protocol::FileChangeOutput {
+                        path: "src/old.rs".into(),
+                        change: smooth_protocol::FileChange::Update {
+                            unified_diff: String::new(),
+                            move_path: Some("src/new.rs".into()),
+                        },
+                    }),
+                    file_changes: Vec::new(),
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("• Moved 1 file (+0 -0)"));
+        assert!(joined.contains("src/old.rs -> src/new.rs (+0 -0)"));
+
+        app.model.screen = Screen::Workspace;
+        app.model.focus = FocusTarget::Transcript;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24))?;
+        terminal.draw(|frame| app.render(frame))?;
+        let rendered = rendered_buffer_text(&terminal);
+        assert!(rendered.contains("src/old.rs -> src/new.rs"), "{rendered}");
         Ok(())
     }
 

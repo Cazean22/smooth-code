@@ -142,6 +142,17 @@ impl EditHunk {
         let lines = self
             .lines
             .into_iter()
+            .enumerate()
+            .map(|(line_index, line)| {
+                if line.text.contains('\n') || line.text.contains('\r') {
+                    return Err(ToolError::invalid_arguments(format!(
+                        "updates[{update_index}].hunks[{hunk_index}].lines[{line_index}].text must not contain newline characters"
+                    )));
+                }
+                Ok(line)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .map(|line| match line.kind {
                 HunkLineKind::Context => HunkLine::Context(line.text),
                 HunkLineKind::Remove => HunkLine::Remove(line.text),
@@ -209,6 +220,12 @@ enum HunkLine {
     Context(String),
     Remove(String),
     Add(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContentLine {
+    text: String,
+    terminator: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,18 +432,16 @@ fn apply_hunks(path: &Path, content: &str, hunks: &[Hunk]) -> Result<String, Too
         return Ok(content.to_string());
     }
 
-    let line_ending = line_ending_for(content);
-    let had_trailing_newline = content.ends_with('\n');
-    let mut lines = content.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+    let mut lines = split_lines_preserving_endings(content);
     for (index, hunk) in hunks.iter().enumerate() {
         apply_hunk(path, &mut lines, hunk, index)?;
     }
-    Ok(join_lines(&lines, line_ending, had_trailing_newline))
+    Ok(join_lines(&lines))
 }
 
 fn apply_hunk(
     path: &Path,
-    lines: &mut Vec<String>,
+    lines: &mut Vec<ContentLine>,
     hunk: &Hunk,
     hunk_index: usize,
 ) -> Result<(), ToolError> {
@@ -438,15 +453,6 @@ fn apply_hunk(
             HunkLine::Add(_) => None,
         })
         .collect::<Vec<_>>();
-    let new_lines = hunk
-        .lines
-        .iter()
-        .filter_map(|line| match line {
-            HunkLine::Context(content) | HunkLine::Add(content) => Some(content.clone()),
-            HunkLine::Remove(_) => None,
-        })
-        .collect::<Vec<_>>();
-
     if old_lines.is_empty() && !lines.is_empty() {
         return Err(ToolError::invalid_arguments(format!(
             "hunk {hunk_index} in {} is add-only; add-only hunks need a context or remove line to locate the insertion unless the file is empty",
@@ -461,7 +467,9 @@ fn apply_hunk(
             path.display()
         ))),
         [start] => {
-            lines.splice(*start..(*start + old_lines.len()), new_lines);
+            let end = *start + old_lines.len();
+            let replacement = build_replacement_lines(lines, *start, end, hunk);
+            lines.splice(*start..end, replacement);
             Ok(())
         }
         _ => Err(ToolError::invalid_arguments(format!(
@@ -472,7 +480,7 @@ fn apply_hunk(
     }
 }
 
-fn find_hunk_matches(lines: &[String], old_lines: &[&str]) -> Vec<usize> {
+fn find_hunk_matches(lines: &[ContentLine], old_lines: &[&str]) -> Vec<usize> {
     if old_lines.is_empty() {
         if lines.is_empty() {
             return vec![0];
@@ -489,26 +497,134 @@ fn find_hunk_matches(lines: &[String], old_lines: &[&str]) -> Vec<usize> {
             old_lines
                 .iter()
                 .enumerate()
-                .all(|(offset, old_line)| lines[start + offset] == *old_line)
+                .all(|(offset, old_line)| lines[start + offset].text == *old_line)
         })
         .collect()
 }
 
-fn line_ending_for(content: &str) -> &'static str {
-    if content.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
+fn build_replacement_lines(
+    lines: &[ContentLine],
+    start: usize,
+    end: usize,
+    hunk: &Hunk,
+) -> Vec<ContentLine> {
+    let matched = lines[start..end].to_vec();
+    let default_terminator = preferred_terminator(lines, start, end);
+    let has_following_line = end < lines.len();
+    let mut old_offset = 0;
+    let mut replacement = Vec::new();
+
+    for hunk_line in &hunk.lines {
+        match hunk_line {
+            HunkLine::Context(text) => {
+                let terminator = matched.get(old_offset).and_then(|line| line.terminator);
+                replacement.push(ContentLine {
+                    text: text.clone(),
+                    terminator,
+                });
+                old_offset += 1;
+            }
+            HunkLine::Remove(_) => {
+                old_offset += 1;
+            }
+            HunkLine::Add(text) => {
+                replacement.push(ContentLine {
+                    text: text.clone(),
+                    terminator: added_line_terminator(
+                        lines,
+                        &matched,
+                        old_offset,
+                        default_terminator,
+                    ),
+                });
+            }
+        }
     }
+
+    for index in 0..replacement.len() {
+        if (index + 1 < replacement.len() || has_following_line)
+            && replacement[index].terminator.is_none()
+        {
+            replacement[index].terminator = Some(default_terminator);
+        }
+    }
+
+    replacement
 }
 
-fn join_lines(lines: &[String], line_ending: &str, trailing_newline: bool) -> String {
+fn added_line_terminator(
+    lines: &[ContentLine],
+    matched: &[ContentLine],
+    old_offset: usize,
+    default_terminator: &'static str,
+) -> Option<&'static str> {
     if lines.is_empty() {
-        return String::new();
+        return None;
     }
-    let mut content = lines.join(line_ending);
-    if trailing_newline {
-        content.push_str(line_ending);
+    if old_offset > 0
+        && let Some(terminator) = matched.get(old_offset - 1).and_then(|line| line.terminator)
+    {
+        return Some(terminator);
+    }
+    if let Some(terminator) = matched.get(old_offset).and_then(|line| line.terminator) {
+        return Some(terminator);
+    }
+    Some(default_terminator)
+}
+
+fn preferred_terminator(lines: &[ContentLine], start: usize, end: usize) -> &'static str {
+    if let Some(terminator) = lines[start..end].iter().find_map(|line| line.terminator) {
+        return terminator;
+    }
+    if let Some(terminator) = lines.get(start).and_then(|line| line.terminator) {
+        return terminator;
+    }
+    if start > 0
+        && let Some(terminator) = lines.get(start - 1).and_then(|line| line.terminator)
+    {
+        return terminator;
+    }
+    lines
+        .iter()
+        .find_map(|line| line.terminator)
+        .unwrap_or("\n")
+}
+
+fn split_lines_preserving_endings(content: &str) -> Vec<ContentLine> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while let Some(relative_end) = content[start..].find('\n') {
+        let newline_index = start + relative_end;
+        let (text_end, terminator) =
+            if newline_index > start && content.as_bytes()[newline_index - 1] == b'\r' {
+                (newline_index - 1, "\r\n")
+            } else {
+                (newline_index, "\n")
+            };
+        lines.push(ContentLine {
+            text: content[start..text_end].to_string(),
+            terminator: Some(terminator),
+        });
+        start = newline_index + 1;
+    }
+
+    if start < content.len() {
+        lines.push(ContentLine {
+            text: content[start..].to_string(),
+            terminator: None,
+        });
+    }
+
+    lines
+}
+
+fn join_lines(lines: &[ContentLine]) -> String {
+    let mut content = String::new();
+    for line in lines {
+        content.push_str(&line.text);
+        if let Some(terminator) = line.terminator {
+            content.push_str(terminator);
+        }
     }
     content
 }
@@ -783,6 +899,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_hunk_text_with_newline() -> TestResult {
+        let (tool, _tmp) = fixture()?;
+
+        let Err(err) = tool
+            .call(args(vec![update(
+                "foo.txt",
+                None,
+                vec![hunk(vec![add("one\ntwo")])],
+            )]))
+            .await
+        else {
+            panic!("edit should fail");
+        };
+
+        assert!(err.to_string().contains("must not contain newline"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn applies_single_file_update() -> TestResult {
         let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
@@ -966,6 +1101,19 @@ mod tests {
         .await?;
 
         assert_eq!(fs::read_to_string(path)?, "alpha\r\ninserted\r\nbeta\r\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_mixed_line_endings() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("mixed.txt");
+        fs::write(&path, "alpha\r\nbeta\ngamma\r\n")?;
+
+        tool.call(replacement_args("mixed.txt", "beta", "bee"))
+            .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "alpha\r\nbee\ngamma\r\n");
         Ok(())
     }
 

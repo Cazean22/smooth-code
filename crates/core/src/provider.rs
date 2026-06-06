@@ -4,6 +4,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -37,7 +38,7 @@ use rig::{
     },
 };
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
@@ -151,11 +152,11 @@ pub enum SessionModel {
     Stub(Arc<dyn SessionModelDriver>),
 }
 
-#[derive(Clone)]
 pub struct OpenAiSessionModel {
     agent: Arc<Agent<openai::responses_api::ResponsesCompletionModel>>,
     client: openai::Client,
     model: String,
+    session_ws: Mutex<Option<OpenAiParkedWebSocket>>,
 }
 
 impl SessionModel {
@@ -217,6 +218,7 @@ impl SessionModel {
                     agent: Arc::new(agent),
                     client,
                     model,
+                    session_ws: Mutex::new(None),
                 })))
             }
             "openrouter" => {
@@ -456,7 +458,13 @@ fn session_assistant_content_from_streamed<R>(
 
 type OpenAiWebSocketRawChoice = RawStreamingChoice<OpenAiStreamingCompletionResponse>;
 type OpenAiWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
-const OPENAI_WEBSOCKET_START_ATTEMPTS: usize = 2;
+const OPENAI_WEBSOCKET_RETRY_BUDGET: usize = 3;
+const OPENAI_WEBSOCKET_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+
+struct OpenAiParkedWebSocket {
+    socket: OpenAiWebSocket,
+    trailing_done_response_id: Option<String>,
+}
 
 #[derive(Debug, Serialize)]
 struct OpenAiWebSocketCreateEvent {
@@ -469,6 +477,8 @@ struct OpenAiWebSocketCreateEvent {
 struct OpenAiWebSocketPayloadOutcome {
     choices: Vec<OpenAiWebSocketRawChoice>,
     terminal: bool,
+    terminal_response_id: Option<String>,
+    terminal_error: Option<CompletionError>,
 }
 
 async fn stream_openai_agent_completion(
@@ -484,18 +494,21 @@ async fn stream_openai_agent_completion(
         .build();
     let openai = Arc::clone(openai);
     Ok(Box::pin(async_stream::try_stream! {
-        for attempt in 1..=OPENAI_WEBSOCKET_START_ATTEMPTS {
+        let mut retry_count = 0;
+        loop {
             let mut stream = match openai_websocket_completion_stream(&openai, completion_request.clone()).await {
                 Ok(stream) => stream,
                 Err(error)
-                    if attempt < OPENAI_WEBSOCKET_START_ATTEMPTS
-                        && is_openai_websocket_transient_start_error(&error) =>
+                    if retry_count < OPENAI_WEBSOCKET_RETRY_BUDGET
+                        && should_retry_openai_websocket_error(&error, false) =>
                 {
+                    retry_count += 1;
                     tracing::debug!(
-                        attempt,
+                        retry_count,
                         error = %error,
                         "OpenAI WebSocket transient failure before the turn stream started; retrying"
                     );
+                    tokio::time::sleep(openai_websocket_retry_delay(retry_count)).await;
                     continue;
                 }
                 Err(error) => Err(error).context("failed to start OpenAI WebSocket completion stream")?,
@@ -511,15 +524,16 @@ async fn stream_openai_agent_completion(
                         yield SessionCompletionEvent::AssistantItem(assistant_item);
                     }
                     Err(error)
-                        if !yielded_assistant_item
-                            && attempt < OPENAI_WEBSOCKET_START_ATTEMPTS
-                            && is_openai_websocket_transient_start_error(&error) =>
+                        if retry_count < OPENAI_WEBSOCKET_RETRY_BUDGET
+                            && should_retry_openai_websocket_error(&error, yielded_assistant_item) =>
                     {
+                        retry_count += 1;
                         tracing::debug!(
-                            attempt,
+                            retry_count,
                             error = %error,
                             "OpenAI WebSocket transient failure before any assistant item; retrying"
                         );
+                        tokio::time::sleep(openai_websocket_retry_delay(retry_count)).await;
                         retry_after_start_error = true;
                         break;
                     }
@@ -548,30 +562,56 @@ async fn stream_openai_agent_completion(
 }
 
 async fn openai_websocket_completion_stream(
-    openai: &OpenAiSessionModel,
+    openai: &Arc<OpenAiSessionModel>,
     completion_request: CompletionRequest,
 ) -> std::result::Result<
     RigStreamingCompletionResponse<OpenAiStreamingCompletionResponse>,
     CompletionError,
 > {
-    let mut socket = openai_websocket_connect(&openai.client).await?;
     let payload = openai_websocket_create_payload(openai.model.as_str(), completion_request)?;
-    socket
-        .send(TungsteniteMessage::Text(payload))
-        .await
-        .map_err(openai_websocket_provider_error)?;
-    Ok(openai_websocket_stream(socket))
+    let parked_socket = openai.session_ws.lock().await.take();
+    let (mut socket, mut trailing_done_response_id, reused_socket) = match parked_socket {
+        Some(parked) => (parked.socket, parked.trailing_done_response_id, true),
+        None => (openai_websocket_connect(&openai.client).await?, None, false),
+    };
+    if let Err(error) = socket.send(TungsteniteMessage::Text(payload.clone())).await {
+        let error = openai_websocket_provider_error(error);
+        if !reused_socket {
+            return Err(error);
+        }
+        tracing::debug!(
+            error = %error,
+            "OpenAI WebSocket send failed on a reused socket; reconnecting before retrying request"
+        );
+        socket = openai_websocket_connect(&openai.client).await?;
+        trailing_done_response_id = None;
+        socket
+            .send(TungsteniteMessage::Text(payload))
+            .await
+            .map_err(openai_websocket_provider_error)?;
+    }
+    Ok(openai_websocket_stream(
+        Arc::clone(openai),
+        socket,
+        trailing_done_response_id,
+    ))
 }
 
 fn openai_websocket_stream(
-    mut socket: OpenAiWebSocket,
+    openai: Arc<OpenAiSessionModel>,
+    socket: OpenAiWebSocket,
+    mut stale_done_response_id: Option<String>,
 ) -> RigStreamingCompletionResponse<OpenAiStreamingCompletionResponse> {
     let raw_stream = async_stream::try_stream! {
+        let mut socket = Some(socket);
         let mut accumulator = OpenAiWebSocketAccumulator::new();
         let mut terminal_error = None;
+        let mut terminal_response_id = None;
+        let mut clean_terminal = false;
 
-        loop {
-            match socket.next().await {
+        while let Some(socket) = socket.as_mut() {
+            let message = socket.next().await;
+            match message {
                 Some(Ok(message)) => {
                     let payload = match openai_websocket_message_to_text(message) {
                         Ok(Some(payload)) => payload,
@@ -588,12 +628,27 @@ fn openai_websocket_stream(
                             break;
                         }
                     };
+                    if stale_done_response_id
+                        .as_deref()
+                        .is_some_and(|response_id| {
+                            openai_websocket_is_response_done_for(&payload, response_id)
+                        })
+                    {
+                        stale_done_response_id = None;
+                        tracing::debug!(
+                            "skipping stale trailing OpenAI WebSocket response.done from previous turn"
+                        );
+                        continue;
+                    }
                     match parse_openai_websocket_payload(&payload, &mut accumulator) {
                         Ok(outcome) => {
                             for choice in outcome.choices {
                                 yield choice;
                             }
                             if outcome.terminal {
+                                clean_terminal = true;
+                                terminal_response_id = outcome.terminal_response_id;
+                                terminal_error = outcome.terminal_error;
                                 break;
                             }
                         }
@@ -633,19 +688,25 @@ fn openai_websocket_stream(
             }
         }
 
-        if let Err(error) = socket.close(None).await {
-            tracing::debug!(
-                error = %error,
-                "failed to close OpenAI WebSocket session cleanly"
-            );
-        }
-
         if let Some(error) = terminal_error {
+            if clean_terminal && let Some(socket) = socket.take() {
+                *openai.session_ws.lock().await = Some(OpenAiParkedWebSocket {
+                    socket,
+                    trailing_done_response_id: terminal_response_id.take(),
+                });
+            }
             Err(openai_websocket_stream_error(error))?;
         }
 
         for choice in accumulator.finish() {
             yield choice;
+        }
+
+        if clean_terminal && let Some(socket) = socket.take() {
+            *openai.session_ws.lock().await = Some(OpenAiParkedWebSocket {
+                socket,
+                trailing_done_response_id: terminal_response_id.take(),
+            });
         }
     };
 
@@ -855,28 +916,27 @@ fn parse_openai_websocket_payload(
         return Ok(OpenAiWebSocketPayloadOutcome {
             choices: Vec::new(),
             terminal: false,
+            terminal_response_id: None,
+            terminal_error: None,
         });
     };
 
     match kind.as_str() {
-        "error" => {
-            let message = value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("OpenAI WebSocket error");
-            Err(CompletionError::ProviderError(message.to_string()))
-        }
+        "error" => Err(CompletionError::ProviderError(
+            openai_websocket_error_event_message(&value),
+        )),
         "response.done" => {
             let response_value = value.get("response").ok_or_else(|| {
                 CompletionError::ProviderError(
                     "OpenAI WebSocket response.done was missing response".to_string(),
                 )
             })?;
-            accumulator.record_done_response_value(response_value)?;
+            let terminal_error = accumulator.record_done_response_value(response_value)?;
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices: Vec::new(),
                 terminal: true,
+                terminal_response_id: openai_websocket_response_id(response_value),
+                terminal_error,
             })
         }
         "response.created"
@@ -903,10 +963,15 @@ fn parse_openai_websocket_payload(
                     | ResponseChunkKind::ResponseFailed
                     | ResponseChunkKind::ResponseIncomplete
             );
-            accumulator.record_response_value(response_kind, response_value)?;
+            let terminal_error =
+                accumulator.record_response_value(response_kind, response_value)?;
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices: Vec::new(),
                 terminal,
+                terminal_response_id: terminal
+                    .then(|| openai_websocket_response_id(response_value))
+                    .flatten(),
+                terminal_error,
             })
         }
         "response.output_item.added" | "response.output_item.done" => {
@@ -924,6 +989,8 @@ fn parse_openai_websocket_payload(
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices,
                 terminal: false,
+                terminal_response_id: None,
+                terminal_error: None,
             })
         }
         "response.output_text.delta" | "response.refusal.delta" => {
@@ -935,6 +1002,8 @@ fn parse_openai_websocket_payload(
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices,
                 terminal: false,
+                terminal_response_id: None,
+                terminal_error: None,
             })
         }
         "response.output_text.done" | "response.refusal.done" => {
@@ -942,6 +1011,8 @@ fn parse_openai_websocket_payload(
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices: Vec::new(),
                 terminal: false,
+                terminal_response_id: None,
+                terminal_error: None,
             })
         }
         "response.content_part.done" => {
@@ -956,6 +1027,8 @@ fn parse_openai_websocket_payload(
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices: Vec::new(),
                 terminal: false,
+                terminal_response_id: None,
+                terminal_error: None,
             })
         }
         "response.function_call_arguments.delta" => {
@@ -967,12 +1040,16 @@ fn parse_openai_websocket_payload(
                 return Ok(OpenAiWebSocketPayloadOutcome {
                     choices: Vec::new(),
                     terminal: false,
+                    terminal_response_id: None,
+                    terminal_error: None,
                 });
             };
             let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) else {
                 return Ok(OpenAiWebSocketPayloadOutcome {
                     choices: Vec::new(),
                     terminal: false,
+                    terminal_response_id: None,
+                    terminal_error: None,
                 });
             };
             let internal_call_id = accumulator.internal_call_id_for(&item_id);
@@ -983,6 +1060,8 @@ fn parse_openai_websocket_payload(
                     content: ToolCallDeltaContent::Delta(delta.to_string()),
                 }],
                 terminal: false,
+                terminal_response_id: None,
+                terminal_error: None,
             })
         }
         "response.function_call_arguments.done" => {
@@ -993,6 +1072,8 @@ fn parse_openai_websocket_payload(
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices: Vec::new(),
                 terminal: false,
+                terminal_response_id: None,
+                terminal_error: None,
             })
         }
         "response.reasoning_summary_text.delta" => {
@@ -1010,11 +1091,15 @@ fn parse_openai_websocket_payload(
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices,
                 terminal: false,
+                terminal_response_id: None,
+                terminal_error: None,
             })
         }
         _ => Ok(OpenAiWebSocketPayloadOutcome {
             choices: Vec::new(),
             terminal: false,
+            terminal_response_id: None,
+            terminal_error: None,
         }),
     }
 }
@@ -1026,6 +1111,29 @@ fn openai_websocket_item_id(value: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn openai_websocket_response_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn openai_websocket_is_response_done_for(payload: &str, response_id: &str) -> bool {
+    // Reuse skips only a late `response.done`: the primary terminal frame is
+    // expected to be `response.completed`/`failed`/`incomplete` for that ID.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == "response.done")
+        && value
+            .get("response")
+            .and_then(openai_websocket_response_id)
+            .is_some_and(|observed_id| observed_id == response_id)
+}
+
 fn openai_websocket_arguments_value(value: &serde_json::Value) -> serde_json::Value {
     let arguments = value
         .get("arguments")
@@ -1035,6 +1143,43 @@ fn openai_websocket_arguments_value(value: &serde_json::Value) -> serde_json::Va
         serde_json::from_str(raw).unwrap_or(arguments)
     } else {
         arguments
+    }
+}
+
+fn openai_websocket_error_event_message(value: &serde_json::Value) -> String {
+    let error = value.get("error");
+    let message = error
+        .and_then(|error| error.get("message"))
+        .or_else(|| value.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("OpenAI WebSocket error");
+    let mut labels = Vec::new();
+    for label in [
+        error
+            .and_then(|error| error.get("code"))
+            .and_then(serde_json::Value::as_str),
+        error
+            .and_then(|error| error.get("type"))
+            .and_then(serde_json::Value::as_str),
+        value.get("code").and_then(serde_json::Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !label.is_empty() && !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+
+    let missing_labels = labels
+        .into_iter()
+        .filter(|label| !message.contains(label))
+        .collect::<Vec<_>>();
+
+    if missing_labels.is_empty() {
+        message.to_string()
+    } else {
+        format!("{}: {message}", missing_labels.join(": "))
     }
 }
 
@@ -1064,6 +1209,7 @@ fn is_openai_websocket_connection_reset(error: &CompletionError) -> bool {
 fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
     let message = error.to_string();
     is_openai_websocket_connection_reset(error)
+        || message.contains("websocket_connection_limit_reached")
         || message.contains("The OpenAI WebSocket connection closed before the turn finished")
         || message.contains("The OpenAI WebSocket connection closed without a close reason")
         || message.contains("An error occurred while processing the request.")
@@ -1071,6 +1217,20 @@ fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
         // `response.completed`; retryable only before any assistant item (see call sites).
         || message.contains("stream closed before response.completed")
         || message.contains("disconnected before completion")
+}
+
+fn should_retry_openai_websocket_error(
+    error: &CompletionError,
+    yielded_assistant_item: bool,
+) -> bool {
+    !yielded_assistant_item && is_openai_websocket_transient_start_error(error)
+}
+
+fn openai_websocket_retry_delay(retry_count: usize) -> Duration {
+    let factor = 1_u32
+        .checked_shl(retry_count.saturating_sub(1) as u32)
+        .unwrap_or(u32::MAX);
+    OPENAI_WEBSOCKET_RETRY_BASE_DELAY * factor
 }
 
 struct OpenAiWebSocketAccumulator {
@@ -1179,29 +1339,29 @@ impl OpenAiWebSocketAccumulator {
         &mut self,
         kind: ResponseChunkKind,
         response: &serde_json::Value,
-    ) -> std::result::Result<(), CompletionError> {
+    ) -> std::result::Result<Option<CompletionError>, CompletionError> {
         match kind {
             ResponseChunkKind::ResponseCompleted => {
                 self.record_completed_response_value(response);
-                Ok(())
+                Ok(None)
             }
-            ResponseChunkKind::ResponseFailed => Err(CompletionError::ProviderError(
+            ResponseChunkKind::ResponseFailed => Ok(Some(CompletionError::ProviderError(
                 openai_response_error_message_value(
                     response,
                     "OpenAI WebSocket returned a failed response",
                 ),
-            )),
-            ResponseChunkKind::ResponseIncomplete => Err(CompletionError::ProviderError(
+            ))),
+            ResponseChunkKind::ResponseIncomplete => Ok(Some(CompletionError::ProviderError(
                 openai_incomplete_response_message_value(response),
-            )),
-            ResponseChunkKind::ResponseCreated | ResponseChunkKind::ResponseInProgress => Ok(()),
+            ))),
+            ResponseChunkKind::ResponseCreated | ResponseChunkKind::ResponseInProgress => Ok(None),
         }
     }
 
     fn record_done_response_value(
         &mut self,
         response: &serde_json::Value,
-    ) -> std::result::Result<(), CompletionError> {
+    ) -> std::result::Result<Option<CompletionError>, CompletionError> {
         // The local proxy sometimes emits `response.done` without a `status`
         // field. Treat a missing status as a completed turn rather than failing
         // the whole response — genuine failures surface earlier via
@@ -1215,20 +1375,20 @@ impl OpenAiWebSocketAccumulator {
         match status {
             ResponseStatus::Completed => {
                 self.record_completed_response_value(response);
-                Ok(())
+                Ok(None)
             }
-            ResponseStatus::Failed => Err(CompletionError::ProviderError(
+            ResponseStatus::Failed => Ok(Some(CompletionError::ProviderError(
                 openai_response_error_message_value(
                     response,
                     "OpenAI WebSocket returned a failed response",
                 ),
-            )),
-            ResponseStatus::Incomplete => Err(CompletionError::ProviderError(
-                openai_incomplete_response_message_value(response),
-            )),
-            status => Err(CompletionError::ProviderError(format!(
-                "OpenAI WebSocket response ended with status {status:?}"
             ))),
+            ResponseStatus::Incomplete => Ok(Some(CompletionError::ProviderError(
+                openai_incomplete_response_message_value(response),
+            ))),
+            status => Ok(Some(CompletionError::ProviderError(format!(
+                "OpenAI WebSocket response ended with status {status:?}"
+            )))),
         }
     }
 
@@ -1446,12 +1606,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{
+        collections::HashSet,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use anyhow::{Context, Result};
+    use futures_util::{SinkExt, StreamExt};
     use rig::{
         OneOrMany,
         agent::AgentBuilder,
+        client::CompletionClient,
         completion::{
             CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
         },
@@ -1466,7 +1635,11 @@ mod tests {
         streaming::{RawStreamingChoice, StreamingCompletionResponse, ToolCallDeltaContent},
     };
     use serde::{Deserialize, Serialize};
-    use tokio::sync::RwLock;
+    use tokio::{
+        net::TcpListener,
+        sync::{Mutex, RwLock},
+    };
+    use tokio_tungstenite::{accept_async, tungstenite::Message as TestWebSocketMessage};
 
     use super::{build_agent, compose_session_preamble};
     use crate::{
@@ -1540,6 +1713,303 @@ mod tests {
             },
             |_thread_id| async {},
         )
+    }
+
+    #[derive(Clone, Copy)]
+    enum OpenAiWebSocketTestServerMode {
+        KeepAlive,
+        KeepAliveWithTrailingDone,
+        CloseAfterResponse,
+        AbortAfterResponse,
+    }
+
+    async fn openai_websocket_test_model(base_url: &str) -> Result<Arc<super::OpenAiSessionModel>> {
+        let client = rig::providers::openai::Client::builder()
+            .api_key("test")
+            .base_url(base_url)
+            .build()?;
+        let agent = client.agent("gpt-test").build();
+        Ok(Arc::new(super::OpenAiSessionModel {
+            agent: Arc::new(agent),
+            client,
+            model: "gpt-test".to_string(),
+            session_ws: Mutex::new(None),
+        }))
+    }
+
+    fn openai_websocket_test_request(input: &str) -> Result<CompletionRequest> {
+        Ok(CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::many(vec![Message::user(input)]).context("chat history")?,
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        })
+    }
+
+    fn openai_websocket_completed_frame(response_id: &str) -> String {
+        openai_websocket_completed_frame_with_total_tokens(response_id, 2)
+    }
+
+    fn openai_websocket_completed_frame_with_total_tokens(
+        response_id: &str,
+        total_tokens: u64,
+    ) -> String {
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": total_tokens
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn openai_websocket_done_frame_with_total_tokens(
+        response_id: &str,
+        total_tokens: u64,
+    ) -> String {
+        serde_json::json!({
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": total_tokens
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn openai_websocket_failed_frame() -> String {
+        serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_failed",
+                "status": "failed",
+                "error": {
+                    "code": "server_error",
+                    "message": "test failure"
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn openai_websocket_incomplete_frame() -> String {
+        serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_incomplete",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}
+            }
+        })
+        .to_string()
+    }
+
+    fn openai_websocket_text_delta_frame() -> String {
+        serde_json::json!({
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "hello"
+        })
+        .to_string()
+    }
+
+    async fn start_openai_websocket_sequence_server(
+        mode: OpenAiWebSocketTestServerMode,
+    ) -> Result<(String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let server_handshakes = Arc::clone(&handshakes);
+        let turns = Arc::new(AtomicUsize::new(0));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_handshakes.fetch_add(1, Ordering::SeqCst);
+                let server_turns = Arc::clone(&turns);
+                let connection_mode = mode;
+                let _connection_task = tokio::spawn(async move {
+                    let Ok(mut socket) = accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(message) = socket.next().await {
+                        let Ok(message) = message else {
+                            break;
+                        };
+                        if !(message.is_text() || message.is_binary()) {
+                            continue;
+                        }
+                        let turn_index = server_turns.fetch_add(1, Ordering::SeqCst) + 1;
+                        let response_id = format!("resp_{turn_index}");
+                        let total_tokens = u64::try_from(turn_index)
+                            .map(|index| index * 100)
+                            .unwrap_or(u64::MAX);
+                        let frame = openai_websocket_completed_frame_with_total_tokens(
+                            &response_id,
+                            total_tokens,
+                        );
+                        if socket
+                            .send(TestWebSocketMessage::Text(frame))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if matches!(
+                            connection_mode,
+                            OpenAiWebSocketTestServerMode::KeepAliveWithTrailingDone
+                        ) {
+                            let done_frame = openai_websocket_done_frame_with_total_tokens(
+                                &response_id,
+                                total_tokens + 1,
+                            );
+                            if socket
+                                .send(TestWebSocketMessage::Text(done_frame))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        if matches!(
+                            connection_mode,
+                            OpenAiWebSocketTestServerMode::CloseAfterResponse
+                        ) {
+                            let _ = socket.close(None).await;
+                            break;
+                        }
+                        if matches!(
+                            connection_mode,
+                            OpenAiWebSocketTestServerMode::AbortAfterResponse
+                        ) {
+                            #[allow(deprecated)]
+                            if let Err(error) = socket.get_ref().set_linger(Some(Duration::ZERO)) {
+                                tracing::debug!(
+                                    error = %error,
+                                    "failed to configure abortive close for test socket"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        Ok((format!("http://{address}/v1"), handshakes, handle))
+    }
+
+    async fn start_openai_websocket_single_frame_server(
+        frame: String,
+        close_after_frame: bool,
+    ) -> Result<(String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let server_handshakes = Arc::clone(&handshakes);
+        let handle = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            server_handshakes.fetch_add(1, Ordering::SeqCst);
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            while let Some(message) = socket.next().await {
+                let Ok(message) = message else {
+                    break;
+                };
+                if !(message.is_text() || message.is_binary()) {
+                    continue;
+                }
+                if socket
+                    .send(TestWebSocketMessage::Text(frame.clone()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if close_after_frame {
+                    let _ = socket.close(None).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+                break;
+            }
+        });
+
+        Ok((format!("http://{address}/v1"), handshakes, handle))
+    }
+
+    async fn drain_openai_websocket_stream(
+        mut stream: StreamingCompletionResponse<super::OpenAiStreamingCompletionResponse>,
+    ) -> Result<()> {
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .context("timed out waiting for OpenAI WebSocket stream item")?;
+            let Some(item) = item else {
+                break;
+            };
+            item?;
+        }
+        Ok(())
+    }
+
+    async fn openai_websocket_final_total_tokens(
+        mut stream: StreamingCompletionResponse<super::OpenAiStreamingCompletionResponse>,
+    ) -> Result<u64> {
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .context("timed out waiting for OpenAI WebSocket stream item")?;
+            let Some(item) = item else {
+                break;
+            };
+            item?;
+        }
+        stream
+            .response
+            .as_ref()
+            .map(|response| response.usage.total_tokens)
+            .context("OpenAI WebSocket stream did not emit a final response")
+    }
+
+    async fn drain_session_completion_stream(
+        mut stream: super::SessionCompletionStream,
+    ) -> Result<()> {
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .context("timed out waiting for session completion stream item")?;
+            let Some(item) = item else {
+                break;
+            };
+            item?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -2090,6 +2560,7 @@ mod tests {
     #[test]
     fn openai_websocket_transient_start_errors_are_retryable() {
         let retryable = [
+            "websocket_connection_limit_reached",
             "OpenAI WebSocket connection reset before response.completed",
             "The OpenAI WebSocket connection closed before the turn finished",
             "The OpenAI WebSocket connection closed without a close reason",
@@ -2115,6 +2586,47 @@ mod tests {
     }
 
     #[test]
+    fn openai_websocket_retry_classification_stops_after_assistant_output() {
+        let error =
+            CompletionError::ProviderError("stream closed before response.completed".to_string());
+
+        assert!(super::should_retry_openai_websocket_error(&error, false));
+        assert!(!super::should_retry_openai_websocket_error(&error, true));
+    }
+
+    #[test]
+    fn openai_websocket_error_event_connection_limit_is_retryable() {
+        let mut accumulator = super::OpenAiWebSocketAccumulator::new();
+        let payload = r#"{"type":"error","error":{"code":"websocket_connection_limit_reached","message":"too many websocket connections"}}"#;
+        let Err(error) = super::parse_openai_websocket_payload(payload, &mut accumulator) else {
+            panic!("proxy error event should surface as a CompletionError");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("websocket_connection_limit_reached")
+        );
+        assert!(super::is_openai_websocket_transient_start_error(&error));
+    }
+
+    #[test]
+    fn openai_websocket_error_event_type_and_top_level_code_are_retryable() {
+        let mut accumulator = super::OpenAiWebSocketAccumulator::new();
+        let payload = r#"{"type":"error","code":"websocket_connection_limit_reached","error":{"type":"websocket_connection_limit_reached","message":"too many websocket connections"}}"#;
+        let Err(error) = super::parse_openai_websocket_payload(payload, &mut accumulator) else {
+            panic!("proxy error event should surface as a CompletionError");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("websocket_connection_limit_reached")
+        );
+        assert!(super::is_openai_websocket_transient_start_error(&error));
+    }
+
+    #[test]
     fn openai_websocket_error_event_early_close_is_retryable() {
         let mut accumulator = super::OpenAiWebSocketAccumulator::new();
         let payload =
@@ -2126,6 +2638,241 @@ mod tests {
             super::is_openai_websocket_transient_start_error(&error),
             "early-close error events must be retryable before output"
         );
+    }
+
+    #[test]
+    fn openai_websocket_error_event_disconnected_before_completion_is_retryable() {
+        let mut accumulator = super::OpenAiWebSocketAccumulator::new();
+        let payload = r#"{"type":"error","error":{"message":"disconnected before completion"}}"#;
+        let Err(error) = super::parse_openai_websocket_payload(payload, &mut accumulator) else {
+            panic!("proxy error event should surface as a CompletionError");
+        };
+        assert!(
+            super::is_openai_websocket_transient_start_error(&error),
+            "disconnect error events must be retryable before output"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_clean_terminal_completion_parks_socket() -> Result<()> {
+        let (base_url, handshakes, server) = start_openai_websocket_single_frame_server(
+            openai_websocket_completed_frame("resp_park"),
+            false,
+        )
+        .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+        let stream = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("first")?,
+        )
+        .await?;
+
+        drain_openai_websocket_stream(stream).await?;
+
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+        assert!(model.session_ws.lock().await.is_some());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_clean_terminal_failed_frame_parks_socket_and_errors() -> Result<()> {
+        let (base_url, _handshakes, server) =
+            start_openai_websocket_single_frame_server(openai_websocket_failed_frame(), false)
+                .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+        let stream = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("failed")?,
+        )
+        .await?;
+
+        let error = drain_openai_websocket_stream(stream)
+            .await
+            .err()
+            .context("failed response should surface provider error")?;
+
+        assert!(error.to_string().contains("server_error: test failure"));
+        assert!(model.session_ws.lock().await.is_some());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_clean_terminal_incomplete_frame_parks_socket_and_errors() -> Result<()>
+    {
+        let (base_url, _handshakes, server) =
+            start_openai_websocket_single_frame_server(openai_websocket_incomplete_frame(), false)
+                .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+        let stream = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("incomplete")?,
+        )
+        .await?;
+
+        let error = drain_openai_websocket_stream(stream)
+            .await
+            .err()
+            .context("incomplete response should surface provider error")?;
+
+        assert!(
+            error
+                .to_string()
+                .contains("OpenAI WebSocket response was incomplete: max_output_tokens")
+        );
+        assert!(model.session_ws.lock().await.is_some());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_mid_turn_transport_error_does_not_park_socket() -> Result<()> {
+        let (base_url, _handshakes, server) =
+            start_openai_websocket_single_frame_server(openai_websocket_text_delta_frame(), true)
+                .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+        let stream = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("transport error")?,
+        )
+        .await?;
+
+        let error = drain_openai_websocket_stream(stream)
+            .await
+            .err()
+            .context("mid-turn close should surface provider error")?;
+
+        assert!(
+            error
+                .to_string()
+                .contains("OpenAI WebSocket connection closed")
+        );
+        assert!(model.session_ws.lock().await.is_none());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_dropped_stream_does_not_park_socket() -> Result<()> {
+        let (base_url, _handshakes, server) =
+            start_openai_websocket_single_frame_server(openai_websocket_text_delta_frame(), false)
+                .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+        let mut stream = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("drop")?,
+        )
+        .await?;
+
+        let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .context("timed out waiting for first stream item")?
+            .context("stream ended before first item")?;
+        item?;
+        drop(stream);
+
+        assert!(model.session_ws.lock().await.is_none());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_sequential_turns_reuse_one_handshake() -> Result<()> {
+        let (base_url, handshakes, server) =
+            start_openai_websocket_sequence_server(OpenAiWebSocketTestServerMode::KeepAlive)
+                .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+
+        let first =
+            super::stream_openai_agent_completion(&model, Message::user("first"), &[]).await?;
+        drain_session_completion_stream(first).await?;
+        let second =
+            super::stream_openai_agent_completion(&model, Message::user("second"), &[]).await?;
+        drain_session_completion_stream(second).await?;
+
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+        assert!(model.session_ws.lock().await.is_some());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_reused_turn_ignores_stale_trailing_response_done() -> Result<()> {
+        let (base_url, handshakes, server) = start_openai_websocket_sequence_server(
+            OpenAiWebSocketTestServerMode::KeepAliveWithTrailingDone,
+        )
+        .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+
+        let first = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("first")?,
+        )
+        .await?;
+        assert_eq!(openai_websocket_final_total_tokens(first).await?, 100);
+
+        let second = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("second")?,
+        )
+        .await?;
+        assert_eq!(openai_websocket_final_total_tokens(second).await?, 200);
+
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+        assert!(model.session_ws.lock().await.is_some());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_reused_socket_send_failure_reconnects_and_resends() -> Result<()> {
+        let (base_url, handshakes, server) = start_openai_websocket_sequence_server(
+            OpenAiWebSocketTestServerMode::AbortAfterResponse,
+        )
+        .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+
+        let first = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("first")?,
+        )
+        .await?;
+        assert_eq!(openai_websocket_final_total_tokens(first).await?, 100);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let second = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("second")?,
+        )
+        .await?;
+        assert_eq!(openai_websocket_final_total_tokens(second).await?, 200);
+
+        assert_eq!(handshakes.load(Ordering::SeqCst), 2);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_server_close_between_turns_forces_reconnect() -> Result<()> {
+        let (base_url, handshakes, server) = start_openai_websocket_sequence_server(
+            OpenAiWebSocketTestServerMode::CloseAfterResponse,
+        )
+        .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+
+        let first =
+            super::stream_openai_agent_completion(&model, Message::user("first"), &[]).await?;
+        drain_session_completion_stream(first).await?;
+        let second =
+            super::stream_openai_agent_completion(&model, Message::user("second"), &[]).await?;
+        drain_session_completion_stream(second).await?;
+
+        assert_eq!(handshakes.load(Ordering::SeqCst), 2);
+        assert!(model.session_ws.lock().await.is_some());
+        server.abort();
+        Ok(())
     }
 
     #[test]

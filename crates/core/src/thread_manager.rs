@@ -515,19 +515,16 @@ mod tests {
 
     use anyhow::Result;
     use futures_util::stream;
-    use rig::{
-        agent::FinalResponse,
-        message::{Message, Text},
-    };
+    use rig::message::{Message, Text};
     use tempfile::TempDir;
     use tokio::sync::RwLock;
     use tools::AskUserClient;
 
     use super::ThreadManagerState;
     use crate::{
-        SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
+        SessionCompletionEvent, SessionCompletionStream, SessionModel, SessionModelDriver,
+        SessionModelFactory, SessionTurnSummary,
         agent::{AgentControl, SystemPromptKind, status::is_final},
-        provider::SessionStreamEvent,
         rollout::find_thread_path,
         test_support::cwd_test_lock,
     };
@@ -547,15 +544,23 @@ mod tests {
     }
 
     impl SessionModelDriver for StubDriver {
-        fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+        fn stream_completion_turn(
+            &self,
+            prompt: Message,
+            history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
             let _ = (prompt, history);
+            let text = self.text.clone();
             Ok(Box::pin(stream::iter(vec![
-                Ok(SessionStreamEvent::StreamAssistantItem(
+                Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(Text {
                         text: self.text.clone(),
                     }),
                 )),
-                Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty())),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-stub".to_string()),
+                    response: text,
+                })),
             ])))
         }
     }
@@ -610,8 +615,12 @@ mod tests {
     struct PendingDriver;
 
     impl SessionModelDriver for PendingDriver {
-        fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-            Ok(Box::pin(stream::pending::<Result<SessionStreamEvent>>()))
+        fn stream_completion_turn(
+            &self,
+            _prompt: Message,
+            _history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
+            Ok(Box::pin(stream::pending::<Result<SessionCompletionEvent>>()))
         }
     }
 

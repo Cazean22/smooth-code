@@ -47,6 +47,7 @@ pub struct ResumeState {
 pub(crate) enum HistoryMessage {
     UserText { text: String },
     AssistantText { text: String },
+    Full { message: Message },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +63,7 @@ pub(crate) struct SessionMeta {
 pub(crate) enum PersistedItem {
     SessionMeta(SessionMeta),
     HistoryMessage(HistoryMessage),
+    UserMessage { text: String },
     Event(EventMsg),
 }
 
@@ -131,20 +133,27 @@ impl RolloutRecorder {
     }
 }
 
-pub(crate) fn persist_event(event: &EventMsg) -> bool {
+fn persist_event(event: &EventMsg) -> bool {
     matches!(
         event,
         EventMsg::SessionConfigured(_)
             | EventMsg::TurnStarted(_)
             | EventMsg::TurnCompleted(_)
             | EventMsg::TurnInterrupted(_)
-            | EventMsg::AgentMessage(_)
             | EventMsg::AgentMessageCompleted(_)
+            | EventMsg::AgentReasoningCompleted(_)
             | EventMsg::ToolCallStarted(_)
             | EventMsg::ToolCallCompleted(_)
-            | EventMsg::UserMessage(_)
             | EventMsg::Error(_)
     )
+}
+
+pub(crate) fn persisted_event_item(event: &EventMsg) -> Option<PersistedItem> {
+    match event {
+        EventMsg::UserMessage(text) => Some(PersistedItem::UserMessage { text: text.clone() }),
+        event if persist_event(event) => Some(PersistedItem::Event(event.clone())),
+        _ => None,
+    }
 }
 
 pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
@@ -180,6 +189,12 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
                     id: None,
                     content: OneOrMany::one(AssistantContent::text(text)),
                 });
+            }
+            PersistedItem::HistoryMessage(HistoryMessage::Full { message }) => {
+                history.push(message);
+            }
+            PersistedItem::UserMessage { text } => {
+                initial_messages.push(EventMsg::UserMessage(text));
             }
             PersistedItem::Event(event) => {
                 update_turn_tracking(
@@ -264,6 +279,31 @@ fn update_turn_tracking(
     }
 }
 
+fn update_assistant_summary_message(
+    message: &Message,
+    last_assistant_message: &mut Option<String>,
+) {
+    match message {
+        Message::Assistant { content, .. } => {
+            if let Some(text) = assistant_text(content) {
+                *last_assistant_message = Some(text);
+            }
+        }
+        Message::System { .. } | Message::User { .. } => {}
+    }
+}
+
+fn assistant_text(content: &OneOrMany<AssistantContent>) -> Option<String> {
+    let text = content
+        .iter()
+        .filter_map(|content| match content {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
+
 async fn summarize_rollout(path: &Path) -> Result<ThreadSummary> {
     let contents = fs::read_to_string(path).await?;
     let mut meta: Option<SessionMeta> = None;
@@ -291,6 +331,12 @@ async fn summarize_rollout(path: &Path) -> Result<ThreadSummary> {
             }
             PersistedItem::HistoryMessage(HistoryMessage::AssistantText { text }) => {
                 last_assistant_message = Some(text);
+            }
+            PersistedItem::HistoryMessage(HistoryMessage::Full { message }) => {
+                update_assistant_summary_message(&message, &mut last_assistant_message);
+            }
+            PersistedItem::UserMessage { text } => {
+                last_user_message = Some(text);
             }
             PersistedItem::Event(_) => {}
         }
@@ -383,6 +429,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_summary_uses_user_message_event_not_internal_full_user_text() -> Result<()> {
+        let root = test_root("list-user-event");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: "human prompt".to_string(),
+                    })),
+                },
+            }))
+            .await?;
+        recorder
+            .append(
+                persisted_event_item(&EventMsg::UserMessage("human prompt".to_string()))
+                    .with_context(|| "user message should persist")?,
+            )
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: r#"{"event":"agent_completed","last_assistant_message":"internal"}"#
+                            .to_string(),
+                    })),
+                },
+            }))
+            .await?;
+
+        let threads = list_threads(&root).await?;
+        assert_eq!(threads.len(), 1);
+        assert_eq!(
+            threads[0].last_user_message.as_deref(),
+            Some("human prompt")
+        );
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn resume_state_reconstructs_history_and_recovery_interrupt() -> Result<()> {
         let root = test_root("resume");
         let cwd = root.join("workspace");
@@ -404,6 +495,13 @@ mod tests {
             }))
             .await?;
         recorder
+            .append(PersistedItem::HistoryMessage(
+                HistoryMessage::AssistantText {
+                    text: "world".to_string(),
+                },
+            ))
+            .await?;
+        recorder
             .append(PersistedItem::Event(EventMsg::TurnStarted(
                 TurnStartedEvent {
                     thread_id: thread_id.to_string(),
@@ -415,11 +513,72 @@ mod tests {
         let state = load_resume_state(recorder.path()).await?;
         assert_eq!(state.thread_id, thread_id);
         assert_eq!(state.next_turn_index, 5);
-        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history.len(), 2);
+        assert!(matches!(state.history[0], Message::User { .. }));
+        assert!(matches!(state.history[1], Message::Assistant { .. }));
         assert!(matches!(
             state.initial_messages.last(),
             Some(EventMsg::TurnInterrupted(turn)) if turn.reason == "resume_recovery"
         ));
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_assistant_message_round_trips() -> Result<()> {
+        let root = test_root("full-assistant");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        let reasoning = rig::message::Reasoning::new("thinking").with_id("rs_1".to_string());
+        let message = Message::Assistant {
+            id: Some("assistant_1".to_string()),
+            content: OneOrMany::many(vec![
+                AssistantContent::Reasoning(reasoning),
+                AssistantContent::text("answer"),
+            ])?,
+        };
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: message.clone(),
+            }))
+            .await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        assert_eq!(state.history, vec![message]);
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn encrypted_reasoning_survives_load_resume_state() -> Result<()> {
+        let root = test_root("encrypted-reasoning");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        let encrypted =
+            rig::message::Reasoning::encrypted("opaque-cot-bytes").with_id("rs_enc".to_string());
+        let message = Message::Assistant {
+            id: Some("assistant_encrypted".to_string()),
+            content: OneOrMany::many(vec![
+                AssistantContent::Reasoning(encrypted),
+                AssistantContent::text("answer"),
+            ])?,
+        };
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: message.clone(),
+            }))
+            .await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        assert_eq!(state.history, vec![message]);
 
         let _ = fs::remove_dir_all(&root).await;
         Ok(())

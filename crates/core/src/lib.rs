@@ -17,8 +17,8 @@ pub use agent::{AgentControl, SystemPromptKind};
 pub use error::{CoreError, CoreResult};
 pub use provider::{
     EnvSessionModelFactory, SessionAssistantContent, SessionCompletionEvent,
-    SessionCompletionStream, SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
-    SessionStreamEvent, SessionTurnSummary,
+    SessionCompletionStream, SessionModel, SessionModelDriver, SessionModelFactory,
+    SessionTurnSummary,
 };
 pub use rollout::ThreadSummary;
 pub use thread_manager::{ResumedThread, StartedThread, ThreadManagerState};

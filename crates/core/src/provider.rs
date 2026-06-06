@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use rig::{
     OneOrMany,
-    agent::{Agent, FinalResponse, MultiTurnStreamItem},
+    agent::Agent,
     client::CompletionClient,
     completion::{Completion, CompletionError, CompletionRequest},
     message::{Message, Reasoning as MessageReasoning, ReasoningContent, Text, ToolCall},
@@ -32,9 +32,8 @@ use rig::{
         openrouter,
     },
     streaming::{
-        RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent, StreamedUserContent,
-        StreamingChat, StreamingCompletionResponse as RigStreamingCompletionResponse,
-        ToolCallDeltaContent,
+        RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent,
+        StreamingCompletionResponse as RigStreamingCompletionResponse, ToolCallDeltaContent,
     },
 };
 use serde::Serialize;
@@ -97,30 +96,15 @@ impl SessionModelFactory for EnvSessionModelFactory {
 
 /// Test seam for custom streaming behavior.
 pub trait SessionModelDriver: Send + Sync {
-    fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream>;
-
-    fn supports_manual_tool_loop(&self) -> bool {
-        false
-    }
-
     fn stream_completion_turn(
         &self,
-        _prompt: Message,
-        _history: Vec<Message>,
-    ) -> Result<SessionCompletionStream> {
-        Err(anyhow!("manual completion streaming is not supported"))
-    }
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream>;
 
     fn call_tool(&self, _tool_name: &str, _args: &str) -> Result<String> {
         Err(anyhow!("manual tool execution is not supported"))
     }
-}
-
-#[derive(Debug)]
-pub enum SessionStreamEvent {
-    StreamAssistantItem(SessionAssistantContent),
-    StreamUserItem(StreamedUserContent),
-    FinalResponse(FinalResponse),
 }
 
 #[derive(Debug, Clone)]
@@ -154,9 +138,6 @@ pub enum SessionAssistantContent {
     },
     Final,
 }
-
-pub type SessionStream =
-    Pin<Box<dyn futures_util::Stream<Item = Result<SessionStreamEvent>> + Send>>;
 
 pub type SessionCompletionStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<SessionCompletionEvent>> + Send>>;
@@ -278,29 +259,6 @@ impl SessionModel {
                 ))))
             }
             other => bail!("unsupported SMOOTH_CODE_LLM_PROVIDER `{other}`"),
-        }
-    }
-
-    pub(crate) async fn stream_turn(
-        &self,
-        prompt: Message,
-        history: &[Message],
-    ) -> Result<SessionStream> {
-        match self {
-            Self::OpenAi(_) => Err(anyhow!(
-                "OpenAI opaque streaming is not supported; OpenAI turns use the manual WebSocket tool loop"
-            )),
-            Self::OpenRouter(agent) => stream_agent(agent, prompt, history).await,
-            Self::Anthropic(agent) => stream_agent(agent, prompt, history).await,
-            Self::Gemini(agent) => stream_agent(agent, prompt, history).await,
-            Self::Stub(driver) => driver.stream_turn(prompt, history.to_vec()),
-        }
-    }
-
-    pub(crate) fn supports_manual_tool_loop(&self) -> bool {
-        match self {
-            Self::Stub(driver) => driver.supports_manual_tool_loop(),
-            _ => true,
         }
     }
 
@@ -428,19 +386,6 @@ where
     };
     let builder = builder.tool(SpawnAgentTool::new(render_spawn_agent_tool_description()));
     builder.default_max_turns(99999).build()
-}
-
-async fn stream_agent<M>(
-    agent: &Arc<Agent<M>>,
-    prompt: Message,
-    history: &[Message],
-) -> Result<SessionStream>
-where
-    M: rig::completion::CompletionModel + 'static,
-    M::StreamingResponse: Clone + Unpin + rig::completion::GetTokenUsage,
-{
-    let stream = agent.stream_chat(prompt, history.iter().cloned()).await;
-    Ok(Box::pin(stream_to_events(stream)))
 }
 
 async fn stream_agent_completion<M>(
@@ -1493,62 +1438,6 @@ where
     M: rig::completion::CompletionModel,
 {
     Ok(agent.tool_server_handle.call_tool(tool_name, args).await?)
-}
-
-fn stream_to_events<R>(
-    mut stream: Pin<
-        Box<
-            dyn futures_util::Stream<
-                    Item = Result<MultiTurnStreamItem<R>, rig::agent::StreamingError>,
-                > + Send,
-        >,
-    >,
-) -> impl futures_util::Stream<Item = Result<SessionStreamEvent>> + Send
-where
-    R: Clone + Unpin + rig::completion::GetTokenUsage + Send,
-{
-    async_stream::try_stream! {
-        while let Some(item) = stream.next().await {
-            match item? {
-                MultiTurnStreamItem::StreamAssistantItem(assistant_item) => {
-                    let assistant_item = match assistant_item {
-                        StreamedAssistantContent::Text(text) => SessionAssistantContent::Text(text),
-                        StreamedAssistantContent::ToolCall {
-                            tool_call,
-                            internal_call_id,
-                        } => SessionAssistantContent::ToolCall {
-                            tool_call,
-                            internal_call_id,
-                        },
-                        StreamedAssistantContent::ToolCallDelta {
-                            id,
-                            internal_call_id,
-                            content,
-                        } => SessionAssistantContent::ToolCallDelta {
-                            id,
-                            internal_call_id,
-                            content,
-                        },
-                        StreamedAssistantContent::Reasoning(reasoning) => {
-                            SessionAssistantContent::Reasoning(reasoning)
-                        }
-                        StreamedAssistantContent::ReasoningDelta { id, reasoning } => {
-                            SessionAssistantContent::ReasoningDelta { id, reasoning }
-                        }
-                        StreamedAssistantContent::Final(_) => SessionAssistantContent::Final,
-                    };
-                    yield SessionStreamEvent::StreamAssistantItem(assistant_item);
-                }
-                MultiTurnStreamItem::StreamUserItem(user_item) => {
-                    yield SessionStreamEvent::StreamUserItem(user_item);
-                }
-                MultiTurnStreamItem::FinalResponse(final_response) => {
-                    yield SessionStreamEvent::FinalResponse(final_response);
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
 #[cfg(test)]

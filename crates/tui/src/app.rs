@@ -3839,6 +3839,12 @@ mod tests {
                 rollout_path: "session.jsonl".to_string(),
                 initial_messages: vec![
                     EventMsg::UserMessage("hello".to_string()),
+                    EventMsg::AgentReasoningCompleted(AgentReasoningCompletedEvent {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "turn".to_string(),
+                        item_id: "r1".to_string(),
+                        text: "thinking".to_string(),
+                    }),
                     EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
                         thread_id: thread_id.to_string(),
                         turn_id: "turn".to_string(),
@@ -3862,6 +3868,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("› hello"));
+        assert!(joined.contains("thinking"));
         assert!(joined.contains("• world"));
         assert!(model.active_assistant_lines.is_none());
         assert!(model.active_reasoning_lines.is_none());

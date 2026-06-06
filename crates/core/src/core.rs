@@ -21,7 +21,7 @@ use crate::{
     context_manager::ContextManager,
     error::{CoreError, CoreResult},
     provider::{SessionModel, SessionModelFactory},
-    rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persist_event},
+    rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persisted_event_item},
     state::{ActiveTurn, RunningTask, SessionState},
     tasks::{AnySessionTask, RegularTask},
 };
@@ -420,31 +420,34 @@ impl Session {
     }
 
     pub(crate) async fn record_user_message(&self, text: String) {
+        let message = Message::User {
+            content: OneOrMany::one(UserContent::Text(Text { text })),
+        };
         let mut state = self.state.lock().await;
-        state.history.push(Message::User {
-            content: OneOrMany::one(UserContent::Text(Text { text: text.clone() })),
-        });
+        state.history.push(message.clone());
         drop(state);
         let _ = self
             .rollout
-            .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
-                text,
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message,
             }))
             .await;
     }
 
-    pub(crate) async fn persist_assistant_message(&self, text: String) {
-        let _ = self
-            .rollout
-            .append(PersistedItem::HistoryMessage(
-                HistoryMessage::AssistantText { text },
-            ))
-            .await;
+    pub(crate) async fn persist_history_messages(&self, messages: &[Message]) {
+        for message in messages {
+            let _ = self
+                .rollout
+                .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                    message: message.clone(),
+                }))
+                .await;
+        }
     }
 
     pub(crate) async fn emit_event(&self, ctx: &TurnContext, msg: EventMsg) {
-        if persist_event(&msg) {
-            let _ = self.rollout.append(PersistedItem::Event(msg.clone())).await;
+        if let Some(item) = persisted_event_item(&msg) {
+            let _ = self.rollout.append(item).await;
         }
         let _ = self.event_tx.send(Event {
             id: ctx.sub_id.clone(),
@@ -453,8 +456,8 @@ impl Session {
     }
 
     pub(crate) async fn emit_session_event(&self, msg: EventMsg) {
-        if persist_event(&msg) {
-            let _ = self.rollout.append(PersistedItem::Event(msg.clone())).await;
+        if let Some(item) = persisted_event_item(&msg) {
+            let _ = self.rollout.append(item).await;
         }
         let _ = self.event_tx.send(Event {
             id: "session".to_string(),
@@ -575,7 +578,8 @@ mod tests {
     use tools::AskUserClient;
 
     use crate::{
-        SessionModel, SessionModelDriver, SessionStream,
+        SessionCompletionEvent, SessionCompletionStream, SessionModel, SessionModelDriver,
+        SessionTurnSummary,
         agent::AgentControl,
         provider::{SessionModelFactory, stub_session_model_factory},
         rollout::RolloutRecorder,
@@ -590,14 +594,22 @@ mod tests {
     struct EmptyDriver;
 
     impl SessionModelDriver for EmptyDriver {
-        fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-            Ok(Box::pin(futures_util::stream::iter(vec![Ok(
-                crate::provider::SessionStreamEvent::StreamAssistantItem(
+        fn stream_completion_turn(
+            &self,
+            _prompt: Message,
+            _history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(rig::message::Text {
                         text: "done".to_string(),
                     }),
-                ),
-            )])))
+                )),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-done".to_string()),
+                    response: "done".to_string(),
+                })),
+            ])))
         }
     }
 

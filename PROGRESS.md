@@ -32,6 +32,14 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - Keep OpenAI WebSocket inbound parsing local and tolerant rather than relying on Rig's private `StreamingCompletionChunk` parser; the local proxy emits provider telemetry and some known event types with payload shapes that may not match Rig's strict structs.
 - OpenAI WebSocket lifecycle responses from the local proxy may omit `output`; parse lifecycle fields (`status`, `usage`, errors, optional output IDs) from raw JSON instead of deserializing the full Responses completion object.
 
+## Rollout and Resume Persistence
+
+- Rollout `HistoryMessage` supports a full Rig `Message` variant; new user/assistant history records should use it so assistant IDs and structured reasoning, including encrypted/redacted provider payloads, survive resume. The legacy `UserText` and `AssistantText` variants remain readable for older sessions.
+- Completed tool-loop turns must persist the full model-facing message tail after the already-recorded initial user prompt, including assistant tool calls, user `ToolResult`s, and subagent completion text messages. Persisting assistant messages alone leaves resumed provider history with unmatched tool calls.
+- Thread-list `last_user_message` previews should come from rollout user-message event records, not model-facing full user messages; full user messages may be internal tool/subagent context such as `agent_completed` JSON.
+- `AgentReasoningCompleted` is persisted and replayed on resume for visible reasoning transcript rows. Raw reasoning deltas remain transient stream state.
+- Regular turns always use the manual `stream_completion_turn` path. The old opaque `stream_turn`/`SessionStream` provider surface was removed; test stubs should implement `SessionModelDriver::stream_completion_turn` and include a `SessionTurnSummary.response` for final assistant text.
+
 ## TUI Subagent Display
 
 - Subagents are model-facing only through `spawn_agent`, with required `description` and `prompt` args plus optional `subagent_type`; omitted, `default`, and `general-purpose` select the implementation-capable default child, while `Explore`/`explore` select the built-in read-only explorer. Explore children start with empty history, receive `prompt` as their input, use `SystemPromptKind::Explore`, and expose only `read` plus `run_command`.

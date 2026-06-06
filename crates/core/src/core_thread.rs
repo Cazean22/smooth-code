@@ -85,14 +85,14 @@ impl CoreThread {
             .await
             .map_err(CoreError::rollout)?;
         for message in &initial_history {
-            if let Some(history_message) = history_message_from_message(message) {
-                rollout
-                    .append(crate::rollout::PersistedItem::HistoryMessage(
-                        history_message,
-                    ))
-                    .await
-                    .map_err(CoreError::rollout)?;
-            }
+            rollout
+                .append(crate::rollout::PersistedItem::HistoryMessage(
+                    crate::rollout::HistoryMessage::Full {
+                        message: message.clone(),
+                    },
+                ))
+                .await
+                .map_err(CoreError::rollout)?;
         }
         let rollout_path = rollout.path().to_path_buf();
         Ok(Self {
@@ -200,28 +200,5 @@ impl CoreThread {
 
     pub(crate) fn rollout_path(&self) -> &PathBuf {
         &self.rollout_path
-    }
-}
-
-fn history_message_from_message(message: &Message) -> Option<crate::rollout::HistoryMessage> {
-    match message {
-        Message::System { .. } => None,
-        Message::User { content } => content.iter().find_map(|content| match content {
-            rig::message::UserContent::Text(text) => {
-                Some(crate::rollout::HistoryMessage::UserText {
-                    text: text.text.clone(),
-                })
-            }
-            rig::message::UserContent::Image(_) | rig::message::UserContent::Audio(_) => None,
-            _ => None,
-        }),
-        Message::Assistant { content, .. } => content.iter().find_map(|content| match content {
-            rig::message::AssistantContent::Text(text) => {
-                Some(crate::rollout::HistoryMessage::AssistantText {
-                    text: text.text.clone(),
-                })
-            }
-            _ => None,
-        }),
     }
 }

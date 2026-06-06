@@ -570,18 +570,16 @@ mod tests {
 
     use anyhow::{Context, Result, anyhow};
     use futures_util::{StreamExt, stream};
-    use rig::{
-        agent::FinalResponse,
-        message::{Message, Text},
-    };
+    use rig::message::{Message, Text};
     use smooth_state_db::StateDbHandle;
     use tempfile::TempDir;
     use tokio::sync::{RwLock, Semaphore};
 
     use super::AgentControl;
     use crate::{
-        SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
-        agent::SystemPromptKind, provider::SessionStreamEvent, thread_manager::ThreadManagerState,
+        SessionCompletionEvent, SessionCompletionStream, SessionModel, SessionModelDriver,
+        SessionModelFactory, SessionTurnSummary, agent::SystemPromptKind,
+        thread_manager::ThreadManagerState,
     };
     use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
     use tools::AskUserClient;
@@ -614,15 +612,23 @@ mod tests {
     }
 
     impl SessionModelDriver for StubDriver {
-        fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+        fn stream_completion_turn(
+            &self,
+            prompt: Message,
+            history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
             let _ = (prompt, history);
+            let text = self.text.clone();
             Ok(Box::pin(stream::iter(vec![
-                Ok(SessionStreamEvent::StreamAssistantItem(
+                Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(Text {
                         text: self.text.clone(),
                     }),
                 )),
-                Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty())),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-stub".to_string()),
+                    response: text,
+                })),
             ])))
         }
     }
@@ -664,19 +670,27 @@ mod tests {
     }
 
     impl SessionModelDriver for RecordingDriver {
-        fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+        fn stream_completion_turn(
+            &self,
+            prompt: Message,
+            history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
             lock_test_mutex(&self.state.calls, "calls")?
                 .entry(self.thread_id)
                 .or_default()
                 .push(history.clone());
             let _ = prompt;
+            let text = self.text.clone();
             Ok(Box::pin(stream::iter(vec![
-                Ok(SessionStreamEvent::StreamAssistantItem(
+                Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(Text {
                         text: self.text.clone(),
                     }),
                 )),
-                Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty())),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-recording".to_string()),
+                    response: text,
+                })),
             ])))
         }
     }
@@ -733,22 +747,30 @@ mod tests {
     }
 
     impl SessionModelDriver for BlockingRootDriver {
-        fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+        fn stream_completion_turn(
+            &self,
+            prompt: Message,
+            history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
             let _ = (prompt, history);
             let release = Arc::clone(&self.release);
             let text = self.text.clone();
+            let completed_text = text.clone();
             Ok(Box::pin(
                 stream::once(async move {
                     let _permit = release
                         .acquire_owned()
                         .await
                         .map_err(|err| anyhow!("release permit: {err}"))?;
-                    Ok(SessionStreamEvent::StreamAssistantItem(
+                    Ok(SessionCompletionEvent::AssistantItem(
                         crate::SessionAssistantContent::Text(Text { text }),
                     ))
                 })
-                .chain(stream::iter(vec![Ok(SessionStreamEvent::FinalResponse(
-                    FinalResponse::empty(),
+                .chain(stream::iter(vec![Ok(SessionCompletionEvent::Completed(
+                    SessionTurnSummary {
+                        assistant_message_id: Some("assistant-blocking".to_string()),
+                        response: completed_text,
+                    },
                 ))])),
             ))
         }

@@ -7,18 +7,15 @@ use std::{
 
 use anyhow::Result;
 use futures_util::{StreamExt, stream};
-use rig::{
-    agent::FinalResponse,
-    message::{
-        AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction,
-        UserContent,
-    },
+use rig::message::{
+    AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction,
+    UserContent,
 };
 use serde::Deserialize;
 use smooth_core::{
     AgentControl, SessionAssistantContent, SessionCompletionEvent, SessionCompletionStream,
-    SessionModel, SessionModelDriver, SessionModelFactory, SessionStream, SessionStreamEvent,
-    SessionTurnSummary, SystemPromptKind, ThreadManagerState,
+    SessionModel, SessionModelDriver, SessionModelFactory, SessionTurnSummary, SystemPromptKind,
+    ThreadManagerState,
 };
 use smooth_protocol::{
     AgentStatus, CollabAgentStatusEntry, EventMsg, ThreadId, ToolCallResultKind,
@@ -53,15 +50,23 @@ struct StubDriver {
 }
 
 impl SessionModelDriver for StubDriver {
-    fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
         let _ = (prompt, history);
+        let text = self.text.clone();
         Ok(Box::pin(stream::iter(vec![
-            Ok(SessionStreamEvent::StreamAssistantItem(
+            Ok(SessionCompletionEvent::AssistantItem(
                 SessionAssistantContent::Text(Text {
                     text: self.text.clone(),
                 }),
             )),
-            Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty())),
+            Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                assistant_message_id: Some("assistant-stub".to_string()),
+                response: text,
+            })),
         ])))
     }
 }
@@ -90,14 +95,6 @@ struct ExploreRoutingParentDriver {
 }
 
 impl SessionModelDriver for ExploreRoutingParentDriver {
-    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-        unreachable!("manual completion stream should be used for explore routing test");
-    }
-
-    fn supports_manual_tool_loop(&self) -> bool {
-        true
-    }
-
     fn stream_completion_turn(
         &self,
         prompt: Message,
@@ -172,7 +169,11 @@ struct ExploreRoutingChildDriver {
 }
 
 impl SessionModelDriver for ExploreRoutingChildDriver {
-    fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
         let prompt_text =
             first_user_text(&prompt).ok_or_else(|| anyhow::anyhow!("missing child prompt"))?;
         let history_len = history.len();
@@ -181,13 +182,15 @@ impl SessionModelDriver for ExploreRoutingChildDriver {
             .map_err(|_| anyhow::anyhow!("child input mutex"))?
             .push((prompt_text, history_len));
 
+        let text = "explore findings".to_string();
         Ok(Box::pin(stream::iter(vec![
-            Ok(SessionStreamEvent::StreamAssistantItem(
-                SessionAssistantContent::Text(Text {
-                    text: "explore findings".to_string(),
-                }),
+            Ok(SessionCompletionEvent::AssistantItem(
+                SessionAssistantContent::Text(Text { text: text.clone() }),
             )),
-            Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty())),
+            Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                assistant_message_id: Some("assistant-explore-child".to_string()),
+                response: text,
+            })),
         ])))
     }
 }
@@ -363,14 +366,6 @@ struct ConcurrentSpawnDriver {
 }
 
 impl SessionModelDriver for ConcurrentSpawnDriver {
-    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-        unreachable!("manual completion stream should be used for concurrent spawn test");
-    }
-
-    fn supports_manual_tool_loop(&self) -> bool {
-        true
-    }
-
     fn stream_completion_turn(
         &self,
         prompt: Message,
@@ -470,19 +465,27 @@ struct DeferredChildDriver {
 }
 
 impl SessionModelDriver for DeferredChildDriver {
-    fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
         let _ = (prompt, history);
         let text = self.text.clone();
+        let completed_text = text.clone();
         let release = Arc::clone(&self.release);
         Ok(Box::pin(
             stream::once(async move {
                 release.acquire().await?.forget();
-                Ok(SessionStreamEvent::StreamAssistantItem(
+                Ok(SessionCompletionEvent::AssistantItem(
                     SessionAssistantContent::Text(Text { text }),
                 ))
             })
-            .chain(stream::iter(vec![Ok(SessionStreamEvent::FinalResponse(
-                FinalResponse::empty(),
+            .chain(stream::iter(vec![Ok(SessionCompletionEvent::Completed(
+                SessionTurnSummary {
+                    assistant_message_id: Some("assistant-deferred-child".to_string()),
+                    response: completed_text,
+                },
             ))])),
         ))
     }
@@ -493,14 +496,6 @@ struct MixedBatchDriver {
 }
 
 impl SessionModelDriver for MixedBatchDriver {
-    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-        unreachable!("manual completion stream should be used for mixed batch test");
-    }
-
-    fn supports_manual_tool_loop(&self) -> bool {
-        true
-    }
-
     fn stream_completion_turn(
         &self,
         prompt: Message,
@@ -624,14 +619,6 @@ struct TwoRetainedDriver {
 }
 
 impl SessionModelDriver for TwoRetainedDriver {
-    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-        unreachable!("manual completion stream should be used for two retained test");
-    }
-
-    fn supports_manual_tool_loop(&self) -> bool {
-        true
-    }
-
     fn stream_completion_turn(
         &self,
         prompt: Message,
@@ -1327,14 +1314,6 @@ struct ReasoningStreamDriver {
 }
 
 impl SessionModelDriver for ReasoningStreamDriver {
-    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-        unreachable!("manual completion stream should be used for reasoning stream test");
-    }
-
-    fn supports_manual_tool_loop(&self) -> bool {
-        true
-    }
-
     fn stream_completion_turn(
         &self,
         prompt: Message,
@@ -1430,14 +1409,6 @@ struct ReasoningToolLoopDriver {
 }
 
 impl SessionModelDriver for ReasoningToolLoopDriver {
-    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-        unreachable!("manual completion stream should be used for reasoning tool loop test");
-    }
-
-    fn supports_manual_tool_loop(&self) -> bool {
-        true
-    }
-
     fn stream_completion_turn(
         &self,
         prompt: Message,
@@ -1584,6 +1555,152 @@ impl SessionModelFactory for ReasoningToolLoopFactory {
     }
 }
 
+struct PersistedToolLoopDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for PersistedToolLoopDriver {
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(
+                    first_user_text(&prompt),
+                    Some("persisted tool loop".to_string())
+                );
+                assert!(history.is_empty());
+                let tool_call = ToolCall::new(
+                    "tool-1".to_string(),
+                    ToolFunction::new(
+                        "normal_tool".to_string(),
+                        serde_json::json!({ "value": "ok" }),
+                    ),
+                )
+                .with_call_id("call-1".to_string());
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-call-1".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-tool-phase".to_string()),
+                        response: String::new(),
+                    })),
+                ])))
+            }
+            1 => {
+                assert_eq!(history.len(), 2);
+                assert_eq!(
+                    first_user_text(&history[0]),
+                    Some("persisted tool loop".to_string())
+                );
+                assert_eq!(assistant_tool_names(&history[1]), vec!["normal_tool"]);
+                assert_eq!(tool_result_texts(&prompt), vec!["tool-output"]);
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "tool-loop-final".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-final".to_string()),
+                        response: "tool-loop-final".to_string(),
+                    })),
+                ])))
+            }
+            other => panic!("unexpected completion turn {other}"),
+        }
+    }
+
+    fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+        assert_eq!(tool_name, "normal_tool");
+        assert_eq!(args, r#"{"value":"ok"}"#);
+        Ok("tool-output".to_string())
+    }
+}
+
+struct VerifyPersistedToolLoopDriver;
+
+impl SessionModelDriver for VerifyPersistedToolLoopDriver {
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        assert_eq!(first_user_text(&prompt), Some("after resume".to_string()));
+        assert_eq!(
+            history.len(),
+            4,
+            "expected initial user, assistant tool call, user tool result, final assistant"
+        );
+        assert_eq!(
+            first_user_text(&history[0]),
+            Some("persisted tool loop".to_string())
+        );
+        assert_eq!(assistant_tool_names(&history[1]), vec!["normal_tool"]);
+        assert_eq!(tool_result_texts(&history[2]), vec!["tool-output"]);
+        let (text, reasonings) = assistant_text_and_reasonings(&history[3]);
+        assert_eq!(text.as_deref(), Some("tool-loop-final"));
+        assert!(reasonings.is_empty());
+
+        Ok(Box::pin(stream::iter(vec![
+            Ok(SessionCompletionEvent::AssistantItem(
+                SessionAssistantContent::Text(Text {
+                    text: "verified resume".to_string(),
+                }),
+            )),
+            Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                assistant_message_id: Some("assistant-after-resume".to_string()),
+                response: "verified resume".to_string(),
+            })),
+        ])))
+    }
+}
+
+struct PersistedToolLoopFactory {
+    build_count: Mutex<usize>,
+}
+
+impl SessionModelFactory for PersistedToolLoopFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _ask_user_client: Option<AskUserClient>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        _system_prompt_kind: SystemPromptKind,
+        _agent_control: AgentControl,
+        _plan_mode: bool,
+    ) -> Result<SessionModel> {
+        let mut build_count = self
+            .build_count
+            .lock()
+            .map_err(|_| anyhow::anyhow!("build count mutex"))?;
+        let model = if *build_count == 0 {
+            SessionModel::Stub(Arc::new(PersistedToolLoopDriver {
+                calls: Mutex::new(0),
+            }))
+        } else {
+            SessionModel::Stub(Arc::new(VerifyPersistedToolLoopDriver))
+        };
+        *build_count += 1;
+        Ok(model)
+    }
+}
+
 /// Emits an Anthropic-shaped reasoning stream: idless `ReasoningDelta` chunks
 /// followed by a single idless full `Reasoning` block carrying a signature.
 /// Used to catch the regression where the pending idless delta bucket wasn't
@@ -1594,16 +1711,6 @@ struct IdlessReasoningCompletionDriver {
 }
 
 impl SessionModelDriver for IdlessReasoningCompletionDriver {
-    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-        unreachable!(
-            "manual completion stream should be used for idless reasoning completion test"
-        );
-    }
-
-    fn supports_manual_tool_loop(&self) -> bool {
-        true
-    }
-
     fn stream_completion_turn(
         &self,
         prompt: Message,
@@ -1723,14 +1830,6 @@ struct EncryptedReasoningDriver {
 }
 
 impl SessionModelDriver for EncryptedReasoningDriver {
-    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
-        unreachable!("manual completion stream should be used for encrypted reasoning test");
-    }
-
-    fn supports_manual_tool_loop(&self) -> bool {
-        true
-    }
-
     fn stream_completion_turn(
         &self,
         prompt: Message,
@@ -1910,6 +2009,39 @@ async fn reasoning_persists_across_tool_call_iteration_and_terminal_turn() -> Re
 }
 
 #[tokio::test]
+async fn resumed_completed_tool_loop_history_includes_tool_results() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
+
+    let factory = Arc::new(PersistedToolLoopFactory {
+        build_count: Mutex::new(0),
+    });
+    let manager = ThreadManagerState::new(None, Some(factory.clone())).await?;
+    let started = manager.start_thread().await?;
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await?;
+
+    let first_turn = manager
+        .start_user_input(root_id, "persisted tool loop".to_string())
+        .await?;
+    wait_for_turn_completion(&mut root_events, &first_turn).await;
+    drop(manager);
+
+    let resumed_manager = ThreadManagerState::new(None, Some(factory)).await?;
+    let _resumed = resumed_manager.resume_thread(root_id).await?;
+    let mut resumed_events = resumed_manager.subscribe(root_id).await?;
+    let follow_up = resumed_manager
+        .start_user_input(root_id, "after resume".to_string())
+        .await?;
+    wait_for_turn_completion(&mut resumed_events, &follow_up).await;
+
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn idless_reasoning_completion_supersedes_pending_deltas_without_duplicating() -> Result<()> {
     let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
     let workspace = TempDir::new()?;
@@ -2071,6 +2203,19 @@ fn tool_result_texts(message: &Message) -> Vec<String> {
             })
             .collect(),
         other => panic!("expected tool result message, got {other:?}"),
+    }
+}
+
+fn assistant_tool_names(message: &Message) -> Vec<String> {
+    match message {
+        Message::Assistant { content, .. } => content
+            .iter()
+            .filter_map(|item| match item {
+                AssistantContent::ToolCall(tool_call) => Some(tool_call.function.name.clone()),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected assistant tool-call message, got {other:?}"),
     }
 }
 

@@ -4,6 +4,7 @@ use futures_util::{FutureExt, StreamExt, future::select_all, stream::FuturesUnor
 use indexmap::IndexMap;
 use rig::{
     OneOrMany,
+    completion::CompletionError,
     message::{
         AssistantContent, Message, Reasoning as MessageReasoning, ReasoningContent, Text,
         ToolResult, ToolResultContent, UserContent,
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use smooth_protocol::{
     AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
     AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, ErrorInfo, EventMsg, ProjectInstructions,
-    ThreadId, ToolCallCompletedEvent, ToolCallResultKind, ToolCallStartedEvent,
+    StreamErrorEvent, ThreadId, ToolCallCompletedEvent, ToolCallResultKind, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
 use tools::{DecodedToolOutput, SubagentArgs, decode_tool_output_for_tool};
@@ -24,7 +25,11 @@ use crate::{
         registry::AgentMetadata, status::last_assistant_message,
     },
     core::{Session, TurnContext},
-    provider::{SessionAssistantContent, SessionCompletionEvent, SessionTurnSummary},
+    provider::{
+        OPENAI_WEBSOCKET_RETRY_BUDGET, SessionAssistantContent, SessionCompletionEvent,
+        SessionTurnSummary, is_openai_websocket_transient_start_error,
+        openai_websocket_retry_delay,
+    },
     state::TaskKind,
 };
 
@@ -255,12 +260,18 @@ async fn run_manual_turn(
     let mut new_messages = vec![initial_prompt];
     let mut saw_tool_loop = false;
     let mut retained_subagents = Vec::new();
+    // This mid-output continuation budget is separate from the provider's
+    // before-output retry budget; provider retries handle startup churn, while
+    // this counter bounds only attempts that already yielded assistant output.
+    let mut stream_retries = 0;
+    let mut stream_phase_completions: Vec<String> = Vec::new();
 
-    loop {
+    'turn_loop: loop {
         if cancellation_token.is_cancelled() {
             return None;
         }
 
+        let attempt_assistant_item_id = assistant_item_id_for_attempt(&ctx, stream_retries);
         let (pending_prompt, request_history) = build_request_parts(
             &history_before_turn,
             session.project_instructions.as_ref(),
@@ -278,10 +289,11 @@ async fn run_manual_turn(
             }
         };
         let mut pending_tool_calls = Vec::new();
+        let mut accumulated_text = String::new();
         let mut accumulated_reasoning = Vec::new();
         let mut pending_reasoning_deltas = PendingReasoningDeltas::default();
-        let mut saw_tool_call_this_turn = false;
-        let mut stream_phase_completions: Vec<String> = Vec::new();
+        let mut saw_assistant_item_this_attempt = false;
+        let mut saw_tool_call_this_attempt = false;
         let mut turn_summary = SessionTurnSummary {
             assistant_message_id: None,
             response: String::new(),
@@ -307,6 +319,82 @@ async fn run_manual_turn(
             let event = match item {
                 Ok(event) => event,
                 Err(err) => {
+                    pending_reasoning_deltas.finalize_into(&mut accumulated_reasoning);
+                    if should_continue_after_stream_error(
+                        &err,
+                        stream_retries,
+                        saw_assistant_item_this_attempt,
+                    ) {
+                        let requires_provider_reasoning_ids =
+                            session.model().await.requires_provider_reasoning_ids();
+                        let assistant_message = build_assistant_message_for_attempt(
+                            &turn_summary,
+                            &accumulated_text,
+                            &mut accumulated_reasoning,
+                            &pending_tool_calls,
+                            saw_tool_call_this_attempt,
+                            requires_provider_reasoning_ids,
+                        );
+                        let tool_results = if saw_tool_call_this_attempt {
+                            execute_pending_tool_calls_for_turn(
+                                Arc::clone(&session),
+                                Arc::clone(&ctx),
+                                pending_tool_calls,
+                                &mut retained_subagents,
+                                &mut stream_phase_completions,
+                                &cancellation_token,
+                            )
+                            .await?
+                        } else {
+                            Vec::new()
+                        };
+                        if let Some(message) = assistant_message {
+                            new_messages.push(message);
+                        }
+                        if let Some(message) = tool_results_to_user_message(tool_results) {
+                            new_messages.push(message);
+                        }
+                        if saw_tool_call_this_attempt
+                            && let Some(message) = text_items_to_user_message(std::mem::take(
+                                &mut stream_phase_completions,
+                            ))
+                        {
+                            new_messages.push(message);
+                        }
+                        if !accumulated_text.is_empty() {
+                            session
+                                .emit_event(
+                                    &ctx,
+                                    EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
+                                        thread_id: session.id.to_string(),
+                                        turn_id: ctx.sub_id.clone(),
+                                        item_id: attempt_assistant_item_id.clone(),
+                                        text: accumulated_text.clone(),
+                                    }),
+                                )
+                                .await;
+                        }
+
+                        let next_retry = stream_retries + 1;
+                        session
+                            .emit_event(
+                                &ctx,
+                                EventMsg::StreamError(StreamErrorEvent {
+                                    thread_id: session.id.to_string(),
+                                    turn_id: ctx.sub_id.clone(),
+                                    message: format!(
+                                        "Reconnecting… {next_retry}/{OPENAI_WEBSOCKET_RETRY_BUDGET}"
+                                    ),
+                                }),
+                            )
+                            .await;
+                        stream_retries = next_retry;
+                        tokio::select! {
+                            _ = cancellation_token.cancelled() => return None,
+                            _ = tokio::time::sleep(openai_websocket_retry_delay(stream_retries)) => {}
+                        }
+                        continue 'turn_loop;
+                    }
                     fail_turn(&session, &ctx, "manual.stream_completion_turn.item", err).await;
                     return None;
                 }
@@ -314,14 +402,17 @@ async fn run_manual_turn(
             match event {
                 SessionCompletionEvent::AssistantItem(assistant_item) => match assistant_item {
                     SessionAssistantContent::Text(text) => {
+                        saw_assistant_item_this_attempt = true;
+                        let delta = text.text;
+                        accumulated_text.push_str(&delta);
                         session
                             .emit_event(
                                 &ctx,
                                 EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
                                     thread_id: session.id.to_string(),
                                     turn_id: ctx.sub_id.clone(),
-                                    item_id: ctx.assistant_item_id.clone(),
-                                    delta: text.text,
+                                    item_id: attempt_assistant_item_id.clone(),
+                                    delta,
                                 }),
                             )
                             .await;
@@ -330,8 +421,9 @@ async fn run_manual_turn(
                         tool_call,
                         internal_call_id,
                     } => {
+                        saw_assistant_item_this_attempt = true;
                         saw_tool_loop = true;
-                        saw_tool_call_this_turn = true;
+                        saw_tool_call_this_attempt = true;
                         session
                             .emit_event(
                                 &ctx,
@@ -352,9 +444,10 @@ async fn run_manual_turn(
                         });
                     }
                     SessionAssistantContent::ReasoningDelta { id, reasoning } => {
+                        saw_assistant_item_this_attempt = true;
                         let item_id = id
                             .clone()
-                            .unwrap_or_else(|| format!("{}-reasoning", ctx.assistant_item_id));
+                            .unwrap_or_else(|| format!("{attempt_assistant_item_id}-reasoning"));
                         pending_reasoning_deltas.push_delta(id, &reasoning);
                         session
                             .emit_event(
@@ -369,6 +462,7 @@ async fn run_manual_turn(
                             .await;
                     }
                     SessionAssistantContent::Reasoning(reasoning) => {
+                        saw_assistant_item_this_attempt = true;
                         // Skip only truly empty completions. A block carrying
                         // `Encrypted` or `Redacted` content has empty
                         // human-readable text but still must be roundtripped
@@ -384,7 +478,7 @@ async fn run_manual_turn(
                         let item_id = reasoning
                             .id
                             .clone()
-                            .unwrap_or_else(|| format!("{}-reasoning", ctx.assistant_item_id));
+                            .unwrap_or_else(|| format!("{attempt_assistant_item_id}-reasoning"));
                         merge_reasoning_blocks(&mut accumulated_reasoning, &reasoning);
                         if !text.is_empty() {
                             session
@@ -402,8 +496,10 @@ async fn run_manual_turn(
                                 .await;
                         }
                     }
-                    SessionAssistantContent::ToolCallDelta { .. }
-                    | SessionAssistantContent::Final => {}
+                    SessionAssistantContent::ToolCallDelta { .. } => {
+                        saw_assistant_item_this_attempt = true;
+                    }
+                    SessionAssistantContent::Final => {}
                 },
                 SessionCompletionEvent::Completed(summary) => {
                     turn_summary = summary;
@@ -413,67 +509,24 @@ async fn run_manual_turn(
 
         pending_reasoning_deltas.finalize_into(&mut accumulated_reasoning);
 
-        if saw_tool_call_this_turn {
+        if saw_tool_call_this_attempt {
             let assistant_message = build_assistant_tool_message(
                 &turn_summary,
+                &accumulated_text,
                 &mut accumulated_reasoning,
                 &pending_tool_calls,
                 session.model().await.requires_provider_reasoning_ids(),
             );
 
-            let (normal_calls, spawn_calls, exit_plan_calls) =
-                partition_pending_tool_calls(pending_tool_calls);
-
-            let started_spawns =
-                start_spawn_calls_concurrently(Arc::clone(&session), Arc::clone(&ctx), spawn_calls)
-                    .await;
-
-            let normal_results = execute_normal_tools_concurrently(
+            let executed_tool_calls = execute_pending_tool_calls_for_turn(
                 Arc::clone(&session),
                 Arc::clone(&ctx),
-                normal_calls,
+                pending_tool_calls,
+                &mut retained_subagents,
+                &mut stream_phase_completions,
                 &cancellation_token,
             )
             .await?;
-
-            let exit_plan_results = execute_exit_plan_mode_calls(
-                Arc::clone(&session),
-                Arc::clone(&ctx),
-                exit_plan_calls,
-            )
-            .await;
-
-            let has_normal_tools = !normal_results.is_empty() || !exit_plan_results.is_empty();
-            let (started_spawns, immediate_spawn_results) =
-                split_started_and_immediate(started_spawns);
-            let started_spawns =
-                wait_for_spawn_batch(started_spawns, has_normal_tools, &cancellation_token).await?;
-
-            let mut spawn_results = collect_spawn_results(
-                Arc::clone(&session),
-                Arc::clone(&ctx),
-                started_spawns,
-                &mut retained_subagents,
-            )
-            .await;
-            spawn_results.extend(immediate_spawn_results);
-
-            let mut combined_normal = normal_results;
-            combined_normal.extend(exit_plan_results);
-            let executed_tool_calls = merge_in_index_order(combined_normal, spawn_results);
-
-            // Pure `spawn_agent` batch: also block on every retained receiver
-            // carried over from prior turns so the model sees their completed
-            // JSON in this same iteration. The drained completions ride along
-            // with anything captured mid-stream and surface together as a
-            // single user-text message below.
-            if !has_normal_tools {
-                let drained = tokio::select! {
-                    _ = cancellation_token.cancelled() => return None,
-                    completions = drain_retained_subagent_completions(&mut retained_subagents) => completions,
-                };
-                stream_phase_completions.extend(drained);
-            }
 
             if let Some(message) = assistant_message {
                 new_messages.push(message);
@@ -481,7 +534,9 @@ async fn run_manual_turn(
             if let Some(message) = tool_results_to_user_message(executed_tool_calls) {
                 new_messages.push(message);
             }
-            if let Some(message) = text_items_to_user_message(stream_phase_completions) {
+            if let Some(message) =
+                text_items_to_user_message(std::mem::take(&mut stream_phase_completions))
+            {
                 new_messages.push(message);
             }
             continue;
@@ -491,9 +546,10 @@ async fn run_manual_turn(
             append_completion_texts_after_assistant_turn(
                 &mut new_messages,
                 &turn_summary,
+                &accumulated_text,
                 &mut accumulated_reasoning,
                 session.model().await.requires_provider_reasoning_ids(),
-                stream_phase_completions,
+                std::mem::take(&mut stream_phase_completions),
             );
             continue;
         }
@@ -506,6 +562,7 @@ async fn run_manual_turn(
             append_completion_texts_after_assistant_turn(
                 &mut new_messages,
                 &turn_summary,
+                &accumulated_text,
                 &mut accumulated_reasoning,
                 session.model().await.requires_provider_reasoning_ids(),
                 completion_texts,
@@ -515,12 +572,13 @@ async fn run_manual_turn(
 
         if let Some(message) = build_assistant_text_reasoning_message(
             &turn_summary,
+            &accumulated_text,
             &mut accumulated_reasoning,
             session.model().await.requires_provider_reasoning_ids(),
         ) {
             new_messages.push(message);
         }
-        let last_assistant_message = turn_summary.response.clone();
+        let last_assistant_message = assistant_text_for_message(&turn_summary, &accumulated_text);
         if let Some((_already_recorded_prompt, model_facing_tail)) = new_messages.split_first() {
             session.persist_history_messages(model_facing_tail).await;
         }
@@ -534,7 +592,7 @@ async fn run_manual_turn(
                     EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
                         thread_id: session.id.to_string(),
                         turn_id: ctx.sub_id.clone(),
-                        item_id: ctx.assistant_item_id.clone(),
+                        item_id: attempt_assistant_item_id,
                         text: last_assistant_message.clone(),
                     }),
                 )
@@ -707,6 +765,64 @@ async fn execute_normal_tools_concurrently(
         resolved.push(executed);
     }
     Some(resolved)
+}
+
+async fn execute_pending_tool_calls_for_turn(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    pending_tool_calls: Vec<PendingToolCall>,
+    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+    stream_phase_completions: &mut Vec<String>,
+    cancellation_token: &CancellationToken,
+) -> Option<Vec<ExecutedToolCall>> {
+    let (normal_calls, spawn_calls, exit_plan_calls) =
+        partition_pending_tool_calls(pending_tool_calls);
+
+    let started_spawns =
+        start_spawn_calls_concurrently(Arc::clone(&session), Arc::clone(&ctx), spawn_calls).await;
+
+    let normal_results = execute_normal_tools_concurrently(
+        Arc::clone(&session),
+        Arc::clone(&ctx),
+        normal_calls,
+        cancellation_token,
+    )
+    .await?;
+
+    let exit_plan_results =
+        execute_exit_plan_mode_calls(Arc::clone(&session), Arc::clone(&ctx), exit_plan_calls).await;
+
+    let has_normal_tools = !normal_results.is_empty() || !exit_plan_results.is_empty();
+    let (started_spawns, immediate_spawn_results) = split_started_and_immediate(started_spawns);
+    let started_spawns =
+        wait_for_spawn_batch(started_spawns, has_normal_tools, cancellation_token).await?;
+
+    let mut spawn_results = collect_spawn_results(
+        Arc::clone(&session),
+        Arc::clone(&ctx),
+        started_spawns,
+        retained_subagents,
+    )
+    .await;
+    spawn_results.extend(immediate_spawn_results);
+
+    let mut combined_normal = normal_results;
+    combined_normal.extend(exit_plan_results);
+    let executed_tool_calls = merge_in_index_order(combined_normal, spawn_results);
+
+    // Pure `spawn_agent` batch: also block on every retained receiver carried
+    // over from prior turns so the model sees their completed JSON in this same
+    // iteration. The drained completions ride along with anything captured
+    // mid-stream and surface together as a single user-text message below.
+    if !has_normal_tools {
+        let drained = tokio::select! {
+            _ = cancellation_token.cancelled() => return None,
+            completions = drain_retained_subagent_completions(retained_subagents) => completions,
+        };
+        stream_phase_completions.extend(drained);
+    }
+
+    Some(executed_tool_calls)
 }
 
 fn partition_pending_tool_calls(
@@ -1192,12 +1308,14 @@ fn retained_completion_text(
 fn append_completion_texts_after_assistant_turn(
     new_messages: &mut Vec<Message>,
     turn_summary: &SessionTurnSummary,
+    accumulated_text: &str,
     accumulated_reasoning: &mut Vec<MessageReasoning>,
     requires_provider_reasoning_ids: bool,
     completion_texts: Vec<String>,
 ) {
     if let Some(message) = build_assistant_text_reasoning_message(
         turn_summary,
+        accumulated_text,
         accumulated_reasoning,
         requires_provider_reasoning_ids,
     ) {
@@ -1208,14 +1326,70 @@ fn append_completion_texts_after_assistant_turn(
     }
 }
 
+fn assistant_item_id_for_attempt(ctx: &TurnContext, stream_retries: usize) -> String {
+    if stream_retries == 0 {
+        ctx.assistant_item_id.clone()
+    } else {
+        format!("{}#{stream_retries}", ctx.assistant_item_id)
+    }
+}
+
+fn should_continue_after_stream_error(
+    err: &anyhow::Error,
+    stream_retries: usize,
+    saw_assistant_item_this_attempt: bool,
+) -> bool {
+    saw_assistant_item_this_attempt
+        && stream_retries < OPENAI_WEBSOCKET_RETRY_BUDGET
+        && err
+            .downcast_ref::<CompletionError>()
+            .is_some_and(is_openai_websocket_transient_start_error)
+}
+
+fn assistant_text_for_message(turn_summary: &SessionTurnSummary, accumulated_text: &str) -> String {
+    if turn_summary.response.is_empty() {
+        accumulated_text.to_string()
+    } else {
+        turn_summary.response.clone()
+    }
+}
+
+fn build_assistant_message_for_attempt(
+    turn_summary: &SessionTurnSummary,
+    accumulated_text: &str,
+    accumulated_reasoning: &mut Vec<MessageReasoning>,
+    pending_tool_calls: &[PendingToolCall],
+    saw_tool_call_this_attempt: bool,
+    requires_provider_reasoning_ids: bool,
+) -> Option<Message> {
+    if saw_tool_call_this_attempt {
+        build_assistant_tool_message(
+            turn_summary,
+            accumulated_text,
+            accumulated_reasoning,
+            pending_tool_calls,
+            requires_provider_reasoning_ids,
+        )
+    } else {
+        build_assistant_text_reasoning_message(
+            turn_summary,
+            accumulated_text,
+            accumulated_reasoning,
+            requires_provider_reasoning_ids,
+        )
+    }
+}
+
 fn build_assistant_text_reasoning_message(
     turn_summary: &SessionTurnSummary,
+    accumulated_text: &str,
     accumulated_reasoning: &mut Vec<MessageReasoning>,
     requires_provider_reasoning_ids: bool,
 ) -> Option<Message> {
     let mut content_items = Vec::new();
-    if !turn_summary.response.is_empty() {
-        content_items.push(AssistantContent::text(&turn_summary.response));
+    let assistant_text = assistant_text_for_message(turn_summary, accumulated_text);
+    if !assistant_text.is_empty() {
+        content_items.push(AssistantContent::text(assistant_text));
     }
     for reasoning in accumulated_reasoning.drain(..) {
         if should_roundtrip_reasoning(requires_provider_reasoning_ids, &reasoning) {
@@ -1351,13 +1525,15 @@ fn should_roundtrip_reasoning(
 
 fn build_assistant_tool_message(
     turn_summary: &SessionTurnSummary,
+    accumulated_text: &str,
     accumulated_reasoning: &mut Vec<MessageReasoning>,
     pending_tool_calls: &[PendingToolCall],
     requires_provider_reasoning_ids: bool,
 ) -> Option<Message> {
     let mut content_items = Vec::new();
-    if !turn_summary.response.is_empty() {
-        content_items.push(AssistantContent::text(&turn_summary.response));
+    let assistant_text = assistant_text_for_message(turn_summary, accumulated_text);
+    if !assistant_text.is_empty() {
+        content_items.push(AssistantContent::text(assistant_text));
     }
     for reasoning in accumulated_reasoning.drain(..) {
         if should_roundtrip_reasoning(requires_provider_reasoning_ids, &reasoning) {

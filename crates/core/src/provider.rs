@@ -462,7 +462,7 @@ type OpenAiWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 // codex account running out of usage: it drops the socket, and on the next attempt the proxy can
 // rotate to a different account. Budget enough attempts to roll through several exhausted accounts
 // before giving up, and cap the exponential backoff so the retry tail stays interactive.
-const OPENAI_WEBSOCKET_RETRY_BUDGET: usize = 8;
+pub(crate) const OPENAI_WEBSOCKET_RETRY_BUDGET: usize = 8;
 const OPENAI_WEBSOCKET_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const OPENAI_WEBSOCKET_RETRY_MAX_DELAY: Duration = Duration::from_secs(3);
 
@@ -1198,12 +1198,11 @@ const OPENAI_WEBSOCKET_RETRYABLE_TRANSIENT_MARKERS: &[&str] = &[
     "disconnected before completion",
 ];
 
-fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
-    // Retries fire only before any assistant output (see `should_retry_openai_websocket_error`),
-    // so this only needs to recognise drops that happen before the turn produces tokens.
+pub(crate) fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
     // Classification is text-based because `CompletionError` carries only a rendered message at
     // this boundary; the marker lists are the single source of truth for what counts as
-    // transient.
+    // transient. The provider uses this before output, and the manual turn loop reuses it after
+    // partial output so both retry paths agree on what a transient WebSocket disconnect means.
     let message = error.to_string();
     is_openai_websocket_connection_reset(error)
         || OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES
@@ -1219,7 +1218,7 @@ fn should_retry_openai_websocket_error(
     !yielded_assistant_item && is_openai_websocket_transient_start_error(error)
 }
 
-fn openai_websocket_retry_delay(retry_count: usize) -> Duration {
+pub(crate) fn openai_websocket_retry_delay(retry_count: usize) -> Duration {
     let factor = 1_u32
         .checked_shl(retry_count.saturating_sub(1) as u32)
         .unwrap_or(u32::MAX);

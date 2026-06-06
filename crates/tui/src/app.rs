@@ -1640,6 +1640,10 @@ impl UiModel {
                 self.running_tools.clear();
                 self.status_line = String::from("Error");
             }
+            EventMsg::StreamError(error) => {
+                self.finalize_assistant_stream(None);
+                self.push_info(error.message);
+            }
             EventMsg::CollabAgentSpawnBegin(_event) => {}
             EventMsg::CollabAgentSpawnEnd(_event) => {}
             EventMsg::CollabAgentCompleted(event) => {
@@ -2743,8 +2747,8 @@ mod tests {
     use smooth_protocol::{
         AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
         AgentReasoningDeltaEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent, EventMsg,
-        ToolCallCompletedEvent, ToolCallStartedEvent, TurnCompletedEvent, TurnInterruptedEvent,
-        TurnStartedEvent,
+        StreamErrorEvent, ToolCallCompletedEvent, ToolCallStartedEvent, TurnCompletedEvent,
+        TurnInterruptedEvent, TurnStartedEvent,
     };
 
     fn event(id: &str, msg: EventMsg) -> Event {
@@ -2998,6 +3002,71 @@ mod tests {
         );
 
         assert_eq!(transcript_strings(&app), vec![String::from("• hello")]);
+    }
+
+    #[test]
+    fn stream_error_finalizes_partial_and_shows_reconnect_notice() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("assistant-1"),
+                    delta: String::from("partial"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "2",
+                EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("assistant-1"),
+                    text: String::from("partial"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::StreamError(StreamErrorEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    message: String::from("Reconnecting… 1/8"),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "4",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    item_id: String::from("assistant-1#1"),
+                    delta: String::from("continued"),
+                }),
+            ),
+            20,
+        );
+
+        assert_eq!(
+            transcript_strings(&app),
+            vec![
+                String::from("• partial"),
+                String::new(),
+                String::from("i Reconnecting… 1/8"),
+                String::new(),
+                String::from("• continued"),
+            ]
+        );
     }
 
     #[test]

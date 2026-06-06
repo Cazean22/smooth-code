@@ -572,11 +572,17 @@ impl Session {
 mod tests {
     use std::{
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use anyhow::Result;
-    use rig::message::Message;
+    use rig::{
+        completion::CompletionError,
+        message::{AssistantContent, Message, Text, ToolCall, ToolFunction, UserContent},
+    };
     use tempfile::TempDir;
     use tokio::sync::RwLock;
     use tools::AskUserClient;
@@ -614,6 +620,115 @@ mod tests {
                     response: "done".to_string(),
                 })),
             ])))
+        }
+    }
+
+    struct ResetOnceDriver {
+        calls: AtomicUsize,
+    }
+
+    impl ResetOnceDriver {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SessionModelDriver for ResetOnceDriver {
+        fn stream_completion_turn(
+            &self,
+            _prompt: Message,
+            _history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                let events: Vec<Result<SessionCompletionEvent>> = vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        crate::SessionAssistantContent::Text(Text {
+                            text: "partial ".to_string(),
+                        }),
+                    )),
+                    Err(anyhow::Error::new(CompletionError::ProviderError(
+                        "OpenAI WebSocket connection reset before response.completed".to_string(),
+                    ))),
+                ];
+                return Ok(Box::pin(futures_util::stream::iter(events)));
+            }
+
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(SessionCompletionEvent::AssistantItem(
+                    crate::SessionAssistantContent::Text(Text {
+                        text: "continued".to_string(),
+                    }),
+                )),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-continued".to_string()),
+                    response: "continued".to_string(),
+                })),
+            ])))
+        }
+    }
+
+    struct ResetAfterToolDriver {
+        calls: AtomicUsize,
+        tool_calls: AtomicUsize,
+    }
+
+    impl ResetAfterToolDriver {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                tool_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SessionModelDriver for ResetAfterToolDriver {
+        fn stream_completion_turn(
+            &self,
+            _prompt: Message,
+            _history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                let tool_call = ToolCall::new(
+                    "tool-1".to_string(),
+                    ToolFunction::new("test_tool".to_string(), serde_json::json!({ "x": 1 })),
+                )
+                .with_call_id("call-1".to_string());
+                let events: Vec<Result<SessionCompletionEvent>> = vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        crate::SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-tool-1".to_string(),
+                        },
+                    )),
+                    Err(anyhow::Error::new(CompletionError::ProviderError(
+                        "OpenAI WebSocket connection reset before response.completed".to_string(),
+                    ))),
+                ];
+                return Ok(Box::pin(futures_util::stream::iter(events)));
+            }
+
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(SessionCompletionEvent::AssistantItem(
+                    crate::SessionAssistantContent::Text(Text {
+                        text: "after tool".to_string(),
+                    }),
+                )),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-after-tool".to_string()),
+                    response: "after tool".to_string(),
+                })),
+            ])))
+        }
+
+        fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+            assert_eq!(tool_name, "test_tool");
+            assert_eq!(args, r#"{"x":1}"#);
+            self.tool_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("tool-output".to_string())
         }
     }
 
@@ -713,6 +828,60 @@ mod tests {
         Ok((core, rx))
     }
 
+    fn user_message_text(message: &Message) -> Option<String> {
+        match message {
+            Message::User { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|content| match content {
+                        UserContent::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            Message::Assistant { .. } | Message::System { .. } => None,
+        }
+    }
+
+    fn assistant_message_text(message: &Message) -> Option<String> {
+        match message {
+            Message::Assistant { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|content| match content {
+                        AssistantContent::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            Message::User { .. } | Message::System { .. } => None,
+        }
+    }
+
+    fn assistant_tool_call_count(message: &Message) -> Option<usize> {
+        match message {
+            Message::Assistant { content, .. } => Some(
+                content
+                    .iter()
+                    .filter(|content| matches!(content, AssistantContent::ToolCall(_)))
+                    .count(),
+            ),
+            Message::User { .. } | Message::System { .. } => None,
+        }
+    }
+
+    fn user_tool_result_count(message: &Message) -> Option<usize> {
+        match message {
+            Message::User { content } => Some(
+                content
+                    .iter()
+                    .filter(|content| matches!(content, UserContent::ToolResult(_)))
+                    .count(),
+            ),
+            Message::Assistant { .. } | Message::System { .. } => None,
+        }
+    }
+
     #[tokio::test]
     async fn submit_interrupt_without_active_turn_is_noop() -> Result<()> {
         let (core, mut rx) = test_core().await?;
@@ -808,6 +977,161 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn retryable_mid_reply_reset_commits_partial_and_continues() -> Result<()> {
+        let workspace = TempDir::new()?;
+        let cwd = PathBuf::from(workspace.path());
+        let thread_id = smooth_protocol::ThreadId::new();
+        let current_turn_id = Arc::new(RwLock::new(None));
+        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
+        let driver = Arc::new(ResetOnceDriver::new());
+        let model = SessionModel::Stub(driver.clone());
+        let factory: Arc<dyn SessionModelFactory> =
+            stub_session_model_factory(std::iter::once((thread_id, model.clone())).collect());
+        let core = Core::new(
+            thread_id,
+            model,
+            Vec::new(),
+            0,
+            rollout,
+            current_turn_id,
+            None,
+            SessionSource::Cli,
+            crate::agent::SystemPromptKind::Root,
+            None,
+            AgentControl::new(),
+            false,
+            factory,
+        );
+        let mut rx = core.subscribe();
+
+        let turn_id = core.start_user_input("hello".to_string()).await?;
+        let mut events = Vec::new();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await??;
+            let turn_completed = matches!(
+                &event.msg,
+                EventMsg::TurnCompleted(turn) if turn.turn_id == turn_id
+            );
+            events.push(event.msg);
+            if turn_completed {
+                break;
+            }
+        }
+
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+        assert!(events.iter().any(|msg| {
+            matches!(
+                msg,
+                EventMsg::StreamError(event)
+                    if event.turn_id == turn_id && event.message == "Reconnecting… 1/8"
+            )
+        }));
+        assert!(events.iter().any(|msg| {
+            matches!(
+                msg,
+                EventMsg::AgentMessageCompleted(event)
+                    if event.turn_id == turn_id && event.text == "partial "
+            )
+        }));
+        assert!(events.iter().any(|msg| {
+            matches!(
+                msg,
+                EventMsg::AgentMessageCompleted(event)
+                    if event.turn_id == turn_id && event.text == "continued"
+            )
+        }));
+
+        let history = core.session.history().await;
+        assert_eq!(history.len(), 3);
+        assert_eq!(user_message_text(&history[0]).as_deref(), Some("hello"));
+        assert_eq!(
+            assistant_message_text(&history[1]).as_deref(),
+            Some("partial ")
+        );
+        assert_eq!(
+            assistant_message_text(&history[2]).as_deref(),
+            Some("continued")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retryable_reset_after_tool_call_executes_tool_once_before_continuing() -> Result<()> {
+        let workspace = TempDir::new()?;
+        let cwd = PathBuf::from(workspace.path());
+        let thread_id = smooth_protocol::ThreadId::new();
+        let current_turn_id = Arc::new(RwLock::new(None));
+        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
+        let driver = Arc::new(ResetAfterToolDriver::new());
+        let model = SessionModel::Stub(driver.clone());
+        let factory: Arc<dyn SessionModelFactory> =
+            stub_session_model_factory(std::iter::once((thread_id, model.clone())).collect());
+        let core = Core::new(
+            thread_id,
+            model,
+            Vec::new(),
+            0,
+            rollout,
+            current_turn_id,
+            None,
+            SessionSource::Cli,
+            crate::agent::SystemPromptKind::Root,
+            None,
+            AgentControl::new(),
+            false,
+            factory,
+        );
+        let mut rx = core.subscribe();
+
+        let turn_id = core.start_user_input("hello".to_string()).await?;
+        let mut events = Vec::new();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await??;
+            let turn_completed = matches!(
+                &event.msg,
+                EventMsg::TurnCompleted(turn) if turn.turn_id == turn_id
+            );
+            events.push(event.msg);
+            if turn_completed {
+                break;
+            }
+        }
+
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(driver.tool_calls.load(Ordering::SeqCst), 1);
+        assert!(events.iter().any(|msg| {
+            matches!(
+                msg,
+                EventMsg::ToolCallCompleted(event)
+                    if event.turn_id == turn_id
+                        && event.call_id == "internal-tool-1"
+                        && event.success
+                        && event.output_preview.as_deref() == Some("tool-output")
+            )
+        }));
+        assert!(events.iter().any(|msg| {
+            matches!(
+                msg,
+                EventMsg::StreamError(event)
+                    if event.turn_id == turn_id && event.message == "Reconnecting… 1/8"
+            )
+        }));
+
+        let history = core.session.history().await;
+        assert_eq!(history.len(), 4);
+        assert_eq!(user_message_text(&history[0]).as_deref(), Some("hello"));
+        assert_eq!(assistant_tool_call_count(&history[1]), Some(1));
+        assert_eq!(user_tool_result_count(&history[2]), Some(1));
+        assert_eq!(
+            assistant_message_text(&history[3]).as_deref(),
+            Some("after tool")
+        );
+        Ok(())
     }
 
     #[tokio::test]

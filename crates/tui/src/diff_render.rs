@@ -18,7 +18,7 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
             move_path: Some(_), ..
         } => "Moved",
         FileChange::Update { .. } => "Edited",
-        FileChange::Omitted { operation, .. } => operation_verb(&operation),
+        FileChange::Omitted { operation, .. } => operation_verb(operation),
     };
     let path_label = file_change_path_label(change);
 

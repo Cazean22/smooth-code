@@ -123,6 +123,7 @@ pub struct Event {
 pub enum EventMsg {
     /// Error while executing a submission
     Error(ErrorEvent),
+    StreamError(StreamErrorEvent),
     SessionConfigured(SessionConfiguredEvent),
     TurnStarted(TurnStartedEvent),
     TurnCompleted(TurnCompletedEvent),
@@ -220,6 +221,14 @@ pub struct TurnInterruptedEvent {
     pub thread_id: String,
     pub turn_id: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamErrorEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]

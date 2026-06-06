@@ -74,6 +74,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - The TUI has dashboard/workspace screens plus Normal, Insert, Command, and Overlay modes. Ctrl-C remains an always-exit shortcut before mode or overlay dispatch; Visual mode and slash search remain intentionally unimplemented.
 - The workspace inspector pane has session-local UI visibility (`UiModel::inspector_visible`, default true). Wide workspaces split Transcript/Inspector only when it is visible; hiding it gives Transcript the full body, removes Inspector from focus cycling, and `:focus inspector` intentionally re-shows it before focusing.
 - The workspace composer is a cursor-aware `ComposerState`, not a raw `String`: Insert mode owns paste/editing keys, Normal mode keeps transcript scrolling, paste text is CRLF/CR-normalized into the composer, and composer cursor/render height use the same Unicode-width visual row calculation.
+- Insert-mode prompt submission is Ctrl+Enter on all platforms. Distinguishing Ctrl+Enter from a bare Enter (which inserts a newline) requires the kitty keyboard protocol, so TUI init pushes `KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES` and restoration pops it. Cmd/Super+Enter is intentionally *not* a submit chord: macOS terminals reserve Cmd for their own bindings (e.g. Ghostty maps `super+enter` to toggle-fullscreen), so it never reaches the app.
 
 ## TUI File Change Safety
 

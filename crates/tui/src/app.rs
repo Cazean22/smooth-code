@@ -980,6 +980,15 @@ impl UiModel {
         }
     }
 
+    /// Enter submits only with Ctrl. Cmd/Super is intentionally not accepted:
+    /// macOS terminals reserve Cmd for their own bindings (e.g. Ghostty maps
+    /// `super+enter` to toggle-fullscreen), so it never reaches the app.
+    /// Distinguishing Ctrl+Enter from a bare Enter requires the kitty keyboard
+    /// protocol, which `init` enables.
+    fn is_submit_key(key_event: KeyEvent) -> bool {
+        key_event.code == KeyCode::Enter && key_event.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
     fn handle_insert_key(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
         match key_event.code {
             KeyCode::Esc => {
@@ -987,9 +996,7 @@ impl UiModel {
                 self.focus = FocusTarget::Transcript;
                 Vec::new()
             }
-            KeyCode::Enter if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.request_turn_start()
-            }
+            _ if Self::is_submit_key(key_event) => self.request_turn_start(),
             KeyCode::Enter => {
                 self.composer.insert_char('\n');
                 Vec::new()
@@ -3395,6 +3402,19 @@ mod tests {
         ));
         assert!(model.composer.is_empty());
         assert_eq!(model.composer.cursor(), 0);
+    }
+
+    #[test]
+    fn super_enter_inserts_newline() {
+        let mut model = workspace_insert_model();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.composer.set_text("hello".to_string());
+
+        let effects = model.handle_key_event(modified_key(KeyCode::Enter, KeyModifiers::SUPER));
+
+        assert!(effects.is_empty());
+        assert_eq!(model.composer.as_str(), "hello\n");
     }
 
     #[test]

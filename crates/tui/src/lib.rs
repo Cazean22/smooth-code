@@ -18,7 +18,10 @@ use std::io::{IsTerminal, Stdout};
 use crate::{app::App, app_server_client::AppServerClient, app_server_session::AppServerSession};
 use app_server::in_process::InProcessServerEvent;
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -97,7 +100,12 @@ fn init() -> TuiResult<Option<AppTerminal>> {
     enable_raw_mode()?;
 
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste,)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+    )?;
 
     let backend = CrosstermBackend::new(stdout);
     Ok(Some(Terminal::new(backend)?))
@@ -111,6 +119,7 @@ fn restore(terminal: Option<&mut AppTerminal>) -> TuiResult<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;

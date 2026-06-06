@@ -16,9 +16,9 @@ use rig::{
 };
 use serde::Deserialize;
 use smooth_core::{
-    AgentControl, RoleOverride, SessionAssistantContent, SessionCompletionEvent,
-    SessionCompletionStream, SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
-    SessionStreamEvent, SessionTurnSummary, ThreadManagerState,
+    AgentControl, SessionAssistantContent, SessionCompletionEvent, SessionCompletionStream,
+    SessionModel, SessionModelDriver, SessionModelFactory, SessionStream, SessionStreamEvent,
+    SessionTurnSummary, SystemPromptKind, ThreadManagerState,
 };
 use smooth_protocol::{
     AgentStatus, CollabAgentStatusEntry, EventMsg, ThreadId, ToolCallResultKind,
@@ -37,7 +37,6 @@ struct TestAgentInfo {
     thread_id: String,
     agent_path: String,
     agent_nickname: Option<String>,
-    agent_role: Option<String>,
     status: Option<String>,
     #[serde(default)]
     status_detail: Option<AgentStatus>,
@@ -76,7 +75,7 @@ impl SessionModelFactory for AnyThreadFactory {
         thread_id: ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
-        _role_override: RoleOverride,
+        _system_prompt_kind: SystemPromptKind,
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -99,16 +98,9 @@ async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() -> 
     let mut root_events = manager.subscribe(root_id).await?;
 
     let spawned = manager
-        .spawn_agent_with_role(
-            root_id,
-            "inspect workspace".to_string(),
-            Some("explorer".to_string()),
-            None,
-            false,
-        )
+        .spawn_agent(root_id, "inspect workspace".to_string(), false)
         .await?;
     assert!(spawned.agent_path.as_str().starts_with("/root/"));
-    assert_eq!(spawned.agent_role.as_deref(), Some("explorer"));
 
     let mut saw_completion = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -198,8 +190,7 @@ impl SessionModelDriver for ConcurrentSpawnDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "message": "child one",
-                            "agent_type": "worker",
+                            "instruction": "child one",
                             "fork_context": false
                         }),
                     ),
@@ -210,8 +201,7 @@ impl SessionModelDriver for ConcurrentSpawnDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "message": "child two",
-                            "agent_type": "worker",
+                            "instruction": "child two",
                             "fork_context": false
                         }),
                     ),
@@ -327,8 +317,7 @@ impl SessionModelDriver for MixedBatchDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "message": "child one",
-                            "agent_type": "worker",
+                            "instruction": "child one",
                             "fork_context": false
                         }),
                     ),
@@ -459,8 +448,7 @@ impl SessionModelDriver for TwoRetainedDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "message": "child one",
-                            "agent_type": "worker",
+                            "instruction": "child one",
                             "fork_context": false
                         }),
                     ),
@@ -471,8 +459,7 @@ impl SessionModelDriver for TwoRetainedDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "message": "child two",
-                            "agent_type": "worker",
+                            "instruction": "child two",
                             "fork_context": false
                         }),
                     ),
@@ -577,7 +564,7 @@ impl SessionModelFactory for TwoRetainedFactory {
         thread_id: ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
-        _role_override: RoleOverride,
+        _system_prompt_kind: SystemPromptKind,
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -607,7 +594,7 @@ impl SessionModelFactory for MixedBatchFactory {
         thread_id: ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
-        _role_override: RoleOverride,
+        _system_prompt_kind: SystemPromptKind,
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -642,7 +629,7 @@ impl SessionModelFactory for ConcurrentSpawnFactory {
         thread_id: ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
-        _role_override: RoleOverride,
+        _system_prompt_kind: SystemPromptKind,
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -1362,7 +1349,7 @@ impl SessionModelFactory for ReasoningStreamFactory {
         _thread_id: ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
-        _role_override: RoleOverride,
+        _system_prompt_kind: SystemPromptKind,
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -1381,7 +1368,7 @@ impl SessionModelFactory for ReasoningToolLoopFactory {
         _thread_id: ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
-        _role_override: RoleOverride,
+        _system_prompt_kind: SystemPromptKind,
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -1509,7 +1496,7 @@ impl SessionModelFactory for IdlessReasoningCompletionFactory {
         _thread_id: ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
-        _role_override: RoleOverride,
+        _system_prompt_kind: SystemPromptKind,
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -1629,7 +1616,7 @@ impl SessionModelFactory for EncryptedReasoningFactory {
         _thread_id: ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
-        _role_override: RoleOverride,
+        _system_prompt_kind: SystemPromptKind,
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {

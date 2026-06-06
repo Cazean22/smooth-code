@@ -17,7 +17,7 @@ pub struct ThreadRow {
     pub thread_id: String,
     pub agent_path: Option<String>,
     pub agent_nickname: Option<String>,
-    pub agent_role: Option<String>,
+    pub prompt_kind: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -67,23 +67,23 @@ impl StateDbHandle {
         thread_id: &str,
         agent_path: Option<&str>,
         agent_nickname: Option<&str>,
-        agent_role: Option<&str>,
+        prompt_kind: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO threads (thread_id, agent_path, agent_nickname, agent_role)
+            INSERT INTO threads (thread_id, agent_path, agent_nickname, prompt_kind)
             VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(thread_id) DO UPDATE SET
                 agent_path = excluded.agent_path,
                 agent_nickname = excluded.agent_nickname,
-                agent_role = excluded.agent_role,
+                prompt_kind = excluded.prompt_kind,
                 updated_at = strftime('%s', 'now')
             "#,
         )
         .bind(thread_id)
         .bind(agent_path)
         .bind(agent_nickname)
-        .bind(agent_role)
+        .bind(prompt_kind)
         .execute(self.pool.as_ref())
         .await
         .map_err(StateDbError::from)?;
@@ -93,7 +93,7 @@ impl StateDbHandle {
     pub async fn get_thread(&self, thread_id: &str) -> Result<Option<ThreadRow>> {
         let row = sqlx::query(
             r#"
-            SELECT thread_id, agent_path, agent_nickname, agent_role, created_at, updated_at
+            SELECT thread_id, agent_path, agent_nickname, prompt_kind, created_at, updated_at
             FROM threads
             WHERE thread_id = ?1
             "#,
@@ -199,6 +199,46 @@ impl StateDbHandle {
             .execute(self.pool.as_ref())
             .await
             .map_err(StateDbError::from)?;
+        self.ensure_prompt_kind_column().await?;
+        Ok(())
+    }
+
+    async fn ensure_prompt_kind_column(&self) -> Result<()> {
+        let rows = sqlx::query("PRAGMA table_info(threads)")
+            .fetch_all(self.pool.as_ref())
+            .await
+            .map_err(StateDbError::from)?;
+        let mut has_prompt_kind = false;
+        let mut has_agent_role = false;
+        for row in rows {
+            let name: String = row.get("name");
+            match name.as_str() {
+                "prompt_kind" => has_prompt_kind = true,
+                "agent_role" => has_agent_role = true,
+                _ => {}
+            }
+        }
+        if !has_prompt_kind {
+            sqlx::query("ALTER TABLE threads ADD COLUMN prompt_kind TEXT NULL")
+                .execute(self.pool.as_ref())
+                .await
+                .map_err(StateDbError::from)?;
+        }
+        if has_agent_role {
+            sqlx::query(
+                r#"
+                UPDATE threads
+                SET prompt_kind = CASE agent_role
+                    WHEN 'explorer' THEN 'explore'
+                    ELSE 'default_subagent'
+                END
+                WHERE prompt_kind IS NULL AND agent_path IS NOT NULL
+                "#,
+            )
+            .execute(self.pool.as_ref())
+            .await
+            .map_err(StateDbError::from)?;
+        }
         Ok(())
     }
 }
@@ -208,7 +248,7 @@ fn map_thread_row(row: sqlx::sqlite::SqliteRow) -> ThreadRow {
         thread_id: row.get("thread_id"),
         agent_path: row.get("agent_path"),
         agent_nickname: row.get("agent_nickname"),
-        agent_role: row.get("agent_role"),
+        prompt_kind: row.get("prompt_kind"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }

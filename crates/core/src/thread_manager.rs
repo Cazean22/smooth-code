@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 use crate::{
     ThreadSummary,
-    agent::{AgentControl, registry::AgentMetadata, status::last_assistant_message},
+    agent::{
+        AgentControl, SystemPromptKind, registry::AgentMetadata, status::last_assistant_message,
+    },
     core_thread::CoreThread,
     error::{CoreError, CoreResult},
     provider::SessionModelFactory,
@@ -75,6 +77,7 @@ impl ThreadManagerState {
                 self.ask_user_client.clone(),
                 self.model_factory.clone(),
                 SessionSource::Cli,
+                SystemPromptKind::Root,
                 self.agent_control.clone(),
             )
             .await?,
@@ -85,7 +88,12 @@ impl ThreadManagerState {
         threads.insert(thread_id, thread);
         self.agent_control.register_session_root(thread_id)?;
         self.state_db
-            .upsert_thread(&thread_id.to_string(), None, None, None)
+            .upsert_thread(
+                &thread_id.to_string(),
+                None,
+                None,
+                Some(SystemPromptKind::Root.storage_key()),
+            )
             .await?;
         Ok(StartedThread {
             thread_id,
@@ -118,6 +126,7 @@ impl ThreadManagerState {
                 self.ask_user_client.clone(),
                 self.model_factory.clone(),
                 SessionSource::Cli,
+                SystemPromptKind::Root,
                 self.agent_control.clone(),
             )
             .await?,
@@ -128,7 +137,12 @@ impl ThreadManagerState {
         self.agent_control.register_session_root(thread_id)?;
         drop(threads);
         self.state_db
-            .upsert_thread(&thread_id.to_string(), None, None, None)
+            .upsert_thread(
+                &thread_id.to_string(),
+                None,
+                None,
+                Some(SystemPromptKind::Root.storage_key()),
+            )
             .await?;
         initial_messages.extend(self.resume_child_subtree(thread_id).await?);
         Ok(ResumedThread {
@@ -195,17 +209,20 @@ impl ThreadManagerState {
         self.agent_control.clone()
     }
 
-    pub async fn spawn_agent_with_role(
+    pub async fn spawn_agent(
         &self,
         parent_thread_id: ThreadId,
-        message: String,
-        agent_role: Option<String>,
-        model: Option<String>,
+        instruction: String,
         fork_context: bool,
     ) -> CoreResult<CollabAgentStatusEntry> {
         let metadata = self
             .agent_control
-            .spawn_agent_with_role(parent_thread_id, message, agent_role, model, fork_context)
+            .spawn_agent_with_prompt_kind(
+                parent_thread_id,
+                instruction,
+                SystemPromptKind::DefaultSubagent,
+                fork_context,
+            )
             .await?;
         agent_status_entry(&self.agent_control, metadata)
     }
@@ -309,7 +326,6 @@ impl ThreadManagerState {
                             sender_thread_id: parent_thread_id,
                             receiver_thread_id: child_thread_id,
                             receiver_agent_nickname: None,
-                            receiver_agent_role: None,
                             status: AgentStatus::Errored(
                                 ErrorInfo::new(
                                     "missing_thread_metadata",
@@ -335,7 +351,6 @@ impl ThreadManagerState {
                     sender_thread_id: parent_thread_id,
                     receiver_thread_id: child_thread_id,
                     receiver_agent_nickname: thread_row.agent_nickname.clone(),
-                    receiver_agent_role: thread_row.agent_role.clone(),
                 }));
 
                 let result = self
@@ -345,7 +360,7 @@ impl ThreadManagerState {
                         child_thread_id,
                         thread_row.agent_path.as_deref(),
                         thread_row.agent_nickname.clone(),
-                        thread_row.agent_role.clone(),
+                        thread_row.prompt_kind.as_deref(),
                     )
                     .await;
                 match result {
@@ -356,7 +371,6 @@ impl ThreadManagerState {
                             sender_thread_id: parent_thread_id,
                             receiver_thread_id: child_thread_id,
                             receiver_agent_nickname: thread_row.agent_nickname,
-                            receiver_agent_role: thread_row.agent_role,
                             status: self.agent_control.get_status(child_thread_id),
                         }));
                     }
@@ -372,7 +386,6 @@ impl ThreadManagerState {
                             sender_thread_id: parent_thread_id,
                             receiver_thread_id: child_thread_id,
                             receiver_agent_nickname: thread_row.agent_nickname,
-                            receiver_agent_role: thread_row.agent_role,
                             status: AgentStatus::Errored(err.to_error_info()),
                         }));
                     }
@@ -390,7 +403,7 @@ impl ThreadManagerState {
         child_thread_id: ThreadId,
         agent_path: Option<&str>,
         agent_nickname: Option<String>,
-        agent_role: Option<String>,
+        prompt_kind: Option<&str>,
     ) -> CoreResult<()> {
         if self.threads.read().await.contains_key(&child_thread_id) {
             return Ok(());
@@ -426,6 +439,7 @@ impl ThreadManagerState {
             .await
             .map_err(CoreError::rollout)?;
         let initial_messages = resume_state.initial_messages.clone();
+        let system_prompt_kind = SystemPromptKind::from_child_storage_key(prompt_kind);
         let thread = Arc::new(
             CoreThread::resume(
                 rollout_path,
@@ -437,8 +451,8 @@ impl ThreadManagerState {
                     depth,
                     agent_path: Some(agent_path.clone()),
                     agent_nickname: agent_nickname.clone(),
-                    agent_role: agent_role.clone(),
                 }),
+                system_prompt_kind,
                 self.agent_control.clone(),
             )
             .await?,
@@ -449,7 +463,7 @@ impl ThreadManagerState {
                 agent_id: Some(child_thread_id),
                 agent_path,
                 agent_nickname,
-                agent_role,
+                system_prompt_kind,
                 parent_thread_id: Some(parent_thread_id),
                 depth,
             },
@@ -488,7 +502,6 @@ fn agent_status_entry(
         thread_id,
         agent_path: metadata.agent_path,
         agent_nickname: metadata.agent_nickname,
-        agent_role: metadata.agent_role,
         last_assistant_message: last_assistant_message(&status),
         status,
     })
@@ -496,7 +509,11 @@ fn agent_status_entry(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::PathBuf, sync::Arc};
+    use std::{
+        collections::HashSet,
+        path::PathBuf,
+        sync::{Arc, Mutex, MutexGuard},
+    };
 
     use anyhow::Result;
     use futures_util::stream;
@@ -511,12 +528,21 @@ mod tests {
     use super::ThreadManagerState;
     use crate::{
         SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
-        agent::{AgentControl, role::RoleOverride, status::is_final},
+        agent::{AgentControl, SystemPromptKind, status::is_final},
         provider::SessionStreamEvent,
         rollout::find_thread_path,
         test_support::cwd_test_lock,
     };
     use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
+
+    fn lock_test_mutex<'a, T>(
+        mutex: &'a Mutex<T>,
+        name: &'static str,
+    ) -> Result<MutexGuard<'a, T>> {
+        mutex
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test mutex `{name}` was poisoned"))
+    }
 
     struct StubDriver {
         text: String,
@@ -547,11 +573,39 @@ mod tests {
             _thread_id: ThreadId,
             _ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
-            _role_override: RoleOverride,
+            _system_prompt_kind: SystemPromptKind,
             _agent_control: AgentControl,
             _plan_mode: bool,
         ) -> Result<SessionModel> {
             Ok(self.model.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct PromptKindState {
+        calls: Mutex<Vec<(ThreadId, SystemPromptKind)>>,
+    }
+
+    struct PromptKindFactory {
+        state: Arc<PromptKindState>,
+    }
+
+    impl SessionModelFactory for PromptKindFactory {
+        fn build(
+            &self,
+            _cwd: PathBuf,
+            thread_id: ThreadId,
+            _ask_user_client: Option<AskUserClient>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
+            system_prompt_kind: SystemPromptKind,
+            _agent_control: AgentControl,
+            _plan_mode: bool,
+        ) -> Result<SessionModel> {
+            lock_test_mutex(&self.state.calls, "prompt_kind_calls")?
+                .push((thread_id, system_prompt_kind));
+            Ok(SessionModel::Stub(Arc::new(StubDriver {
+                text: "done".to_string(),
+            })))
         }
     }
 
@@ -572,7 +626,7 @@ mod tests {
             _thread_id: ThreadId,
             _ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
-            _role_override: RoleOverride,
+            _system_prompt_kind: SystemPromptKind,
             _agent_control: AgentControl,
             _plan_mode: bool,
         ) -> Result<SessionModel> {
@@ -739,6 +793,55 @@ mod tests {
                 .len(),
             3
         );
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_thread_restores_child_prompt_kind() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "done".to_string(),
+                })),
+            })),
+        )
+        .await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+        let child = manager
+            .agent_control()
+            .spawn_agent_with_prompt_kind(
+                root_id,
+                "inspect read-only".to_string(),
+                SystemPromptKind::Explore,
+                false,
+            )
+            .await?;
+        let child_id = child.agent_id.ok_or_else(|| anyhow::anyhow!("child id"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(manager);
+
+        let prompt_state = Arc::new(PromptKindState::default());
+        let resumed_manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(PromptKindFactory {
+                state: Arc::clone(&prompt_state),
+            })),
+        )
+        .await?;
+        let _resumed = resumed_manager.resume_thread(root_id).await?;
+
+        let calls = lock_test_mutex(&prompt_state.calls, "prompt_kind_calls")?;
+        assert!(calls.contains(&(root_id, SystemPromptKind::Root)));
+        assert!(calls.contains(&(child_id, SystemPromptKind::Explore)));
 
         std::env::set_current_dir(original_cwd)?;
         Ok(())

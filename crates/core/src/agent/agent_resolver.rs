@@ -80,7 +80,7 @@ mod tests {
             agent_id: Some(child_id),
             agent_path: AgentPath::root(),
             agent_nickname: Some("alpha".to_string()),
-            agent_role: Some("worker".to_string()),
+            system_prompt_kind: crate::agent::prompt::SystemPromptKind::DefaultSubagent,
             parent_thread_id: None,
             depth: 0,
         })?;
@@ -120,7 +120,6 @@ mod tests {
             depth: 1,
             agent_path: Some(child.agent_path.clone()),
             agent_nickname: child.agent_nickname.clone(),
-            agent_role: child.agent_role.clone(),
         });
 
         assert_eq!(list_agents(&registry, &source, Some("/root"))?.len(), 2);

@@ -33,8 +33,13 @@ async fn edge_round_trip_and_created_at_are_preserved() -> TestResult {
     let (_root, path) = db_path("edge")?;
     let db = StateDbHandle::open(path).await?;
     db.upsert_thread("parent", None, None, None).await?;
-    db.upsert_thread("child", Some("/root/child"), Some("child"), Some("worker"))
-        .await?;
+    db.upsert_thread(
+        "child",
+        Some("/root/child"),
+        Some("child"),
+        Some("default_subagent"),
+    )
+    .await?;
 
     db.upsert_open_edge("parent", "child").await?;
 

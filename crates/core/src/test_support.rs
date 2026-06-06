@@ -6,7 +6,7 @@ use tools::AskUserClient;
 
 use crate::{
     SessionModel, SessionModelFactory,
-    agent::{AgentControl, role::RoleOverride},
+    agent::{AgentControl, SystemPromptKind},
     provider::stub_session_model_factory,
 };
 
@@ -29,7 +29,7 @@ impl SessionModelFactory for StubSessionModelFactory {
         thread_id: smooth_protocol::ThreadId,
         ask_user_client: Option<AskUserClient>,
         current_turn_id: Arc<RwLock<Option<String>>>,
-        role_override: RoleOverride,
+        system_prompt_kind: SystemPromptKind,
         agent_control: AgentControl,
         plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -38,7 +38,7 @@ impl SessionModelFactory for StubSessionModelFactory {
             thread_id,
             ask_user_client,
             current_turn_id,
-            role_override,
+            system_prompt_kind,
             agent_control,
             plan_mode,
         )

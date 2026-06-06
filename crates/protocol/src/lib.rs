@@ -156,15 +156,6 @@ impl SessionSource {
             }
         }
     }
-
-    pub fn get_agent_role(&self) -> Option<String> {
-        match self {
-            SessionSource::Cli | SessionSource::SubAgent(SubAgentSource::Review) => None,
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
-                agent_role.clone()
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -176,7 +167,6 @@ pub enum SubAgentSource {
         depth: i32,
         agent_path: Option<AgentPath>,
         agent_nickname: Option<String>,
-        agent_role: Option<String>,
     },
 }
 
@@ -343,7 +333,6 @@ pub struct CollabAgentStatusEntry {
     pub thread_id: ThreadId,
     pub agent_path: AgentPath,
     pub agent_nickname: Option<String>,
-    pub agent_role: Option<String>,
     pub status: AgentStatus,
     #[serde(default)]
     pub last_assistant_message: Option<String>,
@@ -365,7 +354,6 @@ pub struct CollabAgentSpawnEndEvent {
     pub sender_thread_id: ThreadId,
     pub new_thread_id: Option<ThreadId>,
     pub new_agent_nickname: Option<String>,
-    pub new_agent_role: Option<String>,
     pub prompt: String,
     pub model: Option<String>,
     pub status: AgentStatus,
@@ -378,7 +366,6 @@ pub struct CollabAgentCompletedEvent {
     pub child_thread_id: ThreadId,
     pub agent_path: AgentPath,
     pub agent_nickname: Option<String>,
-    pub agent_role: Option<String>,
     pub status: AgentStatus,
     #[serde(default)]
     pub last_assistant_message: Option<String>,
@@ -391,7 +378,6 @@ pub struct CollabResumeBeginEvent {
     pub sender_thread_id: ThreadId,
     pub receiver_thread_id: ThreadId,
     pub receiver_agent_nickname: Option<String>,
-    pub receiver_agent_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -401,7 +387,6 @@ pub struct CollabResumeEndEvent {
     pub sender_thread_id: ThreadId,
     pub receiver_thread_id: ThreadId,
     pub receiver_agent_nickname: Option<String>,
-    pub receiver_agent_role: Option<String>,
     pub status: AgentStatus,
 }
 
@@ -457,7 +442,6 @@ mod tests {
             depth: 1,
             agent_path: Some(AgentPath::try_from("/root/worker")?),
             agent_nickname: Some("alpha".to_string()),
-            agent_role: Some("explorer".to_string()),
         });
 
         assert_eq!(
@@ -465,7 +449,6 @@ mod tests {
             Some(AgentPath::try_from("/root/worker")?)
         );
         assert_eq!(source.get_nickname(), Some("alpha".to_string()));
-        assert_eq!(source.get_agent_role(), Some("explorer".to_string()));
         Ok(())
     }
 
@@ -476,7 +459,6 @@ mod tests {
             child_thread_id: ThreadId::new(),
             agent_path: AgentPath::try_from("/root/child")?,
             agent_nickname: Some("child".to_string()),
-            agent_role: Some("worker".to_string()),
             status: AgentStatus::Completed(Some("done".to_string())),
             last_assistant_message: Some("done".to_string()),
         });

@@ -16,8 +16,8 @@ use crate::{
     agent::{
         agent_resolver,
         fork::{SpawnAgentForkMode, persisted_items_to_messages},
+        prompt::SystemPromptKind,
         registry::{AgentMetadata, AgentRegistry},
-        role::resolve_role,
         status::{agent_status_from_event, is_final, last_assistant_message},
     },
     core_thread::CoreThread,
@@ -184,25 +184,28 @@ impl AgentControl {
     pub(crate) async fn spawn_agent(
         &self,
         parent_thread_id: ThreadId,
-        message: String,
+        instruction: String,
     ) -> CoreResult<AgentMetadata> {
-        self.spawn_agent_with_role(parent_thread_id, message, None, None, false)
-            .await
+        self.spawn_agent_with_prompt_kind(
+            parent_thread_id,
+            instruction,
+            SystemPromptKind::DefaultSubagent,
+            false,
+        )
+        .await
     }
 
-    pub(crate) async fn spawn_agent_with_role(
+    pub(crate) async fn spawn_agent_with_prompt_kind(
         &self,
         parent_thread_id: ThreadId,
-        message: String,
-        agent_role: Option<String>,
-        model: Option<String>,
+        instruction: String,
+        system_prompt_kind: SystemPromptKind,
         fork_context: bool,
     ) -> CoreResult<AgentMetadata> {
-        self.spawn_agent_with_role_internal(
+        self.spawn_agent_internal(
             parent_thread_id,
-            message,
-            agent_role,
-            model,
+            instruction,
+            system_prompt_kind,
             fork_context,
             false,
         )
@@ -210,20 +213,18 @@ impl AgentControl {
         .map(|(metadata, _, _)| metadata)
     }
 
-    pub(crate) async fn spawn_agent_with_role_inline_wait(
+    pub(crate) async fn spawn_agent_with_prompt_kind_inline_wait(
         &self,
         parent_thread_id: ThreadId,
-        message: String,
-        agent_role: Option<String>,
-        model: Option<String>,
+        instruction: String,
+        system_prompt_kind: SystemPromptKind,
         fork_context: bool,
     ) -> CoreResult<(AgentMetadata, InlineChildCompletionReceiver)> {
         let (metadata, _child_thread_id, waiter) = self
-            .spawn_agent_with_role_internal(
+            .spawn_agent_internal(
                 parent_thread_id,
-                message,
-                agent_role,
-                model,
+                instruction,
+                system_prompt_kind,
                 fork_context,
                 true,
             )
@@ -233,12 +234,11 @@ impl AgentControl {
         Ok((metadata, waiter))
     }
 
-    pub(crate) async fn spawn_agent_with_role_for_tool(
+    pub(crate) async fn spawn_agent_for_tool(
         &self,
         parent_thread_id: ThreadId,
-        message: String,
-        agent_role: Option<String>,
-        model: Option<String>,
+        instruction: String,
+        system_prompt_kind: SystemPromptKind,
         fork_context: bool,
     ) -> CoreResult<(AgentMetadata, AgentStatus, InlineChildCompletionReceiver)> {
         let call_id = Uuid::now_v7().to_string();
@@ -247,18 +247,17 @@ impl AgentControl {
             EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
                 call_id: call_id.clone(),
                 sender_thread_id: parent_thread_id,
-                prompt: message.clone(),
-                model: model.clone(),
+                prompt: instruction.clone(),
+                model: None,
             }),
         )
         .await;
 
         match self
-            .spawn_agent_with_role_inline_wait(
+            .spawn_agent_with_prompt_kind_inline_wait(
                 parent_thread_id,
-                message.clone(),
-                agent_role.clone(),
-                model.clone(),
+                instruction.clone(),
+                system_prompt_kind,
                 fork_context,
             )
             .await
@@ -275,9 +274,8 @@ impl AgentControl {
                         sender_thread_id: parent_thread_id,
                         new_thread_id: Some(thread_id),
                         new_agent_nickname: metadata.agent_nickname.clone(),
-                        new_agent_role: metadata.agent_role.clone(),
-                        prompt: message,
-                        model,
+                        prompt: instruction,
+                        model: None,
                         status: status.clone(),
                     }),
                 )
@@ -292,9 +290,8 @@ impl AgentControl {
                         sender_thread_id: parent_thread_id,
                         new_thread_id: None,
                         new_agent_nickname: None,
-                        new_agent_role: agent_role,
-                        prompt: message,
-                        model,
+                        prompt: instruction,
+                        model: None,
                         status: AgentStatus::Errored(err.to_error_info()),
                     }),
                 )
@@ -304,12 +301,11 @@ impl AgentControl {
         }
     }
 
-    async fn spawn_agent_with_role_internal(
+    async fn spawn_agent_internal(
         &self,
         parent_thread_id: ThreadId,
-        message: String,
-        agent_role: Option<String>,
-        model: Option<String>,
+        instruction: String,
+        system_prompt_kind: SystemPromptKind,
         fork_context: bool,
         inline_wait: bool,
     ) -> CoreResult<(
@@ -317,17 +313,6 @@ impl AgentControl {
         ThreadId,
         Option<InlineChildCompletionReceiver>,
     )> {
-        if let Some(role) = agent_role.as_deref()
-            && resolve_role(role).is_none()
-        {
-            return Err(CoreError::control(format!("unknown agent role `{role}`")));
-        }
-        if model.is_some() {
-            return Err(CoreError::control(
-                "spawn_agent model override is not implemented yet",
-            ));
-        }
-
         let runtime = self.runtime()?;
         let reservation = self
             .state
@@ -341,7 +326,6 @@ impl AgentControl {
             depth: reservation.depth(),
             agent_path: Some(reservation.agent_path().clone()),
             agent_nickname: Some(reservation.agent_path().name().to_string()),
-            agent_role: agent_role.clone(),
         });
         let ask_user_client = runtime.ask_user_client.clone();
         let initial_history = if fork_context {
@@ -356,6 +340,7 @@ impl AgentControl {
                 ask_user_client,
                 runtime.model_factory.clone(),
                 child_source,
+                system_prompt_kind,
                 self.clone(),
                 initial_history,
             )
@@ -373,7 +358,7 @@ impl AgentControl {
             None
         };
 
-        if let Err(err) = child_thread.submit(Op::UserInput(message)).await {
+        if let Err(err) = child_thread.submit(Op::UserInput(instruction)).await {
             runtime.threads.write().await.remove(&child_thread_id);
             self.remove_status_sender(child_thread_id)?;
             if inline_wait {
@@ -390,7 +375,7 @@ impl AgentControl {
                 agent_id: Some(child_thread_id),
                 agent_path,
                 agent_nickname: Some(agent_nickname),
-                agent_role,
+                system_prompt_kind,
                 parent_thread_id: Some(parent_thread_id),
                 depth,
             })
@@ -401,7 +386,7 @@ impl AgentControl {
                 &child_thread_id.to_string(),
                 Some(metadata.agent_path.as_str()),
                 metadata.agent_nickname.as_deref(),
-                metadata.agent_role.as_deref(),
+                Some(metadata.system_prompt_kind.storage_key()),
             )
             .await?;
         runtime
@@ -492,7 +477,6 @@ impl AgentControl {
             depth: metadata.depth,
             agent_path: Some(metadata.agent_path),
             agent_nickname: metadata.agent_nickname,
-            agent_role: metadata.agent_role,
         }))
     }
 
@@ -602,7 +586,6 @@ impl AgentControl {
                 child_thread_id,
                 agent_path: child.agent_path.clone(),
                 agent_nickname: child.agent_nickname.clone(),
-                agent_role: child.agent_role.clone(),
                 last_assistant_message: last_assistant_message(&status),
                 status: status.clone(),
             }),
@@ -657,8 +640,7 @@ mod tests {
     use super::AgentControl;
     use crate::{
         SessionModel, SessionModelDriver, SessionModelFactory, SessionStream,
-        agent::role::RoleOverride, provider::SessionStreamEvent,
-        thread_manager::ThreadManagerState,
+        agent::SystemPromptKind, provider::SessionStreamEvent, thread_manager::ThreadManagerState,
     };
     use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
     use tools::AskUserClient;
@@ -715,7 +697,7 @@ mod tests {
             thread_id: ThreadId,
             _ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
-            _role_override: RoleOverride,
+            _system_prompt_kind: SystemPromptKind,
             _agent_control: AgentControl,
             _plan_mode: bool,
         ) -> Result<SessionModel> {
@@ -727,6 +709,11 @@ mod tests {
     #[derive(Default)]
     struct RecordingState {
         calls: Mutex<HashMap<ThreadId, Vec<Vec<Message>>>>,
+    }
+
+    #[derive(Default)]
+    struct PromptKindState {
+        calls: Mutex<Vec<(ThreadId, SystemPromptKind)>>,
     }
 
     struct RecordingDriver {
@@ -764,7 +751,7 @@ mod tests {
             thread_id: ThreadId,
             _ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
-            _role_override: RoleOverride,
+            _system_prompt_kind: SystemPromptKind,
             _agent_control: AgentControl,
             _plan_mode: bool,
         ) -> Result<SessionModel> {
@@ -772,6 +759,29 @@ mod tests {
                 thread_id,
                 state: Arc::clone(&self.state),
                 text: "recorded".to_string(),
+            })))
+        }
+    }
+
+    struct PromptKindFactory {
+        state: Arc<PromptKindState>,
+    }
+
+    impl SessionModelFactory for PromptKindFactory {
+        fn build(
+            &self,
+            _cwd: PathBuf,
+            thread_id: ThreadId,
+            _ask_user_client: Option<AskUserClient>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
+            system_prompt_kind: SystemPromptKind,
+            _agent_control: AgentControl,
+            _plan_mode: bool,
+        ) -> Result<SessionModel> {
+            lock_test_mutex(&self.state.calls, "prompt_kind_calls")?
+                .push((thread_id, system_prompt_kind));
+            Ok(SessionModel::Stub(Arc::new(StubDriver {
+                text: "prompt-kind".to_string(),
             })))
         }
     }
@@ -789,7 +799,7 @@ mod tests {
             thread_id: ThreadId,
             _ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
-            _role_override: RoleOverride,
+            _system_prompt_kind: SystemPromptKind,
             _agent_control: AgentControl,
             _plan_mode: bool,
         ) -> Result<SessionModel> {
@@ -886,6 +896,74 @@ mod tests {
                 .len(),
             1
         );
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_uses_default_subagent_prompt_kind() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let prompt_state = Arc::new(PromptKindState::default());
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(PromptKindFactory {
+                state: Arc::clone(&prompt_state),
+            })),
+        )
+        .await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent(root_id, "hello child".to_string())
+            .await?;
+        let child_id = child.agent_id.context("child id")?;
+
+        let calls = lock_test_mutex(&prompt_state.calls, "prompt_kind_calls")?;
+        assert!(calls.contains(&(root_id, SystemPromptKind::Root)));
+        assert!(calls.contains(&(child_id, SystemPromptKind::DefaultSubagent)));
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explore_spawn_uses_explorer_prompt_kind() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let prompt_state = Arc::new(PromptKindState::default());
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(PromptKindFactory {
+                state: Arc::clone(&prompt_state),
+            })),
+        )
+        .await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent_with_prompt_kind(
+                root_id,
+                "inspect only".to_string(),
+                SystemPromptKind::Explore,
+                false,
+            )
+            .await?;
+        let child_id = child.agent_id.context("child id")?;
+
+        let calls = lock_test_mutex(&prompt_state.calls, "prompt_kind_calls")?;
+        assert!(calls.contains(&(child_id, SystemPromptKind::Explore)));
 
         std::env::set_current_dir(original_cwd)?;
         Ok(())
@@ -1068,7 +1146,6 @@ mod tests {
                     assert_eq!(completion.child_thread_id, child_id);
                     assert_eq!(completion.agent_path, child.agent_path);
                     assert_eq!(completion.agent_nickname, child.agent_nickname);
-                    assert_eq!(completion.agent_role, child.agent_role);
                     assert_eq!(
                         completion.status,
                         AgentStatus::Completed(Some("response".to_string()))
@@ -1117,11 +1194,10 @@ mod tests {
         let mut root_events = manager.subscribe(root_id).await?;
         let control = manager.agent_control();
         let (child, waiter) = control
-            .spawn_agent_with_role_inline_wait(
+            .spawn_agent_with_prompt_kind_inline_wait(
                 root_id,
                 "hello child".to_string(),
-                Some("worker".to_string()),
-                None,
+                SystemPromptKind::DefaultSubagent,
                 false,
             )
             .await?;
@@ -1193,11 +1269,10 @@ mod tests {
 
         let control = manager.agent_control();
         let child = control
-            .spawn_agent_with_role(
+            .spawn_agent_with_prompt_kind(
                 root_id,
                 "child task".to_string(),
-                Some("explorer".to_string()),
-                None,
+                SystemPromptKind::Explore,
                 true,
             )
             .await?;
@@ -1255,11 +1330,10 @@ mod tests {
 
         let control = manager.agent_control();
         let child = control
-            .spawn_agent_with_role(
+            .spawn_agent_with_prompt_kind(
                 root_id,
                 "explore crates/protocol".to_string(),
-                Some("explorer".to_string()),
-                None,
+                SystemPromptKind::Explore,
                 true,
             )
             .await?;

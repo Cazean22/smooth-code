@@ -3163,7 +3163,7 @@ mod tests {
             "2",
             "c1",
             "spawn_agent",
-            "{\"message\":\"inspect\"}",
+            "{\"instruction\":\"inspect\"}",
         );
         app.handle_session_event(
             event(
@@ -3190,7 +3190,6 @@ mod tests {
                     child_thread_id,
                     agent_path: smooth_protocol::AgentPath::try_from("/root/child")?,
                     agent_nickname: Some("child".to_string()),
-                    agent_role: Some("worker".to_string()),
                     status: AgentStatus::Completed(Some("Done".to_string())),
                     last_assistant_message: Some("Done".to_string()),
                 }),
@@ -3199,8 +3198,8 @@ mod tests {
         );
 
         let joined = transcript_strings(&app).join("\n");
-        assert!(joined.contains("✓ spawn_agent {\"message\":\"inspect\"}"));
-        assert!(!joined.contains("⠋ spawn_agent {\"message\":\"inspect\"}"));
+        assert!(joined.contains("✓ spawn_agent {\"instruction\":\"inspect\"}"));
+        assert!(!joined.contains("⠋ spawn_agent {\"instruction\":\"inspect\"}"));
         assert!(!joined.contains("Sub-agent"));
         assert!(!joined.contains("Done"));
         Ok(())
@@ -3217,7 +3216,7 @@ mod tests {
             "2",
             "c1",
             "spawn_agent",
-            "{\"message\":\"inspect protocol\"}",
+            "{\"instruction\":\"inspect protocol\"}",
         );
         app.handle_session_event(
             event(
@@ -3239,7 +3238,6 @@ mod tests {
                     sender_thread_id: ThreadId::new(),
                     new_thread_id: Some(ThreadId::new()),
                     new_agent_nickname: Some(String::from("child")),
-                    new_agent_role: Some(String::from("explorer")),
                     prompt: prompt.to_string(),
                     model: None,
                     status: AgentStatus::Running,
@@ -3249,7 +3247,7 @@ mod tests {
         );
 
         let joined = transcript_strings(&app).join("\n");
-        assert!(joined.contains("spawn_agent {\"message\":\"inspect protocol\"}"));
+        assert!(joined.contains("spawn_agent {\"instruction\":\"inspect protocol\"}"));
         assert_eq!(joined.matches(prompt).count(), 1);
         assert!(!joined.contains("Spawning sub-agent"));
         assert!(!joined.contains("Spawn ended"));

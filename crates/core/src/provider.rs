@@ -44,17 +44,18 @@ use tokio_tungstenite::{
     tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
 };
 use tools::{
-    AskUserClient, AskUserQuestionTool, DeleteTool, EditTool, ExitPlanModeTool, PlanWriteTool,
-    ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
+    AskUserClient, AskUserQuestionTool, DeleteTool, EditTool, ExitPlanModeTool, ExploreTool,
+    PlanWriteTool, ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
 };
 
 use crate::agent::{
-    AgentControl, PLAN_MODE_INSTRUCTIONS,
-    role::{RoleOverride, render_spawn_agent_tool_description},
+    AgentControl, PLAN_MODE_INSTRUCTIONS, SystemPromptKind,
+    prompt::{
+        render_explore_tool_description, render_spawn_agent_tool_description,
+        system_prompt_for_kind,
+    },
 };
 use crate::environment::EnvironmentContext;
-
-const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../docs/system_prompt.md");
 
 /// Injectable builder for session-scoped models.
 pub trait SessionModelFactory: Send + Sync {
@@ -65,7 +66,7 @@ pub trait SessionModelFactory: Send + Sync {
         thread_id: smooth_protocol::ThreadId,
         ask_user_client: Option<AskUserClient>,
         current_turn_id: Arc<RwLock<Option<String>>>,
-        role_override: RoleOverride,
+        system_prompt_kind: SystemPromptKind,
         agent_control: AgentControl,
         plan_mode: bool,
     ) -> Result<SessionModel>;
@@ -81,7 +82,7 @@ impl SessionModelFactory for EnvSessionModelFactory {
         thread_id: smooth_protocol::ThreadId,
         ask_user_client: Option<AskUserClient>,
         current_turn_id: Arc<RwLock<Option<String>>>,
-        role_override: RoleOverride,
+        system_prompt_kind: SystemPromptKind,
         agent_control: AgentControl,
         plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -90,7 +91,7 @@ impl SessionModelFactory for EnvSessionModelFactory {
             thread_id,
             ask_user_client,
             current_turn_id,
-            role_override,
+            system_prompt_kind,
             agent_control,
             plan_mode,
         )
@@ -190,21 +191,19 @@ impl SessionModel {
         thread_id: smooth_protocol::ThreadId,
         ask_user_client: Option<AskUserClient>,
         current_turn_id: Arc<RwLock<Option<String>>>,
-        role_override: RoleOverride,
+        system_prompt_kind: SystemPromptKind,
         agent_control: AgentControl,
         plan_mode: bool,
     ) -> Result<Self> {
         let provider = env::var("SMOOTH_CODE_LLM_PROVIDER")
             .unwrap_or_else(|_| "openai".to_string())
             .to_ascii_lowercase();
-        let model = role_override
-            .model
-            .clone()
-            .or_else(|| env::var("SMOOTH_CODE_LLM_MODEL").ok())
+        let model = env::var("SMOOTH_CODE_LLM_MODEL")
+            .ok()
             .unwrap_or_else(|| "gpt-5.5".to_string());
         let environment_context = EnvironmentContext::gather(&cwd);
         let preamble = compose_session_preamble(
-            &role_override,
+            system_prompt_kind,
             env::var("SMOOTH_CODE_LLM_PREAMBLE").ok(),
             &environment_context,
             plan_mode,
@@ -352,7 +351,7 @@ impl SessionModelFactory for StubSessionModelFactory {
         thread_id: smooth_protocol::ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
-        _role_override: RoleOverride,
+        _system_prompt_kind: SystemPromptKind,
         _agent_control: AgentControl,
         _plan_mode: bool,
     ) -> Result<SessionModel> {
@@ -366,21 +365,17 @@ impl SessionModelFactory for StubSessionModelFactory {
 }
 
 fn compose_session_preamble(
-    role_override: &RoleOverride,
+    system_prompt_kind: SystemPromptKind,
     env_preamble: Option<String>,
     environment_context: &EnvironmentContext,
     plan_mode: bool,
 ) -> String {
-    let base_preamble = env_preamble.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let base_preamble = if matches!(system_prompt_kind, SystemPromptKind::Root) {
+        env_preamble.unwrap_or_else(|| system_prompt_for_kind(system_prompt_kind).to_string())
+    } else {
+        system_prompt_for_kind(system_prompt_kind).to_string()
+    };
     let mut preamble = environment_context.apply(&base_preamble);
-    if let Some(role_preamble) = role_override
-        .preamble
-        .as_deref()
-        .map(str::trim)
-        .filter(|preamble| !preamble.is_empty())
-    {
-        preamble = format!("{}\n\n{role_preamble}", preamble.trim_end());
-    }
     if plan_mode {
         preamble = format!("{}\n\n{PLAN_MODE_INSTRUCTIONS}", preamble.trim_end());
     }
@@ -426,7 +421,9 @@ where
     } else {
         builder
     };
-    let builder = builder.tool(SpawnAgentTool::new(render_spawn_agent_tool_description()));
+    let builder = builder
+        .tool(SpawnAgentTool::new(render_spawn_agent_tool_description()))
+        .tool(ExploreTool::new(render_explore_tool_description()));
     builder.default_max_turns(99999).build()
 }
 
@@ -1577,7 +1574,7 @@ mod tests {
 
     use super::{build_agent, compose_session_preamble};
     use crate::{
-        agent::{AgentControl, PLAN_MODE_INSTRUCTIONS, role::RoleOverride},
+        agent::{AgentControl, PLAN_MODE_INSTRUCTIONS, SystemPromptKind},
         environment::EnvironmentContext,
     };
 
@@ -1640,12 +1637,8 @@ mod tests {
 
     #[test]
     fn default_session_preamble_uses_markdown_system_prompt() {
-        let preamble = compose_session_preamble(
-            &RoleOverride::default(),
-            None,
-            &environment_context(),
-            false,
-        );
+        let preamble =
+            compose_session_preamble(SystemPromptKind::Root, None, &environment_context(), false);
 
         assert!(preamble.starts_with("# Smooth Code System Prompt"));
         assert!(preamble.contains("You are Smooth Code"));
@@ -1661,7 +1654,7 @@ mod tests {
     #[test]
     fn configured_preamble_replaces_markdown_system_prompt() {
         let preamble = compose_session_preamble(
-            &RoleOverride::default(),
+            SystemPromptKind::Root,
             Some("Custom prompt for ${shell}.".to_string()),
             &environment_context(),
             false,
@@ -1671,14 +1664,38 @@ mod tests {
     }
 
     #[test]
-    fn role_and_plan_mode_preambles_layer_on_base_prompt() {
-        let role_override = RoleOverride {
-            preamble: Some("Role-specific instructions for ${shell}.".to_string()),
-            model: None,
-        };
-
+    fn default_subagent_preamble_uses_builtin_prompt_and_ignores_env_override() {
         let preamble = compose_session_preamble(
-            &role_override,
+            SystemPromptKind::DefaultSubagent,
+            Some("Root override.".to_string()),
+            &environment_context(),
+            false,
+        );
+
+        assert!(preamble.starts_with("# Smooth Code Default Subagent Prompt"));
+        assert!(preamble.contains("delegated task from a parent agent"));
+        assert!(!preamble.contains("Root override."));
+    }
+
+    #[test]
+    fn explore_preamble_uses_documented_explorer_prompt() {
+        let preamble = compose_session_preamble(
+            SystemPromptKind::Explore,
+            Some("Root override.".to_string()),
+            &environment_context(),
+            false,
+        );
+
+        assert!(preamble.starts_with("# Smooth Code Explorer Subagent Prompt"));
+        assert!(preamble.contains("Do not create, edit, delete"));
+        assert!(preamble.contains("run_command"));
+        assert!(!preamble.contains("Root override."));
+    }
+
+    #[test]
+    fn plan_mode_preamble_layers_on_selected_prompt() {
+        let preamble = compose_session_preamble(
+            SystemPromptKind::Root,
             Some("Base prompt.\n".to_string()),
             &environment_context(),
             true,
@@ -1686,14 +1703,12 @@ mod tests {
 
         assert_eq!(
             preamble,
-            format!(
-                "Base prompt.\n\nRole-specific instructions for ${{shell}}.\n\n{PLAN_MODE_INSTRUCTIONS}"
-            )
+            format!("Base prompt.\n\n{PLAN_MODE_INSTRUCTIONS}")
         );
     }
 
     #[tokio::test]
-    async fn build_agent_registers_only_spawn_agent_agent_tool() -> Result<()> {
+    async fn build_agent_registers_subagent_tools() -> Result<()> {
         let workspace = tempfile::TempDir::new()?;
         let agent = build_agent(
             AgentBuilder::new(DummyModel),
@@ -1714,6 +1729,7 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert!(tool_names.contains("spawn_agent"));
+        assert!(tool_names.contains("explore"));
         assert!(tool_names.contains("delete"));
         assert!(!tool_names.contains("list_dir"));
         assert!(!tool_names.contains("send_message"));
@@ -1750,6 +1766,7 @@ mod tests {
         assert!(tool_names.contains("read"));
         assert!(tool_names.contains("run_command"));
         assert!(tool_names.contains("spawn_agent"));
+        assert!(tool_names.contains("explore"));
         assert!(!tool_names.contains("list_dir"));
         // Plan-mode planning tools are registered.
         assert!(tool_names.contains("plan_write"));

@@ -22,7 +22,7 @@ pub use delete::{DeleteArgs, DeleteTool};
 pub use edit::{EditArgs, EditTool};
 pub use error::{ToolError, ToolResult};
 pub use exit_plan_mode::{ExitPlanModeArgs, ExitPlanModeTool};
-pub use multi_agents::SpawnAgentTool;
+pub use multi_agents::{ExploreTool, SpawnAgentTool, SubagentArgs};
 pub use output::{
     DecodedToolOutput, MAX_FILE_CHANGE_BYTES, decode_tool_output_for_tool, encode_tool_output,
 };

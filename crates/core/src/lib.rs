@@ -13,8 +13,7 @@ mod tasks;
 pub mod test_support;
 mod thread_manager;
 
-pub use agent::AgentControl;
-pub use agent::role::RoleOverride;
+pub use agent::{AgentControl, SystemPromptKind};
 pub use error::{CoreError, CoreResult};
 pub use provider::{
     EnvSessionModelFactory, SessionAssistantContent, SessionCompletionEvent,

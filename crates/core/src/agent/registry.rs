@@ -5,6 +5,8 @@ use std::{
 
 use smooth_protocol::{AgentPath, ThreadId};
 
+use crate::agent::prompt::SystemPromptKind;
+
 #[derive(Clone)]
 pub(crate) struct AgentRegistry {
     state: Arc<Mutex<RegistryState>>,
@@ -23,7 +25,7 @@ pub(crate) struct AgentMetadata {
     pub(crate) agent_id: Option<ThreadId>,
     pub(crate) agent_path: AgentPath,
     pub(crate) agent_nickname: Option<String>,
-    pub(crate) agent_role: Option<String>,
+    pub(crate) system_prompt_kind: SystemPromptKind,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) depth: i32,
 }
@@ -63,7 +65,7 @@ impl AgentRegistry {
             agent_id: Some(thread_id),
             agent_path: AgentPath::root(),
             agent_nickname: None,
-            agent_role: None,
+            system_prompt_kind: SystemPromptKind::Root,
             parent_thread_id: None,
             depth: 0,
         };
@@ -290,7 +292,7 @@ mod tests {
             agent_id: Some(child_id),
             agent_path: AgentPath::root(),
             agent_nickname: Some("alpha".to_string()),
-            agent_role: Some("worker".to_string()),
+            system_prompt_kind: crate::agent::prompt::SystemPromptKind::DefaultSubagent,
             parent_thread_id: None,
             depth: 0,
         })?;

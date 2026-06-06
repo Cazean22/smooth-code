@@ -6,8 +6,8 @@ Use this file to capture concise, durable insights when a task produces knowledg
 
 - `PROGRESS.md` is for judgment-based durable insights worth preserving, not every task.
 - Organize `PROGRESS.md` by topic or subsystem instead of chronological task history.
-- `docs/system_prompt.md` is the runtime default base prompt via `include_str!` in `crates/core/src/provider.rs`; `SMOOTH_CODE_LLM_PREAMBLE` still replaces that default, while role-specific preambles from `crates/core/src/agent/role.rs` layer on top of the selected base.
-- Environment context placeholders in the selected base preamble are filled by `crates/core/src/environment.rs` before role-specific and plan-mode text is appended. Keep this context cache-stable: working directory, git-repo yes/no, platform, OS version, shell, and preferred CLI availability (`rg`, `fd`, `eza`).
+- Root threads use the built-in root prompt from `docs/system_prompt.md`, selected by `SystemPromptKind::Root`; `SMOOTH_CODE_LLM_PREAMBLE` replaces that root prompt only for root threads. Subagents ignore that env override and use their tool-owned built-in prompt.
+- Environment context placeholders in the selected base preamble are filled by `crates/core/src/environment.rs` before plan-mode text is appended. Keep this context cache-stable: working directory, git-repo yes/no, platform, OS version, shell, and preferred CLI availability (`rg`, `fd`, `eza`).
 - The model-facing `list_dir` and `dynamic_echo` tools were removed; directory listings should go through shell commands such as `eza`, and client-mediated interaction should use the typed `ask_user_question` tool/server request. Plan mode includes `run_command` for read-only exploration/validation, but still withholds file-mutating `delete`, `edit`, and `write`.
 - Source changes should go through structured file tools (`edit`, `write`, `delete`) so the runtime can emit structured `FileChangeOutput`; keep `run_command` for inspection, validation, formatters, and project commands rather than Python/`sed -i`/`awk`/redirection rewrite scripts.
 - Plan-mode model rebuilds must preserve typed client-backed tools such as `ask_user_question`; the unchecked `exit_plan_mode` path runs in-turn and should reuse the `Session`'s stored client when no explicit client is passed.
@@ -34,8 +34,10 @@ Use this file to capture concise, durable insights when a task produces knowledg
 
 ## TUI Subagent Display
 
+- Subagents are selected by tool, not by a role/type argument. `spawn_agent` uses `SystemPromptKind::DefaultSubagent`; `explore` uses `SystemPromptKind::Explore` and loads its prompt from `docs/explore_subagent_system_prompt.md`. Child thread rows persist this internal prompt kind as `prompt_kind` so resume rebuilds the same built-in prompt.
+- Subagent tool schemas accept only `instruction` and `fork_context`; old `agent_type`, `agent_role`, `model`, and custom `system_prompt` arguments are intentionally rejected by `deny_unknown_fields`.
 - The parent TUI does not subscribe to child thread streams or render a child transcript. Child-visible output reaches the parent as collaboration lifecycle events emitted on the parent thread (`CollabAgentSpawnBegin`, `CollabAgentSpawnEnd`, `CollabAgentCompleted`).
-- A live `spawn_agent` tool result is emitted as `ToolCallCompleted` with `result_kind: StatusUpdate` and `related_thread_id`; the TUI records that child-thread-to-call mapping and keeps the `spawn_agent` row running until the matching `CollabAgentCompleted` arrives.
+- A live subagent tool result is emitted as `ToolCallCompleted` with `result_kind: StatusUpdate` and `related_thread_id`; the TUI records that child-thread-to-call mapping and keeps the tool row running until the matching `CollabAgentCompleted` arrives.
 - `CollabAgentSpawnBegin` and `CollabAgentSpawnEnd` are transcript-silent in the TUI because the `spawn_agent` tool row already displays the prompt/arguments and running state; keep prompt/status text out of extra info rows unless adding a distinct subagent transcript surface.
 - `CollabAgentCompleted` is transcript-silent in the TUI; it only finalizes the correlated `spawn_agent` tool row. The detailed child result for the model is separate structured JSON returned by the manual tool loop.
 - Parent completion notifications should include every final child status, including `Shutdown` and `NotFound`, so retained inline waiters and TUI `spawn_agent` rows cannot remain running after a child reaches a terminal state.

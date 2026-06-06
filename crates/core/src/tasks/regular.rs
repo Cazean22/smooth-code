@@ -20,8 +20,8 @@ use tools::{DecodedToolOutput, decode_tool_output_for_tool};
 
 use crate::{
     agent::{
-        InlineChildCompletionReceiver, control::InlineChildCompletion, registry::AgentMetadata,
-        status::last_assistant_message,
+        InlineChildCompletionReceiver, SystemPromptKind, control::InlineChildCompletion,
+        registry::AgentMetadata, status::last_assistant_message,
     },
     core::{Session, TurnContext},
     provider::{
@@ -90,10 +90,9 @@ impl RegularTask {
 }
 
 #[derive(Debug, Deserialize)]
-struct ManualSpawnAgentArgs {
-    message: String,
-    agent_type: Option<String>,
-    model: Option<String>,
+#[serde(deny_unknown_fields)]
+struct ManualSubagentArgs {
+    instruction: String,
     #[serde(default)]
     fork_context: bool,
 }
@@ -105,7 +104,6 @@ struct SpawnAgentResult {
     thread_id: String,
     agent_path: String,
     agent_nickname: Option<String>,
-    agent_role: Option<String>,
     status: Option<String>,
     #[serde(default)]
     status_detail: Option<AgentStatus>,
@@ -134,6 +132,7 @@ struct StartedSpawnToolCall {
     internal_call_id: String,
     metadata: AgentMetadata,
     child_thread_id: ThreadId,
+    tool_name: String,
     initial_status: AgentStatus,
     waiter: Option<InlineChildCompletionReceiver>,
     completion: Option<Result<InlineChildCompletion, String>>,
@@ -905,7 +904,7 @@ fn partition_pending_tool_calls(
     let mut exit_plan = Vec::new();
     for pending in pending_tool_calls {
         match pending.tool_call.function.name.as_str() {
-            "spawn_agent" => spawn.push(pending),
+            "spawn_agent" | "explore" => spawn.push(pending),
             "exit_plan_mode" => exit_plan.push(pending),
             _ => normal.push(pending),
         }
@@ -973,7 +972,7 @@ async fn execute_exit_plan_mode_calls(
 
 /// Start every queued `spawn_agent` call concurrently and wait for all starts
 /// to finish before returning. We deliberately do NOT race this against the
-/// cancellation token: `start_spawn_tool_call` -> `spawn_agent_with_role_for_tool`
+/// cancellation token: `start_spawn_tool_call` -> `spawn_agent_for_tool`
 /// performs side effects across multiple awaits (emits `CollabAgentSpawnBegin`,
 /// reserves a registry path, inserts the child thread, registers status/inline
 /// waiters, submits initial input, commits registry metadata, writes a DB
@@ -1067,7 +1066,7 @@ async fn collect_spawn_results(
             spawn_call.tool_call_id,
             spawn_call.tool_call_call_id,
             spawn_call.internal_call_id,
-            "spawn_agent".to_string(),
+            spawn_call.tool_name,
             tool_output,
             success,
             error,
@@ -1105,37 +1104,40 @@ async fn start_spawn_tool_call(
         tool_call,
         internal_call_id,
     } = pending;
-    let args = match serde_json::from_value::<ManualSpawnAgentArgs>(
-        tool_call.function.arguments.clone(),
-    ) {
-        Ok(args) => args,
-        Err(err) => {
-            let message = format!("invalid spawn_agent args: {err}");
-            return SpawnToolStart::Completed(Box::new(
-                complete_tool_call(
-                    session,
-                    ctx,
-                    index,
-                    tool_call.id,
-                    tool_call.call_id,
-                    internal_call_id,
-                    "spawn_agent".to_string(),
-                    message.clone(),
-                    false,
-                    Some(message),
-                )
-                .await,
-            ));
-        }
+    let tool_name = tool_call.function.name.clone();
+    let system_prompt_kind = match tool_name.as_str() {
+        "explore" => SystemPromptKind::Explore,
+        _ => SystemPromptKind::DefaultSubagent,
     };
+    let args =
+        match serde_json::from_value::<ManualSubagentArgs>(tool_call.function.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => {
+                let message = format!("invalid {tool_name} args: {err}");
+                return SpawnToolStart::Completed(Box::new(
+                    complete_tool_call(
+                        session,
+                        ctx,
+                        index,
+                        tool_call.id,
+                        tool_call.call_id,
+                        internal_call_id,
+                        tool_name,
+                        message.clone(),
+                        false,
+                        Some(message),
+                    )
+                    .await,
+                ));
+            }
+        };
 
     match session
         .agent_control
-        .spawn_agent_with_role_for_tool(
+        .spawn_agent_for_tool(
             session.id,
-            args.message,
-            args.agent_type,
-            args.model,
+            args.instruction,
+            system_prompt_kind,
             args.fork_context,
         )
         .await
@@ -1151,7 +1153,7 @@ async fn start_spawn_tool_call(
                         tool_call.id,
                         tool_call.call_id,
                         internal_call_id,
-                        "spawn_agent".to_string(),
+                        tool_name,
                         message.clone(),
                         false,
                         Some(message),
@@ -1165,6 +1167,7 @@ async fn start_spawn_tool_call(
                 tool_call_call_id: tool_call.call_id,
                 internal_call_id,
                 child_thread_id,
+                tool_name,
                 metadata,
                 initial_status,
                 waiter: Some(waiter),
@@ -1181,7 +1184,7 @@ async fn start_spawn_tool_call(
                     tool_call.id,
                     tool_call.call_id,
                     internal_call_id,
-                    "spawn_agent".to_string(),
+                    tool_name,
                     message.clone(),
                     false,
                     Some(message),
@@ -1439,7 +1442,6 @@ fn spawn_agent_result_from_metadata(
             .unwrap_or_default(),
         agent_path: metadata.agent_path.to_string(),
         agent_nickname: metadata.agent_nickname.clone(),
-        agent_role: metadata.agent_role.clone(),
         status: Some(agent_status_label(status).to_string()),
         status_detail: Some(status.clone()),
         last_assistant_message: last_assistant_message_override
@@ -1575,7 +1577,35 @@ mod tests {
     use smooth_protocol::{FileChange, FileChangeOutput, ToolCallResultKind};
     use tools::encode_tool_output;
 
-    use super::{PendingReasoningDeltas, decode_completed_tool_output, should_roundtrip_reasoning};
+    use super::{
+        ManualSubagentArgs, PendingReasoningDeltas, decode_completed_tool_output,
+        should_roundtrip_reasoning,
+    };
+
+    #[test]
+    fn manual_subagent_args_accept_instruction() -> Result<(), serde_json::Error> {
+        let args = serde_json::from_value::<ManualSubagentArgs>(serde_json::json!({
+            "instruction": "inspect crates/core",
+            "fork_context": true
+        }))?;
+
+        assert_eq!(args.instruction, "inspect crates/core");
+        assert!(args.fork_context);
+        Ok(())
+    }
+
+    #[test]
+    fn manual_subagent_args_reject_removed_compatibility_fields() {
+        let old_args = serde_json::json!({
+            "message": "inspect",
+            "agent_type": "worker",
+            "agent_role": "worker",
+            "model": "gpt-test",
+            "system_prompt": "custom"
+        });
+
+        assert!(serde_json::from_value::<ManualSubagentArgs>(old_args).is_err());
+    }
 
     #[test]
     fn structured_tool_output_is_only_decoded_for_successful_file_tools() {

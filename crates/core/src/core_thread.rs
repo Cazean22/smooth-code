@@ -6,11 +6,11 @@ use smooth_protocol::{Event, EventMsg, SessionConfiguredEvent, SessionSource};
 use tokio::sync::{RwLock, broadcast};
 use tools::AskUserClient;
 
-use crate::provider::{SessionModelFactory, default_session_model_factory};
 use crate::{
-    agent::{AgentControl, role::role_override_from_source},
+    agent::{AgentControl, SystemPromptKind},
     core::Core,
     error::{CoreError, CoreResult},
+    provider::{SessionModelFactory, default_session_model_factory},
     rollout::{ResumeState, RolloutRecorder, workspace_root},
 };
 use smooth_protocol::{Op, ThreadId};
@@ -31,6 +31,7 @@ impl CoreThread {
         ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
+        system_prompt_kind: SystemPromptKind,
         agent_control: AgentControl,
     ) -> CoreResult<Self> {
         Self::new_with_history(
@@ -38,6 +39,7 @@ impl CoreThread {
             ask_user_client,
             model_factory,
             session_source,
+            system_prompt_kind,
             agent_control,
             Vec::new(),
         )
@@ -59,12 +61,12 @@ impl CoreThread {
         ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
+        system_prompt_kind: SystemPromptKind,
         agent_control: AgentControl,
         initial_history: Vec<Message>,
     ) -> CoreResult<Self> {
         let cwd = std::env::current_dir()?;
         let current_turn_id = Arc::new(RwLock::new(None));
-        let role_override = role_override_from_source(&session_source);
         let resolved_factory = model_factory.unwrap_or_else(default_session_model_factory);
         let plan_mode = false;
         let model = resolved_factory
@@ -73,7 +75,7 @@ impl CoreThread {
                 id,
                 ask_user_client.clone(),
                 Arc::clone(&current_turn_id),
-                role_override,
+                system_prompt_kind,
                 agent_control.clone(),
                 plan_mode,
             )
@@ -103,6 +105,7 @@ impl CoreThread {
                 current_turn_id,
                 ask_user_client.clone(),
                 session_source,
+                system_prompt_kind,
                 agent_control,
                 plan_mode,
                 resolved_factory.clone(),
@@ -128,11 +131,11 @@ impl CoreThread {
         ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
         session_source: SessionSource,
+        system_prompt_kind: SystemPromptKind,
         agent_control: AgentControl,
     ) -> CoreResult<Self> {
         let cwd = std::env::current_dir()?;
         let current_turn_id = Arc::new(RwLock::new(None));
-        let role_override = role_override_from_source(&session_source);
         let resolved_factory = model_factory.unwrap_or_else(default_session_model_factory);
         let plan_mode = false;
         let model = resolved_factory
@@ -141,7 +144,7 @@ impl CoreThread {
                 state.thread_id,
                 ask_user_client.clone(),
                 Arc::clone(&current_turn_id),
-                role_override,
+                system_prompt_kind,
                 agent_control.clone(),
                 plan_mode,
             )
@@ -159,6 +162,7 @@ impl CoreThread {
                 current_turn_id,
                 ask_user_client.clone(),
                 session_source,
+                system_prompt_kind,
                 agent_control,
                 plan_mode,
                 resolved_factory.clone(),

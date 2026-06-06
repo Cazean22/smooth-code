@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS threads (
     thread_id TEXT PRIMARY KEY NOT NULL,
     agent_path TEXT NULL,
     agent_nickname TEXT NULL,
-    agent_role TEXT NULL,
+    prompt_kind TEXT NULL,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
 );

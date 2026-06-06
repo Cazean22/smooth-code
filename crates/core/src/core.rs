@@ -17,7 +17,7 @@ use tools::AskUserClient;
 use tracing::Instrument;
 
 use crate::{
-    agent::AgentControl,
+    agent::{AgentControl, SystemPromptKind},
     context_manager::ContextManager,
     error::{CoreError, CoreResult},
     provider::{SessionModel, SessionModelFactory},
@@ -41,6 +41,7 @@ pub(crate) struct Session {
     turn_closed: tokio::sync::Notify,
     #[allow(dead_code)]
     pub(crate) session_source: SessionSource,
+    pub(crate) system_prompt_kind: SystemPromptKind,
     pub(crate) agent_control: AgentControl,
     current_turn_id: Arc<RwLock<Option<String>>>,
     #[allow(dead_code)]
@@ -72,6 +73,7 @@ impl Core {
         current_turn_id: Arc<RwLock<Option<String>>>,
         ask_user_client: Option<AskUserClient>,
         session_source: SessionSource,
+        system_prompt_kind: SystemPromptKind,
         agent_control: AgentControl,
         plan_mode: bool,
         model_factory: Arc<dyn SessionModelFactory>,
@@ -90,6 +92,7 @@ impl Core {
             current_turn_id,
             ask_user_client,
             next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
+            system_prompt_kind,
             model: Mutex::new(model),
             plan_mode: AtomicBool::new(plan_mode),
             model_factory,
@@ -522,7 +525,6 @@ impl Session {
             return Ok(enabled);
         }
         let cwd = std::env::current_dir()?;
-        let role_override = crate::agent::role::role_override_from_source(&self.session_source);
         let new_model = self
             .model_factory
             .build(
@@ -530,7 +532,7 @@ impl Session {
                 self.id,
                 self.ask_user_client.clone(),
                 Arc::clone(&self.current_turn_id),
-                role_override,
+                self.system_prompt_kind,
                 self.agent_control.clone(),
                 enabled,
             )
@@ -649,7 +651,7 @@ mod tests {
             _thread_id: smooth_protocol::ThreadId,
             ask_user_client: Option<AskUserClient>,
             _current_turn_id: Arc<RwLock<Option<String>>>,
-            _role_override: crate::agent::role::RoleOverride,
+            _system_prompt_kind: crate::agent::SystemPromptKind,
             _agent_control: AgentControl,
             plan_mode: bool,
         ) -> Result<SessionModel> {
@@ -693,6 +695,7 @@ mod tests {
             current_turn_id,
             None,
             SessionSource::Cli,
+            crate::agent::SystemPromptKind::Root,
             AgentControl::new(),
             false,
             factory,
@@ -839,6 +842,7 @@ mod tests {
             current_turn_id,
             Some(stub_ask_user_client()),
             SessionSource::Cli,
+            crate::agent::SystemPromptKind::Root,
             AgentControl::new(),
             true,
             factory,

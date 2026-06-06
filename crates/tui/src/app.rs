@@ -1507,15 +1507,15 @@ impl UiModel {
             EventMsg::AgentStatusChanged(status) => {
                 self.status_line = format!("Status: {}", agent_status_label(&status.status));
             }
-            EventMsg::UserMessage(message) => {
+            EventMsg::UserMessage { text } => {
                 self.finalize_reasoning_stream();
                 let id = self.next_item_id();
-                self.push_history(TranscriptItem::user(id, message));
+                self.push_history(TranscriptItem::user(id, text));
             }
-            EventMsg::AgentMessage(message) => {
+            EventMsg::AgentMessage { text } => {
                 self.finalize_reasoning_stream();
                 if !self.committed_assistant_for_current_turn {
-                    self.push_rendered_assistant_message(&message);
+                    self.push_rendered_assistant_message(&text);
                     self.committed_assistant_for_current_turn = true;
                 }
             }
@@ -2892,7 +2892,15 @@ mod tests {
 
         start_turn(&mut app);
         complete_agent_message(&mut app, "2", "assistant-1", "Done.");
-        app.handle_session_event(event("3", EventMsg::AgentMessage("Done.".to_string())), 20);
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::AgentMessage {
+                    text: "Done.".to_string(),
+                },
+            ),
+            20,
+        );
 
         let joined = transcript_strings(&app).join("\n");
         assert_eq!(joined.matches("Done.").count(), 1);
@@ -3838,7 +3846,9 @@ mod tests {
                 thread_id: thread_id.to_string(),
                 rollout_path: "session.jsonl".to_string(),
                 initial_messages: vec![
-                    EventMsg::UserMessage("hello".to_string()),
+                    EventMsg::UserMessage {
+                        text: "hello".to_string(),
+                    },
                     EventMsg::AgentReasoningCompleted(AgentReasoningCompletedEvent {
                         thread_id: thread_id.to_string(),
                         turn_id: "turn".to_string(),
@@ -3886,7 +3896,9 @@ mod tests {
             source_thread_id: Some(stale_thread),
             event: Box::new(event(
                 "stale",
-                EventMsg::UserMessage("old prompt".to_string()),
+                EventMsg::UserMessage {
+                    text: "old prompt".to_string(),
+                },
             )),
             viewport_height: 20,
         });

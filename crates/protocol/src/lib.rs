@@ -101,7 +101,11 @@ pub struct Event {
     pub msg: EventMsg,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum EventMsg {
     /// Error while executing a submission
     Error(ErrorEvent),
@@ -111,7 +115,9 @@ pub enum EventMsg {
     TurnInterrupted(TurnInterruptedEvent),
     AgentStatusChanged(AgentStatusChangedEvent),
     /// Agent text output message
-    AgentMessage(String),
+    AgentMessage {
+        text: String,
+    },
     AgentMessageDelta(AgentMessageDeltaEvent),
     AgentMessageCompleted(AgentMessageCompletedEvent),
     AgentReasoningDelta(AgentReasoningDeltaEvent),
@@ -126,7 +132,9 @@ pub enum EventMsg {
     PlanModeChanged(PlanModeChangedEvent),
 
     /// User/system input message (what was sent to the model)
-    UserMessage(String),
+    UserMessage {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -466,6 +474,38 @@ mod tests {
         let value = serde_json::to_value(&msg)?;
         let decoded: EventMsg = serde_json::from_value(value)?;
         assert_eq!(decoded, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn text_event_variants_round_trip_as_tagged_objects() -> TestResult {
+        let user_msg = EventMsg::UserMessage {
+            text: "hello".to_string(),
+        };
+        let user_value = serde_json::to_value(&user_msg)?;
+        assert_eq!(
+            user_value,
+            serde_json::json!({
+                "type": "user_message",
+                "text": "hello",
+            })
+        );
+        let decoded_user: EventMsg = serde_json::from_value(user_value)?;
+        assert_eq!(decoded_user, user_msg);
+
+        let agent_msg = EventMsg::AgentMessage {
+            text: "done".to_string(),
+        };
+        let agent_value = serde_json::to_value(&agent_msg)?;
+        assert_eq!(
+            agent_value,
+            serde_json::json!({
+                "type": "agent_message",
+                "text": "done",
+            })
+        );
+        let decoded_agent: EventMsg = serde_json::from_value(agent_value)?;
+        assert_eq!(decoded_agent, agent_msg);
         Ok(())
     }
 

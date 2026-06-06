@@ -474,6 +474,7 @@ struct OpenAiWebSocketCreateEvent {
     request: OpenAiResponsesCompletionRequest,
 }
 
+#[derive(Default)]
 struct OpenAiWebSocketPayloadOutcome {
     choices: Vec<OpenAiWebSocketRawChoice>,
     terminal: bool,
@@ -574,17 +575,24 @@ async fn openai_websocket_completion_stream(
         Some(parked) => (parked.socket, parked.trailing_done_response_id, true),
         None => (openai_websocket_connect(&openai.client).await?, None, false),
     };
-    if let Err(error) = socket.send(TungsteniteMessage::Text(payload.clone())).await {
-        let error = openai_websocket_provider_error(error);
-        if !reused_socket {
-            return Err(error);
+    if reused_socket {
+        // A parked socket may have gone stale since the previous turn, so keep the payload
+        // around to resend after reconnecting if the first send fails. A fresh connection
+        // can't be stale, so the `else` branch sends by move and pays no clone.
+        if let Err(error) = socket.send(TungsteniteMessage::Text(payload.clone())).await {
+            let error = openai_websocket_provider_error(error);
+            tracing::debug!(
+                error = %error,
+                "OpenAI WebSocket send failed on a reused socket; reconnecting before retrying request"
+            );
+            socket = openai_websocket_connect(&openai.client).await?;
+            trailing_done_response_id = None;
+            socket
+                .send(TungsteniteMessage::Text(payload))
+                .await
+                .map_err(openai_websocket_provider_error)?;
         }
-        tracing::debug!(
-            error = %error,
-            "OpenAI WebSocket send failed on a reused socket; reconnecting before retrying request"
-        );
-        socket = openai_websocket_connect(&openai.client).await?;
-        trailing_done_response_id = None;
+    } else {
         socket
             .send(TungsteniteMessage::Text(payload))
             .await
@@ -634,6 +642,11 @@ fn openai_websocket_stream(
                             openai_websocket_is_response_done_for(&payload, response_id)
                         })
                     {
+                        // A reused socket can still carry the previous turn's trailing
+                        // `response.done`. Other previous-turn frames (e.g. telemetry) may be
+                        // buffered ahead of it, so the guard stays armed until the matching
+                        // done is actually seen — disarming earlier would let the stale done
+                        // through and prematurely terminate this turn with old metadata.
                         stale_done_response_id = None;
                         tracing::debug!(
                             "skipping stale trailing OpenAI WebSocket response.done from previous turn"
@@ -688,25 +701,24 @@ fn openai_websocket_stream(
             }
         }
 
-        if let Some(error) = terminal_error {
-            if clean_terminal && let Some(socket) = socket.take() {
-                *openai.session_ws.lock().await = Some(OpenAiParkedWebSocket {
-                    socket,
-                    trailing_done_response_id: terminal_response_id.take(),
-                });
-            }
-            Err(openai_websocket_stream_error(error))?;
-        }
-
-        for choice in accumulator.finish() {
-            yield choice;
-        }
-
+        // Park the socket for the next turn whenever the turn ended on a clean protocol
+        // terminal (success, failure, or incomplete) — the connection itself is still
+        // healthy. A mid-turn transport drop leaves `clean_terminal` false, so the socket is
+        // dropped instead of reused. Parking before yielding `accumulator.finish()` is safe:
+        // `finish()` only drains in-memory accumulator state and never touches the socket.
         if clean_terminal && let Some(socket) = socket.take() {
             *openai.session_ws.lock().await = Some(OpenAiParkedWebSocket {
                 socket,
                 trailing_done_response_id: terminal_response_id.take(),
             });
+        }
+
+        if let Some(error) = terminal_error {
+            Err(openai_websocket_stream_error(error))?;
+        }
+
+        for choice in accumulator.finish() {
+            yield choice;
         }
     };
 
@@ -913,12 +925,7 @@ fn parse_openai_websocket_payload(
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
     else {
-        return Ok(OpenAiWebSocketPayloadOutcome {
-            choices: Vec::new(),
-            terminal: false,
-            terminal_response_id: None,
-            terminal_error: None,
-        });
+        return Ok(OpenAiWebSocketPayloadOutcome::default());
     };
 
     match kind.as_str() {
@@ -933,10 +940,10 @@ fn parse_openai_websocket_payload(
             })?;
             let terminal_error = accumulator.record_done_response_value(response_value)?;
             Ok(OpenAiWebSocketPayloadOutcome {
-                choices: Vec::new(),
                 terminal: true,
                 terminal_response_id: openai_websocket_response_id(response_value),
                 terminal_error,
+                ..Default::default()
             })
         }
         "response.created"
@@ -966,12 +973,12 @@ fn parse_openai_websocket_payload(
             let terminal_error =
                 accumulator.record_response_value(response_kind, response_value)?;
             Ok(OpenAiWebSocketPayloadOutcome {
-                choices: Vec::new(),
                 terminal,
                 terminal_response_id: terminal
                     .then(|| openai_websocket_response_id(response_value))
                     .flatten(),
                 terminal_error,
+                ..Default::default()
             })
         }
         "response.output_item.added" | "response.output_item.done" => {
@@ -988,9 +995,7 @@ fn parse_openai_websocket_payload(
             };
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices,
-                terminal: false,
-                terminal_response_id: None,
-                terminal_error: None,
+                ..Default::default()
             })
         }
         "response.output_text.delta" | "response.refusal.delta" => {
@@ -1001,19 +1006,12 @@ fn parse_openai_websocket_payload(
                 .unwrap_or_default();
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices,
-                terminal: false,
-                terminal_response_id: None,
-                terminal_error: None,
+                ..Default::default()
             })
         }
         "response.output_text.done" | "response.refusal.done" => {
             accumulator.mark_completed_message_item(openai_websocket_item_id(&value));
-            Ok(OpenAiWebSocketPayloadOutcome {
-                choices: Vec::new(),
-                terminal: false,
-                terminal_response_id: None,
-                terminal_error: None,
-            })
+            Ok(OpenAiWebSocketPayloadOutcome::default())
         }
         "response.content_part.done" => {
             if value
@@ -1024,12 +1022,7 @@ fn parse_openai_websocket_payload(
             {
                 accumulator.mark_completed_message_item(openai_websocket_item_id(&value));
             }
-            Ok(OpenAiWebSocketPayloadOutcome {
-                choices: Vec::new(),
-                terminal: false,
-                terminal_response_id: None,
-                terminal_error: None,
-            })
+            Ok(OpenAiWebSocketPayloadOutcome::default())
         }
         "response.function_call_arguments.delta" => {
             let Some(item_id) = value
@@ -1037,20 +1030,10 @@ fn parse_openai_websocket_payload(
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
             else {
-                return Ok(OpenAiWebSocketPayloadOutcome {
-                    choices: Vec::new(),
-                    terminal: false,
-                    terminal_response_id: None,
-                    terminal_error: None,
-                });
+                return Ok(OpenAiWebSocketPayloadOutcome::default());
             };
             let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) else {
-                return Ok(OpenAiWebSocketPayloadOutcome {
-                    choices: Vec::new(),
-                    terminal: false,
-                    terminal_response_id: None,
-                    terminal_error: None,
-                });
+                return Ok(OpenAiWebSocketPayloadOutcome::default());
             };
             let internal_call_id = accumulator.internal_call_id_for(&item_id);
             Ok(OpenAiWebSocketPayloadOutcome {
@@ -1059,9 +1042,7 @@ fn parse_openai_websocket_payload(
                     internal_call_id,
                     content: ToolCallDeltaContent::Delta(delta.to_string()),
                 }],
-                terminal: false,
-                terminal_response_id: None,
-                terminal_error: None,
+                ..Default::default()
             })
         }
         "response.function_call_arguments.done" => {
@@ -1069,12 +1050,7 @@ fn parse_openai_websocket_payload(
                 let arguments = openai_websocket_arguments_value(&value);
                 accumulator.record_tool_call_args_done(item_id, arguments);
             }
-            Ok(OpenAiWebSocketPayloadOutcome {
-                choices: Vec::new(),
-                terminal: false,
-                terminal_response_id: None,
-                terminal_error: None,
-            })
+            Ok(OpenAiWebSocketPayloadOutcome::default())
         }
         "response.reasoning_summary_text.delta" => {
             let choices = value
@@ -1090,17 +1066,10 @@ fn parse_openai_websocket_payload(
                 .unwrap_or_default();
             Ok(OpenAiWebSocketPayloadOutcome {
                 choices,
-                terminal: false,
-                terminal_response_id: None,
-                terminal_error: None,
+                ..Default::default()
             })
         }
-        _ => Ok(OpenAiWebSocketPayloadOutcome {
-            choices: Vec::new(),
-            terminal: false,
-            terminal_response_id: None,
-            terminal_error: None,
-        }),
+        _ => Ok(OpenAiWebSocketPayloadOutcome::default()),
     }
 }
 
@@ -1206,17 +1175,36 @@ fn is_openai_websocket_connection_reset(error: &CompletionError) -> bool {
         || message.contains("OpenAI WebSocket connection reset before response.completed")
 }
 
+/// Structured proxy error codes/types (`error.code` / `error.type` / top-level `code`) that
+/// mark a transient condition worth retrying. `openai_websocket_error_event_message` folds
+/// these into the rendered error string, so matching them here is effectively a match on the
+/// structured code rather than on free-form prose — robust to the proxy's message wording.
+const OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES: &[&str] = &["websocket_connection_limit_reached"];
+
+/// Free-text transport/stream phrases that indicate the connection dropped before the turn
+/// finished. Unlike the codes above, these conditions are only ever surfaced as human-readable
+/// messages — by tungstenite, by our own synthesized errors, or by CLIProxyAPI when the
+/// upstream Responses stream ends early — so substring matching is the only signal available.
+const OPENAI_WEBSOCKET_RETRYABLE_TRANSIENT_MARKERS: &[&str] = &[
+    "The OpenAI WebSocket connection closed before the turn finished",
+    "The OpenAI WebSocket connection closed without a close reason",
+    "An error occurred while processing the request.",
+    "stream closed before response.completed",
+    "disconnected before completion",
+];
+
 fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
+    // Retries fire only before any assistant output (see `should_retry_openai_websocket_error`),
+    // so this only needs to recognise drops that happen before the turn produces tokens.
+    // Classification is text-based because `CompletionError` carries only a rendered message at
+    // this boundary; the marker lists are the single source of truth for what counts as
+    // transient.
     let message = error.to_string();
     is_openai_websocket_connection_reset(error)
-        || message.contains("websocket_connection_limit_reached")
-        || message.contains("The OpenAI WebSocket connection closed before the turn finished")
-        || message.contains("The OpenAI WebSocket connection closed without a close reason")
-        || message.contains("An error occurred while processing the request.")
-        // CLIProxyAPI surfaces these when the upstream Responses stream drops before
-        // `response.completed`; retryable only before any assistant item (see call sites).
-        || message.contains("stream closed before response.completed")
-        || message.contains("disconnected before completion")
+        || OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES
+            .iter()
+            .chain(OPENAI_WEBSOCKET_RETRYABLE_TRANSIENT_MARKERS)
+            .any(|marker| message.contains(marker))
 }
 
 fn should_retry_openai_websocket_error(
@@ -1719,6 +1707,7 @@ mod tests {
     enum OpenAiWebSocketTestServerMode {
         KeepAlive,
         KeepAliveWithTrailingDone,
+        KeepAliveWithTelemetryThenTrailingDone,
         CloseAfterResponse,
         AbortAfterResponse,
     }
@@ -1880,7 +1869,26 @@ mod tests {
                         if matches!(
                             connection_mode,
                             OpenAiWebSocketTestServerMode::KeepAliveWithTrailingDone
+                                | OpenAiWebSocketTestServerMode::KeepAliveWithTelemetryThenTrailingDone
                         ) {
+                            if matches!(
+                                connection_mode,
+                                OpenAiWebSocketTestServerMode::KeepAliveWithTelemetryThenTrailingDone
+                            ) {
+                                // Buffer a non-`response.done` telemetry frame ahead of the
+                                // trailing done so a reused turn must skip past it without
+                                // disarming the stale-done guard early.
+                                let telemetry_frame =
+                                    r#"{"type":"codex.rate_limits","rate_limits":{"allowed":true}}"#
+                                        .to_string();
+                                if socket
+                                    .send(TestWebSocketMessage::Text(telemetry_frame))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
                             let done_frame = openai_websocket_done_frame_with_total_tokens(
                                 &response_id,
                                 total_tokens + 1,
@@ -2801,6 +2809,39 @@ mod tests {
     async fn openai_websocket_reused_turn_ignores_stale_trailing_response_done() -> Result<()> {
         let (base_url, handshakes, server) = start_openai_websocket_sequence_server(
             OpenAiWebSocketTestServerMode::KeepAliveWithTrailingDone,
+        )
+        .await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+
+        let first = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("first")?,
+        )
+        .await?;
+        assert_eq!(openai_websocket_final_total_tokens(first).await?, 100);
+
+        let second = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("second")?,
+        )
+        .await?;
+        assert_eq!(openai_websocket_final_total_tokens(second).await?, 200);
+
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+        assert!(model.session_ws.lock().await.is_some());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_reused_turn_skips_stale_done_behind_buffered_telemetry() -> Result<()>
+    {
+        // A previous-turn telemetry frame is buffered ahead of the trailing `response.done`,
+        // so the stale-done guard must stay armed across it. If it disarms on the first frame,
+        // the stale done (total_tokens 101) terminates the second turn with the previous
+        // turn's metadata instead of the second turn's own `response.completed` (200).
+        let (base_url, handshakes, server) = start_openai_websocket_sequence_server(
+            OpenAiWebSocketTestServerMode::KeepAliveWithTelemetryThenTrailingDone,
         )
         .await?;
         let model = openai_websocket_test_model(&base_url).await?;

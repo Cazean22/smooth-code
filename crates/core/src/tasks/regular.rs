@@ -210,7 +210,12 @@ impl SessionTask for RegularTask {
         let prompt_text = prompt_parts.join("\n");
         session.record_user_message(prompt_text.clone()).await;
         session
-            .emit_event(&ctx, EventMsg::UserMessage(prompt_text.clone()))
+            .emit_event(
+                &ctx,
+                EventMsg::UserMessage {
+                    text: prompt_text.clone(),
+                },
+            )
             .await;
 
         let prompt = Message::User {
@@ -532,7 +537,12 @@ async fn run_manual_turn(
                 )
                 .await;
             session
-                .emit_event(&ctx, EventMsg::AgentMessage(last_assistant_message.clone()))
+                .emit_event(
+                    &ctx,
+                    EventMsg::AgentMessage {
+                        text: last_assistant_message.clone(),
+                    },
+                )
                 .await;
             return Some(last_assistant_message);
         }

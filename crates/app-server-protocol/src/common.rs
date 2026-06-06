@@ -217,6 +217,35 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
+    fn thread_resume_response_serializes_initial_user_messages() -> TestResult {
+        let response = ThreadResumeResponse {
+            thread_id: "018f6f32-7a31-7c22-8c95-3c3dfb63dce1".to_string(),
+            rollout_path: "session.jsonl".to_string(),
+            initial_messages: vec![smooth_protocol::EventMsg::UserMessage {
+                text: "hello".to_string(),
+            }],
+        };
+
+        let value = serde_json::to_value(&response)?;
+        assert_eq!(
+            value,
+            json!({
+                "threadId": "018f6f32-7a31-7c22-8c95-3c3dfb63dce1",
+                "rolloutPath": "session.jsonl",
+                "initialMessages": [
+                    {
+                        "type": "user_message",
+                        "text": "hello",
+                    },
+                ],
+            })
+        );
+        let decoded: ThreadResumeResponse = serde_json::from_value(value)?;
+        assert_eq!(decoded, response);
+        Ok(())
+    }
+
+    #[test]
     fn turn_cancel_request_round_trips_and_is_in_schema() -> TestResult {
         let request = ClientRequest::TurnCancel {
             request_id: RequestId(7),

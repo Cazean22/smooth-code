@@ -150,7 +150,7 @@ fn persist_event(event: &EventMsg) -> bool {
 
 pub(crate) fn persisted_event_item(event: &EventMsg) -> Option<PersistedItem> {
     match event {
-        EventMsg::UserMessage(text) => Some(PersistedItem::UserMessage { text: text.clone() }),
+        EventMsg::UserMessage { text } => Some(PersistedItem::UserMessage { text: text.clone() }),
         event if persist_event(event) => Some(PersistedItem::Event(event.clone())),
         _ => None,
     }
@@ -194,7 +194,7 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
                 history.push(message);
             }
             PersistedItem::UserMessage { text } => {
-                initial_messages.push(EventMsg::UserMessage(text));
+                initial_messages.push(EventMsg::UserMessage { text });
             }
             PersistedItem::Event(event) => {
                 update_turn_tracking(
@@ -447,8 +447,10 @@ mod tests {
             .await?;
         recorder
             .append(
-                persisted_event_item(&EventMsg::UserMessage("human prompt".to_string()))
-                    .with_context(|| "user message should persist")?,
+                persisted_event_item(&EventMsg::UserMessage {
+                    text: "human prompt".to_string(),
+                })
+                .with_context(|| "user message should persist")?,
             )
             .await?;
         recorder

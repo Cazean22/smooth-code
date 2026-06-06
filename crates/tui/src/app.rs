@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
 };
 use smooth_protocol::{
     AgentStatus, ErrorInfo, Event, EventMsg, FileChangeOutput, ThreadId, ToolCallResultKind,
@@ -2260,7 +2260,7 @@ impl UiModel {
             self.scroll_to_bottom(viewport_height);
         }
         let lines = self.visible_transcript_lines(inner_width, viewport_height);
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(lines));
         frame.render_widget(paragraph, area);
     }
 
@@ -3328,6 +3328,65 @@ mod tests {
         assert!(app.model.scroll > 0);
         let max_scroll = app.max_scroll(viewport_height);
         assert_eq!(app.model.scroll, max_scroll);
+    }
+
+    #[test]
+    fn long_edit_diff_rows_do_not_hide_bottom_marker() -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = App::new();
+        app.model.screen = Screen::Workspace;
+        app.model.focus = FocusTarget::Transcript;
+        app.model.inspector_visible = false;
+        let old = (0..20)
+            .map(|_| "a".repeat(80))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (0..20)
+            .map(|_| "b".repeat(80))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "edit", "src/lib.rs");
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("edited src/lib.rs")),
+                    error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
+                    file_change: Some(smooth_protocol::FileChangeOutput {
+                        path: "src/lib.rs".into(),
+                        change: smooth_protocol::FileChange::Update {
+                            unified_diff: diffy::create_patch(
+                                &format!("{old}\n"),
+                                &format!("{new}\n"),
+                            )
+                            .to_string(),
+                            move_path: None,
+                        },
+                    }),
+                    file_changes: Vec::new(),
+                }),
+            ),
+            8,
+        );
+        app.model.push_info("bottom marker");
+        let viewport_height = app.model.transcript_viewport_height(40, 12);
+        app.model.transcript_inner_width = 40;
+        app.model.scroll_to_bottom(viewport_height);
+        app.model.auto_scroll = false;
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12))?;
+        terminal.draw(|frame| app.render(frame))?;
+        let rendered = rendered_buffer_text(&terminal);
+
+        assert!(rendered.contains("bottom marker"), "{rendered}");
+        Ok(())
     }
 
     #[test]

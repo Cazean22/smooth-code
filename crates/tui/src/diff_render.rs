@@ -214,7 +214,7 @@ fn render_diff_line(
     width: usize,
     line_number_width: usize,
 ) -> Vec<Line<'static>> {
-    let gutter_width = line_number_width + 2;
+    let gutter_width = line_number_width + 3;
     let available = width.saturating_sub(gutter_width).max(1);
     let chunks = wrap::wrap_text(text, available);
     let mut out = Vec::with_capacity(chunks.len());
@@ -402,6 +402,31 @@ mod tests {
                 .iter()
                 .all(|line| crate::wrap::display_width(line) <= 12),
             "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn wraps_long_diff_content_within_width() {
+        let old = format!("{}\n", "a".repeat(80));
+        let new = format!("{}\n", "b".repeat(80));
+        let output = FileChangeOutput {
+            path: "src/lib.rs".into(),
+            change: FileChange::Update {
+                unified_diff: diffy::create_patch(&old, &new).to_string(),
+                move_path: None,
+            },
+        };
+        let width = 24;
+
+        let rendered = line_texts(create_diff_summary(&output, width));
+
+        assert!(rendered.iter().any(|line| line.contains("- a")));
+        assert!(rendered.iter().any(|line| line.contains("+ b")));
+        assert!(
+            rendered
+                .iter()
+                .all(|line| crate::wrap::display_width(line) <= usize::from(width)),
+            "line exceeded width: {rendered:?}"
         );
     }
 

@@ -514,6 +514,9 @@ fn build_replacement_lines(
     let mut old_offset = 0;
     let mut replacement = Vec::new();
 
+    // Context lines keep the terminator of the line they matched; added lines inherit
+    // the terminator of an adjacent matched line. Both preserve mixed endings, and an
+    // inherited `None` (the original final line had no newline) is carried through.
     for hunk_line in &hunk.lines {
         match hunk_line {
             HunkLine::Context(text) => {
@@ -530,46 +533,35 @@ fn build_replacement_lines(
             HunkLine::Add(text) => {
                 replacement.push(ContentLine {
                     text: text.clone(),
-                    terminator: added_line_terminator(
-                        lines,
-                        &matched,
-                        old_offset,
-                        default_terminator,
-                    ),
+                    terminator: added_line_terminator(&matched, old_offset),
                 });
             }
         }
     }
 
-    for index in 0..replacement.len() {
-        if (index + 1 < replacement.len() || has_following_line)
-            && replacement[index].terminator.is_none()
-        {
-            replacement[index].terminator = Some(default_terminator);
+    // Any line that is not the file's final line must be terminated to keep the next
+    // line separate. The line that becomes the final line keeps its inherited
+    // terminator, so a missing final newline is preserved.
+    let last_index = replacement.len().saturating_sub(1);
+    for (index, line) in replacement.iter_mut().enumerate() {
+        if line.terminator.is_none() && (index != last_index || has_following_line) {
+            line.terminator = Some(default_terminator);
         }
     }
 
     replacement
 }
 
-fn added_line_terminator(
-    lines: &[ContentLine],
-    matched: &[ContentLine],
-    old_offset: usize,
-    default_terminator: &'static str,
-) -> Option<&'static str> {
-    if lines.is_empty() {
-        return None;
-    }
+fn added_line_terminator(matched: &[ContentLine], old_offset: usize) -> Option<&'static str> {
+    // Inherit from the matched line just before this position (often the line being
+    // replaced), then the line at this position. A matched line that exists but has no
+    // terminator is the original final line, so `None` is the correct answer there.
     if old_offset > 0
-        && let Some(terminator) = matched.get(old_offset - 1).and_then(|line| line.terminator)
+        && let Some(line) = matched.get(old_offset - 1)
     {
-        return Some(terminator);
+        return line.terminator;
     }
-    if let Some(terminator) = matched.get(old_offset).and_then(|line| line.terminator) {
-        return Some(terminator);
-    }
-    Some(default_terminator)
+    matched.get(old_offset).and_then(|line| line.terminator)
 }
 
 fn preferred_terminator(lines: &[ContentLine], start: usize, end: usize) -> &'static str {
@@ -1114,6 +1106,85 @@ mod tests {
             .await?;
 
         assert_eq!(fs::read_to_string(path)?, "alpha\r\nbee\ngamma\r\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_inner_line_ending_for_added_line_in_block() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("mixed.txt");
+        fs::write(&path, "alpha\r\nbeta\ngamma\r\n")?;
+
+        tool.call(args(vec![update(
+            "mixed.txt",
+            None,
+            vec![hunk(vec![
+                context("alpha"),
+                remove("beta"),
+                add("BETA"),
+                context("gamma"),
+            ])],
+        )]))
+        .await?;
+
+        // BETA replaces beta (LF); it must keep LF, not adopt the block's leading CRLF.
+        assert_eq!(fs::read_to_string(path)?, "alpha\r\nBETA\ngamma\r\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_missing_trailing_newline_when_replacing_last_line() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("noeol.txt");
+        fs::write(&path, "alpha\nbeta")?;
+
+        tool.call(replacement_args("noeol.txt", "beta", "BETA"))
+            .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "alpha\nBETA");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_missing_trailing_newline_when_appending() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("noeol.txt");
+        fs::write(&path, "alpha")?;
+
+        tool.call(args(vec![update(
+            "noeol.txt",
+            None,
+            vec![hunk(vec![context("alpha"), add("beta")])],
+        )]))
+        .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "alpha\nbeta");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_crlf_without_trailing_newline_when_replacing_last_line() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("crlf_noeol.txt");
+        fs::write(&path, "alpha\r\nbeta")?;
+
+        tool.call(replacement_args("crlf_noeol.txt", "beta", "BETA"))
+            .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "alpha\r\nBETA");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keeps_trailing_newline_when_replacing_last_line() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("eol.txt");
+        fs::write(&path, "alpha\nbeta\n")?;
+
+        tool.call(replacement_args("eol.txt", "beta", "BETA"))
+            .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "alpha\nBETA\n");
         Ok(())
     }
 

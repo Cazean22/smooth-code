@@ -1067,6 +1067,10 @@ fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
         || message.contains("The OpenAI WebSocket connection closed before the turn finished")
         || message.contains("The OpenAI WebSocket connection closed without a close reason")
         || message.contains("An error occurred while processing the request.")
+        // CLIProxyAPI surfaces these when the upstream Responses stream drops before
+        // `response.completed`; retryable only before any assistant item (see call sites).
+        || message.contains("stream closed before response.completed")
+        || message.contains("disconnected before completion")
 }
 
 struct OpenAiWebSocketAccumulator {
@@ -2090,6 +2094,9 @@ mod tests {
             "The OpenAI WebSocket connection closed before the turn finished",
             "The OpenAI WebSocket connection closed without a close reason",
             "An error occurred while processing the request.",
+            "stream closed before response.completed",
+            "disconnected before completion",
+            "stream disconnected before completion",
         ];
 
         for message in retryable {
@@ -2105,6 +2112,20 @@ mod tests {
         assert!(!super::is_openai_websocket_transient_start_error(
             &invalid_request
         ));
+    }
+
+    #[test]
+    fn openai_websocket_error_event_early_close_is_retryable() {
+        let mut accumulator = super::OpenAiWebSocketAccumulator::new();
+        let payload =
+            r#"{"type":"error","error":{"message":"stream closed before response.completed"}}"#;
+        let Err(error) = super::parse_openai_websocket_payload(payload, &mut accumulator) else {
+            panic!("proxy error event should surface as a CompletionError");
+        };
+        assert!(
+            super::is_openai_websocket_transient_start_error(&error),
+            "early-close error events must be retryable before output"
+        );
     }
 
     #[test]

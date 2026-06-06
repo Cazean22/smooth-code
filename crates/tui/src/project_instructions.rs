@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
 };
 
@@ -9,6 +9,7 @@ use smooth_protocol::{ProjectInstructionEntry, ProjectInstructions};
 use crate::error::TuiResult;
 
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
+const UTF8_BOUNDARY_PROBE_BYTES: usize = 4;
 
 pub(crate) fn load_project_instructions() -> TuiResult<Option<ProjectInstructions>> {
     let cwd = std::env::current_dir()?;
@@ -27,14 +28,14 @@ pub(crate) fn load_project_instructions_from(start_dir: &Path) -> Option<Project
         let Some(source_path) = instruction_file_for_dir(&dir) else {
             continue;
         };
-        let Some(text) = read_instruction_text(&source_path) else {
+        let remaining = PROJECT_INSTRUCTIONS_MAX_BYTES.saturating_sub(total_bytes);
+        let Some(text) = read_instruction_text(&source_path, remaining) else {
             continue;
         };
         if text.trim().is_empty() {
             continue;
         }
 
-        let remaining = PROJECT_INSTRUCTIONS_MAX_BYTES.saturating_sub(total_bytes);
         let (text, truncated) = truncate_to_byte_limit(&text, remaining);
         if truncated {
             tracing::warn!(
@@ -105,9 +106,9 @@ fn is_regular_file(path: &Path) -> bool {
     }
 }
 
-fn read_instruction_text(path: &Path) -> Option<String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+fn read_instruction_text(path: &Path, byte_limit: usize) -> Option<String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(err) => {
             tracing::warn!(
                 source_path = %path.display(),
@@ -117,6 +118,16 @@ fn read_instruction_text(path: &Path) -> Option<String> {
             return None;
         }
     };
+    let read_limit = byte_limit.saturating_add(UTF8_BOUNDARY_PROBE_BYTES) as u64;
+    let mut bytes = Vec::with_capacity(read_limit as usize);
+    if let Err(err) = file.take(read_limit).read_to_end(&mut bytes) {
+        tracing::warn!(
+            source_path = %path.display(),
+            error = %err,
+            "failed to read project instructions file"
+        );
+        return None;
+    }
 
     match String::from_utf8(bytes) {
         Ok(text) => Some(text),
@@ -234,6 +245,27 @@ mod tests {
 
         assert_eq!(loaded.len(), PROJECT_INSTRUCTIONS_MAX_BYTES - 1);
         assert!(loaded.is_char_boundary(loaded.len()));
+        assert!(loaded.chars().all(|ch| ch == 'a'));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_agents_file_is_capped() -> Result<()> {
+        let temp = TempDir::new()?;
+        fs::create_dir(temp.path().join(".git"))?;
+        fs::write(
+            temp.path().join("AGENTS.md"),
+            format!(
+                "{}trailing content should not load",
+                "a".repeat(PROJECT_INSTRUCTIONS_MAX_BYTES)
+            ),
+        )?;
+
+        let instructions = load_project_instructions_from(temp.path())
+            .ok_or_else(|| anyhow::anyhow!("expected project instructions"))?;
+        let loaded = &instructions.entries[0].text;
+
+        assert_eq!(loaded.len(), PROJECT_INSTRUCTIONS_MAX_BYTES);
         assert!(loaded.chars().all(|ch| ch == 'a'));
         Ok(())
     }

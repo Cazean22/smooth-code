@@ -458,8 +458,13 @@ fn session_assistant_content_from_streamed<R>(
 
 type OpenAiWebSocketRawChoice = RawStreamingChoice<OpenAiStreamingCompletionResponse>;
 type OpenAiWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
-const OPENAI_WEBSOCKET_RETRY_BUDGET: usize = 3;
-const OPENAI_WEBSOCKET_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+// A connection reset before output is how the local proxy (CLIProxyAPI) surfaces an upstream
+// codex account running out of usage: it drops the socket, and on the next attempt the proxy can
+// rotate to a different account. Budget enough attempts to roll through several exhausted accounts
+// before giving up, and cap the exponential backoff so the retry tail stays interactive.
+const OPENAI_WEBSOCKET_RETRY_BUDGET: usize = 8;
+const OPENAI_WEBSOCKET_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const OPENAI_WEBSOCKET_RETRY_MAX_DELAY: Duration = Duration::from_secs(3);
 
 struct OpenAiParkedWebSocket {
     socket: OpenAiWebSocket,
@@ -1218,7 +1223,9 @@ fn openai_websocket_retry_delay(retry_count: usize) -> Duration {
     let factor = 1_u32
         .checked_shl(retry_count.saturating_sub(1) as u32)
         .unwrap_or(u32::MAX);
-    OPENAI_WEBSOCKET_RETRY_BASE_DELAY * factor
+    OPENAI_WEBSOCKET_RETRY_BASE_DELAY
+        .saturating_mul(factor)
+        .min(OPENAI_WEBSOCKET_RETRY_MAX_DELAY)
 }
 
 struct OpenAiWebSocketAccumulator {
@@ -2601,6 +2608,30 @@ mod tests {
 
         assert!(super::should_retry_openai_websocket_error(&error, false));
         assert!(!super::should_retry_openai_websocket_error(&error, true));
+    }
+
+    #[test]
+    fn openai_websocket_retry_delay_grows_then_caps() {
+        // Early retries back off exponentially from the base delay.
+        assert_eq!(
+            super::openai_websocket_retry_delay(1),
+            super::OPENAI_WEBSOCKET_RETRY_BASE_DELAY
+        );
+        assert_eq!(
+            super::openai_websocket_retry_delay(2),
+            super::OPENAI_WEBSOCKET_RETRY_BASE_DELAY * 2
+        );
+
+        // The later attempts in the budget are clamped so the retry tail stays interactive, and a
+        // huge retry count saturates to the cap instead of panicking on Duration overflow.
+        assert!(
+            super::openai_websocket_retry_delay(super::OPENAI_WEBSOCKET_RETRY_BUDGET)
+                <= super::OPENAI_WEBSOCKET_RETRY_MAX_DELAY
+        );
+        assert_eq!(
+            super::openai_websocket_retry_delay(64),
+            super::OPENAI_WEBSOCKET_RETRY_MAX_DELAY
+        );
     }
 
     #[test]

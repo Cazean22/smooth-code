@@ -332,7 +332,7 @@ pub struct FileChangeOutput {
     pub change: FileChange,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallCompletedEvent {
     pub thread_id: String,
@@ -347,6 +347,57 @@ pub struct ToolCallCompletedEvent {
     pub related_thread_id: Option<ThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_change: Option<FileChangeOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_changes: Vec<FileChangeOutput>,
+}
+
+impl<'de> Deserialize<'de> for ToolCallCompletedEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ToolCallCompletedEventWire {
+            thread_id: String,
+            turn_id: String,
+            call_id: String,
+            success: bool,
+            output_preview: Option<String>,
+            error: Option<String>,
+            #[serde(default)]
+            result_kind: ToolCallResultKind,
+            #[serde(default)]
+            related_thread_id: Option<ThreadId>,
+            #[serde(default)]
+            file_change: Option<FileChangeOutput>,
+            #[serde(default)]
+            file_changes: Vec<FileChangeOutput>,
+        }
+
+        let mut wire = ToolCallCompletedEventWire::deserialize(deserializer)?;
+        if wire.file_changes.is_empty()
+            && let Some(file_change) = wire.file_change.clone()
+        {
+            wire.file_changes.push(file_change);
+        }
+        if wire.file_change.is_none() {
+            wire.file_change = wire.file_changes.first().cloned();
+        }
+
+        Ok(Self {
+            thread_id: wire.thread_id,
+            turn_id: wire.turn_id,
+            call_id: wire.call_id,
+            success: wire.success,
+            output_preview: wire.output_preview,
+            error: wire.error,
+            result_kind: wire.result_kind,
+            related_thread_id: wire.related_thread_id,
+            file_change: wire.file_change,
+            file_changes: wire.file_changes,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -537,6 +588,7 @@ mod tests {
         assert_eq!(decoded.result_kind, ToolCallResultKind::Final);
         assert_eq!(decoded.related_thread_id, None);
         assert_eq!(decoded.file_change, None);
+        assert_eq!(decoded.file_changes, Vec::new());
         Ok(())
     }
 
@@ -553,6 +605,7 @@ mod tests {
             result_kind: ToolCallResultKind::StatusUpdate,
             related_thread_id: Some(related_thread_id),
             file_change: None,
+            file_changes: Vec::new(),
         };
 
         let value = serde_json::to_value(&event)?;
@@ -565,6 +618,13 @@ mod tests {
 
     #[test]
     fn tool_call_completed_file_change_round_trip() -> TestResult {
+        let file_change = FileChangeOutput {
+            path: "file.txt".into(),
+            change: FileChange::Update {
+                unified_diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                move_path: None,
+            },
+        };
         let event = ToolCallCompletedEvent {
             thread_id: String::from("thread"),
             turn_id: String::from("turn"),
@@ -574,13 +634,8 @@ mod tests {
             error: None,
             result_kind: ToolCallResultKind::Final,
             related_thread_id: None,
-            file_change: Some(FileChangeOutput {
-                path: "file.txt".into(),
-                change: FileChange::Update {
-                    unified_diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
-                    move_path: None,
-                },
-            }),
+            file_change: Some(file_change.clone()),
+            file_changes: vec![file_change],
         };
 
         let value = serde_json::to_value(&event)?;
@@ -591,6 +646,64 @@ mod tests {
         );
         assert!(value["fileChange"]["change"].get("unified_diff").is_none());
         assert!(value["fileChange"]["change"].get("move_path").is_none());
+        let decoded: ToolCallCompletedEvent = serde_json::from_value(value)?;
+        assert_eq!(decoded, event);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_completed_legacy_file_change_decodes_to_file_changes() -> TestResult {
+        let decoded: ToolCallCompletedEvent = serde_json::from_value(serde_json::json!({
+            "threadId": "thread",
+            "turnId": "turn",
+            "callId": "call",
+            "success": true,
+            "outputPreview": "edited file.txt",
+            "error": null,
+            "fileChange": {
+                "path": "file.txt",
+                "change": {
+                    "type": "update",
+                    "unifiedDiff": "@@ -1 +1 @@\n-old\n+new\n",
+                    "movePath": null
+                }
+            }
+        }))?;
+
+        assert_eq!(decoded.file_changes.len(), 1);
+        assert_eq!(decoded.file_change, decoded.file_changes.first().cloned());
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_completed_file_changes_round_trip() -> TestResult {
+        let first = FileChangeOutput {
+            path: "one.txt".into(),
+            change: FileChange::Add {
+                content: "one\n".to_string(),
+            },
+        };
+        let second = FileChangeOutput {
+            path: "two.txt".into(),
+            change: FileChange::Delete {
+                content: "two\n".to_string(),
+            },
+        };
+        let event = ToolCallCompletedEvent {
+            thread_id: String::from("thread"),
+            turn_id: String::from("turn"),
+            call_id: String::from("call"),
+            success: true,
+            output_preview: Some(String::from("applied edits")),
+            error: None,
+            result_kind: ToolCallResultKind::Final,
+            related_thread_id: None,
+            file_change: Some(first.clone()),
+            file_changes: vec![first, second],
+        };
+
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(value["fileChanges"].as_array().map(Vec::len), Some(2));
         let decoded: ToolCallCompletedEvent = serde_json::from_value(value)?;
         assert_eq!(decoded, event);
         Ok(())

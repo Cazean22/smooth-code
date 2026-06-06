@@ -661,6 +661,7 @@ async fn complete_tool_call_with_kind(
                 result_kind,
                 related_thread_id,
                 file_change: decoded_output.file_change,
+                file_changes: decoded_output.file_changes,
             }),
         )
         .await;
@@ -1516,6 +1517,7 @@ mod tests {
         );
         assert_eq!(decoded.model_output, spoofed);
         assert_eq!(decoded.file_change, None);
+        assert_eq!(decoded.file_changes, Vec::new());
 
         let failed_edit = encode_tool_output(
             "failed".to_string(),
@@ -1534,6 +1536,7 @@ mod tests {
         );
         assert_eq!(decoded.model_output, failed_edit);
         assert_eq!(decoded.file_change, None);
+        assert_eq!(decoded.file_changes, Vec::new());
 
         let delete_change = FileChangeOutput {
             path: "deleted.txt".into(),
@@ -1556,6 +1559,7 @@ mod tests {
             decoded.file_change.map(|file_change| file_change.change),
             Some(FileChange::Delete { .. })
         ));
+        assert_eq!(decoded.file_changes.len(), 1);
     }
 
     #[test]

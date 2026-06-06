@@ -9,22 +9,43 @@ pub struct StructuredToolOutput {
     pub model_output: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_change: Option<FileChangeOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_changes: Vec<FileChangeOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedToolOutput {
     pub model_output: String,
     pub file_change: Option<FileChangeOutput>,
+    pub file_changes: Vec<FileChangeOutput>,
 }
 
 pub fn encode_tool_output(model_output: String, file_change: Option<FileChangeOutput>) -> String {
-    if file_change.is_none() {
+    let file_changes = file_change.iter().cloned().collect::<Vec<_>>();
+    encode_structured_tool_output(model_output, file_change, file_changes)
+}
+
+pub fn encode_tool_output_with_file_changes(
+    model_output: String,
+    file_changes: Vec<FileChangeOutput>,
+) -> String {
+    let file_change = file_changes.first().cloned();
+    encode_structured_tool_output(model_output, file_change, file_changes)
+}
+
+fn encode_structured_tool_output(
+    model_output: String,
+    file_change: Option<FileChangeOutput>,
+    file_changes: Vec<FileChangeOutput>,
+) -> String {
+    if file_change.is_none() && file_changes.is_empty() {
         return model_output;
     }
 
     let output = StructuredToolOutput {
         model_output,
         file_change,
+        file_changes,
     };
     match serde_json::to_string(&output) {
         Ok(json) => format!("{STRUCTURED_TOOL_OUTPUT_PREFIX}{json}"),
@@ -44,6 +65,7 @@ pub fn decode_tool_output_for_tool(
     DecodedToolOutput {
         model_output: raw_output,
         file_change: None,
+        file_changes: Vec::new(),
     }
 }
 
@@ -52,17 +74,29 @@ fn decode_tool_output(raw_output: String) -> DecodedToolOutput {
         return DecodedToolOutput {
             model_output: raw_output,
             file_change: None,
+            file_changes: Vec::new(),
         };
     };
 
     match serde_json::from_str::<StructuredToolOutput>(json) {
-        Ok(output) => DecodedToolOutput {
-            model_output: output.model_output,
-            file_change: output.file_change,
-        },
+        Ok(output) => {
+            let mut file_changes = output.file_changes;
+            if file_changes.is_empty()
+                && let Some(file_change) = output.file_change.clone()
+            {
+                file_changes.push(file_change);
+            }
+            let file_change = output.file_change.or_else(|| file_changes.first().cloned());
+            DecodedToolOutput {
+                model_output: output.model_output,
+                file_change,
+                file_changes,
+            }
+        }
         Err(_) => DecodedToolOutput {
             model_output: raw_output,
             file_change: None,
+            file_changes: Vec::new(),
         },
     }
 }
@@ -80,6 +114,7 @@ mod tests {
             DecodedToolOutput {
                 model_output: "done".to_string(),
                 file_change: None,
+                file_changes: Vec::new(),
             }
         );
     }
@@ -101,7 +136,8 @@ mod tests {
             decode_tool_output_for_tool("write", encoded, true),
             DecodedToolOutput {
                 model_output: "wrote 5 bytes to a.txt".to_string(),
-                file_change: Some(file_change),
+                file_change: Some(file_change.clone()),
+                file_changes: vec![file_change],
             }
         );
     }
@@ -123,7 +159,63 @@ mod tests {
             decode_tool_output_for_tool("delete", encoded, true),
             DecodedToolOutput {
                 model_output: "deleted a.txt (5 bytes)".to_string(),
-                file_change: Some(file_change),
+                file_change: Some(file_change.clone()),
+                file_changes: vec![file_change],
+            }
+        );
+    }
+
+    #[test]
+    fn structured_outputs_round_trip_file_changes() {
+        let file_changes = vec![
+            FileChangeOutput {
+                path: "a.txt".into(),
+                change: FileChange::Add {
+                    content: "hello".to_string(),
+                },
+            },
+            FileChangeOutput {
+                path: "b.txt".into(),
+                change: FileChange::Delete {
+                    content: "bye".to_string(),
+                },
+            },
+        ];
+        let encoded =
+            encode_tool_output_with_file_changes("applied patch".to_string(), file_changes.clone());
+
+        assert_eq!(
+            decode_tool_output_for_tool("edit", encoded, true),
+            DecodedToolOutput {
+                model_output: "applied patch".to_string(),
+                file_change: file_changes.first().cloned(),
+                file_changes,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_file_change_decodes_into_file_changes_list() {
+        let file_change = FileChangeOutput {
+            path: "a.txt".into(),
+            change: FileChange::Add {
+                content: "hello".to_string(),
+            },
+        };
+        let encoded = format!(
+            "{STRUCTURED_TOOL_OUTPUT_PREFIX}{}",
+            serde_json::json!({
+                "modelOutput": "legacy",
+                "fileChange": file_change,
+            })
+        );
+
+        assert_eq!(
+            decode_tool_output_for_tool("edit", encoded, true),
+            DecodedToolOutput {
+                model_output: "legacy".to_string(),
+                file_change: Some(file_change.clone()),
+                file_changes: vec![file_change],
             }
         );
     }
@@ -146,6 +238,7 @@ mod tests {
             DecodedToolOutput {
                 model_output: spoofed,
                 file_change: None,
+                file_changes: Vec::new(),
             }
         );
     }
@@ -162,6 +255,7 @@ mod tests {
             DecodedToolOutput {
                 model_output: spoofed,
                 file_change: None,
+                file_changes: Vec::new(),
             }
         );
     }

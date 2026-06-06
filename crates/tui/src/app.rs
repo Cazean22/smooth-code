@@ -1598,12 +1598,12 @@ impl UiModel {
 
                 self.running_tools.remove(&tool.call_id);
                 let handled_file_change = if tool.success {
-                    match tool.file_change {
-                        Some(file_change) => {
-                            self.replace_tool_call_with_file_change(&tool.call_id, file_change)
-                        }
-                        None => false,
-                    }
+                    let file_changes = if tool.file_changes.is_empty() {
+                        tool.file_change.into_iter().collect()
+                    } else {
+                        tool.file_changes
+                    };
+                    self.replace_tool_call_with_file_changes(&tool.call_id, file_changes)
                 } else {
                     false
                 };
@@ -1848,30 +1848,47 @@ impl UiModel {
         }
     }
 
-    fn replace_tool_call_with_file_change(
+    fn replace_tool_call_with_file_changes(
         &mut self,
         call_id: &str,
-        file_change: FileChangeOutput,
+        file_changes: Vec<FileChangeOutput>,
     ) -> bool {
-        self.recent_file_changes.push(file_change.clone());
-        if self.recent_file_changes.len() > 20 {
+        if file_changes.is_empty() {
+            return false;
+        }
+
+        for file_change in &file_changes {
+            self.recent_file_changes.push(file_change.clone());
+        }
+        while self.recent_file_changes.len() > 20 {
             self.recent_file_changes.remove(0);
         }
 
         let Some((cell_idx, entry_idx)) = self.tool_call_rows.remove(call_id) else {
-            let id = self.next_item_id();
-            self.push_history(TranscriptItem::patch(id, file_change));
+            for file_change in file_changes {
+                let id = self.next_item_id();
+                self.push_history(TranscriptItem::patch(id, file_change));
+            }
             return true;
         };
 
+        let mut file_changes = file_changes.into_iter();
+        let Some(first_change) = file_changes.next() else {
+            return false;
+        };
+
         if self.tool_group_mut(cell_idx).entry_count() == 1 {
-            self.transcript_items[cell_idx].replace_with_patch(file_change);
+            self.transcript_items[cell_idx].replace_with_patch(first_change);
             if self
                 .pending_tool_group
                 .as_ref()
                 .is_some_and(|(idx, _)| *idx == cell_idx)
             {
                 self.pending_tool_group = None;
+            }
+            for file_change in file_changes {
+                let id = self.next_item_id();
+                self.push_history(TranscriptItem::patch(id, file_change));
             }
             return true;
         }
@@ -1880,7 +1897,11 @@ impl UiModel {
             .set_entry_outcome(entry_idx, ToolCallState::Success, None);
         self.mark_item_mutated(cell_idx);
         let id = self.next_item_id();
-        self.push_history(TranscriptItem::patch(id, file_change));
+        self.push_history(TranscriptItem::patch(id, first_change));
+        for file_change in file_changes {
+            let id = self.next_item_id();
+            self.push_history(TranscriptItem::patch(id, file_change));
+        }
         true
     }
 
@@ -2851,6 +2872,7 @@ mod tests {
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
                     file_change: None,
+                    file_changes: Vec::new(),
                 }),
             ),
             20,
@@ -3147,6 +3169,7 @@ mod tests {
                             move_path: None,
                         },
                     }),
+                    file_changes: Vec::new(),
                 }),
             ),
             20,
@@ -3169,6 +3192,58 @@ mod tests {
         assert!(rendered.contains("1 + new"), "{rendered}");
         assert!(!rendered.contains("Selected Diff"), "{rendered}");
         Ok(())
+    }
+
+    #[test]
+    fn multi_file_change_completion_renders_multiple_patch_items() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(
+            &mut app,
+            "2",
+            "c1",
+            "edit",
+            "{\"updates\":[{\"file_path\":\"one.txt\",\"hunks\":[]}]}",
+        );
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("applied edits (2 files changed)")),
+                    error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
+                    file_change: None,
+                    file_changes: vec![
+                        smooth_protocol::FileChangeOutput {
+                            path: "one.txt".into(),
+                            change: smooth_protocol::FileChange::Update {
+                                unified_diff: diffy::create_patch("one\n", "uno\n").to_string(),
+                                move_path: None,
+                            },
+                        },
+                        smooth_protocol::FileChangeOutput {
+                            path: "two.txt".into(),
+                            change: smooth_protocol::FileChange::Add {
+                                content: "dos\n".to_string(),
+                            },
+                        },
+                    ],
+                }),
+            ),
+            20,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("one.txt (+1 -1)"));
+        assert!(joined.contains("two.txt (+1 -0)"));
+        assert!(!joined.contains("✓ edit"));
+        assert_eq!(app.model.recent_file_changes.len(), 2);
     }
 
     #[test]
@@ -3199,6 +3274,7 @@ mod tests {
                                 .join("\n"),
                         },
                     }),
+                    file_changes: Vec::new(),
                 }),
             ),
             viewport_height,
@@ -3236,6 +3312,7 @@ mod tests {
                     result_kind: ToolCallResultKind::StatusUpdate,
                     related_thread_id: Some(child_thread_id),
                     file_change: None,
+                    file_changes: Vec::new(),
                 }),
             ),
             20,

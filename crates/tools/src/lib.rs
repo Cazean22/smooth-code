@@ -25,6 +25,7 @@ pub use exit_plan_mode::{ExitPlanModeArgs, ExitPlanModeTool};
 pub use multi_agents::{SpawnAgentTool, SubagentArgs};
 pub use output::{
     DecodedToolOutput, MAX_FILE_CHANGE_BYTES, decode_tool_output_for_tool, encode_tool_output,
+    encode_tool_output_with_file_changes,
 };
 pub use plan_write::{PlanWriteArgs, PlanWriteTool};
 pub use read::{ReadArgs, ReadTool};

@@ -2155,6 +2155,7 @@ mod tests {
         assert!(tool_names.contains("delete"));
         assert!(tool_names.contains("edit"));
         assert!(tool_names.contains("write"));
+        assert!(!tool_names.contains("apply_patch"));
         assert!(!tool_names.contains("explore"));
         Ok(())
     }

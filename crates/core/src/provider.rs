@@ -44,16 +44,13 @@ use tokio_tungstenite::{
     tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
 };
 use tools::{
-    AskUserClient, AskUserQuestionTool, DeleteTool, EditTool, ExitPlanModeTool, ExploreTool,
-    PlanWriteTool, ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
+    AskUserClient, AskUserQuestionTool, DeleteTool, EditTool, ExitPlanModeTool, PlanWriteTool,
+    ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
 };
 
 use crate::agent::{
     AgentControl, PLAN_MODE_INSTRUCTIONS, SystemPromptKind,
-    prompt::{
-        render_explore_tool_description, render_spawn_agent_tool_description,
-        system_prompt_for_kind,
-    },
+    prompt::{render_spawn_agent_tool_description, system_prompt_for_kind},
 };
 use crate::environment::EnvironmentContext;
 
@@ -231,6 +228,7 @@ impl SessionModel {
                     thread_id,
                     ask_user_client.clone(),
                     Arc::clone(&current_turn_id),
+                    system_prompt_kind,
                     agent_control.clone(),
                     plan_mode,
                 );
@@ -248,6 +246,7 @@ impl SessionModel {
                     thread_id,
                     ask_user_client.clone(),
                     Arc::clone(&current_turn_id),
+                    system_prompt_kind,
                     agent_control.clone(),
                     plan_mode,
                 ))))
@@ -260,6 +259,7 @@ impl SessionModel {
                     thread_id,
                     ask_user_client.clone(),
                     Arc::clone(&current_turn_id),
+                    system_prompt_kind,
                     agent_control.clone(),
                     plan_mode,
                 ))))
@@ -272,6 +272,7 @@ impl SessionModel {
                     thread_id,
                     ask_user_client,
                     current_turn_id,
+                    system_prompt_kind,
                     agent_control,
                     plan_mode,
                 ))))
@@ -389,6 +390,7 @@ fn build_agent<M>(
     thread_id: smooth_protocol::ThreadId,
     ask_user_client: Option<AskUserClient>,
     current_turn_id: Arc<RwLock<Option<String>>>,
+    system_prompt_kind: SystemPromptKind,
     _agent_control: AgentControl,
     plan_mode: bool,
 ) -> Agent<M>
@@ -399,6 +401,9 @@ where
     let builder = builder
         .tool(ReadTool::new(cwd.clone()))
         .tool(RunCommandTool::new(cwd.clone()));
+    if matches!(system_prompt_kind, SystemPromptKind::Explore) {
+        return builder.default_max_turns(99999).build();
+    }
     // File-mutating tools are only registered outside plan mode;
     // plan-mode-specific tools (`plan_write`, `exit_plan_mode`) are only
     // registered inside plan mode.
@@ -421,9 +426,7 @@ where
     } else {
         builder
     };
-    let builder = builder
-        .tool(SpawnAgentTool::new(render_spawn_agent_tool_description()))
-        .tool(ExploreTool::new(render_explore_tool_description()));
+    let builder = builder.tool(SpawnAgentTool::new(render_spawn_agent_tool_description()));
     builder.default_max_turns(99999).build()
 }
 
@@ -1635,6 +1638,17 @@ mod tests {
         }
     }
 
+    fn stub_ask_user_client() -> tools::AskUserClient {
+        tools::AskUserClient::new(
+            |_params| async {
+                Ok(app_server_protocol::AskUserQuestionResponse {
+                    answers: Vec::new(),
+                })
+            },
+            |_thread_id| async {},
+        )
+    }
+
     #[test]
     fn default_session_preamble_uses_markdown_system_prompt() {
         let preamble =
@@ -1708,7 +1722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_agent_registers_subagent_tools() -> Result<()> {
+    async fn build_agent_registers_root_tools() -> Result<()> {
         let workspace = tempfile::TempDir::new()?;
         let agent = build_agent(
             AgentBuilder::new(DummyModel),
@@ -1716,6 +1730,7 @@ mod tests {
             smooth_protocol::ThreadId::new(),
             None,
             Arc::new(RwLock::new(None)),
+            SystemPromptKind::Root,
             AgentControl::new(),
             false,
         );
@@ -1729,7 +1744,7 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert!(tool_names.contains("spawn_agent"));
-        assert!(tool_names.contains("explore"));
+        assert!(!tool_names.contains("explore"));
         assert!(tool_names.contains("delete"));
         assert!(!tool_names.contains("list_dir"));
         assert!(!tool_names.contains("send_message"));
@@ -1742,6 +1757,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_agent_for_default_child_keeps_normal_tools() -> Result<()> {
+        let workspace = tempfile::TempDir::new()?;
+        let agent = build_agent(
+            AgentBuilder::new(DummyModel),
+            workspace.path().to_path_buf(),
+            smooth_protocol::ThreadId::new(),
+            None,
+            Arc::new(RwLock::new(None)),
+            SystemPromptKind::DefaultSubagent,
+            AgentControl::new(),
+            false,
+        );
+
+        let tool_names = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await?
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<HashSet<_>>();
+
+        assert!(tool_names.contains("read"));
+        assert!(tool_names.contains("run_command"));
+        assert!(tool_names.contains("spawn_agent"));
+        assert!(tool_names.contains("delete"));
+        assert!(tool_names.contains("edit"));
+        assert!(tool_names.contains("write"));
+        assert!(!tool_names.contains("explore"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn build_agent_in_plan_mode_swaps_mutating_for_planning_tools() -> Result<()> {
         let workspace = tempfile::TempDir::new()?;
         let agent = build_agent(
@@ -1750,6 +1797,7 @@ mod tests {
             smooth_protocol::ThreadId::new(),
             None,
             Arc::new(RwLock::new(None)),
+            SystemPromptKind::Root,
             AgentControl::new(),
             true,
         );
@@ -1766,7 +1814,7 @@ mod tests {
         assert!(tool_names.contains("read"));
         assert!(tool_names.contains("run_command"));
         assert!(tool_names.contains("spawn_agent"));
-        assert!(tool_names.contains("explore"));
+        assert!(!tool_names.contains("explore"));
         assert!(!tool_names.contains("list_dir"));
         // Plan-mode planning tools are registered.
         assert!(tool_names.contains("plan_write"));
@@ -1775,6 +1823,35 @@ mod tests {
         assert!(!tool_names.contains("edit"));
         assert!(!tool_names.contains("delete"));
         assert!(!tool_names.contains("write"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_agent_for_explore_child_is_read_only() -> Result<()> {
+        let workspace = tempfile::TempDir::new()?;
+        let agent = build_agent(
+            AgentBuilder::new(DummyModel),
+            workspace.path().to_path_buf(),
+            smooth_protocol::ThreadId::new(),
+            Some(stub_ask_user_client()),
+            Arc::new(RwLock::new(None)),
+            SystemPromptKind::Explore,
+            AgentControl::new(),
+            false,
+        );
+
+        let tool_names = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await?
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            tool_names,
+            HashSet::from(["read".to_string(), "run_command".to_string()])
+        );
         Ok(())
     }
 

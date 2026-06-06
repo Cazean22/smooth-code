@@ -85,6 +85,151 @@ impl SessionModelFactory for AnyThreadFactory {
     }
 }
 
+struct ExploreRoutingParentDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for ExploreRoutingParentDriver {
+    fn stream_turn(&self, _prompt: Message, _history: Vec<Message>) -> Result<SessionStream> {
+        unreachable!("manual completion stream should be used for explore routing test");
+    }
+
+    fn supports_manual_tool_loop(&self) -> bool {
+        true
+    }
+
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(first_user_text(&prompt), Some("route explore".to_string()));
+                assert!(history.is_empty());
+                let tool_call = ToolCall::new(
+                    "spawn-explore".to_string(),
+                    ToolFunction::new(
+                        "spawn_agent".to_string(),
+                        serde_json::json!({
+                            "description": "explore core",
+                            "prompt": "inspect architecture",
+                            "subagent_type": "Explore"
+                        }),
+                    ),
+                )
+                .with_call_id("call-explore".to_string());
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-call-explore".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-spawn-explore".to_string()),
+                        response: String::new(),
+                    })),
+                ])))
+            }
+            1 => {
+                assert_eq!(history.len(), 2);
+                let results = tool_result_agent_infos(&prompt);
+                assert_eq!(results.len(), 1);
+                assert_completed_spawn_result(&results[0]);
+                assert_eq!(
+                    results[0].last_assistant_message.as_deref(),
+                    Some("explore findings")
+                );
+
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "parent saw explore".to_string(),
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-final".to_string()),
+                        response: "parent saw explore".to_string(),
+                    })),
+                ])))
+            }
+            other => panic!("unexpected completion turn {other}"),
+        }
+    }
+}
+
+struct ExploreRoutingChildDriver {
+    child_inputs: Arc<Mutex<Vec<(String, usize)>>>,
+}
+
+impl SessionModelDriver for ExploreRoutingChildDriver {
+    fn stream_turn(&self, prompt: Message, history: Vec<Message>) -> Result<SessionStream> {
+        let prompt_text =
+            first_user_text(&prompt).ok_or_else(|| anyhow::anyhow!("missing child prompt"))?;
+        let history_len = history.len();
+        self.child_inputs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child input mutex"))?
+            .push((prompt_text, history_len));
+
+        Ok(Box::pin(stream::iter(vec![
+            Ok(SessionStreamEvent::StreamAssistantItem(
+                SessionAssistantContent::Text(Text {
+                    text: "explore findings".to_string(),
+                }),
+            )),
+            Ok(SessionStreamEvent::FinalResponse(FinalResponse::empty())),
+        ])))
+    }
+}
+
+struct ExploreRoutingFactory {
+    builds: Arc<Mutex<Vec<(ThreadId, SystemPromptKind)>>>,
+    child_inputs: Arc<Mutex<Vec<(String, usize)>>>,
+}
+
+impl SessionModelFactory for ExploreRoutingFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        thread_id: ThreadId,
+        _ask_user_client: Option<AskUserClient>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        system_prompt_kind: SystemPromptKind,
+        _agent_control: AgentControl,
+        _plan_mode: bool,
+    ) -> Result<SessionModel> {
+        self.builds
+            .lock()
+            .map_err(|_| anyhow::anyhow!("builds mutex"))?
+            .push((thread_id, system_prompt_kind));
+        match system_prompt_kind {
+            SystemPromptKind::Root => {
+                Ok(SessionModel::Stub(Arc::new(ExploreRoutingParentDriver {
+                    calls: Mutex::new(0),
+                })))
+            }
+            SystemPromptKind::Explore => {
+                Ok(SessionModel::Stub(Arc::new(ExploreRoutingChildDriver {
+                    child_inputs: Arc::clone(&self.child_inputs),
+                })))
+            }
+            SystemPromptKind::DefaultSubagent => Err(anyhow::anyhow!(
+                "Explore subagent_type should not spawn a default subagent"
+            )),
+        }
+    }
+}
+
 #[tokio::test]
 async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() -> Result<()> {
     let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
@@ -98,7 +243,7 @@ async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() -> 
     let mut root_events = manager.subscribe(root_id).await?;
 
     let spawned = manager
-        .spawn_agent(root_id, "inspect workspace".to_string(), false)
+        .spawn_agent(root_id, "inspect workspace".to_string())
         .await?;
     assert!(spawned.agent_path.as_str().starts_with("/root/"));
 
@@ -152,6 +297,67 @@ async fn agent_control_round_trip_spawns_lists_closes_and_emits_completion() -> 
     Ok(())
 }
 
+#[tokio::test]
+async fn spawn_agent_subagent_type_explore_routes_to_explore_prompt_kind() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
+    let builds = Arc::new(Mutex::new(Vec::new()));
+    let child_inputs = Arc::new(Mutex::new(Vec::new()));
+    let manager = ThreadManagerState::new(
+        None,
+        Some(Arc::new(ExploreRoutingFactory {
+            builds: Arc::clone(&builds),
+            child_inputs: Arc::clone(&child_inputs),
+        })),
+    )
+    .await?;
+    let started = manager.start_thread().await?;
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await?;
+
+    let turn_id = manager
+        .start_user_input(root_id, "route explore".to_string())
+        .await?;
+    wait_for_turn_completion(&mut root_events, &turn_id).await;
+
+    let builds = builds
+        .lock()
+        .map_err(|_| anyhow::anyhow!("builds mutex"))?
+        .clone();
+    assert!(
+        builds
+            .iter()
+            .any(|(thread_id, kind)| *thread_id == root_id && *kind == SystemPromptKind::Root)
+    );
+    assert!(
+        builds
+            .iter()
+            .any(|(_, kind)| *kind == SystemPromptKind::Explore),
+        "expected an Explore child build, got {builds:?}"
+    );
+    assert!(
+        !builds
+            .iter()
+            .any(|(_, kind)| *kind == SystemPromptKind::DefaultSubagent),
+        "Explore subagent_type should not use the default subagent prompt"
+    );
+
+    let child_inputs = child_inputs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("child input mutex"))?
+        .clone();
+    assert_eq!(
+        child_inputs,
+        vec![("inspect architecture".to_string(), 0)],
+        "Explore child should receive the prompt as input and start with empty history"
+    );
+
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
+}
+
 struct ConcurrentSpawnDriver {
     calls: Mutex<usize>,
 }
@@ -190,8 +396,8 @@ impl SessionModelDriver for ConcurrentSpawnDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "instruction": "child one",
-                            "fork_context": false
+                            "description": "child one",
+                            "prompt": "child one"
                         }),
                     ),
                 )
@@ -201,8 +407,8 @@ impl SessionModelDriver for ConcurrentSpawnDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "instruction": "child two",
-                            "fork_context": false
+                            "description": "child two",
+                            "prompt": "child two"
                         }),
                     ),
                 )
@@ -317,8 +523,8 @@ impl SessionModelDriver for MixedBatchDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "instruction": "child one",
-                            "fork_context": false
+                            "description": "child one",
+                            "prompt": "child one"
                         }),
                     ),
                 )
@@ -448,8 +654,8 @@ impl SessionModelDriver for TwoRetainedDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "instruction": "child one",
-                            "fork_context": false
+                            "description": "child one",
+                            "prompt": "child one"
                         }),
                     ),
                 )
@@ -459,8 +665,8 @@ impl SessionModelDriver for TwoRetainedDriver {
                     ToolFunction::new(
                         "spawn_agent".to_string(),
                         serde_json::json!({
-                            "instruction": "child two",
-                            "fork_context": false
+                            "description": "child two",
+                            "prompt": "child two"
                         }),
                     ),
                 )

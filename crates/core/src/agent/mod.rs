@@ -2,7 +2,6 @@
 
 pub(crate) mod agent_resolver;
 pub(crate) mod control;
-pub(crate) mod fork;
 pub(crate) mod plan_mode;
 pub(crate) mod prompt;
 pub(crate) mod registry;

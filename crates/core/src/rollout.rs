@@ -129,13 +129,6 @@ impl RolloutRecorder {
         file.flush().await?;
         Ok(())
     }
-
-    pub(crate) async fn flush(&self) -> Result<()> {
-        let mut file = self.file.lock().await;
-        file.flush().await?;
-        file.sync_data().await?;
-        Ok(())
-    }
 }
 
 pub(crate) fn persist_event(event: &EventMsg) -> bool {
@@ -215,22 +208,6 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
         initial_messages,
         next_turn_index: max_turn_index.map_or(0, |value| value.saturating_add(1)),
     })
-}
-
-pub(crate) async fn read_persisted_items(path: &Path) -> Result<Vec<PersistedItem>> {
-    let contents = fs::read_to_string(path).await?;
-    let mut items = Vec::new();
-    for line in contents.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let envelope = match serde_json::from_str::<RolloutEnvelope>(line) {
-            Ok(envelope) => envelope,
-            Err(_) => continue,
-        };
-        items.push(envelope.item);
-    }
-    Ok(items)
 }
 
 pub(crate) async fn list_threads(workspace_root: &Path) -> Result<Vec<ThreadSummary>> {

@@ -16,7 +16,7 @@ use smooth_protocol::{
     ToolCallCompletedEvent, ToolCallResultKind, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
-use tools::{DecodedToolOutput, decode_tool_output_for_tool};
+use tools::{DecodedToolOutput, SubagentArgs, decode_tool_output_for_tool};
 
 use crate::{
     agent::{
@@ -87,14 +87,6 @@ impl RegularTask {
     pub(crate) fn new() -> Self {
         Self
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManualSubagentArgs {
-    instruction: String,
-    #[serde(default)]
-    fork_context: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -904,7 +896,7 @@ fn partition_pending_tool_calls(
     let mut exit_plan = Vec::new();
     for pending in pending_tool_calls {
         match pending.tool_call.function.name.as_str() {
-            "spawn_agent" | "explore" => spawn.push(pending),
+            "spawn_agent" => spawn.push(pending),
             "exit_plan_mode" => exit_plan.push(pending),
             _ => normal.push(pending),
         }
@@ -1105,41 +1097,37 @@ async fn start_spawn_tool_call(
         internal_call_id,
     } = pending;
     let tool_name = tool_call.function.name.clone();
-    let system_prompt_kind = match tool_name.as_str() {
-        "explore" => SystemPromptKind::Explore,
-        _ => SystemPromptKind::DefaultSubagent,
+    let args = match serde_json::from_value::<SubagentArgs>(tool_call.function.arguments.clone()) {
+        Ok(args) => args,
+        Err(err) => {
+            let message = format!("invalid {tool_name} args: {err}");
+            return SpawnToolStart::Completed(Box::new(
+                complete_tool_call(
+                    session,
+                    ctx,
+                    index,
+                    tool_call.id,
+                    tool_call.call_id,
+                    internal_call_id,
+                    tool_name,
+                    message.clone(),
+                    false,
+                    Some(message),
+                )
+                .await,
+            ));
+        }
     };
-    let args =
-        match serde_json::from_value::<ManualSubagentArgs>(tool_call.function.arguments.clone()) {
-            Ok(args) => args,
-            Err(err) => {
-                let message = format!("invalid {tool_name} args: {err}");
-                return SpawnToolStart::Completed(Box::new(
-                    complete_tool_call(
-                        session,
-                        ctx,
-                        index,
-                        tool_call.id,
-                        tool_call.call_id,
-                        internal_call_id,
-                        tool_name,
-                        message.clone(),
-                        false,
-                        Some(message),
-                    )
-                    .await,
-                ));
-            }
-        };
+    let SubagentArgs {
+        description: _,
+        prompt,
+        subagent_type,
+    } = args;
+    let system_prompt_kind = subagent_type_to_prompt_kind(subagent_type.as_deref());
 
     match session
         .agent_control
-        .spawn_agent_for_tool(
-            session.id,
-            args.instruction,
-            system_prompt_kind,
-            args.fork_context,
-        )
+        .spawn_agent_for_tool(session.id, prompt, system_prompt_kind)
         .await
     {
         Ok((metadata, initial_status, waiter)) => {
@@ -1192,6 +1180,13 @@ async fn start_spawn_tool_call(
                 .await,
             ))
         }
+    }
+}
+
+fn subagent_type_to_prompt_kind(subagent_type: Option<&str>) -> SystemPromptKind {
+    match subagent_type {
+        Some("Explore" | "explore") => SystemPromptKind::Explore,
+        _ => SystemPromptKind::DefaultSubagent,
     }
 }
 
@@ -1575,22 +1570,26 @@ fn agent_status_label(status: &AgentStatus) -> &'static str {
 mod tests {
     use rig::message::Reasoning as MessageReasoning;
     use smooth_protocol::{FileChange, FileChangeOutput, ToolCallResultKind};
-    use tools::encode_tool_output;
+    use tools::{SubagentArgs, encode_tool_output};
+
+    use crate::agent::SystemPromptKind;
 
     use super::{
-        ManualSubagentArgs, PendingReasoningDeltas, decode_completed_tool_output,
-        should_roundtrip_reasoning,
+        PendingReasoningDeltas, decode_completed_tool_output, should_roundtrip_reasoning,
+        subagent_type_to_prompt_kind,
     };
 
     #[test]
-    fn manual_subagent_args_accept_instruction() -> Result<(), serde_json::Error> {
-        let args = serde_json::from_value::<ManualSubagentArgs>(serde_json::json!({
-            "instruction": "inspect crates/core",
-            "fork_context": true
+    fn manual_subagent_args_accept_prompt_shape() -> Result<(), serde_json::Error> {
+        let args = serde_json::from_value::<SubagentArgs>(serde_json::json!({
+            "description": "inspect core",
+            "prompt": "inspect crates/core",
+            "subagent_type": "default"
         }))?;
 
-        assert_eq!(args.instruction, "inspect crates/core");
-        assert!(args.fork_context);
+        assert_eq!(args.description, "inspect core");
+        assert_eq!(args.prompt, "inspect crates/core");
+        assert_eq!(args.subagent_type.as_deref(), Some("default"));
         Ok(())
     }
 
@@ -1601,10 +1600,49 @@ mod tests {
             "agent_type": "worker",
             "agent_role": "worker",
             "model": "gpt-test",
-            "system_prompt": "custom"
+            "system_prompt": "custom",
+            "instruction": "inspect",
+            "fork_context": false,
+            "run_in_background": true,
+            "isolation": "workspace"
         });
 
-        assert!(serde_json::from_value::<ManualSubagentArgs>(old_args).is_err());
+        assert!(serde_json::from_value::<SubagentArgs>(old_args).is_err());
+    }
+
+    #[test]
+    fn manual_subagent_args_accept_explore_subagent_type() -> Result<(), serde_json::Error> {
+        let canonical = serde_json::from_value::<SubagentArgs>(serde_json::json!({
+            "description": "inspect",
+            "prompt": "inspect",
+            "subagent_type": "Explore"
+        }))?;
+        let lowercase = serde_json::from_value::<SubagentArgs>(serde_json::json!({
+            "description": "inspect",
+            "prompt": "inspect",
+            "subagent_type": "explore"
+        }))?;
+
+        assert_eq!(
+            subagent_type_to_prompt_kind(canonical.subagent_type.as_deref()),
+            SystemPromptKind::Explore
+        );
+        assert_eq!(
+            subagent_type_to_prompt_kind(lowercase.subagent_type.as_deref()),
+            SystemPromptKind::Explore
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manual_subagent_args_reject_unsupported_subagent_type() {
+        let args = serde_json::json!({
+            "description": "inspect",
+            "prompt": "inspect",
+            "subagent_type": "worker"
+        });
+
+        assert!(serde_json::from_value::<SubagentArgs>(args).is_err());
     }
 
     #[test]

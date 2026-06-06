@@ -212,16 +212,14 @@ impl ThreadManagerState {
     pub async fn spawn_agent(
         &self,
         parent_thread_id: ThreadId,
-        instruction: String,
-        fork_context: bool,
+        prompt: String,
     ) -> CoreResult<CollabAgentStatusEntry> {
         let metadata = self
             .agent_control
             .spawn_agent_with_prompt_kind(
                 parent_thread_id,
-                instruction,
+                prompt,
                 SystemPromptKind::DefaultSubagent,
-                fork_context,
             )
             .await?;
         agent_status_entry(&self.agent_control, metadata)
@@ -822,7 +820,6 @@ mod tests {
                 root_id,
                 "inspect read-only".to_string(),
                 SystemPromptKind::Explore,
-                false,
             )
             .await?;
         let child_id = child.agent_id.ok_or_else(|| anyhow::anyhow!("child id"))?;

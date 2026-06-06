@@ -138,14 +138,6 @@ impl Core {
     pub(crate) async fn emit_session_event(&self, msg: EventMsg) {
         self.session.emit_session_event(msg).await;
     }
-
-    pub(crate) async fn flush_rollout(&self) -> CoreResult<()> {
-        self.session
-            .rollout
-            .flush()
-            .await
-            .map_err(CoreError::rollout)
-    }
 }
 
 impl Session {

@@ -201,10 +201,6 @@ impl CoreThread {
     pub(crate) fn rollout_path(&self) -> &PathBuf {
         &self.rollout_path
     }
-
-    pub(crate) async fn flush_rollout(&self) -> CoreResult<()> {
-        self.core.flush_rollout().await
-    }
 }
 
 fn history_message_from_message(message: &Message) -> Option<crate::rollout::HistoryMessage> {

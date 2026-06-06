@@ -55,27 +55,24 @@ pub(crate) fn system_prompt_for_kind(kind: SystemPromptKind) -> &'static str {
 }
 
 pub(crate) fn render_spawn_agent_tool_description() -> String {
-    "Spawn a default Smooth Code sub-agent with a built-in implementation-capable system prompt. \
-Spawned children run concurrently. In mixed tool batches, `spawn_agent` may return a live JSON \
-result with `event=\"agent_status\"` and a pending/running status; this means the child is still \
-working, so do not produce a final answer or guess from that status. No wait tool is needed: wait \
-for a later user message with `event=\"agent_completed\"` and the same `thread_id`, then use that \
-result. Pure `spawn_agent` batches wait for final child results before continuing."
-        .to_string()
-}
-
-pub(crate) fn render_explore_tool_description() -> String {
-    "Spawn a read-only explorer sub-agent with a built-in investigation system prompt. Use it for \
-codebase exploration, fact-finding, and concise findings. The child reports results as a normal \
-assistant message and does not write findings to files."
+    "Spawn a built-in Smooth Code sub-agent. Supported `subagent_type` values: omit it, \
+`default`, or `general-purpose` for the implementation-capable default subagent; use `Explore` \
+or `explore` for a read-only investigation subagent that can inspect files and run read-only \
+commands but cannot edit files, ask the user, or spawn nested agents. Use `Explore` when you need \
+parallel codebase research, repo inspection, or fact gathering. Use the default/general-purpose \
+subagent when the child may need to implement changes. Spawned children run concurrently. In mixed \
+tool batches, `spawn_agent` may return a live JSON result with `event=\"agent_status\"` and a \
+pending/running status; this means the child is still working, so do not produce a final answer or \
+guess from that status. No wait tool is needed: wait for a later user message with \
+`event=\"agent_completed\"` and the same `thread_id`, then use that result. Pure `spawn_agent` \
+batches wait for final child results before continuing."
         .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPLORE_SUBAGENT_SYSTEM_PROMPT, SystemPromptKind, render_explore_tool_description,
-        render_spawn_agent_tool_description,
+        EXPLORE_SUBAGENT_SYSTEM_PROMPT, SystemPromptKind, render_spawn_agent_tool_description,
     };
 
     #[test]
@@ -113,12 +110,11 @@ mod tests {
     #[test]
     fn tool_descriptions_cover_wait_semantics() {
         let spawn = render_spawn_agent_tool_description();
+        assert!(spawn.contains("Supported `subagent_type` values"));
+        assert!(spawn.contains("Explore"));
+        assert!(spawn.contains("read-only"));
         assert!(spawn.contains("run concurrently"));
         assert!(spawn.contains("No wait tool is needed"));
         assert!(spawn.contains("event=\"agent_completed\""));
-
-        let explore = render_explore_tool_description();
-        assert!(explore.contains("read-only explorer"));
-        assert!(explore.contains("normal assistant message"));
     }
 }

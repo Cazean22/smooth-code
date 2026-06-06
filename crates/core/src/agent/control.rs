@@ -15,7 +15,6 @@ use uuid::Uuid;
 use crate::{
     agent::{
         agent_resolver,
-        fork::{SpawnAgentForkMode, persisted_items_to_messages},
         prompt::SystemPromptKind,
         registry::{AgentMetadata, AgentRegistry},
         status::{agent_status_from_event, is_final, last_assistant_message},
@@ -23,7 +22,6 @@ use crate::{
     core_thread::CoreThread,
     error::{CoreError, CoreResult},
     provider::SessionModelFactory,
-    rollout::read_persisted_items,
 };
 
 const AGENT_MAX_DEPTH: i32 = 8;
@@ -184,13 +182,12 @@ impl AgentControl {
     pub(crate) async fn spawn_agent(
         &self,
         parent_thread_id: ThreadId,
-        instruction: String,
+        prompt: String,
     ) -> CoreResult<AgentMetadata> {
         self.spawn_agent_with_prompt_kind(
             parent_thread_id,
-            instruction,
+            prompt,
             SystemPromptKind::DefaultSubagent,
-            false,
         )
         .await
     }
@@ -198,36 +195,22 @@ impl AgentControl {
     pub(crate) async fn spawn_agent_with_prompt_kind(
         &self,
         parent_thread_id: ThreadId,
-        instruction: String,
+        prompt: String,
         system_prompt_kind: SystemPromptKind,
-        fork_context: bool,
     ) -> CoreResult<AgentMetadata> {
-        self.spawn_agent_internal(
-            parent_thread_id,
-            instruction,
-            system_prompt_kind,
-            fork_context,
-            false,
-        )
-        .await
-        .map(|(metadata, _, _)| metadata)
+        self.spawn_agent_internal(parent_thread_id, prompt, system_prompt_kind, false)
+            .await
+            .map(|(metadata, _, _)| metadata)
     }
 
     pub(crate) async fn spawn_agent_with_prompt_kind_inline_wait(
         &self,
         parent_thread_id: ThreadId,
-        instruction: String,
+        prompt: String,
         system_prompt_kind: SystemPromptKind,
-        fork_context: bool,
     ) -> CoreResult<(AgentMetadata, InlineChildCompletionReceiver)> {
         let (metadata, _child_thread_id, waiter) = self
-            .spawn_agent_internal(
-                parent_thread_id,
-                instruction,
-                system_prompt_kind,
-                fork_context,
-                true,
-            )
+            .spawn_agent_internal(parent_thread_id, prompt, system_prompt_kind, true)
             .await?;
         let waiter =
             waiter.ok_or_else(|| CoreError::invariant("inline waiter should be registered"))?;
@@ -237,9 +220,8 @@ impl AgentControl {
     pub(crate) async fn spawn_agent_for_tool(
         &self,
         parent_thread_id: ThreadId,
-        instruction: String,
+        prompt: String,
         system_prompt_kind: SystemPromptKind,
-        fork_context: bool,
     ) -> CoreResult<(AgentMetadata, AgentStatus, InlineChildCompletionReceiver)> {
         let call_id = Uuid::now_v7().to_string();
         self.emit_collab_event(
@@ -247,7 +229,7 @@ impl AgentControl {
             EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
                 call_id: call_id.clone(),
                 sender_thread_id: parent_thread_id,
-                prompt: instruction.clone(),
+                prompt: prompt.clone(),
                 model: None,
             }),
         )
@@ -256,9 +238,8 @@ impl AgentControl {
         match self
             .spawn_agent_with_prompt_kind_inline_wait(
                 parent_thread_id,
-                instruction.clone(),
+                prompt.clone(),
                 system_prompt_kind,
-                fork_context,
             )
             .await
         {
@@ -274,7 +255,7 @@ impl AgentControl {
                         sender_thread_id: parent_thread_id,
                         new_thread_id: Some(thread_id),
                         new_agent_nickname: metadata.agent_nickname.clone(),
-                        prompt: instruction,
+                        prompt,
                         model: None,
                         status: status.clone(),
                     }),
@@ -290,7 +271,7 @@ impl AgentControl {
                         sender_thread_id: parent_thread_id,
                         new_thread_id: None,
                         new_agent_nickname: None,
-                        prompt: instruction,
+                        prompt,
                         model: None,
                         status: AgentStatus::Errored(err.to_error_info()),
                     }),
@@ -304,9 +285,8 @@ impl AgentControl {
     async fn spawn_agent_internal(
         &self,
         parent_thread_id: ThreadId,
-        instruction: String,
+        prompt: String,
         system_prompt_kind: SystemPromptKind,
-        fork_context: bool,
         inline_wait: bool,
     ) -> CoreResult<(
         AgentMetadata,
@@ -328,12 +308,7 @@ impl AgentControl {
             agent_nickname: Some(reservation.agent_path().name().to_string()),
         });
         let ask_user_client = runtime.ask_user_client.clone();
-        let initial_history = if fork_context {
-            self.load_fork_history(parent_thread_id, SpawnAgentForkMode::ParentHistory)
-                .await?
-        } else {
-            Vec::new()
-        };
+        let initial_history = Vec::new();
         let child_thread = Arc::new(
             CoreThread::new_with_history(
                 child_thread_id,
@@ -358,7 +333,7 @@ impl AgentControl {
             None
         };
 
-        if let Err(err) = child_thread.submit(Op::UserInput(instruction)).await {
+        if let Err(err) = child_thread.submit(Op::UserInput(prompt)).await {
             runtime.threads.write().await.remove(&child_thread_id);
             self.remove_status_sender(child_thread_id)?;
             if inline_wait {
@@ -534,40 +509,6 @@ impl AgentControl {
         thread.core.emit_session_event(msg).await;
     }
 
-    async fn load_fork_history(
-        &self,
-        parent_thread_id: ThreadId,
-        _fork_mode: SpawnAgentForkMode,
-    ) -> CoreResult<Vec<rig::message::Message>> {
-        let parent_status = self.get_status(parent_thread_id);
-        let runtime = self.runtime()?;
-        let threads = runtime.threads.read().await;
-        let parent_thread =
-            threads
-                .get(&parent_thread_id)
-                .cloned()
-                .ok_or(CoreError::UnknownThread {
-                    thread_id: parent_thread_id,
-                })?;
-        drop(threads);
-
-        parent_thread.flush_rollout().await?;
-        let items = read_persisted_items(parent_thread.rollout_path())
-            .await
-            .map_err(CoreError::rollout)?;
-        let mut history = persisted_items_to_messages(items);
-        if matches!(parent_status, AgentStatus::Running) {
-            Self::trim_active_prompt_from_fork_history(&mut history);
-        }
-        Ok(history)
-    }
-
-    fn trim_active_prompt_from_fork_history(history: &mut Vec<rig::message::Message>) {
-        if matches!(history.last(), Some(rig::message::Message::User { .. })) {
-            history.pop();
-        }
-    }
-
     async fn handle_child_completion(
         &self,
         parent_thread_id: ThreadId,
@@ -631,7 +572,7 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use rig::{
         agent::FinalResponse,
-        message::{Message, Text, UserContent},
+        message::{Message, Text},
     };
     use smooth_state_db::StateDbHandle;
     use tempfile::TempDir;
@@ -786,41 +727,6 @@ mod tests {
         }
     }
 
-    struct ForkAwareFactory {
-        build_count: Mutex<usize>,
-        state: Arc<RecordingState>,
-        release: Arc<Semaphore>,
-    }
-
-    impl SessionModelFactory for ForkAwareFactory {
-        fn build(
-            &self,
-            _cwd: PathBuf,
-            thread_id: ThreadId,
-            _ask_user_client: Option<AskUserClient>,
-            _current_turn_id: Arc<RwLock<Option<String>>>,
-            _system_prompt_kind: SystemPromptKind,
-            _agent_control: AgentControl,
-            _plan_mode: bool,
-        ) -> Result<SessionModel> {
-            let mut build_count = lock_test_mutex(&self.build_count, "build_count")?;
-            let build_index = *build_count;
-            *build_count += 1;
-            if build_index == 0 {
-                Ok(SessionModel::Stub(Arc::new(BlockingRootDriver {
-                    release: Arc::clone(&self.release),
-                    text: "root response".to_string(),
-                })))
-            } else {
-                Ok(SessionModel::Stub(Arc::new(RecordingDriver {
-                    thread_id,
-                    state: Arc::clone(&self.state),
-                    text: "recorded".to_string(),
-                })))
-            }
-        }
-    }
-
     struct BlockingRootDriver {
         release: Arc<Semaphore>,
         text: String,
@@ -957,7 +863,6 @@ mod tests {
                 root_id,
                 "inspect only".to_string(),
                 SystemPromptKind::Explore,
-                false,
             )
             .await?;
         let child_id = child.agent_id.context("child id")?;
@@ -1198,7 +1103,6 @@ mod tests {
                 root_id,
                 "hello child".to_string(),
                 SystemPromptKind::DefaultSubagent,
-                false,
             )
             .await?;
         let child_id = child.agent_id.context("child id")?;
@@ -1246,7 +1150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_with_fork_context_seeds_child_history() -> Result<()> {
+    async fn spawn_agent_starts_child_with_empty_history() -> Result<()> {
         let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
         let workspace = TempDir::new()?;
         let original_cwd = std::env::current_dir()?;
@@ -1269,73 +1173,7 @@ mod tests {
 
         let control = manager.agent_control();
         let child = control
-            .spawn_agent_with_prompt_kind(
-                root_id,
-                "child task".to_string(),
-                SystemPromptKind::Explore,
-                true,
-            )
-            .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-
-        let child_id = child.agent_id.context("child id")?;
-        let calls = lock_test_mutex(&recording_state.calls, "calls")?;
-        let child_history = calls
-            .get(&child_id)
-            .and_then(|calls| calls.first())
-            .context("child first call history")?;
-        assert_eq!(child_history.len(), 1);
-        assert!(matches!(
-            &child_history[0],
-            Message::User { content }
-                if matches!(
-                    content.iter().next(),
-                    Some(UserContent::Text(Text { text })) if text == "parent asks"
-                )
-        ));
-
-        std::env::set_current_dir(original_cwd)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn spawn_agent_with_fork_context_excludes_live_parent_prompt() -> Result<()> {
-        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
-        let workspace = TempDir::new()?;
-        let original_cwd = std::env::current_dir()?;
-        std::env::set_current_dir(workspace.path())?;
-
-        let recording_state = Arc::new(RecordingState::default());
-        let release = Arc::new(Semaphore::new(0));
-        let manager = ThreadManagerState::new(
-            None,
-            Some(Arc::new(ForkAwareFactory {
-                build_count: Mutex::new(0),
-                state: Arc::clone(&recording_state),
-                release: Arc::clone(&release),
-            })),
-        )
-        .await?;
-        let started = manager.start_thread().await?;
-        let root_id = started.thread_id;
-
-        manager
-            .start_user_input(
-                root_id,
-                "list crates, spawn two subagents to explore crates/protocol and crates/state-db"
-                    .to_string(),
-            )
-            .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-
-        let control = manager.agent_control();
-        let child = control
-            .spawn_agent_with_prompt_kind(
-                root_id,
-                "explore crates/protocol".to_string(),
-                SystemPromptKind::Explore,
-                true,
-            )
+            .spawn_agent(root_id, "child task".to_string())
             .await?;
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
@@ -1347,11 +1185,8 @@ mod tests {
             .context("child first call history")?;
         assert!(
             child_history.is_empty(),
-            "forked child should not inherit the live parent prompt"
+            "spawned child should not inherit parent history"
         );
-
-        release.add_permits(1);
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         std::env::set_current_dir(original_cwd)?;
         Ok(())

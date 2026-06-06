@@ -3163,7 +3163,7 @@ mod tests {
             "2",
             "c1",
             "spawn_agent",
-            "{\"instruction\":\"inspect\"}",
+            "{\"description\":\"inspect\",\"prompt\":\"inspect\"}",
         );
         app.handle_session_event(
             event(
@@ -3198,8 +3198,12 @@ mod tests {
         );
 
         let joined = transcript_strings(&app).join("\n");
-        assert!(joined.contains("✓ spawn_agent {\"instruction\":\"inspect\"}"));
-        assert!(!joined.contains("⠋ spawn_agent {\"instruction\":\"inspect\"}"));
+        assert!(
+            joined.contains("✓ spawn_agent {\"description\":\"inspect\",\"prompt\":\"inspect\"}")
+        );
+        assert!(
+            !joined.contains("⠋ spawn_agent {\"description\":\"inspect\",\"prompt\":\"inspect\"}")
+        );
         assert!(!joined.contains("Sub-agent"));
         assert!(!joined.contains("Done"));
         Ok(())
@@ -3216,7 +3220,7 @@ mod tests {
             "2",
             "c1",
             "spawn_agent",
-            "{\"instruction\":\"inspect protocol\"}",
+            "{\"description\":\"protocol scan\",\"prompt\":\"inspect protocol\"}",
         );
         app.handle_session_event(
             event(
@@ -3247,7 +3251,9 @@ mod tests {
         );
 
         let joined = transcript_strings(&app).join("\n");
-        assert!(joined.contains("spawn_agent {\"instruction\":\"inspect protocol\"}"));
+        assert!(joined.contains(
+            "spawn_agent {\"description\":\"protocol scan\",\"prompt\":\"inspect protocol\"}"
+        ));
         assert_eq!(joined.matches(prompt).count(), 1);
         assert!(!joined.contains("Spawning sub-agent"));
         assert!(!joined.contains("Spawn ended"));

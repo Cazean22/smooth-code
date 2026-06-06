@@ -7,7 +7,7 @@ pub(crate) const PLAN_MODE_INSTRUCTIONS: &str = "You are in PLAN MODE.
 While in plan mode you may only use these tools:
 - `read` — read known files.
 - `run_command` — run read-only shell commands for exploration and validation, such as `eza`, `fd`, `rg`, and test/build checks.
-- `spawn_agent` — spawn sub-agents to parallelize exploration (children run with full tools).
+- `spawn_agent` — spawn sub-agents to parallelize exploration; use `subagent_type: \"Explore\"` for read-only investigation, or omit it/use `default`/`general-purpose` only when an implementation-capable child is required.
 - `plan_write` — write your plan to the per-thread plan file.
 - `exit_plan_mode` — exit plan mode once the plan is ready.
 

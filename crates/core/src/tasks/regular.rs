@@ -1288,10 +1288,11 @@ fn build_request_parts(
     new_messages: &[Message],
 ) -> Option<(Message, Vec<Message>)> {
     let (pending_prompt, new_history) = new_messages.split_last()?;
-    let mut request_history = history_before_turn.to_vec();
+    let mut request_history = Vec::new();
     if let Some(message) = project_instructions_message(project_instructions) {
         request_history.push(message);
     }
+    request_history.extend_from_slice(history_before_turn);
     request_history.extend_from_slice(new_history);
     Some((pending_prompt.clone(), request_history))
 }
@@ -1304,6 +1305,8 @@ fn project_instructions_message(
         .entries
         .iter()
         .map(|entry| {
+            // `source_path` remains persisted metadata for resume/debug; the
+            // model-facing header names the scoped directory like Codex.
             format!(
                 "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
                 entry.directory, entry.text

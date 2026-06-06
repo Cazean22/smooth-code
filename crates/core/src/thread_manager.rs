@@ -817,22 +817,22 @@ mod tests {
                 .get(1)
                 .ok_or_else(|| anyhow::anyhow!("missing second captured turn"))?;
             assert_eq!(second.history.len(), 3);
-            assert_eq!(
-                user_message_text(&second.history[0]).as_deref(),
-                Some("first prompt")
-            );
-            assert_eq!(
-                assistant_message_text(&second.history[1]).as_deref(),
-                Some("captured response")
-            );
             assert!(
-                user_message_text(&second.history[2])
+                user_message_text(&second.history[0])
                     .as_deref()
                     .is_some_and(|text| {
                         text.contains("# AGENTS.md instructions for")
                             && text.contains("<INSTRUCTIONS>")
                             && text.contains("Original AGENTS instructions")
                     })
+            );
+            assert_eq!(
+                user_message_text(&second.history[1]).as_deref(),
+                Some("first prompt")
+            );
+            assert_eq!(
+                assistant_message_text(&second.history[2]).as_deref(),
+                Some("captured response")
             );
             assert_eq!(
                 user_message_text(&second.prompt).as_deref(),

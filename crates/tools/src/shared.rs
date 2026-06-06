@@ -53,7 +53,11 @@ pub(crate) fn truncate_output(mut output: String) -> String {
     if output.len() <= MAX_TOOL_OUTPUT_BYTES {
         return output;
     }
-    output.truncate(MAX_TOOL_OUTPUT_BYTES);
+    let mut end = MAX_TOOL_OUTPUT_BYTES;
+    while end > 0 && !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.truncate(end);
     output.push_str("\n...[truncated]");
     output
 }
@@ -83,5 +87,18 @@ mod tests {
 
         assert!(err.to_string().contains("escapes the workspace"));
         Ok(())
+    }
+
+    #[test]
+    fn truncate_output_clamps_to_char_boundary() {
+        let mut output = "a".repeat(MAX_TOOL_OUTPUT_BYTES - 1);
+        output.push('中');
+        output.push_str("tail");
+
+        let truncated = truncate_output(output);
+
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.ends_with("\n...[truncated]"));
+        assert!(!truncated.contains('中'));
     }
 }

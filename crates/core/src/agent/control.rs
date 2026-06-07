@@ -104,7 +104,7 @@ impl AgentControl {
         let registered = self
             .state
             .registry
-            .register_existing_thread(metadata.clone(), AGENT_MAX_THREADS)
+            .register_existing_thread(metadata.clone())
             .map_err(CoreError::registry)?;
         let status = initial_events
             .iter()

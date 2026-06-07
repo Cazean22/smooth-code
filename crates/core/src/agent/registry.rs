@@ -119,10 +119,18 @@ impl AgentRegistry {
         })
     }
 
+    /// Register a thread that already exists on disk (resume rehydration).
+    ///
+    /// Unlike [`AgentRegistry::reserve_spawn_slot`], this does **not** enforce a
+    /// thread-count cap: resume reconstructs the persisted topology, so it must
+    /// restore however many open children were recorded. An interrupted long
+    /// turn can leave more open consumed-child edges than the live spawn cap,
+    /// and bounding reconstruction by that cap would silently drop part of the
+    /// subtree. The spawn cap is a limit on *new* concurrent spawns and is
+    /// enforced at reservation time, not here.
     pub(crate) fn register_existing_thread(
         &self,
         metadata: AgentMetadata,
-        max_threads: usize,
     ) -> Result<AgentMetadata, String> {
         let Some(agent_id) = metadata.agent_id else {
             return Err("agent metadata must include an agent_id".to_string());
@@ -141,9 +149,6 @@ impl AgentRegistry {
             if !state.agents_by_thread.contains_key(&parent_thread_id) {
                 return Err(format!("parent thread not registered: {parent_thread_id}"));
             }
-        }
-        if state.agents_by_thread.len() >= max_threads {
-            return Err(format!("agent thread limit exceeded: {max_threads}"));
         }
         if state.thread_by_path.contains_key(&metadata.agent_path) {
             return Err(format!(
@@ -318,6 +323,35 @@ mod tests {
             .clone();
 
         assert_ne!(first_path, second_path);
+        Ok(())
+    }
+
+    #[test]
+    fn register_existing_thread_is_not_bounded_by_the_spawn_cap() -> Result<(), String> {
+        let registry = AgentRegistry::new();
+        let root_id = ThreadId::new();
+        registry.register_root_thread(root_id)?;
+
+        // Resume must restore however many open children were persisted, even
+        // past the live spawn cap (16): one interrupted long turn can leave more
+        // open consumed-child edges than that, and reconstruction must not drop
+        // part of the subtree.
+        for index in 0..20 {
+            let child_id = ThreadId::new();
+            let agent_path = AgentPath::root()
+                .join(&format!("child_{index}"))
+                .map_err(|err| err.to_string())?;
+            registry.register_existing_thread(AgentMetadata {
+                agent_id: Some(child_id),
+                agent_path,
+                agent_nickname: Some(format!("child_{index}")),
+                system_prompt_kind: crate::agent::prompt::SystemPromptKind::DefaultSubagent,
+                parent_thread_id: Some(root_id),
+                depth: 1,
+            })?;
+        }
+
+        assert_eq!(registry.live_agents().len(), 21);
         Ok(())
     }
 }

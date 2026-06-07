@@ -2102,6 +2102,315 @@ async fn encrypted_reasoning_block_is_preserved_in_history() -> Result<()> {
     Ok(())
 }
 
+struct SequentialSpawnParentDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for SequentialSpawnParentDriver {
+    fn stream_completion_turn(
+        &self,
+        _prompt: Message,
+        _history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
+        let idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        // Even model calls spawn one child (a pure-spawn batch that blocks until
+        // the child completes and is consumed); odd calls answer with final text
+        // so the surrounding parent turn ends. Each user turn is therefore one
+        // spawn + reclaim of a single child.
+        if idx % 2 == 0 {
+            let tool_call = ToolCall::new(
+                format!("spawn-{idx}"),
+                ToolFunction::new(
+                    "spawn_agent".to_string(),
+                    serde_json::json!({
+                        "description": "sequential child",
+                        "prompt": "do scoped work"
+                    }),
+                ),
+            )
+            .with_call_id(format!("call-{idx}"));
+            Ok(Box::pin(stream::iter(vec![
+                Ok(SessionCompletionEvent::AssistantItem(
+                    SessionAssistantContent::ToolCall {
+                        tool_call,
+                        internal_call_id: format!("internal-{idx}"),
+                    },
+                )),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some(format!("assistant-spawn-{idx}")),
+                    response: String::new(),
+                })),
+            ])))
+        } else {
+            Ok(Box::pin(stream::iter(vec![
+                Ok(SessionCompletionEvent::AssistantItem(
+                    SessionAssistantContent::Text(Text {
+                        text: "parent done".to_string(),
+                    }),
+                )),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some(format!("assistant-final-{idx}")),
+                    response: "parent done".to_string(),
+                })),
+            ])))
+        }
+    }
+}
+
+struct SequentialSpawnFactory;
+
+impl SessionModelFactory for SequentialSpawnFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _ask_user_client: Option<AskUserClient>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        system_prompt_kind: SystemPromptKind,
+        _agent_control: AgentControl,
+        _plan_mode: bool,
+    ) -> Result<SessionModel> {
+        match system_prompt_kind {
+            SystemPromptKind::Root => Ok(SessionModel::Stub(Arc::new(
+                SequentialSpawnParentDriver {
+                    calls: Mutex::new(0),
+                },
+            ))),
+            _ => Ok(SessionModel::Stub(Arc::new(StubDriver {
+                text: "child done".to_string(),
+            }))),
+        }
+    }
+}
+
+/// Regression test for the spawn-budget leak: completed subagents used to stay
+/// registered forever, so the `AGENT_MAX_THREADS` (16) cap silently became a
+/// per-session *lifetime* budget — the 16th sequential spawn failed even though
+/// only one child is ever live at a time. With consumed children reclaimed, a
+/// root can spawn far more than the concurrency cap over its lifetime.
+#[tokio::test]
+async fn sequential_completed_subagents_do_not_exhaust_the_spawn_budget() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
+
+    let manager = ThreadManagerState::new(None, Some(Arc::new(SequentialSpawnFactory))).await?;
+    let started = manager.start_thread().await?;
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await?;
+
+    // Comfortably more than AGENT_MAX_THREADS (16).
+    let total_children = 20;
+    for _ in 0..total_children {
+        let turn = manager
+            .start_user_input(root_id, "spawn one".to_string())
+            .await?;
+        wait_for_turn_completion(&mut root_events, &turn).await;
+    }
+
+    let live = manager.list_agents(root_id, Some("/root"))?;
+    assert_eq!(
+        live.len(),
+        1,
+        "every consumed child should be reclaimed, leaving only root; got {live:?}"
+    );
+
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
+}
+
+struct ConsumeThenBlockParentDriver {
+    calls: Mutex<usize>,
+    block: Arc<Semaphore>,
+}
+
+impl SessionModelDriver for ConsumeThenBlockParentDriver {
+    fn stream_completion_turn(
+        &self,
+        _prompt: Message,
+        _history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
+        let idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        if idx == 0 {
+            // Spawn one child as a pure-spawn batch: the turn loop blocks until
+            // the child completes, folds its result in, and releases it.
+            let tool_call = ToolCall::new(
+                "spawn-0".to_string(),
+                ToolFunction::new(
+                    "spawn_agent".to_string(),
+                    serde_json::json!({
+                        "description": "consumed child",
+                        "prompt": "do scoped work"
+                    }),
+                ),
+            )
+            .with_call_id("call-0".to_string());
+            Ok(Box::pin(stream::iter(vec![
+                Ok(SessionCompletionEvent::AssistantItem(
+                    SessionAssistantContent::ToolCall {
+                        tool_call,
+                        internal_call_id: "internal-0".to_string(),
+                    },
+                )),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-spawn-0".to_string()),
+                    response: String::new(),
+                })),
+            ])))
+        } else {
+            // Second model call blocks forever, holding the turn open *after* the
+            // child was consumed/released but *before* the turn could persist its
+            // result and close the child's edge. The test interrupts it here.
+            let block = Arc::clone(&self.block);
+            Ok(Box::pin(
+                stream::once(async move {
+                    block.acquire().await?.forget();
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "unreached".to_string(),
+                        }),
+                    ))
+                })
+                .chain(stream::iter(vec![Ok(SessionCompletionEvent::Completed(
+                    SessionTurnSummary {
+                        assistant_message_id: Some("assistant-blocked".to_string()),
+                        response: "unreached".to_string(),
+                    },
+                ))])),
+            ))
+        }
+    }
+}
+
+struct ConsumeThenBlockFactory {
+    block: Arc<Semaphore>,
+}
+
+impl SessionModelFactory for ConsumeThenBlockFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _ask_user_client: Option<AskUserClient>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        system_prompt_kind: SystemPromptKind,
+        _agent_control: AgentControl,
+        _plan_mode: bool,
+    ) -> Result<SessionModel> {
+        match system_prompt_kind {
+            SystemPromptKind::Root => Ok(SessionModel::Stub(Arc::new(
+                ConsumeThenBlockParentDriver {
+                    calls: Mutex::new(0),
+                    block: Arc::clone(&self.block),
+                },
+            ))),
+            _ => Ok(SessionModel::Stub(Arc::new(StubDriver {
+                text: "child done".to_string(),
+            }))),
+        }
+    }
+}
+
+/// Regression test for the consume-before-persist window: a child consumed
+/// mid-turn is released from memory immediately, but its durable parent→child
+/// edge must stay open until the turn's result is persisted. If the turn is
+/// interrupted before that, resume must still be able to rehydrate the child.
+#[tokio::test]
+async fn consumed_child_remains_rehydratable_after_midturn_interrupt() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
+
+    let block = Arc::new(Semaphore::new(0));
+    let manager = ThreadManagerState::new(
+        None,
+        Some(Arc::new(ConsumeThenBlockFactory {
+            block: Arc::clone(&block),
+        })),
+    )
+    .await?;
+    let started = manager.start_thread().await?;
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await?;
+    let _turn = manager
+        .start_user_input(root_id, "spawn then hang".to_string())
+        .await?;
+
+    // Wait until the child has completed (proving it ran).
+    let mut child_completed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, root_events.recv()).await {
+            Ok(Ok(event)) => {
+                if matches!(event.msg, EventMsg::CollabAgentCompleted(_)) {
+                    child_completed = true;
+                    break;
+                }
+            }
+            Ok(Err(err)) => panic!("root event channel closed: {err}"),
+            Err(_) => break,
+        }
+    }
+    assert!(child_completed, "child should complete before the parent blocks");
+
+    // Wait until the child has been released in-memory (registry back to just
+    // root). The parent turn is now blocked in its second model call — past the
+    // consume, before the end-of-turn edge close.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let live = manager.list_agents(root_id, Some("/root"))?;
+        if live.len() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "consumed child was not released from the registry in time"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Interrupt the parent mid-turn, before it could persist its result.
+    manager.cancel_turn_subtree(root_id).await?;
+    drop(manager);
+
+    // Resume in a fresh manager. Because the edge was left open, the consumed
+    // child is rehydrated rather than silently lost.
+    let resumed_manager = ThreadManagerState::new(
+        None,
+        Some(Arc::new(ConsumeThenBlockFactory {
+            block: Arc::new(Semaphore::new(0)),
+        })),
+    )
+    .await?;
+    let _resumed = resumed_manager.resume_thread(root_id).await?;
+    let live = resumed_manager.list_agents(root_id, Some("/root"))?;
+    assert_eq!(
+        live.len(),
+        2,
+        "the open edge should let resume rehydrate the consumed child; got {live:?}"
+    );
+
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
+}
+
 fn assert_live_status_entry(agent: &CollabAgentStatusEntry) {
     assert!(
         matches!(

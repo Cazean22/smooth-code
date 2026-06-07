@@ -408,6 +408,55 @@ impl AgentControl {
         Ok(AgentStatus::Shutdown)
     }
 
+    /// Release a child agent's in-memory resources once its terminal result has
+    /// been folded into the parent's turn.
+    ///
+    /// Unlike [`AgentControl::close_agent`], this performs no shutdown op and
+    /// aborts no tasks — the child's single turn has already reached a terminal
+    /// status, so there is nothing to interrupt. It frees the resources a
+    /// finished child would otherwise pin for the rest of the session:
+    ///
+    /// * the live registry slot, which is what bounds `AGENT_MAX_THREADS`
+    ///   (without this, the cap degrades from a *concurrency* limit into a
+    ///   per-session *lifetime* budget — a long root that spawns many sequential
+    ///   children eventually cannot spawn at all);
+    /// * the in-memory [`CoreThread`] actor and any provider connection it
+    ///   parked (e.g. an OpenAI WebSocket);
+    /// * the status watch channel.
+    ///
+    /// This deliberately does **not** close the persisted parent→child edge: the
+    /// child's result is not durable in the parent's rollout until the turn ends
+    /// (see [`crate::tasks`]'s `persist_history_messages`), so closing the edge
+    /// here would make a child unrecoverable on resume if the turn were
+    /// interrupted or crashed before persistence. Edge closure is deferred to
+    /// [`AgentControl::close_consumed_agent_edge`], called only after the result
+    /// is persisted. Idempotent: releasing an already-removed child is a no-op.
+    pub(crate) async fn release_consumed_agent(&self, child_thread_id: ThreadId) -> CoreResult<()> {
+        let runtime = self.runtime()?;
+        runtime.threads.write().await.remove(&child_thread_id);
+        self.state.registry.unregister_thread(child_thread_id);
+        self.remove_status_sender(child_thread_id)?;
+        Ok(())
+    }
+
+    /// Close the persisted parent→child edge of a consumed child, so a later
+    /// resume does not rehydrate a child whose result already lives in the
+    /// parent's rollout. Call this only **after** the parent's turn result has
+    /// been persisted (see [`AgentControl::release_consumed_agent`] for why the
+    /// ordering matters). Idempotent.
+    pub(crate) async fn close_consumed_agent_edge(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> CoreResult<()> {
+        let runtime = self.runtime()?;
+        runtime
+            .state_db
+            .close_edge(&parent_thread_id.to_string(), &child_thread_id.to_string())
+            .await?;
+        Ok(())
+    }
+
     fn ensure_status_sender(&self, thread_id: ThreadId, status: AgentStatus) -> CoreResult<()> {
         lock_mutex(&self.state.statuses, "agent_control.statuses")?
             .entry(thread_id)
@@ -968,6 +1017,95 @@ mod tests {
                 .await?
                 .is_empty()
         );
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_consumed_agent_frees_resources_and_edge_closes_separately() -> Result<()> {
+        let _cwd_guard = crate::test_support::cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "child".into(),
+                })),
+            })),
+        )
+        .await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent(root_id, "hello child".to_string())
+            .await?;
+        let child_id = child.agent_id.context("child id")?;
+
+        // Wait for the child's single turn to reach a terminal status.
+        let mut status_rx = control.subscribe_status(child_id)?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = status_rx.borrow().clone();
+                if crate::agent::status::is_final(&status) {
+                    break;
+                }
+                if status_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("timed out waiting for child to finish"))?;
+
+        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db")).await?;
+        assert_eq!(control.registry().live_agents().len(), 2);
+        assert_eq!(
+            state_db
+                .list_open_children(&root_id.to_string())
+                .await?
+                .len(),
+            1
+        );
+
+        // In-memory release frees the slot/actor/status immediately...
+        control.release_consumed_agent(child_id).await?;
+        assert_eq!(
+            control.registry().live_agents().len(),
+            1,
+            "release should drop the finished child from the live registry"
+        );
+        assert_eq!(control.get_status(child_id), AgentStatus::NotFound);
+        // ...but the durable parent->child edge must stay open until the parent
+        // has persisted the consumed result, so a resume can still rehydrate the
+        // child if the turn is interrupted before persistence.
+        assert_eq!(
+            state_db
+                .list_open_children(&root_id.to_string())
+                .await?
+                .len(),
+            1,
+            "release must not close the edge"
+        );
+
+        // Closing the edge (end-of-turn, after persistence) completes reclamation.
+        control.close_consumed_agent_edge(root_id, child_id).await?;
+        assert!(
+            state_db
+                .list_open_children(&root_id.to_string())
+                .await?
+                .is_empty(),
+            "closing the edge should remove the open parent->child edge"
+        );
+
+        // Both halves are idempotent.
+        control.release_consumed_agent(child_id).await?;
+        control.close_consumed_agent_edge(root_id, child_id).await?;
+        assert_eq!(control.registry().live_agents().len(), 1);
 
         std::env::set_current_dir(original_cwd)?;
         Ok(())

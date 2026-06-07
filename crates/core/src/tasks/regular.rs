@@ -21,8 +21,8 @@ use tools::{DecodedToolOutput, SubagentArgs, decode_tool_output_for_tool};
 
 use crate::{
     agent::{
-        InlineChildCompletionReceiver, SystemPromptKind, control::InlineChildCompletion,
-        registry::AgentMetadata, status::last_assistant_message,
+        AgentControl, InlineChildCompletionReceiver, SystemPromptKind,
+        control::InlineChildCompletion, registry::AgentMetadata, status::last_assistant_message,
     },
     core::{Session, TurnContext},
     provider::{
@@ -260,6 +260,12 @@ async fn run_manual_turn(
     let mut new_messages = vec![initial_prompt];
     let mut saw_tool_loop = false;
     let mut retained_subagents = Vec::new();
+    // Children consumed during this turn are released from in-memory state
+    // immediately, but their durable parent→child edges are closed only after
+    // the turn's result is persisted (see the terminal arm below). Holding the
+    // edge open until then keeps a consumed child rehydratable if the turn is
+    // interrupted or crashes before its result reaches the rollout.
+    let mut consumed_children: Vec<ThreadId> = Vec::new();
     // This mid-output continuation budget is separate from the provider's
     // before-output retry budget; provider retries handle startup churn, while
     // this counter bounds only attempts that already yielded assistant output.
@@ -306,7 +312,7 @@ async fn run_manual_turn(
 
             let item = tokio::select! {
                 _ = cancellation_token.cancelled() => return None,
-                Some(text) = next_retained_subagent_completion(&mut retained_subagents),
+                Some(text) = next_retained_subagent_completion(&mut retained_subagents, &session.agent_control, &mut consumed_children),
                     if !retained_subagents.is_empty() => {
                     stream_phase_completions.push(text);
                     continue;
@@ -341,6 +347,7 @@ async fn run_manual_turn(
                                 Arc::clone(&ctx),
                                 pending_tool_calls,
                                 &mut retained_subagents,
+                                &mut consumed_children,
                                 &mut stream_phase_completions,
                                 &cancellation_token,
                             )
@@ -523,6 +530,7 @@ async fn run_manual_turn(
                 Arc::clone(&ctx),
                 pending_tool_calls,
                 &mut retained_subagents,
+                &mut consumed_children,
                 &mut stream_phase_completions,
                 &cancellation_token,
             )
@@ -557,7 +565,7 @@ async fn run_manual_turn(
         if !retained_subagents.is_empty() {
             let completion_texts = tokio::select! {
                 _ = cancellation_token.cancelled() => return None,
-                completions = drain_retained_subagent_completions(&mut retained_subagents) => completions,
+                completions = drain_retained_subagent_completions(&mut retained_subagents, &session.agent_control, &mut consumed_children) => completions,
             };
             append_completion_texts_after_assistant_turn(
                 &mut new_messages,
@@ -585,6 +593,14 @@ async fn run_manual_turn(
         let mut final_history = history_before_turn;
         final_history.extend(new_messages);
         session.replace_history(final_history).await;
+        // The turn's result (including every consumed child's completion) is now
+        // durable in the parent's rollout, so it is finally safe to close those
+        // children's parent→child edges. Doing this only here — never on the
+        // cancel/early-return paths above — guarantees we never close an edge
+        // before the result that supersedes it has been persisted: an
+        // interrupted or crashed turn leaves the edge open so resume can
+        // rehydrate the child.
+        close_consumed_child_edges(&session, &consumed_children).await;
         if !last_assistant_message.is_empty() {
             session
                 .emit_event(
@@ -772,6 +788,7 @@ async fn execute_pending_tool_calls_for_turn(
     ctx: Arc<TurnContext>,
     pending_tool_calls: Vec<PendingToolCall>,
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+    consumed_children: &mut Vec<ThreadId>,
     stream_phase_completions: &mut Vec<String>,
     cancellation_token: &CancellationToken,
 ) -> Option<Vec<ExecutedToolCall>> {
@@ -802,6 +819,7 @@ async fn execute_pending_tool_calls_for_turn(
         Arc::clone(&ctx),
         started_spawns,
         retained_subagents,
+        consumed_children,
     )
     .await;
     spawn_results.extend(immediate_spawn_results);
@@ -817,7 +835,7 @@ async fn execute_pending_tool_calls_for_turn(
     if !has_normal_tools {
         let drained = tokio::select! {
             _ = cancellation_token.cancelled() => return None,
-            completions = drain_retained_subagent_completions(retained_subagents) => completions,
+            completions = drain_retained_subagent_completions(retained_subagents, &session.agent_control, consumed_children) => completions,
         };
         stream_phase_completions.extend(drained);
     }
@@ -963,9 +981,19 @@ async fn collect_spawn_results(
     ctx: Arc<TurnContext>,
     spawn_calls: Vec<StartedSpawnToolCall>,
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+    consumed_children: &mut Vec<ThreadId>,
 ) -> Vec<ExecutedToolCall> {
     let mut resolved = Vec::with_capacity(spawn_calls.len());
     for mut spawn_call in spawn_calls {
+        // A child carrying a terminal `completion` here has been folded into the
+        // parent's history by this iteration; release its in-memory resources
+        // now and record it so its durable edge is closed once the turn's result
+        // is persisted. A child without a completion is being retained for a
+        // later turn-phase and is released when its retained waiter is drained.
+        let consumed_child = spawn_call
+            .completion
+            .is_some()
+            .then_some(spawn_call.child_thread_id);
         let (tool_output, success, error, result_kind, related_thread_id) =
             if let Some(completion) = spawn_call.completion.as_ref() {
                 let (tool_output, success, error) =
@@ -1008,6 +1036,10 @@ async fn collect_spawn_results(
         )
         .await;
         resolved.push(executed);
+        if let Some(child_thread_id) = consumed_child {
+            release_consumed_child(&session.agent_control, child_thread_id).await;
+            consumed_children.push(child_thread_id);
+        }
     }
     resolved
 }
@@ -1241,6 +1273,8 @@ fn encode_live_spawn_status(
 /// because `select_all` panics on an empty iterator).
 async fn next_retained_subagent_completion(
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+    agent_control: &AgentControl,
+    consumed_children: &mut Vec<ThreadId>,
 ) -> Option<String> {
     if retained_subagents.is_empty() {
         return None;
@@ -1262,13 +1296,22 @@ async fn next_retained_subagent_completion(
             },
         )
     });
+    if let Some(child_thread_id) = child_thread_id {
+        release_consumed_child(agent_control, child_thread_id).await;
+        consumed_children.push(child_thread_id);
+    }
     Some(retained_completion_text(entry.metadata, completion))
 }
 
 async fn drain_retained_subagent_completions(
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+    agent_control: &AgentControl,
+    consumed_children: &mut Vec<ThreadId>,
 ) -> Vec<String> {
     let retained = std::mem::take(retained_subagents);
+    // Each retained child resolves and is released concurrently; the in-memory
+    // release is internally synchronized, but the `consumed_children` record is
+    // accumulated sequentially after the join to avoid aliasing it across tasks.
     let completions = retained.into_iter().map(|retained| async move {
         let RetainedSpawnCompletion { metadata, waiter } = retained;
         let child_thread_id = metadata.agent_id;
@@ -1282,9 +1325,54 @@ async fn drain_retained_subagent_completions(
                 },
             )
         });
-        retained_completion_text(metadata, completion)
+        if let Some(child_thread_id) = child_thread_id {
+            release_consumed_child(agent_control, child_thread_id).await;
+        }
+        (retained_completion_text(metadata, completion), child_thread_id)
     });
-    futures_util::future::join_all(completions).await
+    let resolved = futures_util::future::join_all(completions).await;
+    let mut texts = Vec::with_capacity(resolved.len());
+    for (text, child_thread_id) in resolved {
+        if let Some(child_thread_id) = child_thread_id {
+            consumed_children.push(child_thread_id);
+        }
+        texts.push(text);
+    }
+    texts
+}
+
+/// Release a consumed child's in-memory resources (actor, registry slot, status
+/// channel). Best-effort: a failure is logged, never fatal to the turn. The
+/// durable parent→child edge is deliberately left open here and closed only by
+/// [`close_consumed_child_edges`] after the turn's result is persisted.
+async fn release_consumed_child(agent_control: &AgentControl, child_thread_id: ThreadId) {
+    if let Err(err) = agent_control.release_consumed_agent(child_thread_id).await {
+        tracing::debug!(
+            %child_thread_id,
+            error = %err,
+            "failed to release consumed subagent resources"
+        );
+    }
+}
+
+/// Close the durable parent→child edges of children consumed during this turn,
+/// now that the turn's result is persisted. Called only on the clean terminal
+/// path so an interrupted/crashed turn leaves edges open for resume to
+/// rehydrate. Best-effort per edge.
+async fn close_consumed_child_edges(session: &Arc<Session>, consumed_children: &[ThreadId]) {
+    for child_thread_id in consumed_children {
+        if let Err(err) = session
+            .agent_control
+            .close_consumed_agent_edge(session.id, *child_thread_id)
+            .await
+        {
+            tracing::debug!(
+                %child_thread_id,
+                error = %err,
+                "failed to close consumed subagent edge after persisting turn"
+            );
+        }
+    }
 }
 
 fn retained_completion_text(

@@ -16,7 +16,9 @@ use uuid::Uuid;
 use crate::{
     ThreadSummary,
     agent::{
-        AgentControl, SystemPromptKind, registry::AgentMetadata, status::last_assistant_message,
+        AgentControl, SystemPromptKind,
+        registry::AgentMetadata,
+        status::{agent_status_from_event, last_assistant_message},
     },
     core_thread::CoreThread,
     error::{CoreError, CoreResult},
@@ -311,11 +313,25 @@ impl ThreadManagerState {
     }
 
     async fn resume_child_subtree(&self, root_thread_id: ThreadId) -> CoreResult<Vec<EventMsg>> {
-        let mut queue = VecDeque::from([root_thread_id]);
+        // BFS over the persisted open-edge subtree. Each entry carries whether
+        // the subtree is being reaped. A child that *completed* is reaped — its
+        // edge is closed and it is not rehydrated, since its result already
+        // lives in the parent's history (or was consumed) and a one-shot
+        // sub-agent cannot be re-driven. Every descendant of a reaped child is
+        // reaped too. Children that ended abnormally (interrupted/errored) are
+        // still rehydrated for visibility. This keeps the many completed/
+        // consumed children an interrupted long turn can leave behind from
+        // piling up on resume, while still restoring the incomplete frontier.
+        //
+        // (Every persisted status is terminal — `AgentStatusChanged(Running)`
+        // is not persisted and an unfinished turn is reconstructed as
+        // `Interrupted` — so the reap/rehydrate split keys on `Completed`
+        // specifically, not on `is_final`.)
+        let mut queue: VecDeque<(ThreadId, bool)> = VecDeque::from([(root_thread_id, false)]);
         let workspace_root = workspace_root().map_err(CoreError::rollout)?;
         let mut events = Vec::new();
 
-        while let Some(parent_thread_id) = queue.pop_front() {
+        while let Some((parent_thread_id, reap_subtree)) = queue.pop_front() {
             let child_edges = self
                 .state_db
                 .list_open_children(&parent_thread_id.to_string())
@@ -356,12 +372,58 @@ impl ThreadManagerState {
                         continue;
                     }
                 };
+
+                // Decide reap vs rehydrate. A reaped ancestor forces reaping the
+                // whole subtree; otherwise only a *completed* child is reaped (a
+                // finished/consumed child whose result is already in the parent's
+                // history). Abnormally-ended children are rehydrated. If the
+                // status can't be determined (e.g. a missing rollout), fall
+                // through to the rehydrate attempt, which surfaces the error and
+                // leaves the edge open, exactly as before.
+                let reap_status = if reap_subtree {
+                    Some(
+                        self.peek_child_status(&workspace_root, child_thread_id)
+                            .await
+                            .unwrap_or(AgentStatus::Shutdown),
+                    )
+                } else {
+                    match self.peek_child_status(&workspace_root, child_thread_id).await {
+                        Ok(status @ AgentStatus::Completed(_)) => Some(status),
+                        _ => None,
+                    }
+                };
+
                 events.push(EventMsg::CollabResumeBegin(CollabResumeBeginEvent {
                     call_id: call_id.clone(),
                     sender_thread_id: parent_thread_id,
                     receiver_thread_id: child_thread_id,
                     receiver_agent_nickname: thread_row.agent_nickname.clone(),
                 }));
+
+                if let Some(status) = reap_status {
+                    if let Err(err) = self
+                        .state_db
+                        .close_edge(&parent_thread_id.to_string(), &child_thread_id.to_string())
+                        .await
+                    {
+                        tracing::warn!(
+                            parent_thread_id = %parent_thread_id,
+                            child_thread_id = %child_thread_id,
+                            error = %err,
+                            "failed to close edge while reaping finished child on resume"
+                        );
+                    }
+                    // Recurse to reap the finished child's own open descendants.
+                    queue.push_back((child_thread_id, true));
+                    events.push(EventMsg::CollabResumeEnd(CollabResumeEndEvent {
+                        call_id,
+                        sender_thread_id: parent_thread_id,
+                        receiver_thread_id: child_thread_id,
+                        receiver_agent_nickname: thread_row.agent_nickname,
+                        status,
+                    }));
+                    continue;
+                }
 
                 let result = self
                     .resume_child_thread(
@@ -375,7 +437,7 @@ impl ThreadManagerState {
                     .await;
                 match result {
                     Ok(()) => {
-                        queue.push_back(child_thread_id);
+                        queue.push_back((child_thread_id, false));
                         events.push(EventMsg::CollabResumeEnd(CollabResumeEndEvent {
                             call_id,
                             sender_thread_id: parent_thread_id,
@@ -404,6 +466,32 @@ impl ThreadManagerState {
         }
 
         Ok(events)
+    }
+
+    /// Read a persisted child's last known status without rehydrating it, used
+    /// to decide whether to reap or rehydrate it on resume. Returns the live
+    /// status if the thread is already loaded, otherwise the last status event
+    /// from its rollout (or `PendingInit` if none was recorded).
+    async fn peek_child_status(
+        &self,
+        workspace_root: &std::path::Path,
+        child_thread_id: ThreadId,
+    ) -> CoreResult<AgentStatus> {
+        if self.threads.read().await.contains_key(&child_thread_id) {
+            return Ok(self.agent_control.get_status(child_thread_id));
+        }
+        let rollout_path = find_thread_path(workspace_root, child_thread_id)
+            .await
+            .map_err(CoreError::rollout)?;
+        let resume_state = load_resume_state(&rollout_path)
+            .await
+            .map_err(CoreError::rollout)?;
+        Ok(resume_state
+            .initial_messages
+            .iter()
+            .filter_map(agent_status_from_event)
+            .next_back()
+            .unwrap_or(AgentStatus::PendingInit))
     }
 
     async fn resume_child_thread(
@@ -1007,7 +1095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_thread_rehydrates_open_subtree() -> Result<()> {
+    async fn resume_reaps_completed_open_subtree() -> Result<()> {
         let _cwd_guard = cwd_test_lock().lock().await;
         let workspace = TempDir::new()?;
         let original_cwd = std::env::current_dir()?;
@@ -1055,6 +1143,10 @@ mod tests {
                 )
             })
             .count();
+        // Both children completed, so resume reaps the whole subtree: a
+        // Begin/End pair is still emitted for each (the End carries the terminal
+        // status), but neither child is rehydrated — only root stays live and
+        // the finished children's edges are closed.
         assert_eq!(resume_events, 4);
         assert_eq!(
             resumed_manager
@@ -1062,7 +1154,15 @@ mod tests {
                 .registry()
                 .live_agents()
                 .len(),
-            3
+            1
+        );
+        assert!(
+            resumed_manager
+                .state_db
+                .list_open_children(&root_id.to_string())
+                .await?
+                .is_empty(),
+            "reaping should close the finished children's edges"
         );
 
         std::env::set_current_dir(original_cwd)?;
@@ -1076,15 +1176,9 @@ mod tests {
         let original_cwd = std::env::current_dir()?;
         std::env::set_current_dir(workspace.path())?;
 
-        let manager = ThreadManagerState::new(
-            None,
-            Some(Arc::new(StubFactory {
-                model: SessionModel::Stub(Arc::new(StubDriver {
-                    text: "done".to_string(),
-                })),
-            })),
-        )
-        .await?;
+        // A non-completing child stays non-terminal, so resume rehydrates it
+        // (rather than reaping a finished child) and restores its prompt kind.
+        let manager = ThreadManagerState::new(None, Some(Arc::new(PendingFactory))).await?;
         let started = manager.start_thread().await?;
         let root_id = started.thread_id;
         let child = manager

@@ -2326,12 +2326,13 @@ impl SessionModelFactory for ConsumeThenBlockFactory {
     }
 }
 
-/// Regression test for the consume-before-persist window: a child consumed
-/// mid-turn is released from memory immediately, but its durable parent→child
-/// edge must stay open until the turn's result is persisted. If the turn is
-/// interrupted before that, resume must still be able to rehydrate the child.
+/// A child consumed mid-turn is released from memory immediately, but its
+/// durable parent→child edge is left open until the turn's result is persisted
+/// (never closed early). If the turn is interrupted before persistence, that
+/// stale edge is cleaned up on resume: the finished child is reaped — its edge
+/// closed and it is not resurrected as a live agent — rather than rehydrated.
 #[tokio::test]
-async fn consumed_child_remains_rehydratable_after_midturn_interrupt() -> Result<()> {
+async fn interrupted_consumed_child_is_reaped_on_resume() -> Result<()> {
     let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
     let workspace = TempDir::new()?;
     let original_cwd = std::env::current_dir()?;
@@ -2390,8 +2391,9 @@ async fn consumed_child_remains_rehydratable_after_midturn_interrupt() -> Result
     manager.cancel_turn_subtree(root_id).await?;
     drop(manager);
 
-    // Resume in a fresh manager. Because the edge was left open, the consumed
-    // child is rehydrated rather than silently lost.
+    // Resume in a fresh manager. The interrupted turn left the child's edge
+    // open; resume reaps the finished child (closes the edge, does not
+    // rehydrate it), leaving only root.
     let resumed_manager = ThreadManagerState::new(
         None,
         Some(Arc::new(ConsumeThenBlockFactory {
@@ -2403,8 +2405,8 @@ async fn consumed_child_remains_rehydratable_after_midturn_interrupt() -> Result
     let live = resumed_manager.list_agents(root_id, Some("/root"))?;
     assert_eq!(
         live.len(),
-        2,
-        "the open edge should let resume rehydrate the consumed child; got {live:?}"
+        1,
+        "resume should reap the finished consumed child, leaving only root; got {live:?}"
     );
 
     std::env::set_current_dir(original_cwd)?;

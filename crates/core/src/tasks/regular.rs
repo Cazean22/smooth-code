@@ -604,7 +604,7 @@ async fn run_manual_turn(
         // cancel/early-return paths above, and never when persistence failed —
         // guarantees we never close an edge before the result that supersedes it
         // is durable: an interrupted, crashed, or unpersisted turn leaves the
-        // edge open so resume can rehydrate the child.
+        // edge open, and resume reaps the finished child instead.
         if persisted {
             close_consumed_child_edges(&session, &consumed_children).await;
         } else if !consumed_children.is_empty() {
@@ -1456,8 +1456,8 @@ async fn release_consumed_child(agent_control: &AgentControl, child_thread_id: T
 
 /// Close the durable parent→child edges of children consumed during this turn,
 /// now that the turn's result is persisted. Called only on the clean terminal
-/// path so an interrupted/crashed turn leaves edges open for resume to
-/// rehydrate. Best-effort per edge.
+/// path, so an interrupted/crashed turn leaves edges open and resume reaps the
+/// finished children instead. Best-effort per edge.
 async fn close_consumed_child_edges(session: &Arc<Session>, consumed_children: &[ThreadId]) {
     for child_thread_id in consumed_children {
         if let Err(err) = session

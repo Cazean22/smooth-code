@@ -427,10 +427,11 @@ impl AgentControl {
     /// This deliberately does **not** close the persisted parent→child edge: the
     /// child's result is not durable in the parent's rollout until the turn ends
     /// (see [`crate::tasks`]'s `persist_history_messages`), so closing the edge
-    /// here would make a child unrecoverable on resume if the turn were
-    /// interrupted or crashed before persistence. Edge closure is deferred to
-    /// [`AgentControl::close_consumed_agent_edge`], called only after the result
-    /// is persisted. Idempotent: releasing an already-removed child is a no-op.
+    /// here would close it before the result that supersedes it is durable. Edge
+    /// closure is deferred to [`AgentControl::close_consumed_agent_edge`], called
+    /// only after the result is persisted; an interrupted or crashed turn instead
+    /// leaves the edge open, and resume reconciles it by reaping the finished
+    /// child. Idempotent: releasing an already-removed child is a no-op.
     pub(crate) async fn release_consumed_agent(&self, child_thread_id: ThreadId) -> CoreResult<()> {
         let runtime = self.runtime()?;
         runtime.threads.write().await.remove(&child_thread_id);
@@ -440,10 +441,10 @@ impl AgentControl {
     }
 
     /// Close the persisted parent→child edge of a consumed child, so a later
-    /// resume does not rehydrate a child whose result already lives in the
-    /// parent's rollout. Call this only **after** the parent's turn result has
-    /// been persisted (see [`AgentControl::release_consumed_agent`] for why the
-    /// ordering matters). Idempotent.
+    /// resume skips it entirely (a still-open edge to a finished child is
+    /// otherwise reaped on resume). Call this only **after** the parent's turn
+    /// result has been persisted (see [`AgentControl::release_consumed_agent`]
+    /// for why the ordering matters). Idempotent.
     pub(crate) async fn close_consumed_agent_edge(
         &self,
         parent_thread_id: ThreadId,
@@ -1081,8 +1082,8 @@ mod tests {
         );
         assert_eq!(control.get_status(child_id), AgentStatus::NotFound);
         // ...but the durable parent->child edge must stay open until the parent
-        // has persisted the consumed result, so a resume can still rehydrate the
-        // child if the turn is interrupted before persistence.
+        // has persisted the consumed result, so it is closed only after
+        // persistence (an interrupted turn leaves it open for resume to reap).
         assert_eq!(
             state_db
                 .list_open_children(&root_id.to_string())

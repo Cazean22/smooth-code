@@ -22,7 +22,9 @@ use tools::{DecodedToolOutput, SubagentArgs, decode_tool_output_for_tool};
 use crate::{
     agent::{
         AgentControl, InlineChildCompletionReceiver, SystemPromptKind,
-        control::InlineChildCompletion, registry::AgentMetadata, status::last_assistant_message,
+        control::InlineChildCompletion,
+        registry::AgentMetadata,
+        status::{is_final, last_assistant_message},
     },
     core::{Session, TurnContext},
     provider::{
@@ -1043,40 +1045,67 @@ async fn collect_spawn_results(
 ) -> Vec<ExecutedToolCall> {
     let mut resolved = Vec::with_capacity(spawn_calls.len());
     for mut spawn_call in spawn_calls {
-        // A child carrying a terminal `completion` here has been folded into the
-        // parent's history by this iteration; release its in-memory resources
-        // now and record it so its durable edge is closed once the turn's result
-        // is persisted. A child without a completion is being retained for a
-        // later turn-phase and is released when its retained waiter is drained.
-        let consumed_child = spawn_call
-            .completion
-            .is_some()
-            .then_some(spawn_call.child_thread_id);
-        let (tool_output, success, error, result_kind, related_thread_id) =
+        let child_thread_id = spawn_call.child_thread_id;
+        // Classify the spawn's outcome at collection time:
+        //  (a) a completion captured during the wait window -> final;
+        //  (b) no completion captured, but the child has since reached a
+        //      terminal status -> final now, dropping the redundant waiter so
+        //      the retained drain cannot surface the same completion twice;
+        //  (c) still live -> report live status and retain the waiter.
+        // A spawn resolved as final in (a)/(b) is consumed: release its
+        // in-memory resources now and record it so its durable edge is closed
+        // once the turn's result is persisted. A retained spawn is released when
+        // its waiter is later drained.
+        let (tool_output, success, error, result_kind, related_thread_id, consumed) =
             if let Some(completion) = spawn_call.completion.as_ref() {
                 let (tool_output, success, error) =
                     encode_completed_spawn_result(&spawn_call.metadata, completion);
-                (tool_output, success, error, ToolCallResultKind::Final, None)
-            } else {
-                if let Some(waiter) = spawn_call.waiter.take() {
-                    retained_subagents.push(RetainedSpawnCompletion {
-                        metadata: spawn_call.metadata.clone(),
-                        waiter,
-                    });
-                }
-                let (tool_output, success, error) = encode_live_spawn_status(
-                    &session,
-                    &spawn_call.metadata,
-                    &spawn_call.initial_status,
-                    spawn_call.child_thread_id,
-                );
                 (
                     tool_output,
                     success,
                     error,
-                    ToolCallResultKind::StatusUpdate,
-                    Some(spawn_call.child_thread_id),
+                    ToolCallResultKind::Final,
+                    None,
+                    true,
                 )
+            } else {
+                // `NotFound` means the live status is not observable yet; fall
+                // back to the spawn's initial (live) status, matching how a
+                // running child is reported.
+                let observed = match session.agent_control.get_status(child_thread_id) {
+                    AgentStatus::NotFound => spawn_call.initial_status.clone(),
+                    status => status,
+                };
+                let (tool_output, success, error) =
+                    encode_spawn_agent_result(&spawn_call.metadata, &observed, None)
+                        .map(|output| (output, true, None))
+                        .unwrap_or_else(|message| (message.clone(), false, Some(message)));
+                if is_final(&observed) {
+                    let _ = spawn_call.waiter.take();
+                    (
+                        tool_output,
+                        success,
+                        error,
+                        ToolCallResultKind::Final,
+                        None,
+                        true,
+                    )
+                } else {
+                    if let Some(waiter) = spawn_call.waiter.take() {
+                        retained_subagents.push(RetainedSpawnCompletion {
+                            metadata: spawn_call.metadata.clone(),
+                            waiter,
+                        });
+                    }
+                    (
+                        tool_output,
+                        success,
+                        error,
+                        ToolCallResultKind::StatusUpdate,
+                        Some(child_thread_id),
+                        false,
+                    )
+                }
             };
         let executed = complete_tool_call_with_kind(
             Arc::clone(&session),
@@ -1094,7 +1123,7 @@ async fn collect_spawn_results(
         )
         .await;
         resolved.push(executed);
-        if let Some(child_thread_id) = consumed_child {
+        if consumed {
             release_consumed_child(&session.agent_control, child_thread_id).await;
             consumed_children.push(child_thread_id);
         }
@@ -1321,21 +1350,6 @@ fn encode_completed_spawn_result(
         .unwrap_or_else(|message| (message.clone(), false, Some(message))),
         Err(message) => (message.clone(), false, Some(message.clone())),
     }
-}
-
-fn encode_live_spawn_status(
-    session: &Session,
-    metadata: &AgentMetadata,
-    initial_status: &AgentStatus,
-    child_thread_id: ThreadId,
-) -> (String, bool, Option<String>) {
-    let status = match session.agent_control.get_status(child_thread_id) {
-        AgentStatus::NotFound => initial_status.clone(),
-        status => status,
-    };
-    encode_spawn_agent_result(metadata, &status, None)
-        .map(|output| (output, true, None))
-        .unwrap_or_else(|message| (message.clone(), false, Some(message)))
 }
 
 /// Race every retained subagent receiver in parallel and resolve the first

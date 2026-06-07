@@ -111,12 +111,13 @@ impl TranscriptItem {
         self.version
     }
 
+    pub(crate) fn is_user(&self) -> bool {
+        matches!(self.kind, TranscriptItemKind::User { .. })
+    }
+
     pub(crate) fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         match &self.kind {
-            TranscriptItemKind::User { message } => wrap_display(
-                prefix_multiline_text(message, "› ".cyan().bold(), "  ".cyan()),
-                width,
-            ),
+            TranscriptItemKind::User { message } => render_user_message(message, width),
             TranscriptItemKind::Assistant {
                 lines,
                 is_first_line,
@@ -386,10 +387,6 @@ pub(crate) fn prefix_lines(
     out
 }
 
-fn wrap_display(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
-    wrap::wrap_lines(lines, usize::from(width.max(1)))
-}
-
 /// Wrap markdown-rendered content, choosing the wrap policy per logical line:
 /// prose word-wraps, while fenced code lines (marked at the line level)
 /// wrap column-faithfully so indentation and alignment survive. `dim` applies
@@ -436,20 +433,39 @@ fn is_preformatted_line(line: &Line<'static>) -> bool {
     !line.spans.is_empty() && line.style.fg == Some(crate::markdown_render::CODE_COLOR)
 }
 
-fn prefix_multiline_text(
-    text: &str,
-    first_prefix: Span<'static>,
-    rest_prefix: Span<'static>,
-) -> Vec<Line<'static>> {
-    if text.is_empty() {
-        return vec![Line::from(vec![first_prefix])];
-    }
+/// User messages are bracketed by a blue left gutter bar on every wrapped row,
+/// setting them apart from the assistant's single `•` glyph. The body is wrapped
+/// to the reduced width *first* so the gutter column is reserved on continuation
+/// rows too (unlike a prefix-then-wrap approach, which only marks the first row).
+fn render_user_message(message: &str, width: u16) -> Vec<Line<'static>> {
+    const GUTTER: &str = "▌ ";
+    let gutter_width = wrap::display_width(GUTTER);
+    let body_width = usize::from(width.max(1)).saturating_sub(gutter_width).max(1);
 
-    let lines = text
-        .split('\n')
-        .map(|line| Line::from(line.to_owned()))
-        .collect::<Vec<_>>();
-    prefix_lines(lines, first_prefix, rest_prefix)
+    let body = if message.is_empty() {
+        vec![Line::default()]
+    } else {
+        message
+            .split('\n')
+            .map(|line| Line::from(line.to_owned()))
+            .collect::<Vec<_>>()
+    };
+    let wrapped = wrap::wrap_lines(body, body_width);
+
+    let gutter = Span::styled(GUTTER, Style::default().fg(Color::Blue).bold());
+    let mut lines = vec![user_separator(width)];
+    lines.extend(prefix_lines(wrapped, gutter.clone(), gutter));
+    lines.push(user_separator(width));
+    lines
+}
+
+/// Full-width muted rule used to bracket a user message above and below,
+/// setting it apart from the surrounding assistant output.
+fn user_separator(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(usize::from(width.max(1))),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 #[cfg(test)]
@@ -601,6 +617,37 @@ mod tests {
                 cont.starts_with("  "),
                 "error continuation not hung: {cont:?}"
             );
+        }
+        within_width(&lines, 20);
+    }
+
+    #[test]
+    fn user_message_is_framed_by_gutter_and_separators() {
+        let item = TranscriptItem::user(
+            1,
+            "this is a fairly long user message that should wrap across several rows".to_string(),
+        );
+        let lines = item.display_lines(20);
+
+        assert!(lines.len() > 3, "expected top/bottom rules + wrapped body");
+
+        // The first and last rows are full-width muted rules bracketing the
+        // message above and below.
+        for sep in [&lines[0], &lines[lines.len() - 1]] {
+            let sep_text = line_text(sep);
+            assert!(
+                !sep_text.is_empty() && sep_text.chars().all(|c| c == '─'),
+                "expected a rule, got: {sep_text:?}"
+            );
+            assert_eq!(sep.spans[0].style.fg, Some(Color::DarkGray));
+        }
+
+        // Every body row between the rules carries the blue gutter, including
+        // wrapped continuations.
+        for line in &lines[1..lines.len() - 1] {
+            let gutter = &line.spans[0];
+            assert_eq!(gutter.content.as_ref(), "▌ ");
+            assert_eq!(gutter.style.fg, Some(Color::Blue));
         }
         within_width(&lines, 20);
     }

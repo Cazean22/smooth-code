@@ -1956,11 +1956,17 @@ impl UiModel {
     #[cfg(test)]
     fn transcript_lines_uncached(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        let item_count = self.transcript_items.len();
+        let has_active_below = self.has_active_stream_lines();
         for (idx, item) in self.transcript_items.iter().enumerate() {
             if idx > 0 {
                 lines.push(Line::default());
             }
-            lines.extend(item.display_lines(width));
+            let mut item_lines = item.display_lines(width);
+            if idx + 1 == item_count && !has_active_below && item.is_user() {
+                item_lines.pop();
+            }
+            lines.extend(item_lines);
         }
         self.append_active_lines(&mut lines, width);
         if lines.is_empty() {
@@ -1972,25 +1978,48 @@ impl UiModel {
         lines
     }
 
+    /// Whether an active reasoning/assistant stream is currently rendered below
+    /// the committed transcript items. Used to decide whether the last user
+    /// message has anything following it: when nothing does, its bottom
+    /// separator is dropped so the transcript doesn't end on a dangling rule.
+    fn has_active_stream_lines(&self) -> bool {
+        self.active_reasoning_lines
+            .as_ref()
+            .is_some_and(|lines| !lines.is_empty())
+            || self
+                .active_assistant_lines
+                .as_ref()
+                .is_some_and(|lines| !lines.is_empty())
+    }
+
     fn visible_transcript_lines(&mut self, width: u16, viewport_height: u16) -> Vec<Line<'static>> {
         let start = usize::from(self.scroll);
         let end = usize::from(self.scroll).saturating_add(usize::from(viewport_height));
         let mut all_rows = 0usize;
         let mut lines = Vec::new();
 
+        let item_count = self.transcript_items.len();
+        let has_active_below = self.has_active_stream_lines();
         self.render_cache.evict_stale_widths(width);
         for (idx, item) in self.transcript_items.iter().enumerate() {
             if idx > 0 {
                 append_visible_line(&mut lines, Line::default(), all_rows, start, end);
                 all_rows += 1;
             }
-            let item_height = self.render_cache.item_height(item, width);
+            let omit_bottom = idx + 1 == item_count && !has_active_below && item.is_user();
+            let mut item_height = self.render_cache.item_height(item, width);
+            if omit_bottom {
+                item_height = item_height.saturating_sub(1);
+            }
             if all_rows >= end || all_rows.saturating_add(item_height) <= start {
                 all_rows = all_rows.saturating_add(item_height);
                 continue;
             }
 
-            let item_lines = self.render_cache.item_lines(item, width);
+            let mut item_lines = self.render_cache.item_lines(item, width);
+            if omit_bottom {
+                item_lines.pop();
+            }
             for line in item_lines {
                 append_visible_line(&mut lines, line, all_rows, start, end);
                 all_rows += 1;
@@ -2056,13 +2085,20 @@ impl UiModel {
             return 1;
         }
 
+        let item_count = self.transcript_items.len();
+        let has_active_below = self.has_active_stream_lines();
         self.render_cache.evict_stale_widths(width);
         let mut rows = 0usize;
         for (idx, item) in self.transcript_items.iter().enumerate() {
             if idx > 0 {
                 rows += 1;
             }
-            rows += self.render_cache.item_height(item, width);
+            let omit_bottom = idx + 1 == item_count && !has_active_below && item.is_user();
+            let mut height = self.render_cache.item_height(item, width);
+            if omit_bottom {
+                height = height.saturating_sub(1);
+            }
+            rows += height;
         }
 
         self.refresh_active_wrap(width);
@@ -2996,6 +3032,53 @@ mod tests {
         );
 
         assert_eq!(transcript_strings(&app), vec![String::from("• hello")]);
+    }
+
+    #[test]
+    fn last_user_message_drops_its_bottom_separator() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        app.handle_session_event(
+            event(
+                "u1",
+                EventMsg::UserMessage {
+                    text: "hello".to_string(),
+                },
+            ),
+            20,
+        );
+
+        let texts = transcript_strings(&app);
+        let rule = "─".repeat(80);
+        // Only the top rule is drawn; the bottom rule is dropped because the
+        // user message is the last thing in the transcript.
+        assert_eq!(texts.iter().filter(|t| **t == rule).count(), 1, "{texts:?}");
+        assert_eq!(
+            texts.last().map(String::as_str),
+            Some("▌ hello"),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn user_message_keeps_bottom_separator_when_followed_by_reply() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        app.handle_session_event(
+            event(
+                "u1",
+                EventMsg::UserMessage {
+                    text: "hello".to_string(),
+                },
+            ),
+            20,
+        );
+        complete_agent_message(&mut app, "a1", "assistant-1", "world");
+
+        let texts = transcript_strings(&app);
+        let rule = "─".repeat(80);
+        // The user message now has a reply after it, so both rules are drawn.
+        assert_eq!(texts.iter().filter(|t| **t == rule).count(), 2, "{texts:?}");
     }
 
     #[test]
@@ -4209,7 +4292,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("› hello"));
+        assert!(joined.contains("▌ hello"));
         assert!(joined.contains("thinking"));
         assert!(joined.contains("• world"));
         assert!(model.active_assistant_lines.is_none());

@@ -792,6 +792,69 @@ async fn execute_pending_tool_calls_for_turn(
     stream_phase_completions: &mut Vec<String>,
     cancellation_token: &CancellationToken,
 ) -> Option<Vec<ExecutedToolCall>> {
+    let DispatchedTools {
+        immediate,
+        deferred,
+        has_immediate_results,
+    } = dispatch_tool_calls(
+        Arc::clone(&session),
+        Arc::clone(&ctx),
+        pending_tool_calls,
+        cancellation_token,
+    )
+    .await?;
+
+    let surfacing = Surfacing::for_batch(has_immediate_results);
+    let deferred = wait_for_deferred(deferred, &surfacing, cancellation_token).await?;
+    let deferred_results = collect_spawn_results(
+        Arc::clone(&session),
+        Arc::clone(&ctx),
+        deferred,
+        retained_subagents,
+        consumed_children,
+    )
+    .await;
+
+    let executed_tool_calls = merge_in_index_order(immediate, deferred_results);
+
+    // A batch with no immediate results also blocks on every retained receiver
+    // carried over from prior turns, so the model sees their completed JSON in
+    // this same iteration. The drained completions ride along with anything
+    // captured mid-stream and surface together as a single user-text message.
+    if matches!(surfacing, Surfacing::BlockInline) {
+        let drained = tokio::select! {
+            _ = cancellation_token.cancelled() => return None,
+            completions = drain_retained_subagent_completions(retained_subagents, &session.agent_control, consumed_children) => completions,
+        };
+        stream_phase_completions.extend(drained);
+    }
+
+    Some(executed_tool_calls)
+}
+
+struct DispatchedTools {
+    /// Results ready now (re-sorted by model index on merge): normal tools,
+    /// `exit_plan_mode`, and spawns that failed to start.
+    immediate: Vec<ExecutedToolCall>,
+    /// Spawned children whose completion is surfaced per the batch's `Surfacing`.
+    deferred: Vec<StartedSpawnToolCall>,
+    /// Whether the batch contained any non-deferred tool result — this, not
+    /// whether a spawn happened to fail at start, is what decides `Surfacing`.
+    has_immediate_results: bool,
+}
+
+/// Run every tool call to the point where its outcome is known, preserving the
+/// phasing the rest of the loop relies on: deferred (`spawn_agent`) starts run
+/// first and are never cancelled mid-flight (their multi-await side effects must
+/// fully complete or never begin — see [`start_spawn_calls_concurrently`]), then
+/// the immediate tools run and observe cancellation. Returns `None` only on
+/// cancellation.
+async fn dispatch_tool_calls(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    pending_tool_calls: Vec<PendingToolCall>,
+    cancellation_token: &CancellationToken,
+) -> Option<DispatchedTools> {
     let (normal_calls, spawn_calls, exit_plan_calls) =
         partition_pending_tool_calls(pending_tool_calls);
 
@@ -809,38 +872,38 @@ async fn execute_pending_tool_calls_for_turn(
     let exit_plan_results =
         execute_exit_plan_mode_calls(Arc::clone(&session), Arc::clone(&ctx), exit_plan_calls).await;
 
-    let has_normal_tools = !normal_results.is_empty() || !exit_plan_results.is_empty();
-    let (started_spawns, immediate_spawn_results) = split_started_and_immediate(started_spawns);
-    let started_spawns =
-        wait_for_spawn_batch(started_spawns, has_normal_tools, cancellation_token).await?;
+    let has_immediate_results = !normal_results.is_empty() || !exit_plan_results.is_empty();
+    let (deferred, immediate_spawn_results) = split_started_and_immediate(started_spawns);
 
-    let mut spawn_results = collect_spawn_results(
-        Arc::clone(&session),
-        Arc::clone(&ctx),
-        started_spawns,
-        retained_subagents,
-        consumed_children,
-    )
-    .await;
-    spawn_results.extend(immediate_spawn_results);
+    let mut immediate = normal_results;
+    immediate.extend(exit_plan_results);
+    immediate.extend(immediate_spawn_results);
 
-    let mut combined_normal = normal_results;
-    combined_normal.extend(exit_plan_results);
-    let executed_tool_calls = merge_in_index_order(combined_normal, spawn_results);
+    Some(DispatchedTools {
+        immediate,
+        deferred,
+        has_immediate_results,
+    })
+}
 
-    // Pure `spawn_agent` batch: also block on every retained receiver carried
-    // over from prior turns so the model sees their completed JSON in this same
-    // iteration. The drained completions ride along with anything captured
-    // mid-stream and surface together as a single user-text message below.
-    if !has_normal_tools {
-        let drained = tokio::select! {
-            _ = cancellation_token.cancelled() => return None,
-            completions = drain_retained_subagent_completions(retained_subagents, &session.agent_control, consumed_children) => completions,
-        };
-        stream_phase_completions.extend(drained);
+/// How the turn loop runs a given tool call. The names of the built-in tools
+/// that get special treatment live only here, so adding or changing one is a
+/// localized edit rather than a string match scattered through the loop.
+enum ToolClass {
+    /// Executed for an immediate result (read, edit, write, run_command, …).
+    Immediate,
+    /// Starts asynchronous work whose completion is surfaced later.
+    Deferred,
+    /// Mutates session state, then yields an immediate result.
+    SessionMutation,
+}
+
+fn classify_tool(tool_name: &str) -> ToolClass {
+    match tool_name {
+        "spawn_agent" => ToolClass::Deferred,
+        "exit_plan_mode" => ToolClass::SessionMutation,
+        _ => ToolClass::Immediate,
     }
-
-    Some(executed_tool_calls)
 }
 
 fn partition_pending_tool_calls(
@@ -854,10 +917,10 @@ fn partition_pending_tool_calls(
     let mut spawn = Vec::new();
     let mut exit_plan = Vec::new();
     for pending in pending_tool_calls {
-        match pending.tool_call.function.name.as_str() {
-            "spawn_agent" => spawn.push(pending),
-            "exit_plan_mode" => exit_plan.push(pending),
-            _ => normal.push(pending),
+        match classify_tool(&pending.tool_call.function.name) {
+            ToolClass::Deferred => spawn.push(pending),
+            ToolClass::SessionMutation => exit_plan.push(pending),
+            ToolClass::Immediate => normal.push(pending),
         }
     }
     (normal, spawn, exit_plan)
@@ -959,21 +1022,16 @@ fn split_started_and_immediate(
     (started, immediate)
 }
 
-async fn wait_for_spawn_batch(
-    mut spawn_calls: Vec<StartedSpawnToolCall>,
-    has_normal_tools: bool,
+async fn wait_for_deferred(
+    mut deferred: Vec<StartedSpawnToolCall>,
+    surfacing: &Surfacing,
     cancellation_token: &CancellationToken,
 ) -> Option<Vec<StartedSpawnToolCall>> {
-    if spawn_calls.is_empty() {
-        return Some(spawn_calls);
+    if deferred.is_empty() {
+        return Some(deferred);
     }
-    let wait_mode = if has_normal_tools {
-        SpawnWaitMode::GracePeriod(Duration::from_secs(1))
-    } else {
-        SpawnWaitMode::UntilAllComplete
-    };
-    wait_for_spawn_tool_calls(&mut spawn_calls, wait_mode, cancellation_token).await?;
-    Some(spawn_calls)
+    await_deferred_completions(&mut deferred, surfacing, cancellation_token).await?;
+    Some(deferred)
 }
 
 async fn collect_spawn_results(
@@ -1163,18 +1221,33 @@ fn subagent_type_to_prompt_kind(subagent_type: Option<&str>) -> SystemPromptKind
     }
 }
 
-enum SpawnWaitMode {
-    UntilAllComplete,
-    GracePeriod(Duration),
+/// How a batch's deferred tool effects (currently only `spawn_agent`) surface
+/// this turn. A batch with no immediate tool results blocks until the deferred
+/// effects finish, so the model sees their final results in the same iteration;
+/// a mixed batch shows live status after a short grace period and retains the
+/// rest to surface later as a follow-up user-text message.
+enum Surfacing {
+    BlockInline,
+    GraceThenRetain(Duration),
 }
 
-async fn wait_for_spawn_tool_calls(
+impl Surfacing {
+    fn for_batch(has_immediate_results: bool) -> Self {
+        if has_immediate_results {
+            Self::GraceThenRetain(Duration::from_secs(1))
+        } else {
+            Self::BlockInline
+        }
+    }
+}
+
+async fn await_deferred_completions(
     spawn_tool_calls: &mut [StartedSpawnToolCall],
-    wait_mode: SpawnWaitMode,
+    surfacing: &Surfacing,
     cancellation_token: &CancellationToken,
 ) -> Option<()> {
-    match wait_mode {
-        SpawnWaitMode::UntilAllComplete => {
+    match surfacing {
+        Surfacing::BlockInline => {
             while spawn_tool_calls.iter().any(|call| call.waiter.is_some()) {
                 let completion = tokio::select! {
                     _ = cancellation_token.cancelled() => return None,
@@ -1186,8 +1259,8 @@ async fn wait_for_spawn_tool_calls(
                 spawn_tool_calls[index].completion = Some(completion);
             }
         }
-        SpawnWaitMode::GracePeriod(duration) => {
-            let deadline = tokio::time::sleep(duration);
+        Surfacing::GraceThenRetain(duration) => {
+            let deadline = tokio::time::sleep(*duration);
             tokio::pin!(deadline);
             while spawn_tool_calls.iter().any(|call| call.waiter.is_some()) {
                 let completion = tokio::select! {

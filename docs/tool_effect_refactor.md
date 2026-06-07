@@ -1,9 +1,31 @@
 # `ToolEffect` — making `spawn_agent` and `exit_plan_mode` ordinary tools
 
-Design sketch. Not yet implemented. The goal is to remove the tool-name
-string-matching and the bespoke per-tool code paths from
-`crates/core/src/tasks/regular.rs` so the turn loop dispatches every tool the
-same way and only the *shape of the outcome* differs.
+> **Status: steps 1–2 implemented** in `crates/core/src/tasks/regular.rs`. The
+> tool-name match now lives only in `classify_tool` (`ToolClass`); the turn loop
+> dispatches via `dispatch_tool_calls` into `DispatchedTools { immediate,
+> deferred, has_immediate_results }` and surfaces deferred effects via a
+> `Surfacing` enum (`BlockInline` / `GraceThenRetain`). `exit_plan_mode` and
+> `spawn_agent` are no longer special-cased in the top-level flow.
+>
+> **Deviations from the sketch below**, forced by the real code:
+> - The implemented carrier is `DispatchedTools` (two buckets + a flag), not a
+>   per-call `ToolOutcome` enum. The turn loop runs tools in *phases* with
+>   different cancellation rules (spawn starts are uncancellable and run first;
+>   immediate tools observe cancellation), so a single "map each call to an
+>   outcome" pass would have changed cancellation semantics. The phasing lives
+>   in `dispatch_tool_calls`; the buckets are its output.
+> - The deferred carrier stays `StartedSpawnToolCall` (it holds spawn-specific
+>   data — child thread id, agent metadata, the inline-completion waiter). Only
+>   the *control flow* is generalized to "deferred"; the single concrete
+>   producer is still spawn. A second deferred tool would generalize the data.
+> - **Steps 3–4 not done** (see below) — step 3 (`on_consumed`) buys little for
+>   one producer given reclamation is already localized to the consume points;
+>   step 4 changes the transcript/protocol shape and is behavior-changing, not a
+>   refactor, so it should be opted into separately.
+
+The goal is to remove the tool-name string-matching and the bespoke per-tool
+code paths from `crates/core/src/tasks/regular.rs` so the turn loop dispatches
+every tool the same way and only the *shape of the outcome* differs.
 
 ## The problem today
 

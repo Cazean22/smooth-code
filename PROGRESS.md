@@ -62,6 +62,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - A live subagent tool result is emitted as `ToolCallCompleted` with `result_kind: StatusUpdate` and `related_thread_id`; the TUI records that child-thread-to-call mapping and keeps the tool row running until the matching `CollabAgentCompleted` arrives.
 - `CollabAgentSpawnBegin` and `CollabAgentSpawnEnd` are transcript-silent in the TUI because the `spawn_agent` tool row already displays the prompt/arguments and running state; keep prompt/status text out of extra info rows unless adding a distinct subagent transcript surface.
 - `CollabAgentCompleted` is transcript-silent in the TUI; it only finalizes the correlated `spawn_agent` tool row. The detailed child result for the model is separate structured JSON returned by the manual tool loop.
+- `CollabResumeBegin` and `CollabResumeEnd` are also transcript-silent in the TUI. Core can emit them during resume hydration to re-open child subtrees, but the parent transcript should not show "Resuming agent" or child final-message status rows.
 - Parent completion notifications should include every final child status, including `Shutdown` and `NotFound`, so retained inline waiters and TUI `spawn_agent` rows cannot remain running after a child reaches a terminal state.
 
 ## Turn Cancellation

@@ -1649,15 +1649,8 @@ impl UiModel {
             EventMsg::CollabAgentCompleted(event) => {
                 self.complete_subagent_tool_call(event.child_thread_id, &event.status);
             }
-            EventMsg::CollabResumeBegin(event) => {
-                self.push_info(format!("Resuming agent {}", event.receiver_thread_id));
-            }
-            EventMsg::CollabResumeEnd(event) => {
-                self.push_info(format!(
-                    "Resume finished with status {}",
-                    agent_status_label(&event.status)
-                ));
-            }
+            EventMsg::CollabResumeBegin(_event) => {}
+            EventMsg::CollabResumeEnd(_event) => {}
             EventMsg::PlanModeChanged(event) => {
                 self.plan_mode = event.enabled;
                 let message = if event.enabled {
@@ -2746,9 +2739,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use smooth_protocol::{
         AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
-        AgentReasoningDeltaEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent, EventMsg,
-        StreamErrorEvent, ToolCallCompletedEvent, ToolCallStartedEvent, TurnCompletedEvent,
-        TurnInterruptedEvent, TurnStartedEvent,
+        AgentReasoningDeltaEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
+        CollabResumeBeginEvent, CollabResumeEndEvent, EventMsg, StreamErrorEvent,
+        ToolCallCompletedEvent, ToolCallStartedEvent, TurnCompletedEvent, TurnInterruptedEvent,
+        TurnStartedEvent,
     };
 
     fn event(id: &str, msg: EventMsg) -> Event {
@@ -3565,6 +3559,44 @@ mod tests {
         assert_eq!(joined.matches(prompt).count(), 1);
         assert!(!joined.contains("Spawning sub-agent"));
         assert!(!joined.contains("Spawn ended"));
+    }
+
+    #[test]
+    fn resume_lifecycle_events_are_transcript_silent() {
+        let mut app = App::new();
+        let sender_thread_id = ThreadId::new();
+        let receiver_thread_id = ThreadId::new();
+
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::CollabResumeBegin(CollabResumeBeginEvent {
+                    call_id: String::from("resume-child"),
+                    sender_thread_id,
+                    receiver_thread_id,
+                    receiver_agent_nickname: Some(String::from("child")),
+                }),
+            ),
+            20,
+        );
+        app.handle_session_event(
+            event(
+                "2",
+                EventMsg::CollabResumeEnd(CollabResumeEndEvent {
+                    call_id: String::from("resume-child"),
+                    sender_thread_id,
+                    receiver_thread_id,
+                    receiver_agent_nickname: Some(String::from("child")),
+                    status: AgentStatus::Completed(Some(String::from("done"))),
+                }),
+            ),
+            20,
+        );
+
+        assert!(app.model.transcript_items.is_empty());
+        let rendered = transcript_strings(&app).join("\n");
+        assert!(!rendered.contains("Resuming agent"));
+        assert!(!rendered.contains("Resume finished"));
     }
 
     #[test]

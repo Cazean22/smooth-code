@@ -589,20 +589,32 @@ async fn run_manual_turn(
             new_messages.push(message);
         }
         let last_assistant_message = assistant_text_for_message(&turn_summary, &accumulated_text);
-        if let Some((_already_recorded_prompt, model_facing_tail)) = new_messages.split_first() {
-            session.persist_history_messages(model_facing_tail).await;
-        }
+        let persisted = match new_messages.split_first() {
+            Some((_already_recorded_prompt, model_facing_tail)) => {
+                session.persist_history_messages(model_facing_tail).await
+            }
+            None => true,
+        };
         let mut final_history = history_before_turn;
         final_history.extend(new_messages);
         session.replace_history(final_history).await;
         // The turn's result (including every consumed child's completion) is now
         // durable in the parent's rollout, so it is finally safe to close those
         // children's parent→child edges. Doing this only here — never on the
-        // cancel/early-return paths above — guarantees we never close an edge
-        // before the result that supersedes it has been persisted: an
-        // interrupted or crashed turn leaves the edge open so resume can
-        // rehydrate the child.
-        close_consumed_child_edges(&session, &consumed_children).await;
+        // cancel/early-return paths above, and never when persistence failed —
+        // guarantees we never close an edge before the result that supersedes it
+        // is durable: an interrupted, crashed, or unpersisted turn leaves the
+        // edge open so resume can rehydrate the child.
+        if persisted {
+            close_consumed_child_edges(&session, &consumed_children).await;
+        } else if !consumed_children.is_empty() {
+            tracing::warn!(
+                thread_id = %session.id,
+                turn_id = %ctx.sub_id,
+                consumed_children = consumed_children.len(),
+                "history persistence failed; leaving consumed-child edges open for resume"
+            );
+        }
         if !last_assistant_message.is_empty() {
             session
                 .emit_event(

@@ -438,15 +438,28 @@ impl Session {
             .await;
     }
 
-    pub(crate) async fn persist_history_messages(&self, messages: &[Message]) {
+    /// Persist the turn's model-facing tail to the rollout. Returns `false` if
+    /// any append failed, so callers can skip irreversible follow-up actions
+    /// (e.g. closing consumed-child edges) when the result is not durable.
+    pub(crate) async fn persist_history_messages(&self, messages: &[Message]) -> bool {
+        let mut persisted = true;
         for message in messages {
-            let _ = self
+            if let Err(err) = self
                 .rollout
                 .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
                     message: message.clone(),
                 }))
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    thread_id = %self.id,
+                    error = %err,
+                    "failed to persist history message to rollout"
+                );
+                persisted = false;
+            }
         }
+        persisted
     }
 
     pub(crate) async fn emit_event(&self, ctx: &TurnContext, msg: EventMsg) {

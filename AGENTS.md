@@ -3,7 +3,7 @@
 ## Repo Scope
 
 - This is a Rust 2024 workspace. No nested `AGENTS.md`/`AGENT.md` files or Cursor/Claude/Windsurf/Cline/Goose/Copilot rule files were found in this repo.
-- When a task yields durable repo knowledge, record it in `PROGRESS.md` before the final response. Organize entries by subsystem/topic, not by chat timeline, and keep them focused on reusable decisions, caveats, and verification notes.
+- When a real implementation, debugging, or fix task yields durable repo knowledge, record it in `PROGRESS.md` before the final response. Organize entries by subsystem/topic, not by chat timeline, and keep them focused on reusable decisions, caveats, and verification notes. Do not update `PROGRESS.md` for inspection-only/listing/exploration tasks unless the user explicitly asks to persist findings.
 - `.cargo/config.toml` enables `tokio_unstable`; do not remove or bypass it casually.
 - Default workspace member is `crates/tui`, so bare `cargo build`, `cargo test`, and `cargo run` target `smooth-tui` unless `--workspace` or `-p` is used.
 - Workspace members are `app-server`, `app-server-protocol`, `smooth-core`, `smooth-protocol`, `smooth-state-db`, `tools`, and `smooth-tui`.

@@ -18,6 +18,8 @@ use tokio::{
     sync::Mutex,
 };
 
+use crate::agent::subagent_result::{CompletionEntry, completion_entries_to_user_message};
+
 #[derive(Debug, Clone)]
 pub(crate) struct RolloutRecorder {
     path: PathBuf,
@@ -46,9 +48,22 @@ pub struct ResumeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub(crate) enum HistoryMessage {
-    UserText { text: String },
-    AssistantText { text: String },
-    Full { message: Message },
+    UserText {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
+    Full {
+        message: Message,
+    },
+    /// A deferred subagent batch's completions. Stored as the typed source of
+    /// truth; the model-facing `Message::User` (one `agent_completed` JSON text
+    /// item per entry) is reconstructed from it on resume via
+    /// [`completion_entries_to_user_message`], byte-identical to the live turn.
+    SubagentCompletion {
+        completions: Vec<CompletionEntry>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +222,15 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
             PersistedItem::HistoryMessage(HistoryMessage::Full { message }) => {
                 history.push(message);
             }
+            PersistedItem::HistoryMessage(HistoryMessage::SubagentCompletion { completions }) => {
+                // Reconstruct the model-facing user message the live turn built,
+                // restoring it into provider history. Like `Full`, it carries no
+                // transcript row (deferred completions are transcript-silent), so
+                // it does not push to `initial_messages`.
+                if let Some(message) = completion_entries_to_user_message(&completions) {
+                    history.push(message);
+                }
+            }
             PersistedItem::UserMessage { text } => {
                 initial_messages.push(EventMsg::UserMessage { text });
             }
@@ -350,6 +374,11 @@ async fn summarize_rollout(path: &Path) -> Result<ThreadSummary> {
             PersistedItem::HistoryMessage(HistoryMessage::Full { message }) => {
                 update_assistant_summary_message(&message, &mut last_assistant_message);
             }
+            PersistedItem::HistoryMessage(HistoryMessage::SubagentCompletion { .. }) => {
+                // A subagent completion is internal tool context, not the
+                // parent's own speech: it must not surface as the thread's
+                // `last_user_message` preview (nor as an assistant summary).
+            }
             PersistedItem::UserMessage { text } => {
                 last_user_message = Some(text);
             }
@@ -415,7 +444,8 @@ pub(crate) fn workspace_root() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use smooth_protocol::{
-        ProjectInstructionEntry, ProjectInstructions, SessionConfiguredEvent, TurnStartedEvent,
+        AgentPath, AgentStatus, ProjectInstructionEntry, ProjectInstructions,
+        SessionConfiguredEvent, TurnStartedEvent,
     };
 
     fn test_root(name: &str) -> PathBuf {
@@ -539,6 +569,119 @@ mod tests {
             state.initial_messages.last(),
             Some(EventMsg::TurnInterrupted(turn)) if turn.reason == "resume_recovery"
         ));
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_reconstructs_subagent_completion_into_model_history() -> Result<()> {
+        let root = test_root("resume-subagent-completion");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
+                text: "spawn two agents".to_string(),
+            }))
+            .await?;
+        // A grouped deferred completion: two entries sharing one user message,
+        // exactly as a mixed-batch flush persists them.
+        let completions = vec![
+            CompletionEntry {
+                child_thread_id: Some(ThreadId::new()),
+                agent_path: AgentPath::root().join("alpha")?,
+                agent_nickname: Some("alpha".to_string()),
+                status: AgentStatus::Completed(Some("alpha done".to_string())),
+                last_assistant_message: None,
+            },
+            CompletionEntry {
+                child_thread_id: Some(ThreadId::new()),
+                agent_path: AgentPath::root().join("beta")?,
+                agent_nickname: Some("beta".to_string()),
+                status: AgentStatus::Completed(Some("beta done".to_string())),
+                last_assistant_message: Some("explicit override".to_string()),
+            },
+        ];
+        recorder
+            .append(PersistedItem::HistoryMessage(
+                HistoryMessage::SubagentCompletion {
+                    completions: completions.clone(),
+                },
+            ))
+            .await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        // Reconstructs into provider history (prompt + the completion message),
+        // never into the visible transcript.
+        assert_eq!(state.history.len(), 2);
+        assert!(matches!(state.history[0], Message::User { .. }));
+        let Some(Message::User { content }) = state.history.get(1) else {
+            panic!("expected the reconstructed subagent-completion user message");
+        };
+        let reconstructed_texts = content
+            .iter()
+            .filter_map(|item| match item {
+                UserContent::Text(Text { text }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Byte-identical to what the live turn would have produced (one
+        // `agent_completed` JSON text item per entry, in order).
+        let expected_texts = completions
+            .iter()
+            .map(CompletionEntry::to_model_json)
+            .collect::<Vec<_>>();
+        assert_eq!(reconstructed_texts, expected_texts);
+        assert!(
+            !state
+                .initial_messages
+                .iter()
+                .any(|event| matches!(event, EventMsg::UserMessage { .. }))
+        );
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_summary_ignores_subagent_completion_record() -> Result<()> {
+        let root = test_root("list-subagent-completion");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(
+                persisted_event_item(&EventMsg::UserMessage {
+                    text: "human prompt".to_string(),
+                })
+                .with_context(|| "user message should persist")?,
+            )
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(
+                HistoryMessage::SubagentCompletion {
+                    completions: vec![CompletionEntry {
+                        child_thread_id: Some(ThreadId::new()),
+                        agent_path: AgentPath::root().join("alpha")?,
+                        agent_nickname: Some("alpha".to_string()),
+                        status: AgentStatus::Completed(Some("internal".to_string())),
+                        last_assistant_message: Some("internal".to_string()),
+                    }],
+                },
+            ))
+            .await?;
+
+        let threads = list_threads(&root).await?;
+        assert_eq!(threads.len(), 1);
+        assert_eq!(
+            threads[0].last_user_message.as_deref(),
+            Some("human prompt")
+        );
 
         let _ = fs::remove_dir_all(&root).await;
         Ok(())

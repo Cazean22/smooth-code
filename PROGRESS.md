@@ -44,6 +44,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - The local OpenAI-compatible WebSocket proxy closes immediately after upgrade when `input` contains `role: system`; after Rig builds the Responses request, move system-role input items into the provider-level `instructions` field instead of downgrading them to user-visible text.
 - Keep OpenAI WebSocket inbound parsing local and tolerant rather than relying on Rig's private `StreamingCompletionChunk` parser; the local proxy emits provider telemetry and some known event types with payload shapes that may not match Rig's strict structs.
 - OpenAI WebSocket lifecycle responses from the local proxy may omit `output`; parse lifecycle fields (`status`, `usage`, errors, optional output IDs) from raw JSON instead of deserializing the full Responses completion object.
+- OpenAI Responses requires assistant `message` input items that came from a reasoning response to be paired with the corresponding `reasoning` input item (`msg_*` depends on `rs_*`). If a fallback parser extracts only the assistant message ID/text from a terminal `response.completed`/`response.done` `output`, it must also extract the paired reasoning output or drop the provider message ID before replaying history.
 
 ## Rollout and Resume Persistence
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,7 +19,7 @@ use tools::AskUserClient;
 use tracing::Instrument;
 
 use crate::{
-    agent::{AgentControl, SystemPromptKind},
+    agent::{AgentControl, SystemPromptKind, subagent_result::CompletionEntry},
     context_manager::ContextManager,
     error::{CoreError, CoreResult},
     provider::{SessionModel, SessionModelFactory},
@@ -438,23 +439,35 @@ impl Session {
             .await;
     }
 
-    /// Persist the turn's model-facing tail to the rollout. Returns `false` if
-    /// any append failed, so callers can skip irreversible follow-up actions
+    /// Persist the turn's model-facing tail (everything after the
+    /// already-recorded prompt at index 0) to the rollout. Tail indices present
+    /// in `completions_by_index` are written as typed `SubagentCompletion`
+    /// records — the durable source of truth — instead of the rendered
+    /// `Message::User`; every other tail message is written as `Full`. Returns
+    /// `false` if any append failed, so callers can skip irreversible follow-up
     /// (e.g. closing consumed-child edges) when the result is not durable.
-    pub(crate) async fn persist_history_messages(&self, messages: &[Message]) -> bool {
+    pub(crate) async fn persist_turn_tail(
+        &self,
+        new_messages: &[Message],
+        completions_by_index: &BTreeMap<usize, Vec<CompletionEntry>>,
+    ) -> bool {
         let mut persisted = true;
-        for message in messages {
-            if let Err(err) = self
-                .rollout
-                .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+        for (index, message) in new_messages.iter().enumerate().skip(1) {
+            let item = match completions_by_index.get(&index) {
+                Some(completions) => {
+                    PersistedItem::HistoryMessage(HistoryMessage::SubagentCompletion {
+                        completions: completions.clone(),
+                    })
+                }
+                None => PersistedItem::HistoryMessage(HistoryMessage::Full {
                     message: message.clone(),
-                }))
-                .await
-            {
+                }),
+            };
+            if let Err(err) = self.rollout.append(item).await {
                 tracing::warn!(
                     thread_id = %self.id,
                     error = %err,
-                    "failed to persist history message to rollout"
+                    "failed to persist turn-tail item to rollout"
                 );
                 persisted = false;
             }

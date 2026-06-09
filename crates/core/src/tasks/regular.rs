@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures_util::{FutureExt, StreamExt, future::select_all, stream::FuturesUnordered};
 use indexmap::IndexMap;
@@ -10,7 +10,6 @@ use rig::{
         ToolResult, ToolResultContent, UserContent,
     },
 };
-use serde::{Deserialize, Serialize};
 use smooth_protocol::{
     AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
     AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, ErrorInfo, EventMsg, ProjectInstructions,
@@ -24,7 +23,10 @@ use crate::{
         AgentControl, InlineChildCompletionReceiver, SystemPromptKind,
         control::InlineChildCompletion,
         registry::AgentMetadata,
-        status::{is_final, last_assistant_message},
+        status::is_final,
+        subagent_result::{
+            CompletionEntry, completion_entries_to_user_message, encode_spawn_agent_result,
+        },
     },
     core::{Session, TurnContext},
     provider::{
@@ -92,22 +94,6 @@ impl RegularTask {
     pub(crate) fn new() -> Self {
         Self
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct SpawnAgentResult {
-    event: String,
-    thread_id: String,
-    agent_path: String,
-    agent_nickname: Option<String>,
-    status: Option<String>,
-    #[serde(default)]
-    status_detail: Option<AgentStatus>,
-    #[serde(default)]
-    last_assistant_message: Option<String>,
-    next_action: String,
-    instructions: String,
 }
 
 struct ExecutedToolCall {
@@ -260,6 +246,12 @@ async fn run_manual_turn(
     cancellation_token: CancellationToken,
 ) -> Option<String> {
     let mut new_messages = vec![initial_prompt];
+    // Maps an index in `new_messages` to the typed completion group that index
+    // was rendered from, so the turn-end persist can write a typed
+    // `SubagentCompletion` record there instead of an opaque user message while
+    // the in-memory history keeps the rendered `Message::User`. Populated only
+    // through `push_completion_group`, so the index can never drift.
+    let mut completions_by_index: BTreeMap<usize, Vec<CompletionEntry>> = BTreeMap::new();
     let mut saw_tool_loop = false;
     let mut retained_subagents = Vec::new();
     // Children consumed during this turn are released from in-memory state
@@ -272,7 +264,7 @@ async fn run_manual_turn(
     // before-output retry budget; provider retries handle startup churn, while
     // this counter bounds only attempts that already yielded assistant output.
     let mut stream_retries = 0;
-    let mut stream_phase_completions: Vec<String> = Vec::new();
+    let mut stream_phase_completions: Vec<CompletionEntry> = Vec::new();
 
     'turn_loop: loop {
         if cancellation_token.is_cancelled() {
@@ -363,12 +355,12 @@ async fn run_manual_turn(
                         if let Some(message) = tool_results_to_user_message(tool_results) {
                             new_messages.push(message);
                         }
-                        if saw_tool_call_this_attempt
-                            && let Some(message) = text_items_to_user_message(std::mem::take(
-                                &mut stream_phase_completions,
-                            ))
-                        {
-                            new_messages.push(message);
+                        if saw_tool_call_this_attempt {
+                            push_completion_group(
+                                &mut new_messages,
+                                &mut completions_by_index,
+                                std::mem::take(&mut stream_phase_completions),
+                            );
                         }
                         if !accumulated_text.is_empty() {
                             session
@@ -544,17 +536,18 @@ async fn run_manual_turn(
             if let Some(message) = tool_results_to_user_message(executed_tool_calls) {
                 new_messages.push(message);
             }
-            if let Some(message) =
-                text_items_to_user_message(std::mem::take(&mut stream_phase_completions))
-            {
-                new_messages.push(message);
-            }
+            push_completion_group(
+                &mut new_messages,
+                &mut completions_by_index,
+                std::mem::take(&mut stream_phase_completions),
+            );
             continue;
         }
 
         if !stream_phase_completions.is_empty() {
             append_completion_texts_after_assistant_turn(
                 &mut new_messages,
+                &mut completions_by_index,
                 &turn_summary,
                 &accumulated_text,
                 &mut accumulated_reasoning,
@@ -565,17 +558,18 @@ async fn run_manual_turn(
         }
 
         if !retained_subagents.is_empty() {
-            let completion_texts = tokio::select! {
+            let completion_entries = tokio::select! {
                 _ = cancellation_token.cancelled() => return None,
                 completions = drain_retained_subagent_completions(&mut retained_subagents, &session.agent_control, &mut consumed_children) => completions,
             };
             append_completion_texts_after_assistant_turn(
                 &mut new_messages,
+                &mut completions_by_index,
                 &turn_summary,
                 &accumulated_text,
                 &mut accumulated_reasoning,
                 session.model().await.requires_provider_reasoning_ids(),
-                completion_texts,
+                completion_entries,
             );
             continue;
         }
@@ -589,12 +583,9 @@ async fn run_manual_turn(
             new_messages.push(message);
         }
         let last_assistant_message = assistant_text_for_message(&turn_summary, &accumulated_text);
-        let persisted = match new_messages.split_first() {
-            Some((_already_recorded_prompt, model_facing_tail)) => {
-                session.persist_history_messages(model_facing_tail).await
-            }
-            None => true,
-        };
+        let persisted = session
+            .persist_turn_tail(&new_messages, &completions_by_index)
+            .await;
         let mut final_history = history_before_turn;
         final_history.extend(new_messages);
         session.replace_history(final_history).await;
@@ -803,7 +794,7 @@ async fn execute_pending_tool_calls_for_turn(
     pending_tool_calls: Vec<PendingToolCall>,
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
     consumed_children: &mut Vec<ThreadId>,
-    stream_phase_completions: &mut Vec<String>,
+    stream_phase_completions: &mut Vec<CompletionEntry>,
     cancellation_token: &CancellationToken,
 ) -> Option<Vec<ExecutedToolCall>> {
     let DispatchedTools {
@@ -1374,7 +1365,7 @@ async fn next_retained_subagent_completion(
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
     agent_control: &AgentControl,
     consumed_children: &mut Vec<ThreadId>,
-) -> Option<String> {
+) -> Option<CompletionEntry> {
     if retained_subagents.is_empty() {
         return None;
     }
@@ -1399,14 +1390,14 @@ async fn next_retained_subagent_completion(
         release_consumed_child(agent_control, child_thread_id).await;
         consumed_children.push(child_thread_id);
     }
-    Some(retained_completion_text(entry.metadata, completion))
+    Some(CompletionEntry::from_inline(&entry.metadata, completion))
 }
 
 async fn drain_retained_subagent_completions(
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
     agent_control: &AgentControl,
     consumed_children: &mut Vec<ThreadId>,
-) -> Vec<String> {
+) -> Vec<CompletionEntry> {
     let retained = std::mem::take(retained_subagents);
     // Each retained child resolves and is released concurrently; the in-memory
     // release is internally synchronized, but the `consumed_children` record is
@@ -1427,17 +1418,20 @@ async fn drain_retained_subagent_completions(
         if let Some(child_thread_id) = child_thread_id {
             release_consumed_child(agent_control, child_thread_id).await;
         }
-        (retained_completion_text(metadata, completion), child_thread_id)
+        (
+            CompletionEntry::from_inline(&metadata, completion),
+            child_thread_id,
+        )
     });
     let resolved = futures_util::future::join_all(completions).await;
-    let mut texts = Vec::with_capacity(resolved.len());
-    for (text, child_thread_id) in resolved {
+    let mut entries = Vec::with_capacity(resolved.len());
+    for (entry, child_thread_id) in resolved {
         if let Some(child_thread_id) = child_thread_id {
             consumed_children.push(child_thread_id);
         }
-        texts.push(text);
+        entries.push(entry);
     }
-    texts
+    entries
 }
 
 /// Release a consumed child's in-memory resources (actor, registry slot, status
@@ -1474,31 +1468,14 @@ async fn close_consumed_child_edges(session: &Arc<Session>, consumed_children: &
     }
 }
 
-fn retained_completion_text(
-    metadata: AgentMetadata,
-    completion: Result<InlineChildCompletion, String>,
-) -> String {
-    let (status, last_assistant_message) = match completion {
-        Ok(completion) => (completion.status, completion.last_assistant_message),
-        Err(message) => (
-            AgentStatus::Errored(
-                ErrorInfo::new("spawn_agent_inline_wait_failed", message)
-                    .with_source("smooth-core"),
-            ),
-            None,
-        ),
-    };
-    encode_spawn_agent_result(&metadata, &status, last_assistant_message)
-        .unwrap_or_else(|message| message)
-}
-
 fn append_completion_texts_after_assistant_turn(
     new_messages: &mut Vec<Message>,
+    completions_by_index: &mut BTreeMap<usize, Vec<CompletionEntry>>,
     turn_summary: &SessionTurnSummary,
     accumulated_text: &str,
     accumulated_reasoning: &mut Vec<MessageReasoning>,
     requires_provider_reasoning_ids: bool,
-    completion_texts: Vec<String>,
+    completion_entries: Vec<CompletionEntry>,
 ) {
     if let Some(message) = build_assistant_text_reasoning_message(
         turn_summary,
@@ -1508,7 +1485,21 @@ fn append_completion_texts_after_assistant_turn(
     ) {
         new_messages.push(message);
     }
-    if let Some(message) = text_items_to_user_message(completion_texts) {
+    push_completion_group(new_messages, completions_by_index, completion_entries);
+}
+
+/// Render a completion group into the model-facing `Message::User` and push it to
+/// `new_messages`, recording its index so the turn-end persist writes a typed
+/// `SubagentCompletion` record there. The index is recorded immediately before
+/// the matching push and `new_messages` is append-only within a turn, so the two
+/// cannot drift. An empty group pushes nothing (and records nothing).
+fn push_completion_group(
+    new_messages: &mut Vec<Message>,
+    completions_by_index: &mut BTreeMap<usize, Vec<CompletionEntry>>,
+    entries: Vec<CompletionEntry>,
+) {
+    if let Some(message) = completion_entries_to_user_message(&entries) {
+        completions_by_index.insert(new_messages.len(), entries);
         new_messages.push(message);
     }
 }
@@ -1590,58 +1581,6 @@ fn build_assistant_text_reasoning_message(
         id: turn_summary.assistant_message_id.clone(),
         content: OneOrMany::many(content_items).ok()?,
     })
-}
-
-fn encode_spawn_agent_result(
-    metadata: &AgentMetadata,
-    status: &AgentStatus,
-    last_assistant_message_override: Option<String>,
-) -> Result<String, String> {
-    serde_json::to_string(&spawn_agent_result_from_metadata(
-        metadata,
-        status,
-        last_assistant_message_override,
-    ))
-    .map_err(|err| format!("failed to encode spawn_agent output: {err}"))
-}
-
-fn spawn_agent_result_from_metadata(
-    metadata: &AgentMetadata,
-    status: &AgentStatus,
-    last_assistant_message_override: Option<String>,
-) -> SpawnAgentResult {
-    let is_live = matches!(status, AgentStatus::PendingInit | AgentStatus::Running);
-    SpawnAgentResult {
-        event: if is_live {
-            String::from("agent_status")
-        } else {
-            String::from("agent_completed")
-        },
-        thread_id: metadata
-            .agent_id
-            .map(|thread_id| thread_id.to_string())
-            .unwrap_or_default(),
-        agent_path: metadata.agent_path.to_string(),
-        agent_nickname: metadata.agent_nickname.clone(),
-        status: Some(agent_status_label(status).to_string()),
-        status_detail: Some(status.clone()),
-        last_assistant_message: last_assistant_message_override
-            .or_else(|| last_assistant_message(status)),
-        next_action: if is_live {
-            String::from("wait_for_agent_completed")
-        } else {
-            String::from("use_agent_result")
-        },
-        instructions: if is_live {
-            String::from(
-                "This sub-agent is still running. Do not answer or guess from this status. No wait tool is needed; wait for a later user message with event=\"agent_completed\" and the same thread_id.",
-            )
-        } else {
-            String::from(
-                "This sub-agent has finished. Use last_assistant_message and status_detail as the sub-agent result.",
-            )
-        },
-    }
 }
 
 fn build_request_parts(
@@ -1751,33 +1690,11 @@ fn tool_results_to_user_message(executed_tool_calls: Vec<ExecutedToolCall>) -> O
         .map(|content| Message::User { content })
 }
 
-fn text_items_to_user_message(texts: Vec<String>) -> Option<Message> {
-    let content = texts
-        .into_iter()
-        .map(|text| UserContent::Text(Text { text }))
-        .collect::<Vec<_>>();
-    OneOrMany::many(content)
-        .ok()
-        .map(|content| Message::User { content })
-}
-
 fn tool_result(id: String, call_id: Option<String>, tool_result: String) -> ToolResult {
     ToolResult {
         id,
         call_id,
         content: ToolResultContent::from_tool_output(tool_result),
-    }
-}
-
-fn agent_status_label(status: &AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::PendingInit => "pending_init",
-        AgentStatus::Running => "running",
-        AgentStatus::Interrupted => "interrupted",
-        AgentStatus::Completed(_) => "completed",
-        AgentStatus::Errored(_) => "errored",
-        AgentStatus::Shutdown => "shutdown",
-        AgentStatus::NotFound => "not_found",
     }
 }
 

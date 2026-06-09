@@ -426,7 +426,7 @@ impl AgentControl {
     ///
     /// This deliberately does **not** close the persisted parent→child edge: the
     /// child's result is not durable in the parent's rollout until the turn ends
-    /// (see [`crate::tasks`]'s `persist_history_messages`), so closing the edge
+    /// (see [`crate::tasks`]'s `persist_turn_tail`), so closing the edge
     /// here would close it before the result that supersedes it is durable. Edge
     /// closure is deferred to [`AgentControl::close_consumed_agent_edge`], called
     /// only after the result is persisted; an interrupted or crashed turn instead

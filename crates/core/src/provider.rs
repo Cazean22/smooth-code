@@ -1230,6 +1230,8 @@ pub(crate) fn openai_websocket_retry_delay(retry_count: usize) -> Duration {
 struct OpenAiWebSocketAccumulator {
     final_usage: ResponsesUsage,
     message_id: Option<String>,
+    fallback_reasoning: Vec<OpenAiWebSocketRawChoice>,
+    completed_reasoning_ids: HashSet<String>,
     tool_calls: Vec<OpenAiWebSocketRawChoice>,
     tool_call_internal_ids: HashMap<String, String>,
     pending_tool_calls: HashMap<String, PendingOpenAiToolCall>,
@@ -1257,6 +1259,8 @@ impl OpenAiWebSocketAccumulator {
         Self {
             final_usage: empty_openai_usage(),
             message_id: None,
+            fallback_reasoning: Vec::new(),
+            completed_reasoning_ids: HashSet::new(),
             tool_calls: Vec::new(),
             tool_call_internal_ids: HashMap::new(),
             pending_tool_calls: HashMap::new(),
@@ -1395,25 +1399,77 @@ impl OpenAiWebSocketAccumulator {
         {
             self.final_usage = usage;
         }
-        if self.message_id.is_none() {
-            self.message_id = response
-                .get("output")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|output| {
-                    output.iter().find_map(|item| {
-                        if item
-                            .get("type")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|kind| kind == "message")
-                        {
-                            item.get("id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string)
-                        } else {
-                            None
-                        }
-                    })
-                });
+        self.record_terminal_output_items(response);
+    }
+
+    fn record_terminal_output_items(&mut self, response: &serde_json::Value) {
+        let Some(output) = response.get("output").and_then(serde_json::Value::as_array) else {
+            return;
+        };
+
+        for item in output {
+            match serde_json::from_value::<Output>(item.clone()) {
+                Ok(output) => self.record_terminal_output_item(output),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "skipping OpenAI WebSocket terminal output item with unsupported payload shape"
+                    );
+                }
+            }
+        }
+    }
+
+    fn record_terminal_output_item(&mut self, item: Output) {
+        match item {
+            Output::Reasoning {
+                id,
+                summary,
+                encrypted_content,
+                ..
+            } => self.push_fallback_reasoning_output(id, summary, encrypted_content),
+            Output::FunctionCall(func) => {
+                if !self.completed_tool_call_ids.contains(&func.id) {
+                    self.complete_output_seen = true;
+                    self.completed_tool_call_ids.insert(func.id.clone());
+                    let internal_call_id = self.internal_call_id_for(&func.id);
+                    let tool_call = RawStreamingToolCall::new(func.id, func.name, func.arguments)
+                        .with_internal_call_id(internal_call_id)
+                        .with_call_id(func.call_id);
+                    self.tool_calls
+                        .push(RawStreamingChoice::ToolCall(tool_call));
+                }
+            }
+            Output::Message(message) => {
+                self.complete_output_seen = true;
+                if self.message_id.is_none() {
+                    self.message_id = Some(message.id);
+                }
+            }
+            Output::Unknown => {}
+        }
+    }
+
+    fn push_fallback_reasoning_output(
+        &mut self,
+        id: String,
+        summary: Vec<ReasoningSummary>,
+        encrypted_content: Option<String>,
+    ) {
+        if self.completed_reasoning_ids.insert(id.clone()) {
+            push_reasoning_choices(&mut self.fallback_reasoning, id, summary, encrypted_content);
+        }
+    }
+
+    fn push_reasoning_output_immediate(
+        &mut self,
+        id: String,
+        summary: Vec<ReasoningSummary>,
+        encrypted_content: Option<String>,
+        immediate: &mut Vec<OpenAiWebSocketRawChoice>,
+    ) {
+        if self.completed_reasoning_ids.insert(id.clone()) {
+            push_reasoning_choices(immediate, id, summary, encrypted_content);
         }
     }
 
@@ -1439,19 +1495,7 @@ impl OpenAiWebSocketAccumulator {
                 encrypted_content,
                 ..
             } => {
-                for summary in summary {
-                    let ReasoningSummary::SummaryText { text } = summary;
-                    immediate.push(RawStreamingChoice::Reasoning {
-                        id: Some(id.clone()),
-                        content: ReasoningContent::Summary(text),
-                    });
-                }
-                if let Some(encrypted_content) = encrypted_content {
-                    immediate.push(RawStreamingChoice::Reasoning {
-                        id: Some(id),
-                        content: ReasoningContent::Encrypted(encrypted_content),
-                    });
-                }
+                self.push_reasoning_output_immediate(id, summary, encrypted_content, immediate);
             }
             Output::Message(message) => {
                 self.complete_output_seen = true;
@@ -1541,6 +1585,7 @@ impl OpenAiWebSocketAccumulator {
                     .push(RawStreamingChoice::ToolCall(tool_call));
             }
         }
+        choices.append(&mut self.fallback_reasoning);
         if let Some(message_id) = self.message_id.take() {
             choices.push(RawStreamingChoice::MessageId(message_id));
         }
@@ -1551,6 +1596,27 @@ impl OpenAiWebSocketAccumulator {
             },
         ));
         choices
+    }
+}
+
+fn push_reasoning_choices(
+    choices: &mut Vec<OpenAiWebSocketRawChoice>,
+    id: String,
+    summary: Vec<ReasoningSummary>,
+    encrypted_content: Option<String>,
+) {
+    for summary in summary {
+        let ReasoningSummary::SummaryText { text } = summary;
+        choices.push(RawStreamingChoice::Reasoning {
+            id: Some(id.clone()),
+            content: ReasoningContent::Summary(text),
+        });
+    }
+    if let Some(encrypted_content) = encrypted_content {
+        choices.push(RawStreamingChoice::Reasoning {
+            id: Some(id),
+            content: ReasoningContent::Encrypted(encrypted_content),
+        });
     }
 }
 
@@ -2447,6 +2513,85 @@ mod tests {
             finished.last(),
             Some(RawStreamingChoice::FinalResponse(response)) if response.usage.total_tokens == 3
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_websocket_completed_response_output_preserves_reasoning_before_message_id()
+    -> Result<()> {
+        let mut accumulator = super::OpenAiWebSocketAccumulator::new();
+        let payload = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [{
+                            "type": "summary_text",
+                            "text": "thinking"
+                        }],
+                        "encrypted_content": "opaque-cot"
+                    },
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "answer"
+                        }]
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "output_tokens_details": {"reasoning_tokens": 1},
+                    "total_tokens": 3
+                }
+            }
+        })
+        .to_string();
+
+        let outcome = super::parse_openai_websocket_payload(&payload, &mut accumulator)?;
+
+        assert!(outcome.choices.is_empty());
+        assert!(outcome.terminal);
+        let finished = accumulator.finish();
+        let summary_index = finished
+            .iter()
+            .position(|choice| {
+                matches!(
+                    choice,
+                    RawStreamingChoice::Reasoning {
+                        id,
+                        content: rig::message::ReasoningContent::Summary(text)
+                    } if id.as_deref() == Some("rs_1") && text == "thinking"
+                )
+            })
+            .context("terminal response reasoning summary should be emitted")?;
+        let encrypted_index = finished
+            .iter()
+            .position(|choice| {
+                matches!(
+                    choice,
+                    RawStreamingChoice::Reasoning {
+                        id,
+                        content: rig::message::ReasoningContent::Encrypted(data)
+                    } if id.as_deref() == Some("rs_1") && data == "opaque-cot"
+                )
+            })
+            .context("terminal response encrypted reasoning should be emitted")?;
+        let message_index = finished
+            .iter()
+            .position(|choice| matches!(choice, RawStreamingChoice::MessageId(id) if id == "msg_1"))
+            .context("terminal response message id should be emitted")?;
+
+        assert!(summary_index < message_index);
+        assert!(encrypted_index < message_index);
         Ok(())
     }
 

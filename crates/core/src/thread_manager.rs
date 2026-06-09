@@ -387,7 +387,10 @@ impl ThreadManagerState {
                             .unwrap_or(AgentStatus::Shutdown),
                     )
                 } else {
-                    match self.peek_child_status(&workspace_root, child_thread_id).await {
+                    match self
+                        .peek_child_status(&workspace_root, child_thread_id)
+                        .await
+                    {
                         Ok(status @ AgentStatus::Completed(_)) => Some(status),
                         _ => None,
                     }

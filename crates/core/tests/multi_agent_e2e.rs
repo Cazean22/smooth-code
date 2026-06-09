@@ -2178,11 +2178,11 @@ impl SessionModelFactory for SequentialSpawnFactory {
         _plan_mode: bool,
     ) -> Result<SessionModel> {
         match system_prompt_kind {
-            SystemPromptKind::Root => Ok(SessionModel::Stub(Arc::new(
-                SequentialSpawnParentDriver {
+            SystemPromptKind::Root => {
+                Ok(SessionModel::Stub(Arc::new(SequentialSpawnParentDriver {
                     calls: Mutex::new(0),
-                },
-            ))),
+                })))
+            }
             _ => Ok(SessionModel::Stub(Arc::new(StubDriver {
                 text: "child done".to_string(),
             }))),
@@ -2313,12 +2313,12 @@ impl SessionModelFactory for ConsumeThenBlockFactory {
         _plan_mode: bool,
     ) -> Result<SessionModel> {
         match system_prompt_kind {
-            SystemPromptKind::Root => Ok(SessionModel::Stub(Arc::new(
-                ConsumeThenBlockParentDriver {
+            SystemPromptKind::Root => {
+                Ok(SessionModel::Stub(Arc::new(ConsumeThenBlockParentDriver {
                     calls: Mutex::new(0),
                     block: Arc::clone(&self.block),
-                },
-            ))),
+                })))
+            }
             _ => Ok(SessionModel::Stub(Arc::new(StubDriver {
                 text: "child done".to_string(),
             }))),
@@ -2369,7 +2369,10 @@ async fn interrupted_consumed_child_is_reaped_on_resume() -> Result<()> {
             Err(_) => break,
         }
     }
-    assert!(child_completed, "child should complete before the parent blocks");
+    assert!(
+        child_completed,
+        "child should complete before the parent blocks"
+    );
 
     // Wait until the child has been released in-memory (registry back to just
     // root). The parent turn is now blocked in its second model call — past the

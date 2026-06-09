@@ -440,7 +440,9 @@ fn is_preformatted_line(line: &Line<'static>) -> bool {
 fn render_user_message(message: &str, width: u16) -> Vec<Line<'static>> {
     const GUTTER: &str = "▌ ";
     let gutter_width = wrap::display_width(GUTTER);
-    let body_width = usize::from(width.max(1)).saturating_sub(gutter_width).max(1);
+    let body_width = usize::from(width.max(1))
+        .saturating_sub(gutter_width)
+        .max(1);
 
     let body = if message.is_empty() {
         vec![Line::default()]

@@ -1,3 +1,4 @@
+use app_server_protocol::AskUserQuestionAnswer;
 use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
@@ -63,6 +64,26 @@ impl TranscriptItem {
             version: 0,
             kind: TranscriptItemKind::Plain { lines, hang_indent },
         }
+    }
+
+    /// Summary row pushed when the user answers an `ask_user_question` picker,
+    /// so the Q→A exchange stays visible in scrollback.
+    pub(crate) fn question_answers(
+        id: TranscriptItemId,
+        answers: &[AskUserQuestionAnswer],
+    ) -> Self {
+        let mut lines = Vec::new();
+        for answer in answers {
+            lines.push(Line::from(vec![
+                Span::styled("? ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(answer.question.clone(), Style::default().dim()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("  → "),
+                Span::styled(answer.selected.join(", "), Style::default().fg(Color::Cyan)),
+            ]));
+        }
+        Self::plain_hanging(id, lines, 4)
     }
 
     pub(crate) fn info(id: TranscriptItemId, message: impl Into<String>) -> Self {

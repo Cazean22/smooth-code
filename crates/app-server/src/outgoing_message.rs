@@ -216,11 +216,10 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn ask_user_request(thread_id: ThreadId, call_id: &str) -> ServerRequestPayload {
+    fn ask_user_request(thread_id: ThreadId) -> ServerRequestPayload {
         ServerRequestPayload::AskUserQuestion(AskUserQuestionParams {
             thread_id: thread_id.to_string(),
             turn_id: "turn-1".to_string(),
-            call_id: call_id.to_string(),
             questions: Vec::new(),
         })
     }
@@ -231,9 +230,7 @@ mod tests {
         let outgoing = OutgoingMessageSender::new(event_tx);
         let thread_id = ThreadId::new();
 
-        let (request_id, _response_rx) = outgoing
-            .send_request(ask_user_request(thread_id, "call-1"))
-            .await;
+        let (request_id, _response_rx) = outgoing.send_request(ask_user_request(thread_id)).await;
 
         let event = event_rx.recv().await.ok_or("expected outgoing event")?;
         match event {
@@ -254,7 +251,7 @@ mod tests {
         let outgoing = OutgoingMessageSender::new(event_tx);
         let thread_id = ThreadId::new();
         let (request_id, response_rx) = outgoing
-            .send_request_for_thread(thread_id, ask_user_request(thread_id, "call-1"))
+            .send_request_for_thread(thread_id, ask_user_request(thread_id))
             .await;
         let error = JsonRpcError::new(
             -32000,
@@ -277,9 +274,7 @@ mod tests {
         let outgoing = OutgoingMessageSender::new(event_tx);
         let thread_id = ThreadId::new();
 
-        let (_request_id, response_rx) = outgoing
-            .send_request(ask_user_request(thread_id, "call-1"))
-            .await;
+        let (_request_id, response_rx) = outgoing.send_request(ask_user_request(thread_id)).await;
 
         let response = timeout(Duration::from_secs(1), response_rx).await??;
         assert!(matches!(
@@ -300,13 +295,13 @@ mod tests {
         let other_thread_id = ThreadId::new();
 
         let (_, first_rx) = outgoing
-            .send_request_for_thread(thread_id, ask_user_request(thread_id, "first"))
+            .send_request_for_thread(thread_id, ask_user_request(thread_id))
             .await;
         let (_, second_rx) = outgoing
-            .send_request_for_thread(thread_id, ask_user_request(thread_id, "second"))
+            .send_request_for_thread(thread_id, ask_user_request(thread_id))
             .await;
         let (_, other_rx) = outgoing
-            .send_request_for_thread(other_thread_id, ask_user_request(other_thread_id, "other"))
+            .send_request_for_thread(other_thread_id, ask_user_request(other_thread_id))
             .await;
         let error = JsonRpcError::new(
             -32002,

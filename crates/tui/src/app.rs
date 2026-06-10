@@ -16,11 +16,11 @@ use ratatui::{
 use smooth_protocol::{
     AgentStatus, ErrorInfo, Event, EventMsg, FileChangeOutput, ThreadId, ToolCallResultKind,
 };
-use unicode_width::UnicodeWidthChar;
 
 use crate::{
     AppTerminal,
     app_server_session::AppServerSession,
+    composer::ComposerState,
     diff_render::file_change_path_label,
     error::TuiResult,
     history_cell::{ToolCallGroupCell, ToolCallState, TranscriptItem, TranscriptItemId},
@@ -346,279 +346,6 @@ struct RunningToolInfo {
     args_preview: String,
 }
 
-#[derive(Debug, Default)]
-struct ComposerState {
-    text: String,
-    cursor: usize,
-    visual_goal_col: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ComposerVisualRow {
-    start: usize,
-    end: usize,
-    width: usize,
-}
-
-impl ComposerState {
-    fn as_str(&self) -> &str {
-        &self.text
-    }
-
-    fn is_empty(&self) -> bool {
-        self.text.is_empty()
-    }
-
-    #[cfg(test)]
-    fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    fn set_text(&mut self, text: String) {
-        self.cursor = text.len();
-        self.text = text;
-        self.visual_goal_col = None;
-    }
-
-    fn take_text(&mut self) -> String {
-        self.cursor = 0;
-        self.visual_goal_col = None;
-        std::mem::take(&mut self.text)
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        self.text.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
-        self.visual_goal_col = None;
-    }
-
-    fn insert_str(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.text.insert_str(self.cursor, text);
-        self.cursor += text.len();
-        self.visual_goal_col = None;
-    }
-
-    fn insert_paste(&mut self, text: &str) {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.insert_str(&normalized);
-    }
-
-    fn backspace(&mut self) {
-        let Some(prev) = self.prev_cursor_boundary() else {
-            return;
-        };
-        self.text.drain(prev..self.cursor);
-        self.cursor = prev;
-        self.visual_goal_col = None;
-    }
-
-    fn delete(&mut self) {
-        let Some(next) = self.next_cursor_boundary() else {
-            return;
-        };
-        self.text.drain(self.cursor..next);
-        self.visual_goal_col = None;
-    }
-
-    fn move_left(&mut self) {
-        if let Some(prev) = self.prev_cursor_boundary() {
-            self.cursor = prev;
-        }
-        self.visual_goal_col = None;
-    }
-
-    fn move_right(&mut self) {
-        if let Some(next) = self.next_cursor_boundary() {
-            self.cursor = next;
-        }
-        self.visual_goal_col = None;
-    }
-
-    fn move_line_start(&mut self) {
-        self.cursor = self.current_line_start();
-        self.visual_goal_col = None;
-    }
-
-    fn move_line_end(&mut self) {
-        self.cursor = self.current_line_end();
-        self.visual_goal_col = None;
-    }
-
-    fn move_visual_up(&mut self, width: usize) {
-        let (row, col) = self.cursor_visual_position(width);
-        let goal_col = self.visual_goal_col.unwrap_or(col);
-        if row > 0 {
-            self.cursor = self.byte_offset_for_visual_position(row - 1, goal_col, width);
-        }
-        self.visual_goal_col = Some(goal_col);
-    }
-
-    fn move_visual_down(&mut self, width: usize) {
-        let rows = self.visual_rows(width);
-        let (row, col) = self.cursor_visual_position_in_rows(&rows);
-        let goal_col = self.visual_goal_col.unwrap_or(col);
-        if row + 1 < rows.len() {
-            self.cursor = self.byte_offset_for_visual_position_in_rows(&rows, row + 1, goal_col);
-        }
-        self.visual_goal_col = Some(goal_col);
-    }
-
-    fn visual_rows(&self, width: usize) -> Vec<ComposerVisualRow> {
-        let width = width.max(1);
-        let mut rows = Vec::new();
-        let mut row_start = 0;
-        let mut row_width = 0usize;
-
-        for (idx, ch) in self.text.char_indices() {
-            if ch == '\n' {
-                rows.push(ComposerVisualRow {
-                    start: row_start,
-                    end: idx,
-                    width: row_width,
-                });
-                row_start = idx + ch.len_utf8();
-                row_width = 0;
-                continue;
-            }
-
-            let ch_width = Self::char_width(ch);
-            if row_width > 0 && row_width.saturating_add(ch_width) > width {
-                rows.push(ComposerVisualRow {
-                    start: row_start,
-                    end: idx,
-                    width: row_width,
-                });
-                row_start = idx;
-                row_width = 0;
-            }
-            row_width = row_width.saturating_add(ch_width);
-        }
-
-        rows.push(ComposerVisualRow {
-            start: row_start,
-            end: self.text.len(),
-            width: row_width,
-        });
-
-        if !self.text.is_empty() && !self.text.ends_with('\n') && row_width >= width {
-            rows.push(ComposerVisualRow {
-                start: self.text.len(),
-                end: self.text.len(),
-                width: 0,
-            });
-        }
-
-        rows
-    }
-
-    fn cursor_visual_position(&self, width: usize) -> (usize, usize) {
-        let rows = self.visual_rows(width);
-        self.cursor_visual_position_in_rows(&rows)
-    }
-
-    fn cursor_visual_position_in_rows(&self, rows: &[ComposerVisualRow]) -> (usize, usize) {
-        for (idx, row) in rows.iter().enumerate() {
-            let next_starts_here = rows
-                .get(idx + 1)
-                .is_some_and(|next| next.start == self.cursor);
-            let cursor_is_on_row = self.cursor >= row.start
-                && (self.cursor < row.end
-                    || (self.cursor == row.end
-                        && !next_starts_here
-                        && (self.cursor == self.text.len()
-                            || self.text[self.cursor..].starts_with('\n')
-                            || row.start == row.end)));
-            if cursor_is_on_row {
-                return (idx, self.display_width(row.start, self.cursor));
-            }
-        }
-
-        let fallback_row = rows.len().saturating_sub(1);
-        (fallback_row, rows.last().map(|row| row.width).unwrap_or(0))
-    }
-
-    fn byte_offset_for_visual_position(
-        &self,
-        row: usize,
-        target_col: usize,
-        width: usize,
-    ) -> usize {
-        let rows = self.visual_rows(width);
-        self.byte_offset_for_visual_position_in_rows(&rows, row, target_col)
-    }
-
-    fn byte_offset_for_visual_position_in_rows(
-        &self,
-        rows: &[ComposerVisualRow],
-        row: usize,
-        target_col: usize,
-    ) -> usize {
-        let Some(row) = rows.get(row) else {
-            return self.text.len();
-        };
-        let mut cursor = row.start;
-        let mut col = 0usize;
-        for (idx, ch) in self.text[row.start..row.end].char_indices() {
-            let ch_width = Self::char_width(ch);
-            if col.saturating_add(ch_width) > target_col {
-                break;
-            }
-            col = col.saturating_add(ch_width);
-            cursor = row.start + idx + ch.len_utf8();
-        }
-        cursor
-    }
-
-    fn prev_cursor_boundary(&self) -> Option<usize> {
-        if self.cursor == 0 {
-            return None;
-        }
-        self.text[..self.cursor]
-            .char_indices()
-            .last()
-            .map(|(idx, _)| idx)
-    }
-
-    fn next_cursor_boundary(&self) -> Option<usize> {
-        if self.cursor >= self.text.len() {
-            return None;
-        }
-        self.text[self.cursor..]
-            .chars()
-            .next()
-            .map(|ch| self.cursor + ch.len_utf8())
-    }
-
-    fn current_line_start(&self) -> usize {
-        self.text[..self.cursor]
-            .rfind('\n')
-            .map(|idx| idx + 1)
-            .unwrap_or(0)
-    }
-
-    fn current_line_end(&self) -> usize {
-        self.text[self.cursor..]
-            .find('\n')
-            .map(|idx| self.cursor + idx)
-            .unwrap_or(self.text.len())
-    }
-
-    fn display_width(&self, start: usize, end: usize) -> usize {
-        self.text[start..end].chars().map(Self::char_width).sum()
-    }
-
-    fn char_width(ch: char) -> usize {
-        if ch == '\t' {
-            4
-        } else {
-            UnicodeWidthChar::width(ch).unwrap_or(0)
-        }
-    }
-}
-
 struct UiModel {
     current_thread_id: Option<ThreadId>,
     transcript_items: Vec<TranscriptItem>,
@@ -823,8 +550,12 @@ impl UiModel {
     }
 
     fn handle_paste_event(&mut self, text: String) -> Vec<UiEffect> {
-        if self.screen == Screen::Workspace && self.mode == UiMode::Insert {
-            self.composer.insert_paste(&text);
+        if self.screen == Screen::Workspace {
+            if let Some(picker) = self.question_picker.as_mut() {
+                picker.handle_paste(&text);
+            } else if self.mode == UiMode::Insert {
+                self.composer.insert_paste(&text);
+            }
         }
         Vec::new()
     }
@@ -1169,6 +900,8 @@ impl UiModel {
                 };
                 self.mode = UiMode::Normal;
                 self.focus = FocusTarget::Transcript;
+                let id = self.next_item_id();
+                self.push_history(TranscriptItem::question_answers(id, &response.answers));
                 vec![self.effect(
                     EffectContext::ServerRequest,
                     UiEffectKind::AnswerQuestion {
@@ -1299,6 +1032,12 @@ impl UiModel {
 
         match request {
             ServerRequest::AskUserQuestion { request_id, params } => {
+                if self.question_picker.is_some() || self.plan_approval.is_some() {
+                    return self.fail_server_request(
+                        request_id,
+                        "another interactive request is already pending".to_string(),
+                    );
+                }
                 self.screen = Screen::Workspace;
                 self.question_picker = Some(QuestionPicker::new(request_id, params));
                 self.mode = UiMode::Overlay;
@@ -3833,6 +3572,51 @@ mod tests {
     }
 
     #[test]
+    fn paste_while_other_editing_inserts_into_answer() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        let _ = model.update(UiEvent::ServerRequest(ServerRequest::AskUserQuestion {
+            request_id: RequestId(42),
+            params: AskUserQuestionParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn".to_string(),
+                questions: vec![AskUserQuestion {
+                    question: "Pick a path?".to_string(),
+                    header: "Choice".to_string(),
+                    options: vec![
+                        AskUserQuestionOption {
+                            label: "A".to_string(),
+                            description: "Use option A".to_string(),
+                            preview: None,
+                        },
+                        AskUserQuestionOption {
+                            label: "B".to_string(),
+                            description: "Use option B".to_string(),
+                            preview: None,
+                        },
+                    ],
+                    multi_select: false,
+                }],
+            },
+        }));
+
+        // Move to the "Other" row and start editing, then paste.
+        let _ = model.handle_key_event(key(KeyCode::Down));
+        let _ = model.handle_key_event(key(KeyCode::Down));
+        let _ = model.handle_key_event(key(KeyCode::Enter));
+        let _ = model.handle_terminal_event(CrosstermEvent::Paste("pasted\nanswer".to_string()));
+        let effects = model.handle_key_event(key(KeyCode::Enter));
+
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::AnswerQuestion { request_id, response }
+                if *request_id == RequestId(42)
+                    && response.answers[0].selected == vec!["pasted answer".to_string()]
+        ));
+    }
+
+    #[test]
     fn insert_mode_left_and_right_edit_inside_composer() {
         let mut model = workspace_insert_model();
         model.composer.set_text("helo".to_string());
@@ -4427,7 +4211,6 @@ mod tests {
             params: AskUserQuestionParams {
                 thread_id: thread_id.to_string(),
                 turn_id: "turn".to_string(),
-                call_id: "call".to_string(),
                 questions: vec![AskUserQuestion {
                     question: "Pick a path?".to_string(),
                     header: "Choice".to_string(),
@@ -4454,6 +4237,53 @@ mod tests {
     }
 
     #[test]
+    fn confirming_question_picker_pushes_answer_summary_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        let _ = model.update(UiEvent::ServerRequest(ServerRequest::AskUserQuestion {
+            request_id: RequestId(42),
+            params: AskUserQuestionParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn".to_string(),
+                questions: vec![AskUserQuestion {
+                    question: "Pick a path?".to_string(),
+                    header: "Choice".to_string(),
+                    options: vec![
+                        AskUserQuestionOption {
+                            label: "A".to_string(),
+                            description: "Use option A".to_string(),
+                            preview: None,
+                        },
+                        AskUserQuestionOption {
+                            label: "B".to_string(),
+                            description: "Use option B".to_string(),
+                            preview: None,
+                        },
+                    ],
+                    multi_select: false,
+                }],
+            },
+        }));
+
+        let effects = model.handle_key_event(key(KeyCode::Enter));
+
+        assert!(model.question_picker.is_none());
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::AnswerQuestion { request_id, .. } if *request_id == RequestId(42)
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        terminal.draw(|frame| model.render(frame))?;
+        let rendered = rendered_buffer_text(&terminal);
+        assert!(rendered.contains("? Pick a path?"), "{rendered}");
+        assert!(rendered.contains("→ A"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
     fn dashboard_does_not_render_question_picker_overlay() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut model = UiModel::new();
@@ -4462,7 +4292,6 @@ mod tests {
             AskUserQuestionParams {
                 thread_id: "thread".to_string(),
                 turn_id: "turn".to_string(),
-                call_id: "call".to_string(),
                 questions: vec![AskUserQuestion {
                     question: "Pick a path?".to_string(),
                     header: "Choice".to_string(),
@@ -4504,7 +4333,6 @@ mod tests {
             AskUserQuestionParams {
                 thread_id: thread_id.to_string(),
                 turn_id: "turn".to_string(),
-                call_id: "call".to_string(),
                 questions: vec![AskUserQuestion {
                     question: "Pick a path?".to_string(),
                     header: "Choice".to_string(),
@@ -4541,7 +4369,6 @@ mod tests {
             params: AskUserQuestionParams {
                 thread_id: stale_thread.to_string(),
                 turn_id: "turn".to_string(),
-                call_id: "call".to_string(),
                 questions: vec![AskUserQuestion {
                     question: "Pick a path?".to_string(),
                     header: "Choice".to_string(),
@@ -4770,7 +4597,6 @@ mod tests {
                     AskUserQuestionParams {
                         thread_id: "t".into(),
                         turn_id: "u".into(),
-                        call_id: "c".into(),
                         questions: Vec::new(),
                     },
                 ));
@@ -4803,7 +4629,6 @@ mod tests {
                     AskUserQuestionParams {
                         thread_id: thread_id.to_string(),
                         turn_id: "turn-1".into(),
-                        call_id: "c".into(),
                         questions: Vec::new(),
                     },
                 ));
@@ -4885,7 +4710,6 @@ mod tests {
             AskUserQuestionParams {
                 thread_id: thread_id.to_string(),
                 turn_id: "turn-1".into(),
-                call_id: "c".into(),
                 questions: Vec::new(),
             },
         ));
@@ -4972,7 +4796,6 @@ mod tests {
             AskUserQuestionParams {
                 thread_id: thread_id.to_string(),
                 turn_id: "turn-1".into(),
-                call_id: "c".into(),
                 questions: Vec::new(),
             },
         ));
@@ -4989,6 +4812,42 @@ mod tests {
                 if *request_id == RequestId(52)
                     && error.message.contains("already pending")
         ));
+    }
+
+    #[test]
+    fn ask_user_question_request_while_overlay_pending_is_failed() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.question_picker = Some(QuestionPicker::new(
+            RequestId(1),
+            AskUserQuestionParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".into(),
+                questions: Vec::new(),
+            },
+        ));
+
+        let effects = model.update(UiEvent::ServerRequest(ServerRequest::AskUserQuestion {
+            request_id: RequestId(2),
+            params: AskUserQuestionParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".into(),
+                questions: Vec::new(),
+            },
+        }));
+
+        // The new request fails; the first picker stays untouched.
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::FailServerRequest { request_id, error }
+                if *request_id == RequestId(2)
+                    && error.message.contains("already pending")
+        ));
+        let Some(picker) = model.question_picker.as_ref() else {
+            panic!("first picker should remain pending");
+        };
+        assert_eq!(picker.request_id, RequestId(1));
     }
 
     #[test]

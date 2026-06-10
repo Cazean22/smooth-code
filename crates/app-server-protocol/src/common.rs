@@ -103,7 +103,6 @@ pub struct SetPlanModeResponse {
 pub struct AskUserQuestionParams {
     pub thread_id: String,
     pub turn_id: String,
-    pub call_id: String,
     pub questions: Vec<AskUserQuestion>,
 }
 
@@ -372,6 +371,57 @@ mod tests {
         );
         let decoded: TurnCancelResponse = serde_json::from_value(value)?;
         assert_eq!(decoded, response);
+        Ok(())
+    }
+
+    #[test]
+    fn ask_user_question_request_round_trips_and_is_in_schema() -> TestResult {
+        let request = ServerRequestPayload::AskUserQuestion(AskUserQuestionParams {
+            thread_id: "018f6f32-7a31-7c22-8c95-3c3dfb63dce1".to_string(),
+            turn_id: "3".to_string(),
+            questions: vec![AskUserQuestion {
+                question: "Which database?".to_string(),
+                header: "Database".to_string(),
+                multi_select: false,
+                options: vec![
+                    AskUserQuestionOption {
+                        label: "Postgres".to_string(),
+                        description: "Relational".to_string(),
+                        preview: None,
+                    },
+                    AskUserQuestionOption {
+                        label: "SQLite".to_string(),
+                        description: "Embedded".to_string(),
+                        preview: None,
+                    },
+                ],
+            }],
+        })
+        .request_with_id(RequestId(12));
+
+        let value = serde_json::to_value(&request)?;
+        assert_eq!(
+            value,
+            json!({
+                "method": "item/ask_user_question",
+                "id": 12,
+                "params": {
+                    "threadId": "018f6f32-7a31-7c22-8c95-3c3dfb63dce1",
+                    "turnId": "3",
+                    "questions": [{
+                        "question": "Which database?",
+                        "header": "Database",
+                        "multiSelect": false,
+                        "options": [
+                            { "label": "Postgres", "description": "Relational" },
+                            { "label": "SQLite", "description": "Embedded" },
+                        ],
+                    }],
+                },
+            })
+        );
+        let decoded: ServerRequest = serde_json::from_value(value)?;
+        assert_eq!(decoded, request);
         Ok(())
     }
 

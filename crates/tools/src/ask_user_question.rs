@@ -7,7 +7,6 @@ use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use crate::{AskUserClient, ToolError};
 
@@ -128,7 +127,6 @@ impl Tool for AskUserQuestionTool {
         let params = AskUserQuestionParams {
             thread_id: self.thread_id.to_string(),
             turn_id,
-            call_id: Uuid::new_v4().to_string(),
             questions,
         };
 
@@ -169,23 +167,19 @@ fn validate_args(args: &AskUserQuestionArgs) -> Result<(), ToolError> {
 }
 
 fn format_tool_result(response: &AskUserQuestionResponse) -> String {
-    let parts: Vec<String> = response
-        .answers
-        .iter()
-        .map(|answer| {
-            let joined = answer.selected.join(", ");
-            let mut piece = format!("\"{}\"=\"{}\"", answer.question, joined);
-            if let Some(preview) = &answer.preview {
-                piece.push_str(&format!(" (selected preview:\n{preview})"));
-            }
-            piece
-        })
-        .collect();
-
-    format!(
-        "User has answered your questions: {}, . You can now continue with the user's answers in mind.",
-        parts.join(", ")
-    )
+    let mut out = String::from("The user answered your questions:\n");
+    for answer in &response.answers {
+        out.push_str(&format!(
+            "\n\"{}\": {}",
+            answer.question,
+            answer.selected.join(", ")
+        ));
+        if let Some(preview) = &answer.preview {
+            out.push_str(&format!("\n  Preview of the selected option:\n{preview}"));
+        }
+    }
+    out.push_str("\n\nContinue with the user's answers in mind.");
+    out
 }
 
 #[cfg(test)]
@@ -271,7 +265,7 @@ mod tests {
         let out = tool.call(simple_args()).await?;
         assert_eq!(
             out,
-            "User has answered your questions: \"Which database?\"=\"Postgres\", . You can now continue with the user's answers in mind."
+            "The user answered your questions:\n\n\"Which database?\": Postgres\n\nContinue with the user's answers in mind."
         );
         let params = last_params
             .lock()
@@ -301,8 +295,37 @@ mod tests {
         let out = tool.call(simple_args()).await?;
         assert_eq!(
             out,
-            "User has answered your questions: \"Pick frameworks\"=\"React, Vue\" (selected preview:\n<App/>), . You can now continue with the user's answers in mind."
+            "The user answered your questions:\n\n\"Pick frameworks\": React, Vue\n  Preview of the selected option:\n<App/>\n\nContinue with the user's answers in mind."
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn formats_multiple_answers_one_line_each() -> TestResult {
+        let (client, _) = ok_client(AskUserQuestionResponse {
+            answers: vec![
+                AskUserQuestionAnswer {
+                    question: "Which database?".to_string(),
+                    selected: vec!["Postgres".to_string()],
+                    preview: None,
+                },
+                AskUserQuestionAnswer {
+                    question: "Pick frameworks".to_string(),
+                    selected: vec!["React".to_string(), "Vue".to_string()],
+                    preview: None,
+                },
+            ],
+        });
+        let tool = AskUserQuestionTool::new(
+            smooth_protocol::ThreadId::new(),
+            client,
+            Arc::new(RwLock::new(Some("turn-4".to_string()))),
+        );
+
+        let out = tool.call(simple_args()).await?;
+        assert!(out.contains("\n\"Which database?\": Postgres\n"));
+        assert!(out.contains("\n\"Pick frameworks\": React, Vue\n"));
+        assert!(!out.contains(", ."));
         Ok(())
     }
 

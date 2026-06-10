@@ -3,6 +3,7 @@
 mod app;
 mod app_server_client;
 mod app_server_session;
+mod composer;
 mod diff_render;
 mod error;
 mod highlight;

@@ -13,6 +13,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use crate::composer::ComposerState;
 use crate::wrap;
 
 const OTHER_LABEL: &str = "Other (type your own answer)";
@@ -37,7 +38,7 @@ struct PickerLayout {
 struct QuestionState {
     cursor: usize,
     multi_selected: HashSet<usize>,
-    other_text: String,
+    other_editor: ComposerState,
     other_editing: bool,
 }
 
@@ -46,7 +47,7 @@ impl QuestionState {
         Self {
             cursor: 0,
             multi_selected: HashSet::new(),
-            other_text: String::new(),
+            other_editor: ComposerState::default(),
             other_editing: false,
         }
     }
@@ -97,7 +98,7 @@ impl QuestionPicker {
                     state.other_editing = false;
                 }
                 KeyCode::Enter => {
-                    if state.other_text.trim().is_empty() {
+                    if state.other_editor.as_str().trim().is_empty() {
                         self.hint = Some("Type an answer or press Esc to cancel".to_string());
                     } else {
                         state.other_editing = false;
@@ -107,15 +108,18 @@ impl QuestionPicker {
                         return self.advance_or_confirm();
                     }
                 }
-                KeyCode::Backspace => {
-                    state.other_text.pop();
-                }
+                KeyCode::Backspace => state.other_editor.backspace(),
+                KeyCode::Delete => state.other_editor.delete(),
+                KeyCode::Left => state.other_editor.move_left(),
+                KeyCode::Right => state.other_editor.move_right(),
+                KeyCode::Home => state.other_editor.move_line_start(),
+                KeyCode::End => state.other_editor.move_line_end(),
                 KeyCode::Char(ch)
                     if key.modifiers.is_empty()
                         || key.modifiers == KeyModifiers::SHIFT
                         || key.modifiers == KeyModifiers::NONE =>
                 {
-                    state.other_text.push(ch);
+                    state.other_editor.insert_char(ch);
                 }
                 _ => {}
             }
@@ -160,7 +164,7 @@ impl QuestionPicker {
             }
             KeyCode::Enter => {
                 if state.cursor == other_row {
-                    if state.other_text.trim().is_empty() {
+                    if state.other_editor.as_str().trim().is_empty() {
                         state.other_editing = true;
                         return PickerOutcome::None;
                     }
@@ -172,6 +176,19 @@ impl QuestionPicker {
             }
             _ => PickerOutcome::None,
         }
+    }
+
+    /// Insert pasted text into the "Other" field. The field is single-line, so
+    /// line breaks and tabs are flattened to spaces.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        let Some(state) = self.states.get_mut(self.current) else {
+            return;
+        };
+        if !state.other_editing {
+            return;
+        }
+        let flat = text.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
+        state.other_editor.insert_str(&flat);
     }
 
     fn advance_or_confirm(&mut self) -> PickerOutcome {
@@ -198,7 +215,7 @@ impl QuestionPicker {
                     .copied()
                     .filter_map(|i| {
                         if i == other_row {
-                            let txt = state.other_text.trim();
+                            let txt = state.other_editor.as_str().trim();
                             if txt.is_empty() {
                                 None
                             } else {
@@ -216,7 +233,7 @@ impl QuestionPicker {
                 let labels: Vec<String> = picks.into_iter().map(|(_, l)| l).collect();
                 (labels, None)
             } else if state.cursor == other_row {
-                let txt = state.other_text.trim();
+                let txt = state.other_editor.as_str().trim();
                 if txt.is_empty() {
                     return None;
                 }
@@ -318,11 +335,6 @@ impl QuestionPicker {
         } else {
             "( )"
         };
-        let other_display = if state.other_text.is_empty() {
-            OTHER_LABEL.to_string()
-        } else {
-            format!("Other: {}", state.other_text)
-        };
         let mut other_style = Style::default();
         if state.cursor == other_row {
             other_style = other_style.add_modifier(Modifier::BOLD).fg(Color::Cyan);
@@ -332,17 +344,40 @@ impl QuestionPicker {
         }
         let other_marks = format!("{other_cursor} {other_mark} ");
         let other_indent = wrap::display_width(&other_marks);
+        let mut other_spans = vec![Span::raw(other_marks)];
+        if state.other_editing {
+            // Split the text at the editing cursor so a reversed cell marks it.
+            let text = state.other_editor.as_str();
+            let cursor = state.other_editor.cursor();
+            let cursor_style = other_style.add_modifier(Modifier::REVERSED);
+            other_spans.push(Span::styled("Other: ".to_string(), other_style));
+            other_spans.push(Span::styled(text[..cursor].to_string(), other_style));
+            match text[cursor..].chars().next() {
+                Some(ch) => {
+                    other_spans.push(Span::styled(ch.to_string(), cursor_style));
+                    other_spans.push(Span::styled(
+                        text[cursor + ch.len_utf8()..].to_string(),
+                        other_style,
+                    ));
+                }
+                None => other_spans.push(Span::styled(" ".to_string(), cursor_style)),
+            }
+        } else {
+            let other_display = if state.other_editor.is_empty() {
+                OTHER_LABEL.to_string()
+            } else {
+                format!("Other: {}", state.other_editor.as_str())
+            };
+            other_spans.push(Span::styled(other_display, other_style));
+        }
         blocks.push(wrap::wrap_line_hanging(
-            Line::from(vec![
-                Span::raw(other_marks),
-                Span::styled(other_display, other_style),
-            ]),
+            Line::from(other_spans),
             wrap_width,
             other_indent,
         ));
 
         let footer_text = if state.other_editing {
-            "Enter to confirm  Esc to cancel typing".to_string()
+            "Enter to confirm  ←/→ Home End move  Esc to cancel typing".to_string()
         } else if multi {
             "Space toggle  Enter next/submit  Tab switch question  Esc cancel".to_string()
         } else {
@@ -469,7 +504,6 @@ mod tests {
         AskUserQuestionParams {
             thread_id: "t".into(),
             turn_id: "u".into(),
-            call_id: "c".into(),
             questions: vec![AskUserQuestion {
                 question: "Pick one".into(),
                 header: "Pick".into(),
@@ -543,6 +577,77 @@ mod tests {
                 assert_eq!(resp.answers[0].selected, vec!["hi".to_string()]);
             }
             _ => panic!("expected confirm with free-text"),
+        }
+    }
+
+    #[test]
+    fn other_editor_cursor_movement() {
+        let mut picker = QuestionPicker::new(RequestId(1), sample_params());
+        picker.handle_key(key(KeyCode::Down));
+        picker.handle_key(key(KeyCode::Down));
+        picker.handle_key(key(KeyCode::Enter));
+        // Type "ab", move left, type "c" -> "acb".
+        picker.handle_key(key(KeyCode::Char('a')));
+        picker.handle_key(key(KeyCode::Char('b')));
+        picker.handle_key(key(KeyCode::Left));
+        picker.handle_key(key(KeyCode::Char('c')));
+        match picker.handle_key(key(KeyCode::Enter)) {
+            PickerOutcome::Confirm(resp) => {
+                assert_eq!(resp.answers[0].selected, vec!["acb".to_string()]);
+            }
+            _ => panic!("expected confirm with edited free-text"),
+        }
+    }
+
+    #[test]
+    fn other_editor_home_end_delete() {
+        let mut picker = QuestionPicker::new(RequestId(1), sample_params());
+        picker.handle_key(key(KeyCode::Down));
+        picker.handle_key(key(KeyCode::Down));
+        picker.handle_key(key(KeyCode::Enter));
+        // Type "xab", Home, Delete -> "ab", End, type "c" -> "abc".
+        picker.handle_key(key(KeyCode::Char('x')));
+        picker.handle_key(key(KeyCode::Char('a')));
+        picker.handle_key(key(KeyCode::Char('b')));
+        picker.handle_key(key(KeyCode::Home));
+        picker.handle_key(key(KeyCode::Delete));
+        picker.handle_key(key(KeyCode::End));
+        picker.handle_key(key(KeyCode::Char('c')));
+        match picker.handle_key(key(KeyCode::Enter)) {
+            PickerOutcome::Confirm(resp) => {
+                assert_eq!(resp.answers[0].selected, vec!["abc".to_string()]);
+            }
+            _ => panic!("expected confirm with edited free-text"),
+        }
+    }
+
+    #[test]
+    fn handle_paste_flattens_newlines() {
+        let mut picker = QuestionPicker::new(RequestId(1), sample_params());
+        picker.handle_key(key(KeyCode::Down));
+        picker.handle_key(key(KeyCode::Down));
+        picker.handle_key(key(KeyCode::Enter));
+        picker.handle_paste("multi\r\nline\tpaste");
+        match picker.handle_key(key(KeyCode::Enter)) {
+            PickerOutcome::Confirm(resp) => {
+                assert_eq!(
+                    resp.answers[0].selected,
+                    vec!["multi line paste".to_string()]
+                );
+            }
+            _ => panic!("expected confirm with pasted free-text"),
+        }
+    }
+
+    #[test]
+    fn handle_paste_ignored_when_not_editing() {
+        let mut picker = QuestionPicker::new(RequestId(1), sample_params());
+        picker.handle_paste("ignored");
+        match picker.handle_key(key(KeyCode::Enter)) {
+            PickerOutcome::Confirm(resp) => {
+                assert_eq!(resp.answers[0].selected, vec!["First".to_string()]);
+            }
+            _ => panic!("expected confirm of the first option"),
         }
     }
 

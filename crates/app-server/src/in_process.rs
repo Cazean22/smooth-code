@@ -141,7 +141,6 @@ mod tests {
                 AskUserQuestionParams {
                     thread_id: thread_id.to_string(),
                     turn_id: "turn-1".to_string(),
-                    call_id: "call-1".to_string(),
                     questions: Vec::new(),
                 },
             ))

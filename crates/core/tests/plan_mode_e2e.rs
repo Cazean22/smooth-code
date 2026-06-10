@@ -474,6 +474,52 @@ impl SessionModelFactory for SpawnRecordingFactory {
 }
 
 #[tokio::test]
+async fn plan_mode_survives_resume_with_fresh_manager() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
+
+    let builds = Arc::new(Mutex::new(Vec::new()));
+    let manager = ThreadManagerState::new(
+        None,
+        Some(Arc::new(SpawnRecordingFactory {
+            builds: Arc::clone(&builds),
+        })),
+    )
+    .await?;
+    let started = manager.start_thread().await?;
+    let root_id = started.thread_id;
+    manager.set_plan_mode(root_id, true).await?;
+    assert!(manager.plan_mode(root_id).await?);
+    drop(manager);
+
+    let resumed_manager = ThreadManagerState::new(
+        None,
+        Some(Arc::new(SpawnRecordingFactory {
+            builds: Arc::clone(&builds),
+        })),
+    )
+    .await?;
+    let resumed = resumed_manager.resume_thread(root_id).await?;
+
+    assert!(
+        resumed_manager.plan_mode(root_id).await?,
+        "a thread persisted in plan mode must resume in plan mode"
+    );
+    assert!(
+        resumed.initial_messages.iter().any(|event| matches!(
+            event,
+            EventMsg::PlanModeChanged(change) if change.enabled
+        )),
+        "resume replay should carry the PlanModeChanged event for the UI badge"
+    );
+
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn plan_mode_spawns_are_coerced_to_explore() -> Result<()> {
     let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
     let workspace = TempDir::new()?;

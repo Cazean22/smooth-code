@@ -1717,13 +1717,17 @@ impl UiModel {
             EventMsg::CollabResumeBegin(_event) => {}
             EventMsg::CollabResumeEnd(_event) => {}
             EventMsg::PlanModeChanged(event) => {
+                // Resume replays historical PlanModeChanged events to restore
+                // the badge; only narrate actual state changes.
+                if self.plan_mode != event.enabled {
+                    let message = if event.enabled {
+                        "plan mode enabled — file mutations are locked while the agent plans"
+                    } else {
+                        "plan mode disabled — agent back to the full tool set"
+                    };
+                    self.push_info(message);
+                }
                 self.plan_mode = event.enabled;
-                let message = if event.enabled {
-                    "plan mode enabled — file mutations are locked while the agent plans"
-                } else {
-                    "plan mode disabled — agent back to the full tool set"
-                };
-                self.push_info(message);
             }
         }
     }

@@ -43,6 +43,10 @@ pub struct ResumeState {
     pub initial_messages: Vec<EventMsg>,
     pub next_turn_index: u64,
     pub project_instructions: Option<ProjectInstructions>,
+    /// Plan-mode state at the time the rollout was written (the last persisted
+    /// `PlanModeChanged` wins), so a thread resumed mid-planning keeps its
+    /// restricted tool set.
+    pub plan_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +177,7 @@ fn persist_event(event: &EventMsg) -> bool {
             | EventMsg::AgentReasoningCompleted(_)
             | EventMsg::ToolCallStarted(_)
             | EventMsg::ToolCallCompleted(_)
+            | EventMsg::PlanModeChanged(_)
             | EventMsg::Error(_)
     )
 }
@@ -193,6 +198,7 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
     let mut max_turn_index = None::<u64>;
     let mut has_open_turn = false;
     let mut has_terminal_turn = false;
+    let mut plan_mode = false;
 
     for line in contents.lines() {
         if line.trim().is_empty() {
@@ -241,6 +247,9 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
                     &mut has_open_turn,
                     &mut has_terminal_turn,
                 );
+                if let EventMsg::PlanModeChanged(change) = &event {
+                    plan_mode = change.enabled;
+                }
                 initial_messages.push(event);
             }
         }
@@ -261,6 +270,7 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
         initial_messages,
         next_turn_index: max_turn_index.map_or(0, |value| value.saturating_add(1)),
         project_instructions: meta.project_instructions,
+        plan_mode,
     })
 }
 
@@ -517,6 +527,42 @@ mod tests {
             threads[0].last_user_message.as_deref(),
             Some("human prompt")
         );
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_state_restores_last_plan_mode() -> Result<()> {
+        let root = test_root("plan-mode");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        assert!(!state.plan_mode, "fresh rollout should not be in plan mode");
+
+        let enabled = EventMsg::PlanModeChanged(smooth_protocol::PlanModeChangedEvent {
+            thread_id: thread_id.to_string(),
+            enabled: true,
+        });
+        recorder
+            .append(persisted_event_item(&enabled).with_context(|| "plan mode should persist")?)
+            .await?;
+        let state = load_resume_state(recorder.path()).await?;
+        assert!(state.plan_mode, "last PlanModeChanged(true) should win");
+
+        let disabled = EventMsg::PlanModeChanged(smooth_protocol::PlanModeChangedEvent {
+            thread_id: thread_id.to_string(),
+            enabled: false,
+        });
+        recorder
+            .append(persisted_event_item(&disabled).with_context(|| "plan mode should persist")?)
+            .await?;
+        let state = load_resume_state(recorder.path()).await?;
+        assert!(!state.plan_mode, "an on->off sequence resolves to off");
 
         let _ = fs::remove_dir_all(&root).await;
         Ok(())

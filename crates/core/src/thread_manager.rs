@@ -208,6 +208,12 @@ impl ThreadManagerState {
         thread.set_plan_mode(enabled).await
     }
 
+    /// Current plan-mode state of the given thread.
+    pub async fn plan_mode(&self, thread_id: ThreadId) -> CoreResult<bool> {
+        let thread = self.get(thread_id).await?;
+        Ok(thread.plan_mode())
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn send_op(&self, thread_id: ThreadId, op: Op) -> CoreResult<String> {
         self.submit(thread_id, op).await

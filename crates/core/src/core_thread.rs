@@ -174,7 +174,7 @@ impl CoreThread {
         let cwd = std::env::current_dir()?;
         let current_turn_id = Arc::new(RwLock::new(None));
         let resolved_factory = model_factory.unwrap_or_else(default_session_model_factory);
-        let plan_mode = false;
+        let plan_mode = state.plan_mode;
         let models = build_session_models(
             resolved_factory.as_ref(),
             cwd.clone(),
@@ -218,6 +218,11 @@ impl CoreThread {
     /// Toggle plan mode for this thread. Returns the new effective plan-mode state.
     pub(crate) async fn set_plan_mode(&self, enabled: bool) -> CoreResult<bool> {
         self.core.session.apply_plan_mode(enabled).await
+    }
+
+    /// Current plan-mode state of this thread.
+    pub(crate) fn plan_mode(&self) -> bool {
+        self.core.session.plan_mode()
     }
 
     #[tracing::instrument(name = "core.thread.emit_session_configured", skip(self), fields(thread_id = %self.core.session.id))]

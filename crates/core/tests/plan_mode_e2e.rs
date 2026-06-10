@@ -369,3 +369,158 @@ async fn exit_without_plan_file_fails_and_never_asks_for_approval() -> Result<()
     assert_eq!(*calls, 0, "approval must not be requested without a plan");
     Ok(())
 }
+
+/// Plan-side root driver for the spawn-coercion test: spawns a child with an
+/// explicit non-Explore `subagent_type`, then finishes once the child result
+/// arrives.
+struct PlanSpawnDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for PlanSpawnDriver {
+    fn stream_completion_turn(
+        &self,
+        _prompt: Message,
+        _history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("spawn calls mutex"))?;
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                let tool_call = ToolCall::new(
+                    "spawn-1".to_string(),
+                    ToolFunction::new(
+                        "spawn_agent".to_string(),
+                        serde_json::json!({
+                            "description": "implement something",
+                            "prompt": "go implement",
+                            "subagent_type": "default"
+                        }),
+                    ),
+                )
+                .with_call_id("call-spawn-1".to_string());
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-spawn-1".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-spawn".to_string()),
+                        response: String::new(),
+                    })),
+                ])))
+            }
+            1 => Ok(final_text_stream("spawn done")),
+            other => panic!("unexpected spawn-parent completion turn {other}"),
+        }
+    }
+}
+
+struct ChildStubDriver;
+
+impl SessionModelDriver for ChildStubDriver {
+    fn stream_completion_turn(
+        &self,
+        _prompt: Message,
+        _history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        Ok(final_text_stream("explored"))
+    }
+}
+
+struct SpawnRecordingFactory {
+    builds: Arc<Mutex<Vec<(SystemPromptKind, bool)>>>,
+}
+
+impl SessionModelFactory for SpawnRecordingFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _ask_user_client: Option<AskUserClient>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        system_prompt_kind: SystemPromptKind,
+        _agent_control: AgentControl,
+        plan_mode: bool,
+    ) -> Result<SessionModel> {
+        self.builds
+            .lock()
+            .map_err(|_| anyhow::anyhow!("builds mutex"))?
+            .push((system_prompt_kind, plan_mode));
+        match system_prompt_kind {
+            SystemPromptKind::Root => {
+                if plan_mode {
+                    Ok(SessionModel::Stub(Arc::new(PlanSpawnDriver {
+                        calls: Mutex::new(0),
+                    })))
+                } else {
+                    Ok(SessionModel::Stub(Arc::new(ChildStubDriver)))
+                }
+            }
+            SystemPromptKind::Explore => Ok(SessionModel::Stub(Arc::new(ChildStubDriver))),
+            SystemPromptKind::DefaultSubagent => Err(anyhow::anyhow!(
+                "plan-mode spawns must be coerced to Explore, got DefaultSubagent"
+            )),
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan_mode_spawns_are_coerced_to_explore() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
+
+    let builds = Arc::new(Mutex::new(Vec::new()));
+    let manager = ThreadManagerState::new(
+        None,
+        Some(Arc::new(SpawnRecordingFactory {
+            builds: Arc::clone(&builds),
+        })),
+    )
+    .await?;
+    let started = manager.start_thread().await?;
+    let root_id = started.thread_id;
+    let mut events = manager.subscribe(root_id).await?;
+
+    manager.set_plan_mode(root_id, true).await?;
+    manager
+        .start_user_input(root_id, "spawn a child".to_string())
+        .await?;
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await??;
+        if matches!(event.msg, EventMsg::TurnCompleted(_)) {
+            break;
+        }
+    }
+
+    let builds = builds.lock().map_err(|_| anyhow::anyhow!("builds mutex"))?;
+    let child_kinds: Vec<SystemPromptKind> = builds
+        .iter()
+        .filter(|(kind, _)| !matches!(kind, SystemPromptKind::Root))
+        .map(|(kind, _)| *kind)
+        .collect();
+    assert!(
+        !child_kinds.is_empty(),
+        "expected the spawned child to build a model"
+    );
+    assert!(
+        child_kinds
+            .iter()
+            .all(|kind| matches!(kind, SystemPromptKind::Explore)),
+        "plan-mode spawn with subagent_type=default must run as Explore, got {child_kinds:?}"
+    );
+
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
+}

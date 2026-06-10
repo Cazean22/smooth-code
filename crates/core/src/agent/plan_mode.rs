@@ -16,9 +16,9 @@ pub(crate) const PLAN_MODE_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "spawn_agent",
-        "spawn sub-agents to parallelize exploration; use `subagent_type: \"Explore\"` for \
-         read-only investigation, or omit it/use `default`/`general-purpose` only when an \
-         implementation-capable child is required.",
+        "spawn sub-agents for parallel read-only exploration. While in plan mode every child \
+         runs as an Explore agent regardless of the `subagent_type` you pass; none of them can \
+         modify files.",
     ),
     (
         "ask_user_question",
@@ -30,7 +30,7 @@ pub(crate) const PLAN_MODE_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "exit_plan_mode",
-        "exit plan mode once the plan is ready.",
+        "submit the plan you wrote with `plan_write` for user approval.",
     ),
 ];
 
@@ -59,7 +59,7 @@ Proceed in four phases:
 1. EXPLORE — read the relevant code and gather context for the user's request.
 2. DESIGN — decide on the approach, considering trade-offs and conventions you observed.
 3. WRITE — call `plan_write` with a markdown plan covering: goal, files to change, step-by-step strategy, risks, and any decisions needing user confirmation.
-4. EXIT — call `exit_plan_mode`. Plan mode will turn off automatically and you may then implement the plan with the full tool set.
+4. SUBMIT — call `exit_plan_mode` to present the plan to the user for approval. If they approve, plan mode turns off and you implement the plan with the full tool set. If they reject, you stay in plan mode: revise the plan per their feedback with `plan_write`, then submit it again.
 "
         )
     });

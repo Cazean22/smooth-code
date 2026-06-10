@@ -1363,7 +1363,15 @@ async fn start_spawn_tool_call(
         prompt,
         subagent_type,
     } = args;
-    let system_prompt_kind = subagent_type_to_prompt_kind(subagent_type.as_deref());
+    // Plan mode must hold for the whole agent subtree: Explore children are
+    // structurally read-only (their tool registry is read + run_command only),
+    // so every spawn during plan mode is coerced to Explore regardless of the
+    // requested subagent_type.
+    let system_prompt_kind = if session.plan_mode() {
+        SystemPromptKind::Explore
+    } else {
+        subagent_type_to_prompt_kind(subagent_type.as_deref())
+    };
 
     match session
         .agent_control

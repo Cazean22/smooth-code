@@ -1257,12 +1257,23 @@ impl UiModel {
                 self.focus = FocusTarget::Overlay;
                 Vec::new()
             }
+            ServerRequest::RequestPlanApproval { request_id, .. } => {
+                // Placeholder until the plan-approval overlay lands; core does
+                // not send this request yet.
+                self.fail_server_request(
+                    request_id,
+                    "plan approval UI is not available in this client".to_string(),
+                )
+            }
         }
     }
 
     fn reject_inactive_server_request(&mut self, request: &ServerRequest) -> Option<Vec<UiEffect>> {
         let (request_id, request_thread_id) = match request {
             ServerRequest::AskUserQuestion { request_id, params } => {
+                (request_id.clone(), params.thread_id.as_str())
+            }
+            ServerRequest::RequestPlanApproval { request_id, params } => {
                 (request_id.clone(), params.thread_id.as_str())
             }
         };

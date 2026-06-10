@@ -141,15 +141,45 @@ pub struct AskUserQuestionAnswer {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPlanApprovalParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    /// Full markdown of the plan being submitted for approval.
+    pub plan: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanApprovalDecision {
+    Approved,
+    Rejected,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPlanApprovalResponse {
+    pub decision: PlanApprovalDecision,
+    /// Optional user feedback explaining a rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[allow(clippy::large_enum_variant)]
 pub enum ServerRequestPayload {
     AskUserQuestion(AskUserQuestionParams),
+    RequestPlanApproval(RequestPlanApprovalParams),
 }
 
 impl ServerRequestPayload {
     pub fn request_with_id(self, request_id: RequestId) -> ServerRequest {
         match self {
             Self::AskUserQuestion(params) => ServerRequest::AskUserQuestion { request_id, params },
+            Self::RequestPlanApproval(params) => {
+                ServerRequest::RequestPlanApproval { request_id, params }
+            }
         }
     }
 }
@@ -202,12 +232,20 @@ pub enum ServerRequest {
         request_id: RequestId,
         params: AskUserQuestionParams,
     },
+    #[doc = r" Present a plan to the user for approval before leaving plan mode."]
+    #[serde(rename = "item/request_plan_approval")]
+    RequestPlanApproval {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: RequestPlanApprovalParams,
+    },
 }
 
 impl ServerRequest {
     pub fn id(&self) -> &RequestId {
         match self {
             Self::AskUserQuestion { request_id, .. } => request_id,
+            Self::RequestPlanApproval { request_id, .. } => request_id,
         }
     }
 }
@@ -334,6 +372,64 @@ mod tests {
         );
         let decoded: TurnCancelResponse = serde_json::from_value(value)?;
         assert_eq!(decoded, response);
+        Ok(())
+    }
+
+    #[test]
+    fn request_plan_approval_round_trips_and_is_in_schema() -> TestResult {
+        let request = ServerRequestPayload::RequestPlanApproval(RequestPlanApprovalParams {
+            thread_id: "018f6f32-7a31-7c22-8c95-3c3dfb63dce1".to_string(),
+            turn_id: "3".to_string(),
+            call_id: "call-9".to_string(),
+            plan: "# Plan\n\n1. Do the thing.".to_string(),
+        })
+        .request_with_id(RequestId(11));
+
+        let value = serde_json::to_value(&request)?;
+        assert_eq!(
+            value,
+            json!({
+                "method": "item/request_plan_approval",
+                "id": 11,
+                "params": {
+                    "threadId": "018f6f32-7a31-7c22-8c95-3c3dfb63dce1",
+                    "turnId": "3",
+                    "callId": "call-9",
+                    "plan": "# Plan\n\n1. Do the thing.",
+                },
+            })
+        );
+        let decoded: ServerRequest = serde_json::from_value(value)?;
+        assert_eq!(decoded, request);
+        assert_eq!(request.id(), &RequestId(11));
+
+        let schema = serde_json::to_value(schemars::schema_for!(ServerRequest))?;
+        assert!(schema.to_string().contains("item/request_plan_approval"));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_approval_response_round_trips_with_and_without_feedback() -> TestResult {
+        let approved = RequestPlanApprovalResponse {
+            decision: PlanApprovalDecision::Approved,
+            feedback: None,
+        };
+        let value = serde_json::to_value(&approved)?;
+        assert_eq!(value, json!({ "decision": "approved" }));
+        let decoded: RequestPlanApprovalResponse = serde_json::from_value(value)?;
+        assert_eq!(decoded, approved);
+
+        let rejected = RequestPlanApprovalResponse {
+            decision: PlanApprovalDecision::Rejected,
+            feedback: Some("use sqlite instead".to_string()),
+        };
+        let value = serde_json::to_value(&rejected)?;
+        assert_eq!(
+            value,
+            json!({ "decision": "rejected", "feedback": "use sqlite instead" })
+        );
+        let decoded: RequestPlanApprovalResponse = serde_json::from_value(value)?;
+        assert_eq!(decoded, rejected);
         Ok(())
     }
 }

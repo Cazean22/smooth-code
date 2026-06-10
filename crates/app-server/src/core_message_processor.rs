@@ -2,8 +2,9 @@ use std::{collections::HashSet, sync::Arc};
 
 use app_server_protocol::{
     AskUserQuestionParams, AskUserQuestionResponse, ClientRequest, JsonRpcError,
-    ServerRequestPayload, SetPlanModeResponse, ThreadListItem, ThreadListResponse,
-    ThreadResumeResponse, ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
+    RequestPlanApprovalParams, RequestPlanApprovalResponse, ServerRequestPayload,
+    SetPlanModeResponse, ThreadListItem, ThreadListResponse, ThreadResumeResponse,
+    ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
 };
 use smooth_core::{AskUserClient, ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
@@ -25,6 +26,7 @@ pub(crate) struct CoreMessageProcessor {
 
 fn ask_user_client(outgoing: Arc<OutgoingMessageSender>) -> AskUserClient {
     let ask_source = Arc::clone(&outgoing);
+    let approval_source = Arc::clone(&outgoing);
     AskUserClient::new(
         move |params: AskUserQuestionParams| {
             let outgoing = Arc::clone(&ask_source);
@@ -71,6 +73,42 @@ fn ask_user_client(outgoing: Arc<OutgoingMessageSender>) -> AskUserClient {
             }
         },
     )
+    .with_plan_approval(move |params: RequestPlanApprovalParams| {
+        let outgoing = Arc::clone(&approval_source);
+        async move {
+            let thread_id = params.thread_id.parse::<ThreadId>().map_err(|err| {
+                JsonRpcError::message_only(
+                    INVALID_PARAMS_ERROR_CODE,
+                    "invalid_thread_id",
+                    format!("invalid request_plan_approval thread id: {err}"),
+                )
+            })?;
+            let (_, response_rx) = outgoing
+                .send_request_for_thread(
+                    thread_id,
+                    ServerRequestPayload::RequestPlanApproval(params),
+                )
+                .await;
+            let value = match response_rx.await {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => return Err(err),
+                Err(err) => {
+                    return Err(JsonRpcError::message_only(
+                        SERVER_ERROR_CODE,
+                        "server_request_waiter_closed",
+                        err.to_string(),
+                    ));
+                }
+            };
+            serde_json::from_value::<RequestPlanApprovalResponse>(value).map_err(|err| {
+                JsonRpcError::message_only(
+                    INTERNAL_ERROR_CODE,
+                    "invalid_request_plan_approval_response",
+                    format!("invalid request_plan_approval response: {err}"),
+                )
+            })
+        }
+    })
 }
 
 impl CoreMessageProcessor {

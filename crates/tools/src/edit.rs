@@ -1,9 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    io::ErrorKind,
-    path::{Path, PathBuf},
-};
+use std::{fs, io::ErrorKind, path::PathBuf};
 
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
@@ -15,20 +10,22 @@ use crate::{
     shared::resolve_path_for_write,
 };
 
-const DESCRIPTION: &str = r#"Update existing UTF-8 text files with structured hunks.
+const DESCRIPTION: &str = r#"Edit one existing UTF-8 text file with sed-style literal replacements.
 
 Call shape:
-{"updates":[{"file_path":"path/to/file.rs","move_to":"optional/new/path.rs","hunks":[{"lines":[{"kind":"context","text":"old context"},{"kind":"remove","text":"old line"},{"kind":"add","text":"new line"}]}]}]}
+{"file_path":"path/to/file.rs","replacements":[{"old_string":"exact text to find","new_string":"replacement text","replace_all":false}],"move_to":"optional/new/path.rs"}
 
 Usage:
-- `updates` must be non-empty. Each update targets an existing UTF-8 file; use `write` to create files and `delete` to remove files.
-- `file_path` and optional `move_to` may be absolute or relative to the current working directory, but must resolve inside the workspace.
-- A hunk is an ordered `lines` array. `context` and `remove` lines form the exact old block to match; `context` and `add` lines form the replacement block.
-- Each hunk must match exactly once in the current in-memory file content. Hunks are applied sequentially within a file.
-- Add-only hunks are allowed only when the target file is empty; otherwise include at least one `context` or `remove` line to locate the insertion.
-- Zero hunks are allowed only when `move_to` is present.
-- Updates that do not change content or move the file fail, and each source path or real move target may appear only once per call.
-- All updates are prepared before any filesystem mutation. If a later apply step fails, earlier applied filesystem changes are not rolled back."#;
+- `file_path` may be absolute or relative to the current working directory, but must resolve inside the workspace.
+- The target must be an existing UTF-8 file. Use `write` to create files and `delete` to remove files.
+- `replacements` are applied sequentially to the in-memory file content before any filesystem mutation.
+- `old_string` is a literal string, not a regex or shell/sed script. It may span multiple lines and must not be empty.
+- `new_string` is inserted exactly as provided and may be empty to delete text.
+- `replace_all` defaults to false. When false, `old_string` must match exactly once; when true, every match is replaced and at least one match is required.
+- Include enough surrounding text in `old_string` to make a targeted replacement unique, or set `replace_all` to true for a deliberate global replacement.
+- Optional `move_to` renames the file after replacements. The target must not already exist unless it is the same path as `file_path`.
+- Empty `replacements` are allowed only when `move_to` performs a real move.
+- Edits that do not change content or move the file fail. Preparation happens before filesystem mutation; apply-phase filesystem failures are not transactionally rolled back."#;
 
 #[derive(Clone)]
 pub struct EditTool {
@@ -41,127 +38,33 @@ impl EditTool {
     }
 }
 
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct EditArgs {
-    /// Ordered file updates to prepare and then apply.
-    updates: Vec<EditUpdate>,
-}
-
 #[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct EditUpdate {
-    /// Absolute path to an existing file, or a path relative to the current working directory.
+pub struct EditArgs {
+    /// Absolute path to an existing UTF-8 file, or a path relative to the current working directory.
     file_path: String,
+
+    /// Ordered sed-style literal substitutions to apply before any optional move.
+    #[serde(default)]
+    replacements: Vec<ReplacementArgs>,
 
     /// Optional destination path for a rename/move. The target must not already exist unless it is
     /// the same path as file_path.
     move_to: Option<String>,
-
-    /// Ordered hunks to apply to the file before any optional move.
-    hunks: Vec<EditHunk>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct EditHunk {
-    /// Ordered hunk lines. Context/remove lines must match the current content exactly once.
-    lines: Vec<EditHunkLine>,
-}
+struct ReplacementArgs {
+    /// Literal text to find. This is not a regex and may span multiple lines.
+    old_string: String,
 
-#[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct EditHunkLine {
-    /// One of `context`, `remove`, or `add`.
-    kind: HunkLineKind,
+    /// Replacement text. May be empty to delete the matched text.
+    new_string: String,
 
-    /// Line content without a trailing newline.
-    text: String,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum HunkLineKind {
-    Context,
-    Remove,
-    Add,
-}
-
-impl EditArgs {
-    fn into_operations(self) -> Result<Vec<PatchOperation>, ToolError> {
-        if self.updates.is_empty() {
-            return Err(ToolError::invalid_arguments("updates must not be empty"));
-        }
-
-        self.updates
-            .into_iter()
-            .enumerate()
-            .map(|(index, update)| update.into_operation(index))
-            .collect()
-    }
-}
-
-impl EditUpdate {
-    fn into_operation(self, update_index: usize) -> Result<PatchOperation, ToolError> {
-        validate_update_path(
-            &self.file_path,
-            format!("updates[{update_index}].file_path"),
-        )?;
-        if let Some(move_to) = self.move_to.as_deref() {
-            validate_update_path(move_to, format!("updates[{update_index}].move_to"))?;
-        }
-        if self.hunks.is_empty() && self.move_to.is_none() {
-            return Err(ToolError::invalid_arguments(format!(
-                "updates[{update_index}] must include at least one hunk or move_to"
-            )));
-        }
-
-        let hunks = self
-            .hunks
-            .into_iter()
-            .enumerate()
-            .map(|(hunk_index, hunk)| hunk.into_hunk(update_index, hunk_index))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(PatchOperation::Update {
-            path: self.file_path,
-            move_to: self.move_to,
-            hunks,
-        })
-    }
-}
-
-impl EditHunk {
-    fn into_hunk(self, update_index: usize, hunk_index: usize) -> Result<Hunk, ToolError> {
-        if self.lines.is_empty() {
-            return Err(ToolError::invalid_arguments(format!(
-                "updates[{update_index}].hunks[{hunk_index}].lines must not be empty"
-            )));
-        }
-
-        let lines = self
-            .lines
-            .into_iter()
-            .enumerate()
-            .map(|(line_index, line)| {
-                if line.text.contains('\n') || line.text.contains('\r') {
-                    return Err(ToolError::invalid_arguments(format!(
-                        "updates[{update_index}].hunks[{hunk_index}].lines[{line_index}].text must not contain newline characters"
-                    )));
-                }
-                Ok(line)
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|line| match line.kind {
-                HunkLineKind::Context => HunkLine::Context(line.text),
-                HunkLineKind::Remove => HunkLine::Remove(line.text),
-                HunkLineKind::Add => HunkLine::Add(line.text),
-            })
-            .collect();
-
-        Ok(Hunk { lines })
-    }
+    /// Replace every match. If false or omitted, old_string must match exactly once.
+    #[serde(default)]
+    replace_all: bool,
 }
 
 impl Tool for EditTool {
@@ -180,20 +83,11 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let operations = args.into_operations()?;
-        let prepared = prepare_operations(&self.cwd, operations)?;
-        let file_changes = prepared
-            .iter()
-            .map(PreparedChange::file_change)
-            .collect::<Vec<_>>();
+        let prepared = prepare_edit(&self.cwd, args)?;
+        let file_changes = vec![prepared.file_change()];
+        prepared.apply()?;
 
-        for change in prepared {
-            change.apply()?;
-        }
-
-        let count = file_changes.len();
-        let file_label = if count == 1 { "file" } else { "files" };
-        let model_output = format!("applied edits ({count} {file_label} changed)");
+        let model_output = String::from("applied edits (1 file changed)");
         Ok(encode_tool_output_with_file_changes(
             model_output,
             file_changes,
@@ -201,95 +95,91 @@ impl Tool for EditTool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PatchOperation {
-    Update {
-        path: String,
-        move_to: Option<String>,
-        hunks: Vec<Hunk>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Hunk {
-    lines: Vec<HunkLine>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HunkLine {
-    Context(String),
-    Remove(String),
-    Add(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ContentLine {
-    text: String,
-    terminator: Option<&'static str>,
-}
-
 #[derive(Debug, Clone)]
-enum PreparedChange {
-    Update {
-        path: PathBuf,
-        move_to: Option<PathBuf>,
-        original_content: String,
-        new_content: String,
-    },
+struct PreparedChange {
+    path: PathBuf,
+    move_to: Option<PathBuf>,
+    original_content: String,
+    new_content: String,
 }
 
 impl PreparedChange {
     fn apply(self) -> Result<(), ToolError> {
-        match self {
-            Self::Update {
-                path,
-                move_to,
-                original_content,
-                new_content,
-            } => {
-                if original_content != new_content {
-                    fs::write(&path, &new_content).map_err(|err| {
-                        ToolError::io(format!("failed to write {}: {err}", path.display()))
-                    })?;
-                }
-                if let Some(move_to) = move_to
-                    && move_to != path
-                {
-                    fs::rename(&path, &move_to).map_err(|err| {
-                        ToolError::io(format!(
-                            "failed to move {} to {}: {err}",
-                            path.display(),
-                            move_to.display()
-                        ))
-                    })?;
-                }
-                Ok(())
-            }
+        if self.original_content != self.new_content {
+            fs::write(&self.path, &self.new_content).map_err(|err| {
+                ToolError::io(format!("failed to write {}: {err}", self.path.display()))
+            })?;
         }
+        if let Some(move_to) = self.move_to
+            && move_to != self.path
+        {
+            fs::rename(&self.path, &move_to).map_err(|err| {
+                ToolError::io(format!(
+                    "failed to move {} to {}: {err}",
+                    self.path.display(),
+                    move_to.display()
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     fn file_change(&self) -> FileChangeOutput {
-        match self {
-            Self::Update {
-                path,
-                move_to,
-                original_content,
-                new_content,
-            } => FileChangeOutput {
-                path: path.clone(),
-                change: update_file_change(original_content, new_content, move_to.clone()),
-            },
-        }
-    }
-
-    fn source_path(&self) -> &Path {
-        match self {
-            Self::Update { path, .. } => path,
+        FileChangeOutput {
+            path: self.path.clone(),
+            change: update_file_change(
+                &self.original_content,
+                &self.new_content,
+                self.move_to.clone(),
+            ),
         }
     }
 }
 
-fn validate_update_path(path: &str, label: String) -> Result<(), ToolError> {
+fn prepare_edit(cwd: &std::path::Path, args: EditArgs) -> Result<PreparedChange, ToolError> {
+    validate_path_arg(&args.file_path, "file_path")?;
+    if let Some(move_to) = args.move_to.as_deref() {
+        validate_path_arg(move_to, "move_to")?;
+    }
+
+    let path = resolve_path_for_write(cwd, &args.file_path)?;
+    validate_existing_file(&path, "edit")?;
+    let original_content = read_utf8_file(&path, "edit")?;
+    let mut new_content = original_content.clone();
+
+    for (index, replacement) in args.replacements.iter().enumerate() {
+        apply_replacement(&path, &mut new_content, replacement, index)?;
+    }
+
+    let move_to = args
+        .move_to
+        .as_deref()
+        .map(|move_to| resolve_move_target(cwd, &path, move_to))
+        .transpose()?
+        .filter(|move_to| move_to != &path);
+
+    if args.replacements.is_empty() && move_to.is_none() {
+        return Err(ToolError::invalid_arguments(
+            "edit must include at least one replacement or move_to",
+        ));
+    }
+
+    if move_to.is_none() && original_content == new_content {
+        return Err(ToolError::invalid_arguments(format!(
+            "edit file {} produced no changes",
+            path.display()
+        )));
+    }
+
+    Ok(PreparedChange {
+        path,
+        move_to,
+        original_content,
+        new_content,
+    })
+}
+
+fn validate_path_arg(path: &str, label: &str) -> Result<(), ToolError> {
     if path.is_empty() {
         return Err(ToolError::invalid_arguments(format!(
             "{label} must not be empty"
@@ -303,69 +193,7 @@ fn validate_update_path(path: &str, label: String) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn prepare_operations(
-    cwd: &Path,
-    operations: Vec<PatchOperation>,
-) -> Result<Vec<PreparedChange>, ToolError> {
-    let mut prepared = Vec::new();
-    let mut touched_paths = BTreeSet::new();
-
-    for operation in operations {
-        let change = match operation {
-            PatchOperation::Update {
-                path,
-                move_to,
-                hunks,
-            } => prepare_update(cwd, &path, move_to.as_deref(), &hunks)?,
-        };
-
-        let source_path = change.source_path().to_path_buf();
-        insert_unique_path(&mut touched_paths, &source_path)?;
-        if let PreparedChange::Update {
-            move_to: Some(move_to),
-            ..
-        } = &change
-            && move_to != &source_path
-        {
-            insert_unique_path(&mut touched_paths, move_to)?;
-        }
-        prepared.push(change);
-    }
-
-    Ok(prepared)
-}
-
-fn prepare_update(
-    cwd: &Path,
-    path: &str,
-    move_to: Option<&str>,
-    hunks: &[Hunk],
-) -> Result<PreparedChange, ToolError> {
-    let path = resolve_path_for_write(cwd, path)?;
-    validate_existing_file(&path, "update")?;
-    let original_content = read_utf8_file(&path, "update")?;
-    let new_content = apply_hunks(&path, &original_content, hunks)?;
-    let move_to = move_to
-        .map(|move_to| resolve_move_target(cwd, &path, move_to))
-        .transpose()?
-        .filter(|move_to| move_to != &path);
-
-    if move_to.is_none() && original_content == new_content {
-        return Err(ToolError::invalid_arguments(format!(
-            "update file {} produced no changes",
-            path.display()
-        )));
-    }
-
-    Ok(PreparedChange::Update {
-        path,
-        move_to,
-        original_content,
-        new_content,
-    })
-}
-
-fn validate_existing_file(path: &Path, operation: &str) -> Result<(), ToolError> {
+fn validate_existing_file(path: &std::path::Path, operation: &str) -> Result<(), ToolError> {
     let metadata = fs::metadata(path).map_err(|err| {
         if err.kind() == ErrorKind::NotFound {
             ToolError::io(format!("file {} does not exist", path.display()))
@@ -382,7 +210,7 @@ fn validate_existing_file(path: &Path, operation: &str) -> Result<(), ToolError>
     Ok(())
 }
 
-fn read_utf8_file(path: &Path, operation: &str) -> Result<String, ToolError> {
+fn read_utf8_file(path: &std::path::Path, operation: &str) -> Result<String, ToolError> {
     fs::read_to_string(path).map_err(|err| {
         if err.kind() == ErrorKind::InvalidData {
             ToolError::invalid_arguments(format!(
@@ -395,7 +223,11 @@ fn read_utf8_file(path: &Path, operation: &str) -> Result<String, ToolError> {
     })
 }
 
-fn resolve_move_target(cwd: &Path, source: &Path, move_to: &str) -> Result<PathBuf, ToolError> {
+fn resolve_move_target(
+    cwd: &std::path::Path,
+    source: &std::path::Path,
+    move_to: &str,
+) -> Result<PathBuf, ToolError> {
     let target = resolve_path_for_write(cwd, move_to)?;
     if target != source {
         match fs::metadata(&target) {
@@ -417,208 +249,44 @@ fn resolve_move_target(cwd: &Path, source: &Path, move_to: &str) -> Result<PathB
     Ok(target)
 }
 
-fn insert_unique_path(paths: &mut BTreeSet<PathBuf>, path: &Path) -> Result<(), ToolError> {
-    if paths.insert(path.to_path_buf()) {
-        return Ok(());
-    }
-    Err(ToolError::invalid_arguments(format!(
-        "edit updates touch {} more than once; combine edits for each file into one update",
-        path.display()
-    )))
-}
-
-fn apply_hunks(path: &Path, content: &str, hunks: &[Hunk]) -> Result<String, ToolError> {
-    if hunks.is_empty() {
-        return Ok(content.to_string());
-    }
-
-    let mut lines = split_lines_preserving_endings(content);
-    for (index, hunk) in hunks.iter().enumerate() {
-        apply_hunk(path, &mut lines, hunk, index)?;
-    }
-    Ok(join_lines(&lines))
-}
-
-fn apply_hunk(
-    path: &Path,
-    lines: &mut Vec<ContentLine>,
-    hunk: &Hunk,
-    hunk_index: usize,
+fn apply_replacement(
+    path: &std::path::Path,
+    content: &mut String,
+    replacement: &ReplacementArgs,
+    index: usize,
 ) -> Result<(), ToolError> {
-    let old_lines = hunk
-        .lines
-        .iter()
-        .filter_map(|line| match line {
-            HunkLine::Context(content) | HunkLine::Remove(content) => Some(content.as_str()),
-            HunkLine::Add(_) => None,
-        })
-        .collect::<Vec<_>>();
-    if old_lines.is_empty() && !lines.is_empty() {
+    if replacement.old_string.is_empty() {
         return Err(ToolError::invalid_arguments(format!(
-            "hunk {hunk_index} in {} is add-only; add-only hunks need a context or remove line to locate the insertion unless the file is empty",
+            "replacements[{index}].old_string must not be empty"
+        )));
+    }
+    if replacement.old_string == replacement.new_string {
+        return Err(ToolError::invalid_arguments(format!(
+            "replacements[{index}] old_string and new_string must differ"
+        )));
+    }
+
+    let matches = content.matches(&replacement.old_string).count();
+    if matches == 0 {
+        return Err(ToolError::invalid_arguments(format!(
+            "replacement {index} old_string not found in {}",
+            path.display()
+        )));
+    }
+    if !replacement.replace_all && matches > 1 {
+        return Err(ToolError::invalid_arguments(format!(
+            "replacement {index} old_string is ambiguous in {} ({matches} matches); provide more context or set replace_all to true",
             path.display()
         )));
     }
 
-    let matches = find_hunk_matches(lines, &old_lines);
-    match matches.as_slice() {
-        [] => Err(ToolError::invalid_arguments(format!(
-            "hunk {hunk_index} context not found in {}",
-            path.display()
-        ))),
-        [start] => {
-            let end = *start + old_lines.len();
-            let replacement = build_replacement_lines(lines, *start, end, hunk);
-            lines.splice(*start..end, replacement);
-            Ok(())
-        }
-        _ => Err(ToolError::invalid_arguments(format!(
-            "hunk {hunk_index} context is ambiguous in {} ({} matches)",
-            path.display(),
-            matches.len()
-        ))),
-    }
-}
-
-fn find_hunk_matches(lines: &[ContentLine], old_lines: &[&str]) -> Vec<usize> {
-    if old_lines.is_empty() {
-        if lines.is_empty() {
-            return vec![0];
-        }
-        return (0..=lines.len()).collect();
-    }
-
-    if old_lines.len() > lines.len() {
-        return Vec::new();
-    }
-
-    (0..=(lines.len() - old_lines.len()))
-        .filter(|start| {
-            old_lines
-                .iter()
-                .enumerate()
-                .all(|(offset, old_line)| lines[start + offset].text == *old_line)
-        })
-        .collect()
-}
-
-fn build_replacement_lines(
-    lines: &[ContentLine],
-    start: usize,
-    end: usize,
-    hunk: &Hunk,
-) -> Vec<ContentLine> {
-    let matched = lines[start..end].to_vec();
-    let default_terminator = preferred_terminator(lines, start, end);
-    let has_following_line = end < lines.len();
-    let mut old_offset = 0;
-    let mut replacement = Vec::new();
-
-    // Context lines keep the terminator of the line they matched; added lines inherit
-    // the terminator of an adjacent matched line. Both preserve mixed endings, and an
-    // inherited `None` (the original final line had no newline) is carried through.
-    for hunk_line in &hunk.lines {
-        match hunk_line {
-            HunkLine::Context(text) => {
-                let terminator = matched.get(old_offset).and_then(|line| line.terminator);
-                replacement.push(ContentLine {
-                    text: text.clone(),
-                    terminator,
-                });
-                old_offset += 1;
-            }
-            HunkLine::Remove(_) => {
-                old_offset += 1;
-            }
-            HunkLine::Add(text) => {
-                replacement.push(ContentLine {
-                    text: text.clone(),
-                    terminator: added_line_terminator(&matched, old_offset),
-                });
-            }
-        }
-    }
-
-    // Any line that is not the file's final line must be terminated to keep the next
-    // line separate. The line that becomes the final line keeps its inherited
-    // terminator, so a missing final newline is preserved.
-    let last_index = replacement.len().saturating_sub(1);
-    for (index, line) in replacement.iter_mut().enumerate() {
-        if line.terminator.is_none() && (index != last_index || has_following_line) {
-            line.terminator = Some(default_terminator);
-        }
-    }
-
-    replacement
-}
-
-fn added_line_terminator(matched: &[ContentLine], old_offset: usize) -> Option<&'static str> {
-    // Inherit from the matched line just before this position (often the line being
-    // replaced), then the line at this position. A matched line that exists but has no
-    // terminator is the original final line, so `None` is the correct answer there.
-    if old_offset > 0
-        && let Some(line) = matched.get(old_offset - 1)
-    {
-        return line.terminator;
-    }
-    matched.get(old_offset).and_then(|line| line.terminator)
-}
-
-fn preferred_terminator(lines: &[ContentLine], start: usize, end: usize) -> &'static str {
-    if let Some(terminator) = lines[start..end].iter().find_map(|line| line.terminator) {
-        return terminator;
-    }
-    if let Some(terminator) = lines.get(start).and_then(|line| line.terminator) {
-        return terminator;
-    }
-    if start > 0
-        && let Some(terminator) = lines.get(start - 1).and_then(|line| line.terminator)
-    {
-        return terminator;
-    }
-    lines
-        .iter()
-        .find_map(|line| line.terminator)
-        .unwrap_or("\n")
-}
-
-fn split_lines_preserving_endings(content: &str) -> Vec<ContentLine> {
-    let mut lines = Vec::new();
-    let mut start = 0;
-    while let Some(relative_end) = content[start..].find('\n') {
-        let newline_index = start + relative_end;
-        let (text_end, terminator) =
-            if newline_index > start && content.as_bytes()[newline_index - 1] == b'\r' {
-                (newline_index - 1, "\r\n")
-            } else {
-                (newline_index, "\n")
-            };
-        lines.push(ContentLine {
-            text: content[start..text_end].to_string(),
-            terminator: Some(terminator),
-        });
-        start = newline_index + 1;
-    }
-
-    if start < content.len() {
-        lines.push(ContentLine {
-            text: content[start..].to_string(),
-            terminator: None,
-        });
-    }
-
-    lines
-}
-
-fn join_lines(lines: &[ContentLine]) -> String {
-    let mut content = String::new();
-    for line in lines {
-        content.push_str(&line.text);
-        if let Some(terminator) = line.terminator {
-            content.push_str(terminator);
-        }
-    }
-    content
+    let replaced = if replacement.replace_all {
+        content.replace(&replacement.old_string, &replacement.new_string)
+    } else {
+        content.replacen(&replacement.old_string, &replacement.new_string, 1)
+    };
+    *content = replaced;
+    Ok(())
 }
 
 fn update_file_change(
@@ -683,61 +351,46 @@ mod tests {
         Ok((tool, tmp))
     }
 
-    fn args(updates: Vec<EditUpdate>) -> EditArgs {
-        EditArgs { updates }
-    }
-
-    fn update(
+    fn args(
         file_path: impl Into<String>,
+        replacements: Vec<ReplacementArgs>,
         move_to: Option<&str>,
-        hunks: Vec<EditHunk>,
-    ) -> EditUpdate {
-        EditUpdate {
+    ) -> EditArgs {
+        EditArgs {
             file_path: file_path.into(),
+            replacements,
             move_to: move_to.map(str::to_string),
-            hunks,
         }
     }
 
-    fn hunk(lines: Vec<EditHunkLine>) -> EditHunk {
-        EditHunk { lines }
-    }
-
-    fn context(text: impl Into<String>) -> EditHunkLine {
-        EditHunkLine {
-            kind: HunkLineKind::Context,
-            text: text.into(),
+    fn replacement(
+        old_string: impl Into<String>,
+        new_string: impl Into<String>,
+    ) -> ReplacementArgs {
+        ReplacementArgs {
+            old_string: old_string.into(),
+            new_string: new_string.into(),
+            replace_all: false,
         }
     }
 
-    fn remove(text: impl Into<String>) -> EditHunkLine {
-        EditHunkLine {
-            kind: HunkLineKind::Remove,
-            text: text.into(),
+    fn replacement_all(
+        old_string: impl Into<String>,
+        new_string: impl Into<String>,
+    ) -> ReplacementArgs {
+        ReplacementArgs {
+            old_string: old_string.into(),
+            new_string: new_string.into(),
+            replace_all: true,
         }
-    }
-
-    fn add(text: impl Into<String>) -> EditHunkLine {
-        EditHunkLine {
-            kind: HunkLineKind::Add,
-            text: text.into(),
-        }
-    }
-
-    fn replacement_hunk(old: impl Into<String>, new: impl Into<String>) -> EditHunk {
-        hunk(vec![remove(old), add(new)])
     }
 
     fn replacement_args(
         file_path: impl Into<String>,
-        old: impl Into<String>,
-        new: impl Into<String>,
+        old_string: impl Into<String>,
+        new_string: impl Into<String>,
     ) -> EditArgs {
-        args(vec![update(
-            file_path,
-            None,
-            vec![replacement_hunk(old, new)],
-        )])
+        args(file_path, vec![replacement(old_string, new_string)], None)
     }
 
     fn decoded_changes(
@@ -758,32 +411,41 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_structured_args() -> TestResult {
+    fn deserializes_sed_style_args() -> TestResult {
         let args: EditArgs = serde_json::from_value(serde_json::json!({
-            "updates": [
+            "file_path": "foo.txt",
+            "move_to": "bar.txt",
+            "replacements": [
                 {
-                    "file_path": "foo.txt",
-                    "move_to": "bar.txt",
-                    "hunks": [
-                        {
-                            "lines": [
-                                { "kind": "context", "text": "before" },
-                                { "kind": "remove", "text": "old" },
-                                { "kind": "add", "text": "new" }
-                            ]
-                        }
-                    ]
+                    "old_string": "world",
+                    "new_string": "there",
+                    "replace_all": true
                 }
             ]
         }))?;
 
-        assert_eq!(args.updates.len(), 1);
-        assert_eq!(args.updates[0].file_path, "foo.txt");
-        assert_eq!(args.updates[0].move_to.as_deref(), Some("bar.txt"));
-        assert_eq!(
-            args.updates[0].hunks[0].lines[0].kind,
-            HunkLineKind::Context
-        );
+        assert_eq!(args.file_path, "foo.txt");
+        assert_eq!(args.move_to.as_deref(), Some("bar.txt"));
+        assert_eq!(args.replacements.len(), 1);
+        assert_eq!(args.replacements[0].old_string, "world");
+        assert_eq!(args.replacements[0].new_string, "there");
+        assert!(args.replacements[0].replace_all);
+        Ok(())
+    }
+
+    #[test]
+    fn defaults_replace_all_to_false() -> TestResult {
+        let args: EditArgs = serde_json::from_value(serde_json::json!({
+            "file_path": "foo.txt",
+            "replacements": [
+                {
+                    "old_string": "world",
+                    "new_string": "there"
+                }
+            ]
+        }))?;
+
+        assert!(!args.replacements[0].replace_all);
         Ok(())
     }
 
@@ -794,25 +456,31 @@ mod tests {
         }));
 
         assert!(
-            message.contains("missing field `updates`") || message.contains("unknown field"),
+            message.contains("missing field `file_path`") || message.contains("unknown field"),
             "{message}"
         );
     }
 
     #[test]
-    fn rejects_old_replacement_args() {
+    fn rejects_old_hunk_args() {
         let message = deserialize_error(serde_json::json!({
-            "file_path": "foo.txt",
-            "replacements": [
+            "updates": [
                 {
-                    "old_string": "world",
-                    "new_string": "there"
+                    "file_path": "foo.txt",
+                    "hunks": [
+                        {
+                            "lines": [
+                                { "kind": "remove", "text": "old" },
+                                { "kind": "add", "text": "new" }
+                            ]
+                        }
+                    ]
                 }
             ]
         }));
 
         assert!(
-            message.contains("missing field `updates`") || message.contains("unknown field"),
+            message.contains("missing field `file_path`") || message.contains("unknown field"),
             "{message}"
         );
     }
@@ -821,46 +489,17 @@ mod tests {
     fn rejects_unknown_args() {
         for value in [
             serde_json::json!({
-                "updates": [],
+                "file_path": "foo.txt",
+                "replacements": [],
                 "unexpected": true
             }),
             serde_json::json!({
-                "updates": [
+                "file_path": "foo.txt",
+                "replacements": [
                     {
-                        "file_path": "foo.txt",
-                        "hunks": [],
+                        "old_string": "old",
+                        "new_string": "new",
                         "unexpected": true
-                    }
-                ]
-            }),
-            serde_json::json!({
-                "updates": [
-                    {
-                        "file_path": "foo.txt",
-                        "hunks": [
-                            {
-                                "lines": [],
-                                "unexpected": true
-                            }
-                        ]
-                    }
-                ]
-            }),
-            serde_json::json!({
-                "updates": [
-                    {
-                        "file_path": "foo.txt",
-                        "hunks": [
-                            {
-                                "lines": [
-                                    {
-                                        "kind": "context",
-                                        "text": "old",
-                                        "unexpected": true
-                                    }
-                                ]
-                            }
-                        ]
                     }
                 ]
             }),
@@ -870,47 +509,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_invalid_hunk_kind() {
-        let message = deserialize_error(serde_json::json!({
-            "updates": [
-                {
-                    "file_path": "foo.txt",
-                    "hunks": [
-                        {
-                            "lines": [
-                                { "kind": "replace", "text": "old" }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        }));
-
-        assert!(message.contains("unknown variant"), "{message}");
-    }
-
     #[tokio::test]
-    async fn rejects_hunk_text_with_newline() -> TestResult {
-        let (tool, _tmp) = fixture()?;
-
-        let Err(err) = tool
-            .call(args(vec![update(
-                "foo.txt",
-                None,
-                vec![hunk(vec![add("one\ntwo")])],
-            )]))
-            .await
-        else {
-            panic!("edit should fail");
-        };
-
-        assert!(err.to_string().contains("must not contain newline"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn applies_single_file_update() -> TestResult {
+    async fn applies_single_replacement() -> TestResult {
         let (tool, tmp) = fixture()?;
         let path = tmp.path().join("foo.txt");
         fs::write(&path, "hello world\n")?;
@@ -939,6 +539,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn applies_multiple_sequential_replacements() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("foo.txt");
+        fs::write(&path, "one two three\n")?;
+
+        tool.call(args(
+            "foo.txt",
+            vec![replacement("one", "uno"), replacement("three", "tres")],
+            None,
+        ))
+        .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "uno two tres\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacements_are_applied_to_current_in_memory_content() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("foo.txt");
+        fs::write(&path, "alpha\n")?;
+
+        tool.call(args(
+            "foo.txt",
+            vec![replacement("alpha", "beta"), replacement("beta", "gamma")],
+            None,
+        ))
+        .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "gamma\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn applies_multiline_replacement() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("foo.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n")?;
+
+        tool.call(replacement_args(
+            "foo.txt",
+            "alpha\nbeta",
+            "alpha\ninserted\nbeta",
+        ))
+        .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "alpha\ninserted\nbeta\ngamma\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletes_text_with_empty_new_string() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("foo.txt");
+        fs::write(&path, "alpha beta gamma\n")?;
+
+        tool.call(replacement_args("foo.txt", " beta", "")).await?;
+
+        assert_eq!(fs::read_to_string(path)?, "alpha gamma\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_all_replaces_every_match() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("foo.txt");
+        fs::write(&path, "same\nsame\n")?;
+
+        tool.call(args(
+            "foo.txt",
+            vec![replacement_all("same", "changed")],
+            None,
+        ))
+        .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "changed\nchanged\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_ambiguous_replacement_by_default() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("foo.txt");
+        fs::write(&path, "same\nsame\n")?;
+
+        let Err(err) = tool
+            .call(replacement_args("foo.txt", "same", "changed"))
+            .await
+        else {
+            panic!("edit should fail");
+        };
+
+        assert!(err.to_string().contains("ambiguous"));
+        assert!(err.to_string().contains("replace_all"));
+        assert_eq!(fs::read_to_string(path)?, "same\nsame\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_replacement() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("foo.txt");
+        fs::write(&path, "actual\n")?;
+
+        let Err(err) = tool.call(replacement_args("foo.txt", "old", "new")).await else {
+            panic!("edit should fail");
+        };
+
+        assert!(err.to_string().contains("not found"));
+        assert_eq!(fs::read_to_string(path)?, "actual\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_old_string() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::write(tmp.path().join("foo.txt"), "actual\n")?;
+
+        let Err(err) = tool.call(replacement_args("foo.txt", "", "new")).await else {
+            panic!("edit should fail");
+        };
+
+        assert!(err.to_string().contains("old_string must not be empty"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_no_op_replacement() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::write(tmp.path().join("foo.txt"), "actual\n")?;
+
+        let Err(err) = tool
+            .call(replacement_args("foo.txt", "actual", "actual"))
+            .await
+        else {
+            panic!("edit should fail");
+        };
+
+        assert!(err.to_string().contains("must differ"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_no_effect_after_sequential_replacements() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        fs::write(tmp.path().join("foo.txt"), "alpha\n")?;
+
+        let Err(err) = tool
+            .call(args(
+                "foo.txt",
+                vec![replacement("alpha", "beta"), replacement("beta", "alpha")],
+                None,
+            ))
+            .await
+        else {
+            panic!("edit should fail");
+        };
+
+        assert!(err.to_string().contains("produced no changes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_existing_line_endings_outside_replacement() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("mixed.txt");
+        fs::write(&path, "alpha\r\nbeta\ngamma\r\n")?;
+
+        tool.call(replacement_args("mixed.txt", "beta", "bee"))
+            .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "alpha\r\nbee\ngamma\r\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_missing_trailing_newline_when_replacing_last_line() -> TestResult {
+        let (tool, tmp) = fixture()?;
+        let path = tmp.path().join("noeol.txt");
+        fs::write(&path, "alpha\nbeta")?;
+
+        tool.call(replacement_args("noeol.txt", "beta", "BETA"))
+            .await?;
+
+        assert_eq!(fs::read_to_string(path)?, "alpha\nBETA");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn applies_move_update() -> TestResult {
         let (tool, tmp) = fixture()?;
         let source = tmp.path().join("old.txt");
@@ -946,11 +735,11 @@ mod tests {
         fs::write(&source, "before\n")?;
 
         let output = tool
-            .call(args(vec![update(
+            .call(args(
                 "old.txt",
+                vec![replacement("before", "after")],
                 Some("new.txt"),
-                vec![replacement_hunk("before", "after")],
-            )]))
+            ))
             .await?;
 
         assert!(!source.exists());
@@ -974,14 +763,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_rename_only_update_without_hunks() -> TestResult {
+    async fn applies_rename_only_update_without_replacements() -> TestResult {
         let (tool, tmp) = fixture()?;
         let source = tmp.path().join("old.txt");
         let target = tmp.path().join("new.txt");
         fs::write(&source, "same\n")?;
 
         let output = tool
-            .call(args(vec![update("old.txt", Some("new.txt"), Vec::new())]))
+            .call(args("old.txt", Vec::new(), Some("new.txt")))
             .await?;
 
         assert!(!source.exists());
@@ -1004,17 +793,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_move_to_equal_file_path() -> TestResult {
+    async fn accepts_move_to_equal_file_path_with_content_change() -> TestResult {
         let (tool, tmp) = fixture()?;
         let path = tmp.path().join("same.txt");
         fs::write(&path, "before\n")?;
 
         let output = tool
-            .call(args(vec![update(
+            .call(args(
                 "same.txt",
+                vec![replacement("before", "after")],
                 Some("same.txt"),
-                vec![replacement_hunk("before", "after")],
-            )]))
+            ))
             .await?;
 
         assert_eq!(fs::read_to_string(&path)?, "after\n");
@@ -1035,178 +824,14 @@ mod tests {
         fs::write(&path, "before\n")?;
 
         let Err(err) = tool
-            .call(args(vec![update("same.txt", Some("same.txt"), Vec::new())]))
+            .call(args("same.txt", Vec::new(), Some("same.txt")))
             .await
         else {
             panic!("edit should fail");
         };
 
-        assert!(err.to_string().contains("produced no changes"));
+        assert!(err.to_string().contains("replacement or move_to"));
         assert_eq!(fs::read_to_string(path)?, "before\n");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn applies_multi_file_update() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        fs::write(tmp.path().join("one.txt"), "one\n")?;
-        fs::write(tmp.path().join("two.txt"), "two\n")?;
-
-        let output = tool
-            .call(args(vec![
-                update("one.txt", None, vec![replacement_hunk("one", "uno")]),
-                update("two.txt", None, vec![replacement_hunk("two", "dos")]),
-            ]))
-            .await?;
-
-        assert_eq!(fs::read_to_string(tmp.path().join("one.txt"))?, "uno\n");
-        assert_eq!(fs::read_to_string(tmp.path().join("two.txt"))?, "dos\n");
-        let decoded = decoded_changes(output)?;
-        assert_eq!(decoded.model_output, "applied edits (2 files changed)");
-        assert_eq!(decoded.file_changes.len(), 2);
-        assert!(matches!(
-            decoded.file_changes[0].change,
-            FileChange::Update { .. }
-        ));
-        assert!(matches!(
-            decoded.file_changes[1].change,
-            FileChange::Update { .. }
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn preserves_crlf_for_update_insertions() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("crlf.txt");
-        fs::write(&path, "alpha\r\nbeta\r\n")?;
-
-        tool.call(args(vec![update(
-            "crlf.txt",
-            None,
-            vec![hunk(vec![
-                context("alpha"),
-                add("inserted"),
-                context("beta"),
-            ])],
-        )]))
-        .await?;
-
-        assert_eq!(fs::read_to_string(path)?, "alpha\r\ninserted\r\nbeta\r\n");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn preserves_mixed_line_endings() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("mixed.txt");
-        fs::write(&path, "alpha\r\nbeta\ngamma\r\n")?;
-
-        tool.call(replacement_args("mixed.txt", "beta", "bee"))
-            .await?;
-
-        assert_eq!(fs::read_to_string(path)?, "alpha\r\nbee\ngamma\r\n");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn preserves_inner_line_ending_for_added_line_in_block() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("mixed.txt");
-        fs::write(&path, "alpha\r\nbeta\ngamma\r\n")?;
-
-        tool.call(args(vec![update(
-            "mixed.txt",
-            None,
-            vec![hunk(vec![
-                context("alpha"),
-                remove("beta"),
-                add("BETA"),
-                context("gamma"),
-            ])],
-        )]))
-        .await?;
-
-        // BETA replaces beta (LF); it must keep LF, not adopt the block's leading CRLF.
-        assert_eq!(fs::read_to_string(path)?, "alpha\r\nBETA\ngamma\r\n");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn preserves_missing_trailing_newline_when_replacing_last_line() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("noeol.txt");
-        fs::write(&path, "alpha\nbeta")?;
-
-        tool.call(replacement_args("noeol.txt", "beta", "BETA"))
-            .await?;
-
-        assert_eq!(fs::read_to_string(path)?, "alpha\nBETA");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn preserves_missing_trailing_newline_when_appending() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("noeol.txt");
-        fs::write(&path, "alpha")?;
-
-        tool.call(args(vec![update(
-            "noeol.txt",
-            None,
-            vec![hunk(vec![context("alpha"), add("beta")])],
-        )]))
-        .await?;
-
-        assert_eq!(fs::read_to_string(path)?, "alpha\nbeta");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn preserves_crlf_without_trailing_newline_when_replacing_last_line() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("crlf_noeol.txt");
-        fs::write(&path, "alpha\r\nbeta")?;
-
-        tool.call(replacement_args("crlf_noeol.txt", "beta", "BETA"))
-            .await?;
-
-        assert_eq!(fs::read_to_string(path)?, "alpha\r\nBETA");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn keeps_trailing_newline_when_replacing_last_line() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("eol.txt");
-        fs::write(&path, "alpha\nbeta\n")?;
-
-        tool.call(replacement_args("eol.txt", "beta", "BETA"))
-            .await?;
-
-        assert_eq!(fs::read_to_string(path)?, "alpha\nBETA\n");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn applies_blank_context_line() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("blank.txt");
-        fs::write(&path, "alpha\n\nbeta\n")?;
-
-        tool.call(args(vec![update(
-            "blank.txt",
-            None,
-            vec![hunk(vec![
-                context("alpha"),
-                context(""),
-                add("inserted"),
-                context("beta"),
-            ])],
-        )]))
-        .await?;
-
-        assert_eq!(fs::read_to_string(path)?, "alpha\n\ninserted\nbeta\n");
         Ok(())
     }
 
@@ -1222,79 +847,6 @@ mod tests {
         };
 
         assert!(err.to_string().contains("does not exist"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejects_missing_hunk_context() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        fs::write(tmp.path().join("foo.txt"), "actual\n")?;
-
-        let Err(err) = tool.call(replacement_args("foo.txt", "old", "new")).await else {
-            panic!("edit should fail");
-        };
-
-        assert!(err.to_string().contains("context not found"));
-        assert_eq!(fs::read_to_string(tmp.path().join("foo.txt"))?, "actual\n");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejects_ambiguous_hunk_context() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        fs::write(tmp.path().join("foo.txt"), "same\nsame\n")?;
-
-        let Err(err) = tool
-            .call(replacement_args("foo.txt", "same", "changed"))
-            .await
-        else {
-            panic!("edit should fail");
-        };
-
-        assert!(err.to_string().contains("context is ambiguous"));
-        assert_eq!(
-            fs::read_to_string(tmp.path().join("foo.txt"))?,
-            "same\nsame\n"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejects_add_only_hunk_on_non_empty_file_with_targeted_error() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        fs::write(tmp.path().join("foo.txt"), "actual\n")?;
-
-        let Err(err) = tool
-            .call(args(vec![update(
-                "foo.txt",
-                None,
-                vec![hunk(vec![add("inserted")])],
-            )]))
-            .await
-        else {
-            panic!("edit should fail");
-        };
-
-        assert!(err.to_string().contains("is add-only"));
-        assert!(err.to_string().contains("unless the file is empty"));
-        assert_eq!(fs::read_to_string(tmp.path().join("foo.txt"))?, "actual\n");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn applies_add_only_hunk_to_empty_file() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("empty.txt");
-        fs::write(&path, "")?;
-
-        tool.call(args(vec![update(
-            "empty.txt",
-            None,
-            vec![hunk(vec![add("inserted")])],
-        )]))
-        .await?;
-
-        assert_eq!(fs::read_to_string(path)?, "inserted");
         Ok(())
     }
 
@@ -1322,7 +874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_non_utf8_update_input() -> TestResult {
+    async fn rejects_non_utf8_input() -> TestResult {
         let (tool, tmp) = fixture()?;
         let path = tmp.path().join("binary.dat");
         fs::write(&path, [0xff, 0xfe])?;
@@ -1340,66 +892,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_empty_updates() -> TestResult {
-        let (tool, _tmp) = fixture()?;
-
-        let Err(err) = tool.call(args(Vec::new())).await else {
-            panic!("edit should fail");
-        };
-
-        assert!(err.to_string().contains("updates must not be empty"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejects_update_without_hunks_or_move() -> TestResult {
+    async fn rejects_empty_replacements_without_move() -> TestResult {
         let (tool, tmp) = fixture()?;
         fs::write(tmp.path().join("foo.txt"), "hello\n")?;
 
-        let Err(err) = tool
-            .call(args(vec![update("foo.txt", None, Vec::new())]))
-            .await
-        else {
+        let Err(err) = tool.call(args("foo.txt", Vec::new(), None)).await else {
             panic!("edit should fail");
         };
 
-        assert!(err.to_string().contains("hunk or move_to"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejects_empty_hunk() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        fs::write(tmp.path().join("foo.txt"), "hello\n")?;
-
-        let Err(err) = tool
-            .call(args(vec![update("foo.txt", None, vec![hunk(Vec::new())])]))
-            .await
-        else {
-            panic!("edit should fail");
-        };
-
-        assert!(err.to_string().contains("lines must not be empty"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejects_no_op_update() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        fs::write(tmp.path().join("foo.txt"), "hello\n")?;
-
-        let Err(err) = tool
-            .call(args(vec![update(
-                "foo.txt",
-                None,
-                vec![hunk(vec![context("hello")])],
-            )]))
-            .await
-        else {
-            panic!("edit should fail");
-        };
-
-        assert!(err.to_string().contains("produced no changes"));
+        assert!(err.to_string().contains("replacement or move_to"));
         Ok(())
     }
 
@@ -1417,52 +918,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_duplicate_file_path() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let path = tmp.path().join("foo.txt");
-        fs::write(&path, "old\n")?;
-
-        let Err(err) = tool
-            .call(args(vec![
-                update("foo.txt", None, vec![replacement_hunk("old", "new")]),
-                update("foo.txt", None, vec![replacement_hunk("old", "newer")]),
-            ]))
-            .await
-        else {
-            panic!("edit should fail");
-        };
-
-        assert!(err.to_string().contains("more than once"));
-        assert_eq!(fs::read_to_string(path)?, "old\n");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejects_move_target_collision() -> TestResult {
-        let (tool, tmp) = fixture()?;
-        let first = tmp.path().join("first.txt");
-        let second = tmp.path().join("second.txt");
-        fs::write(&first, "first\n")?;
-        fs::write(&second, "second\n")?;
-
-        let Err(err) = tool
-            .call(args(vec![
-                update("first.txt", Some("moved.txt"), Vec::new()),
-                update("second.txt", Some("moved.txt"), Vec::new()),
-            ]))
-            .await
-        else {
-            panic!("edit should fail");
-        };
-
-        assert!(err.to_string().contains("more than once"));
-        assert_eq!(fs::read_to_string(first)?, "first\n");
-        assert_eq!(fs::read_to_string(second)?, "second\n");
-        assert!(!tmp.path().join("moved.txt").exists());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn rejects_move_target_that_already_exists() -> TestResult {
         let (tool, tmp) = fixture()?;
         let source = tmp.path().join("source.txt");
@@ -1471,11 +926,7 @@ mod tests {
         fs::write(&target, "target\n")?;
 
         let Err(err) = tool
-            .call(args(vec![update(
-                "source.txt",
-                Some("target.txt"),
-                Vec::new(),
-            )]))
+            .call(args("source.txt", Vec::new(), Some("target.txt")))
             .await
         else {
             panic!("edit should fail");
@@ -1488,30 +939,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rolls_back_when_later_hunk_fails() -> TestResult {
+    async fn prepares_every_replacement_before_writing() -> TestResult {
         let (tool, tmp) = fixture()?;
-        let first = tmp.path().join("first.txt");
-        let second = tmp.path().join("second.txt");
-        fs::write(&first, "old\n")?;
-        fs::write(&second, "actual\n")?;
+        let path = tmp.path().join("foo.txt");
+        fs::write(&path, "old\nactual\n")?;
 
         let Err(err) = tool
-            .call(args(vec![
-                update("first.txt", None, vec![replacement_hunk("old", "new")]),
-                update(
-                    "second.txt",
-                    None,
-                    vec![replacement_hunk("missing", "changed")],
-                ),
-            ]))
+            .call(args(
+                "foo.txt",
+                vec![replacement("old", "new"), replacement("missing", "changed")],
+                None,
+            ))
             .await
         else {
             panic!("edit should fail");
         };
 
-        assert!(err.to_string().contains("context not found"));
-        assert_eq!(fs::read_to_string(first)?, "old\n");
-        assert_eq!(fs::read_to_string(second)?, "actual\n");
+        assert!(err.to_string().contains("not found"));
+        assert_eq!(fs::read_to_string(path)?, "old\nactual\n");
         Ok(())
     }
 

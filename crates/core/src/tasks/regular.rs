@@ -1210,8 +1210,7 @@ async fn collect_spawn_results(
         .await;
         resolved.push(executed);
         if consumed {
-            release_consumed_child(&session.agent_control, child_thread_id).await;
-            consumed_children.push(child_thread_id);
+            consumed_children.push(consume_child(&session.agent_control, child_thread_id).await);
         }
     }
     resolved
@@ -1470,8 +1469,7 @@ async fn next_retained_subagent_completion(
         )
     });
     if let Some(child_thread_id) = child_thread_id {
-        release_consumed_child(agent_control, child_thread_id).await;
-        consumed_children.push(child_thread_id);
+        consumed_children.push(consume_child(agent_control, child_thread_id).await);
     }
     Some(CompletionEntry::from_inline(&entry.metadata, completion))
 }
@@ -1499,7 +1497,7 @@ async fn drain_retained_subagent_completions(
             )
         });
         if let Some(child_thread_id) = child_thread_id {
-            release_consumed_child(agent_control, child_thread_id).await;
+            consume_child(agent_control, child_thread_id).await;
         }
         (
             CompletionEntry::from_inline(&metadata, completion),
@@ -1529,6 +1527,17 @@ async fn release_consumed_child(agent_control: &AgentControl, child_thread_id: T
             "failed to release consumed subagent resources"
         );
     }
+}
+
+/// Release a consumed child's in-memory resources (via [`release_consumed_child`])
+/// and return its id so the caller can record it for the post-persist edge close.
+/// Returning the id — rather than taking `&mut consumed_children` — is what lets
+/// the concurrent drain in [`drain_retained_subagent_completions`] call this
+/// inside each per-child future while still accumulating `consumed_children`
+/// sequentially after the join (a shared `&mut Vec` cannot cross those futures).
+async fn consume_child(agent_control: &AgentControl, child_thread_id: ThreadId) -> ThreadId {
+    release_consumed_child(agent_control, child_thread_id).await;
+    child_thread_id
 }
 
 /// Close the durable parent→child edges of children consumed during this turn,

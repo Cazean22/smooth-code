@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -22,13 +23,32 @@ use crate::{
     agent::{AgentControl, SystemPromptKind, subagent_result::CompletionEntry},
     context_manager::ContextManager,
     error::{CoreError, CoreResult},
-    provider::{SessionModel, SessionModelFactory},
+    provider::SessionModel,
     rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persisted_event_item},
     state::{ActiveTurn, RunningTask, SessionState},
     tasks::{AnySessionTask, RegularTask},
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// The session's models for both plan-mode states, built once at thread
+/// creation. Toggling plan mode selects between them instead of rebuilding
+/// from the environment, so provider state (e.g. the parked OpenAI websocket)
+/// survives toggles untouched.
+pub(crate) struct SessionModels {
+    normal: SessionModel,
+    plan: SessionModel,
+}
+
+impl SessionModels {
+    pub(crate) fn new(normal: SessionModel, plan: SessionModel) -> Self {
+        Self { normal, plan }
+    }
+
+    fn for_mode(&self, plan_mode: bool) -> &SessionModel {
+        if plan_mode { &self.plan } else { &self.normal }
+    }
+}
 
 pub struct Core {
     pub(crate) session: Arc<Session>,
@@ -43,6 +63,7 @@ pub(crate) struct Session {
     turn_closed: tokio::sync::Notify,
     #[allow(dead_code)]
     pub(crate) session_source: SessionSource,
+    #[allow(dead_code)]
     pub(crate) system_prompt_kind: SystemPromptKind,
     pub(crate) project_instructions: Option<ProjectInstructions>,
     pub(crate) agent_control: AgentControl,
@@ -50,9 +71,10 @@ pub(crate) struct Session {
     #[allow(dead_code)]
     ask_user_client: Option<AskUserClient>,
     next_internal_sub_id: AtomicU64,
-    model: Mutex<SessionModel>,
+    models: SessionModels,
     plan_mode: AtomicBool,
-    pub(crate) model_factory: Arc<dyn SessionModelFactory>,
+    #[allow(dead_code)]
+    pub(crate) cwd: PathBuf,
     rollout: RolloutRecorder,
 }
 
@@ -69,7 +91,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: ThreadId,
-        model: SessionModel,
+        models: SessionModels,
         history: Vec<Message>,
         next_internal_sub_id: u64,
         rollout: RolloutRecorder,
@@ -80,7 +102,7 @@ impl Core {
         project_instructions: Option<ProjectInstructions>,
         agent_control: AgentControl,
         plan_mode: bool,
-        model_factory: Arc<dyn SessionModelFactory>,
+        cwd: PathBuf,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut context_manager = ContextManager::default();
@@ -98,9 +120,9 @@ impl Core {
             next_internal_sub_id: AtomicU64::new(next_internal_sub_id),
             system_prompt_kind,
             project_instructions,
-            model: Mutex::new(model),
+            models,
             plan_mode: AtomicBool::new(plan_mode),
-            model_factory,
+            cwd,
             rollout,
         });
         Self { session }
@@ -509,12 +531,8 @@ impl Session {
         });
     }
 
-    pub(crate) async fn model(&self) -> SessionModel {
-        self.model.lock().await.clone()
-    }
-
-    pub(crate) async fn set_model(&self, model: SessionModel) {
-        *self.model.lock().await = model;
+    pub(crate) fn model(&self) -> SessionModel {
+        self.models.for_mode(self.plan_mode()).clone()
     }
 
     pub(crate) fn plan_mode(&self) -> bool {
@@ -525,13 +543,16 @@ impl Session {
         self.plan_mode.store(enabled, Ordering::Release);
     }
 
-    /// Re-build the thread's `SessionModel` with the requested plan-mode state
-    /// and swap it in. Refuses mid-turn so the active stream is not torn down
-    /// while a tool call is in flight. Use [`Self::apply_plan_mode_unchecked`]
-    /// from within the tool loop itself (where holding `active_turn` is a
-    /// pre-condition, not a conflict).
+    /// Flip the thread's plan-mode state. Refuses mid-turn so the active
+    /// stream's tool set does not change underneath a tool call already in
+    /// flight. Use [`Self::apply_plan_mode_unchecked`] from within the tool
+    /// loop itself (where holding `active_turn` is a pre-condition, not a
+    /// conflict).
     pub(crate) async fn apply_plan_mode(self: &Arc<Self>, enabled: bool) -> CoreResult<bool> {
-        if self.active_turn.lock().await.is_some() {
+        // Hold the guard across the flip so a turn cannot start between the
+        // check and the state change.
+        let active_turn = self.active_turn.lock().await;
+        if active_turn.is_some() {
             return Err(CoreError::invariant(
                 "cannot toggle plan mode while a turn is in flight",
             ));
@@ -539,9 +560,10 @@ impl Session {
         self.apply_plan_mode_unchecked(enabled).await
     }
 
-    /// Rebuild + swap without the in-turn guard. Used by the `exit_plan_mode`
+    /// Flip plan mode without the in-turn guard. Used by the `exit_plan_mode`
     /// tool handler, which by definition runs inside the parent turn's tool
-    /// loop.
+    /// loop. Both models are prebuilt at session creation, so this is just a
+    /// flag store plus the `PlanModeChanged` event.
     pub(crate) async fn apply_plan_mode_unchecked(
         self: &Arc<Self>,
         enabled: bool,
@@ -549,20 +571,6 @@ impl Session {
         if self.plan_mode() == enabled {
             return Ok(enabled);
         }
-        let cwd = std::env::current_dir()?;
-        let new_model = self
-            .model_factory
-            .build(
-                cwd,
-                self.id,
-                self.ask_user_client.clone(),
-                Arc::clone(&self.current_turn_id),
-                self.system_prompt_kind,
-                self.agent_control.clone(),
-                enabled,
-            )
-            .map_err(CoreError::provider)?;
-        self.set_model(new_model).await;
         self.set_plan_mode_flag(enabled);
         self.emit_session_event(EventMsg::PlanModeChanged(PlanModeChangedEvent {
             thread_id: self.id.to_string(),
@@ -599,7 +607,7 @@ mod tests {
     use std::{
         path::PathBuf,
         sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -611,19 +619,17 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::sync::RwLock;
-    use tools::AskUserClient;
 
     use crate::{
         SessionCompletionEvent, SessionCompletionStream, SessionModel, SessionModelDriver,
         SessionTurnSummary,
         agent::AgentControl,
-        provider::{SessionModelFactory, stub_session_model_factory},
         rollout::RolloutRecorder,
         state::TaskKind,
         tasks::SessionTask,
     };
 
-    use super::{Core, Session, TurnContext};
+    use super::{Core, Session, SessionModels, TurnContext};
     use smooth_protocol::{AgentStatus, AgentStatusChangedEvent, EventMsg, SessionSource};
     use tokio_util::sync::CancellationToken;
 
@@ -788,41 +794,6 @@ mod tests {
         }
     }
 
-    struct RecordingFactory {
-        calls: Arc<Mutex<Vec<(bool, bool)>>>,
-        model: SessionModel,
-    }
-
-    impl SessionModelFactory for RecordingFactory {
-        fn build(
-            &self,
-            _cwd: PathBuf,
-            _thread_id: smooth_protocol::ThreadId,
-            ask_user_client: Option<AskUserClient>,
-            _current_turn_id: Arc<RwLock<Option<String>>>,
-            _system_prompt_kind: crate::agent::SystemPromptKind,
-            _agent_control: AgentControl,
-            plan_mode: bool,
-        ) -> Result<SessionModel> {
-            self.calls
-                .lock()
-                .map_err(|_| anyhow::anyhow!("recording factory mutex should lock"))?
-                .push((ask_user_client.is_some(), plan_mode));
-            Ok(self.model.clone())
-        }
-    }
-
-    fn stub_ask_user_client() -> AskUserClient {
-        AskUserClient::new(
-            |_params| async {
-                Ok(app_server_protocol::AskUserQuestionResponse {
-                    answers: Vec::new(),
-                })
-            },
-            |_thread_id| async {},
-        )
-    }
-
     async fn test_core() -> Result<(
         Core,
         tokio::sync::broadcast::Receiver<smooth_protocol::Event>,
@@ -833,11 +804,9 @@ mod tests {
         let current_turn_id = Arc::new(RwLock::new(None));
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let model = SessionModel::Stub(Arc::new(EmptyDriver));
-        let factory: Arc<dyn SessionModelFactory> =
-            stub_session_model_factory(std::iter::once((thread_id, model.clone())).collect());
         let core = Core::new(
             thread_id,
-            model,
+            SessionModels::new(model.clone(), model),
             Vec::new(),
             0,
             rollout,
@@ -848,7 +817,7 @@ mod tests {
             None,
             AgentControl::new(),
             false,
-            factory,
+            cwd,
         );
         let rx = core.subscribe();
         Ok((core, rx))
@@ -1014,11 +983,9 @@ mod tests {
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let driver = Arc::new(ResetOnceDriver::new());
         let model = SessionModel::Stub(driver.clone());
-        let factory: Arc<dyn SessionModelFactory> =
-            stub_session_model_factory(std::iter::once((thread_id, model.clone())).collect());
         let core = Core::new(
             thread_id,
-            model,
+            SessionModels::new(model.clone(), model),
             Vec::new(),
             0,
             rollout,
@@ -1029,7 +996,7 @@ mod tests {
             None,
             AgentControl::new(),
             false,
-            factory,
+            cwd,
         );
         let mut rx = core.subscribe();
 
@@ -1094,11 +1061,9 @@ mod tests {
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let driver = Arc::new(ResetAfterToolDriver::new());
         let model = SessionModel::Stub(driver.clone());
-        let factory: Arc<dyn SessionModelFactory> =
-            stub_session_model_factory(std::iter::once((thread_id, model.clone())).collect());
         let core = Core::new(
             thread_id,
-            model,
+            SessionModels::new(model.clone(), model),
             Vec::new(),
             0,
             rollout,
@@ -1109,7 +1074,7 @@ mod tests {
             None,
             AgentControl::new(),
             false,
-            factory,
+            cwd,
         );
         let mut rx = core.subscribe();
 
@@ -1180,42 +1145,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unchecked_plan_mode_rebuild_reuses_stored_ask_user_client() -> Result<()> {
+    async fn toggle_plan_mode_selects_prebuilt_model_and_emits_event() -> Result<()> {
         let workspace = TempDir::new()?;
         let cwd = PathBuf::from(workspace.path());
         let thread_id = smooth_protocol::ThreadId::new();
         let current_turn_id = Arc::new(RwLock::new(None));
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
-        let model = SessionModel::Stub(Arc::new(EmptyDriver));
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let factory: Arc<dyn SessionModelFactory> = Arc::new(RecordingFactory {
-            calls: Arc::clone(&calls),
-            model: model.clone(),
-        });
+        let normal_driver: Arc<dyn SessionModelDriver> = Arc::new(EmptyDriver);
+        let plan_driver: Arc<dyn SessionModelDriver> = Arc::new(EmptyDriver);
         let core = Core::new(
             thread_id,
-            model,
+            SessionModels::new(
+                SessionModel::Stub(Arc::clone(&normal_driver)),
+                SessionModel::Stub(Arc::clone(&plan_driver)),
+            ),
             Vec::new(),
             0,
             rollout,
             current_turn_id,
-            Some(stub_ask_user_client()),
+            None,
             SessionSource::Cli,
             crate::agent::SystemPromptKind::Root,
             None,
             AgentControl::new(),
-            true,
-            factory,
+            false,
+            cwd,
         );
+        let mut rx = core.subscribe();
 
-        core.session.apply_plan_mode_unchecked(false).await?;
+        let driver_of = |model: SessionModel| match model {
+            SessionModel::Stub(driver) => Ok(driver),
+            _ => Err(anyhow::anyhow!("expected stub session model")),
+        };
+        assert!(Arc::ptr_eq(
+            &driver_of(core.session.model())?,
+            &normal_driver
+        ));
 
-        assert_eq!(
-            *calls
-                .lock()
-                .map_err(|_| anyhow::anyhow!("recording factory mutex should lock"))?,
-            vec![(true, false)]
-        );
+        let enabled = core.session.apply_plan_mode(true).await?;
+        assert!(enabled);
+        assert!(core.session.plan_mode());
+        assert!(Arc::ptr_eq(
+            &driver_of(core.session.model())?,
+            &plan_driver
+        ));
+        let event = rx.recv().await?;
+        assert!(matches!(
+            event.msg,
+            EventMsg::PlanModeChanged(ref change) if change.enabled
+        ));
+
+        // Toggling to the same state is a no-op and emits nothing further.
+        let enabled = core.session.apply_plan_mode(true).await?;
+        assert!(enabled);
+
+        let enabled = core.session.apply_plan_mode(false).await?;
+        assert!(!enabled);
+        assert!(Arc::ptr_eq(
+            &driver_of(core.session.model())?,
+            &normal_driver
+        ));
+        let event = rx.recv().await?;
+        assert!(matches!(
+            event.msg,
+            EventMsg::PlanModeChanged(ref change) if !change.enabled
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_plan_mode_refuses_while_turn_is_in_flight() -> Result<()> {
+        let (core, _rx) = test_core().await?;
+
+        let turn_context = Arc::new(core.session.fresh_turn_context());
+        core.session
+            .start_task(
+                turn_context,
+                Vec::new(),
+                Arc::new(CancellationAwareTask),
+                TaskKind::Regular,
+            )
+            .await?;
+
+        let result = core.session.apply_plan_mode(true).await;
+        assert!(result.is_err());
+        assert!(!core.session.plan_mode());
+
+        core.session.abort_all_tasks("test cleanup").await;
         Ok(())
     }
 }

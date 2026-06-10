@@ -1385,4 +1385,60 @@ mod tests {
         std::env::set_current_dir(original_cwd)?;
         Ok(())
     }
+
+    struct PlanModeRecordingFactory {
+        calls: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl SessionModelFactory for PlanModeRecordingFactory {
+        fn build(
+            &self,
+            _cwd: PathBuf,
+            _thread_id: ThreadId,
+            _ask_user_client: Option<AskUserClient>,
+            _current_turn_id: Arc<RwLock<Option<String>>>,
+            _system_prompt_kind: SystemPromptKind,
+            _agent_control: AgentControl,
+            plan_mode: bool,
+        ) -> Result<SessionModel> {
+            lock_test_mutex(&self.calls, "plan_mode_factory_calls")?.push(plan_mode);
+            Ok(SessionModel::Stub(Arc::new(StubDriver {
+                text: "done".to_string(),
+            })))
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_toggle_does_not_rebuild_session_models() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(PlanModeRecordingFactory {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await?;
+        let started = manager.start_thread().await?;
+        assert_eq!(
+            *lock_test_mutex(&calls, "plan_mode_factory_calls")?,
+            vec![false, true],
+            "both plan-mode variants should be built once at thread creation"
+        );
+
+        assert!(manager.set_plan_mode(started.thread_id, true).await?);
+        assert!(!manager.set_plan_mode(started.thread_id, false).await?);
+        assert_eq!(
+            *lock_test_mutex(&calls, "plan_mode_factory_calls")?,
+            vec![false, true],
+            "toggling plan mode must not rebuild the session model"
+        );
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
 }

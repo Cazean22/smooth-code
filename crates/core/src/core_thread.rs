@@ -10,7 +10,7 @@ use tools::AskUserClient;
 
 use crate::{
     agent::{AgentControl, SystemPromptKind},
-    core::Core,
+    core::{Core, SessionModels},
     error::{CoreError, CoreResult},
     provider::{SessionModelFactory, default_session_model_factory},
     rollout::{ResumeState, RolloutRecorder, workspace_root},
@@ -20,6 +20,33 @@ use smooth_protocol::{Op, ThreadId};
 pub struct CoreThread {
     pub(crate) core: Core,
     rollout_path: PathBuf,
+}
+
+/// Build the session's models for both plan-mode states up front so toggling
+/// plan mode never has to rebuild from the environment mid-session.
+fn build_session_models(
+    factory: &dyn SessionModelFactory,
+    cwd: PathBuf,
+    id: ThreadId,
+    ask_user_client: Option<AskUserClient>,
+    current_turn_id: &Arc<RwLock<Option<String>>>,
+    system_prompt_kind: SystemPromptKind,
+    agent_control: &AgentControl,
+) -> CoreResult<SessionModels> {
+    let build = |plan_mode: bool| {
+        factory
+            .build(
+                cwd.clone(),
+                id,
+                ask_user_client.clone(),
+                Arc::clone(current_turn_id),
+                system_prompt_kind,
+                agent_control.clone(),
+                plan_mode,
+            )
+            .map_err(CoreError::provider)
+    };
+    Ok(SessionModels::new(build(false)?, build(true)?))
 }
 
 impl CoreThread {
@@ -75,17 +102,15 @@ impl CoreThread {
         let current_turn_id = Arc::new(RwLock::new(None));
         let resolved_factory = model_factory.unwrap_or_else(default_session_model_factory);
         let plan_mode = false;
-        let model = resolved_factory
-            .build(
-                cwd.clone(),
-                id,
-                ask_user_client.clone(),
-                Arc::clone(&current_turn_id),
-                system_prompt_kind,
-                agent_control.clone(),
-                plan_mode,
-            )
-            .map_err(CoreError::provider)?;
+        let models = build_session_models(
+            resolved_factory.as_ref(),
+            cwd.clone(),
+            id,
+            ask_user_client.clone(),
+            &current_turn_id,
+            system_prompt_kind,
+            &agent_control,
+        )?;
         let workspace_root = workspace_root().map_err(CoreError::rollout)?;
         let rollout = RolloutRecorder::create_with_project_instructions(
             &workspace_root,
@@ -109,7 +134,7 @@ impl CoreThread {
         Ok(Self {
             core: Core::new(
                 id,
-                model,
+                models,
                 initial_history,
                 0,
                 rollout,
@@ -120,7 +145,7 @@ impl CoreThread {
                 project_instructions,
                 agent_control,
                 plan_mode,
-                resolved_factory.clone(),
+                cwd,
             ),
             rollout_path,
         })
@@ -150,24 +175,22 @@ impl CoreThread {
         let current_turn_id = Arc::new(RwLock::new(None));
         let resolved_factory = model_factory.unwrap_or_else(default_session_model_factory);
         let plan_mode = false;
-        let model = resolved_factory
-            .build(
-                cwd,
-                state.thread_id,
-                ask_user_client.clone(),
-                Arc::clone(&current_turn_id),
-                system_prompt_kind,
-                agent_control.clone(),
-                plan_mode,
-            )
-            .map_err(CoreError::provider)?;
+        let models = build_session_models(
+            resolved_factory.as_ref(),
+            cwd.clone(),
+            state.thread_id,
+            ask_user_client.clone(),
+            &current_turn_id,
+            system_prompt_kind,
+            &agent_control,
+        )?;
         let rollout = RolloutRecorder::resume(path.clone())
             .await
             .map_err(CoreError::rollout)?;
         Ok(Self {
             core: Core::new(
                 state.thread_id,
-                model,
+                models,
                 state.history,
                 state.next_turn_index,
                 rollout,
@@ -178,7 +201,7 @@ impl CoreThread {
                 state.project_instructions,
                 agent_control,
                 plan_mode,
-                resolved_factory.clone(),
+                cwd,
             ),
             rollout_path: path,
         })

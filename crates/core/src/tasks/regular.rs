@@ -435,7 +435,7 @@ async fn run_manual_turn(
             session.project_instructions.as_ref(),
             &new_messages,
         )?;
-        let model_for_stream = session.model().await;
+        let model_for_stream = session.model();
         let mut stream = match model_for_stream
             .stream_completion_turn(pending_prompt, &request_history)
             .await
@@ -558,7 +558,7 @@ async fn run_manual_turn(
                 &attempt.turn_summary,
                 &attempt.accumulated_text,
                 &mut attempt.accumulated_reasoning,
-                session.model().await.requires_provider_reasoning_ids(),
+                session.model().requires_provider_reasoning_ids(),
                 std::mem::take(&mut stream_phase_completions),
             );
             continue;
@@ -575,7 +575,7 @@ async fn run_manual_turn(
                 &attempt.turn_summary,
                 &attempt.accumulated_text,
                 &mut attempt.accumulated_reasoning,
-                session.model().await.requires_provider_reasoning_ids(),
+                session.model().requires_provider_reasoning_ids(),
                 completion_entries,
             );
             continue;
@@ -585,7 +585,7 @@ async fn run_manual_turn(
             &attempt.turn_summary,
             &attempt.accumulated_text,
             &mut attempt.accumulated_reasoning,
-            session.model().await.requires_provider_reasoning_ids(),
+            session.model().requires_provider_reasoning_ids(),
         ) {
             new_messages.push(message);
         }
@@ -671,7 +671,7 @@ async fn commit_attempt_messages(
     stream_phase_completions: &mut Vec<CompletionEntry>,
     cancellation_token: &CancellationToken,
 ) -> Option<()> {
-    let requires_provider_reasoning_ids = session.model().await.requires_provider_reasoning_ids();
+    let requires_provider_reasoning_ids = session.model().requires_provider_reasoning_ids();
     let assistant_message = if attempt.saw_tool_call_this_attempt {
         build_assistant_tool_message(
             &attempt.turn_summary,
@@ -732,7 +732,7 @@ async fn execute_normal_tool_call(
         internal_call_id,
     } = pending;
 
-    let model_for_call = session.model().await;
+    let model_for_call = session.model();
     let (tool_output, success, error) = match model_for_call
         .call_tool(
             &tool_call.function.name,

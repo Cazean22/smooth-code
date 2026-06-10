@@ -624,10 +624,7 @@ mod tests {
 
     use crate::{
         SessionCompletionEvent, SessionCompletionStream, SessionModel, SessionModelDriver,
-        SessionTurnSummary,
-        agent::AgentControl,
-        rollout::RolloutRecorder,
-        state::TaskKind,
+        SessionTurnSummary, agent::AgentControl, rollout::RolloutRecorder, state::TaskKind,
         tasks::SessionTask,
     };
 
@@ -1187,10 +1184,7 @@ mod tests {
         let enabled = core.session.apply_plan_mode(true).await?;
         assert!(enabled);
         assert!(core.session.plan_mode());
-        assert!(Arc::ptr_eq(
-            &driver_of(core.session.model())?,
-            &plan_driver
-        ));
+        assert!(Arc::ptr_eq(&driver_of(core.session.model())?, &plan_driver));
         let event = rx.recv().await?;
         assert!(matches!(
             event.msg,

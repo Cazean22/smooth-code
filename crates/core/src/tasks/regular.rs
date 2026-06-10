@@ -1039,13 +1039,9 @@ async fn execute_exit_plan_mode_call(
         internal_call_id,
     } = pending;
 
-    let (tool_output, success, error) = exit_plan_mode_outcome(
-        &session,
-        &ctx,
-        internal_call_id.clone(),
-        cancellation_token,
-    )
-    .await?;
+    let (tool_output, success, error) =
+        exit_plan_mode_outcome(&session, &ctx, internal_call_id.clone(), cancellation_token)
+            .await?;
 
     Some(
         complete_tool_call(

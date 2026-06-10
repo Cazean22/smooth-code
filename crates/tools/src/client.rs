@@ -49,7 +49,10 @@ impl AskUserClient {
 
     /// Attach a plan-approval handler. Clients that cannot present a plan for
     /// approval keep the default handler, which fails the request.
-    pub fn with_plan_approval<ApproveFn, ApproveFut>(mut self, request_plan_approval: ApproveFn) -> Self
+    pub fn with_plan_approval<ApproveFn, ApproveFut>(
+        mut self,
+        request_plan_approval: ApproveFn,
+    ) -> Self
     where
         ApproveFn: Fn(RequestPlanApprovalParams) -> ApproveFut + Send + Sync + 'static,
         ApproveFut:

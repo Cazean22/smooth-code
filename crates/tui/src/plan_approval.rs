@@ -298,8 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_plan_markdown_with_pinned_header_and_footer() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn renders_plan_markdown_with_pinned_header_and_footer()
+    -> Result<(), Box<dyn std::error::Error>> {
         let overlay = PlanApprovalOverlay::new(RequestId(1), sample_params());
         let width = 60usize;
         let mut terminal = Terminal::new(TestBackend::new(width as u16, 12))?;

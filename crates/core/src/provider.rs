@@ -1704,8 +1704,7 @@ mod tests {
     use super::{build_agent, compose_session_preamble};
     use crate::{
         agent::{
-            AgentControl, SystemPromptKind, plan_mode_instructions,
-            plan_mode::plan_mode_tool_names,
+            AgentControl, SystemPromptKind, plan_mode::plan_mode_tool_names, plan_mode_instructions,
         },
         environment::EnvironmentContext,
     };

@@ -24,10 +24,7 @@ pub(crate) const PLAN_MODE_TOOLS: &[(&str, &str)] = &[
         "ask_user_question",
         "ask the user to clarify requirements or choose between approaches.",
     ),
-    (
-        "plan_write",
-        "write your plan to the per-thread plan file.",
-    ),
+    ("plan_write", "write your plan to the per-thread plan file."),
     (
         "exit_plan_mode",
         "submit the plan you wrote with `plan_write` for user approval.",

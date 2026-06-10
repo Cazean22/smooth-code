@@ -20,9 +20,9 @@
 
 - Runtime flow is TUI -> `AppServerSession` -> `app_server::in_process` -> `MessageProcessor`/`CoreMessageProcessor` -> `ThreadManagerState` -> `CoreThread`/`Core` -> Rig model/tool loop -> protocol events back to the TUI.
 - `smooth-tui` is the terminal UI entrypoint. It uses ratatui/crossterm, keeps state in a reducer-style `UiModel::update(UiEvent) -> Vec<UiEffect>`, and lets `App` run async effects and render.
-- `app-server` is an in-process request/event bridge. It owns `CoreMessageProcessor`, thread subscriptions, and client-directed server requests such as `ask_user_question`.
-- `app-server-protocol` owns typed client/server request envelopes: `ClientRequest`, `ServerRequest`, `ThreadStart`, `ThreadResume`, `ThreadList`, `TurnStart`, `SetPlanMode`, and ask-user request/response types.
-- `smooth-core` owns session/thread runtime, rollout persistence, model/provider setup, manual tool-loop execution, plan-mode model rebuilds, and multi-agent orchestration.
+- `app-server` is an in-process request/event bridge. It owns `CoreMessageProcessor`, thread subscriptions, and client-directed server requests such as `ask_user_question` and `request_plan_approval`.
+- `app-server-protocol` owns typed client/server request envelopes: `ClientRequest`, `ServerRequest`, `ThreadStart`, `ThreadResume`, `ThreadList`, `TurnStart`, `SetPlanMode`, and ask-user/plan-approval request/response types.
+- `smooth-core` owns session/thread runtime, rollout persistence, model/provider setup, manual tool-loop execution, plan-mode state and approval, and multi-agent orchestration.
 - `smooth-protocol` owns shared event/status/thread/file-change wire types, `ThreadId`, `AgentPath`, and structured `ErrorInfo`.
 - `smooth-state-db` owns SQLite state at `.smooth-code/state.db`, currently thread metadata plus parent/child thread spawn edges.
 - `tools` owns Rig tool definitions and implementations: `read`, `run_command`, `ask_user_question`, `spawn_agent`, `delete`, `edit`, `write`, `plan_write`, and `exit_plan_mode`.
@@ -48,7 +48,11 @@
 ## Tools and Plan Mode
 
 - Default tools include `read`, `run_command`, `delete`, `edit`, `write`, optional `ask_user_question`, and `spawn_agent`.
-- Plan mode swaps mutating file tools for `plan_write` and `exit_plan_mode`, while keeping read/inspection tools and `spawn_agent`.
+- Plan mode swaps mutating file tools for `plan_write` and `exit_plan_mode`, while keeping read/inspection tools and `spawn_agent`. `PLAN_MODE_TOOLS` in `crates/core/src/agent/plan_mode.rs` is the single source of truth for that list: the plan-mode instructions are generated from it and a provider test asserts the registered tool set matches.
+- Both plan-mode and normal session models are prebuilt once at thread creation (`SessionModels` on `Session`); toggling plan mode is a flag flip plus a `PlanModeChanged` event, never a model rebuild. `apply_plan_mode` holds the `active_turn` guard and refuses mid-turn; the unchecked variant is reserved for the in-turn `exit_plan_mode` handler.
+- `exit_plan_mode` is an approval gate, not a plain toggle: core reads the plan written by `plan_write` (`tools::plan_file_path`), sends a `RequestPlanApproval` server request, and waits. Approval flips plan mode off mid-turn (the rest of the turn runs on the normal model); rejection keeps plan mode on and feeds the user's feedback back as a successful tool result. Missing plan file, non-plan-mode calls, or a client without plan-approval support are tool errors.
+- Plan mode holds for the whole agent subtree: any `spawn_agent` issued while the parent is in plan mode is coerced to the structurally read-only `Explore` prompt kind regardless of `subagent_type`.
+- `PlanModeChanged` is persisted to the rollout and the last one wins on resume (`ResumeState.plan_mode`), so a thread resumed mid-planning keeps its restricted tool set and the TUI badge restores from replay.
 - The model-facing `list_dir` and `dynamic_echo` tools are gone. Directory inspection should use shell commands through `run_command` or local agent shell tools.
 - Source changes should go through structured file tools (`edit`, `write`, `delete`) so core can emit `FileChangeOutput` and the TUI can render diffs. Keep `run_command` for inspection, validation, formatters, and project commands, not ad hoc source rewrites.
 - Tool argument schemas should derive `schemars::JsonSchema` on args structs and use `schema_for!(Args).to_value()`. Prefer `#[serde(deny_unknown_fields)]`; doc comments become schema descriptions and `#[schemars(range(...))]` carries numeric bounds.

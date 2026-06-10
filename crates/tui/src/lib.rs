@@ -10,6 +10,7 @@ mod history_cell;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
+mod plan_approval;
 mod project_instructions;
 mod question_picker;
 mod streaming;

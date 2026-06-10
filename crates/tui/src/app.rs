@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use app_server_protocol::{
-    AskUserQuestionResponse, JsonRpcError, RequestId, ServerRequest, SetPlanModeResponse,
-    ThreadListItem, ThreadListResponse, ThreadResumeResponse, ThreadStartResponse,
-    TurnCancelResponse, TurnStartResponse,
+    AskUserQuestionResponse, JsonRpcError, RequestId, RequestPlanApprovalResponse, ServerRequest,
+    SetPlanModeResponse, ThreadListItem, ThreadListResponse, ThreadResumeResponse,
+    ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
 };
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -24,6 +24,7 @@ use crate::{
     diff_render::file_change_path_label,
     error::TuiResult,
     history_cell::{ToolCallGroupCell, ToolCallState, TranscriptItem, TranscriptItemId},
+    plan_approval::{PlanApprovalOutcome, PlanApprovalOverlay},
     question_picker::{PickerOutcome, QuestionPicker},
     streaming::StreamController,
     wrap,
@@ -147,6 +148,16 @@ impl App {
                         .await
                         .map(|_| UiEffectResult::ServerRequestAnswered)
                 }
+                UiEffectKind::RespondPlanApproval {
+                    request_id,
+                    response,
+                } => {
+                    let value = serde_json::to_value(response)?;
+                    app_server
+                        .respond_to_server_request(request_id, value)
+                        .await
+                        .map(|_| UiEffectResult::ServerRequestAnswered)
+                }
                 UiEffectKind::FailQuestion { request_id, error } => app_server
                     .fail_server_request(request_id, error)
                     .await
@@ -230,6 +241,10 @@ enum UiEffectKind {
     AnswerQuestion {
         request_id: RequestId,
         response: AskUserQuestionResponse,
+    },
+    RespondPlanApproval {
+        request_id: RequestId,
+        response: RequestPlanApprovalResponse,
     },
     FailQuestion {
         request_id: RequestId,
@@ -637,6 +652,7 @@ struct UiModel {
     // row count that drives `max_scroll`) differs from the full terminal width.
     transcript_inner_width: u16,
     question_picker: Option<QuestionPicker>,
+    plan_approval: Option<PlanApprovalOverlay>,
     effect_counter: u64,
     effect_contexts: HashMap<EffectId, EffectContext>,
     screen: Screen,
@@ -689,6 +705,7 @@ impl UiModel {
             viewport_height: 20,
             transcript_inner_width: 78,
             question_picker: None,
+            plan_approval: None,
             effect_counter: 0,
             effect_contexts: HashMap::new(),
             screen: Screen::Dashboard,
@@ -828,6 +845,10 @@ impl UiModel {
 
         if self.screen == Screen::Workspace && self.question_picker.is_some() {
             return self.dispatch_picker_key(key_event);
+        }
+
+        if self.screen == Screen::Workspace && self.plan_approval.is_some() {
+            return self.dispatch_plan_approval_key(key_event);
         }
 
         if self.mode == UiMode::Command {
@@ -1053,7 +1074,9 @@ impl UiModel {
         match key_event.code {
             KeyCode::Esc => {
                 self.command.clear();
-                self.mode = if self.screen == Screen::Workspace && self.question_picker.is_some() {
+                self.mode = if self.screen == Screen::Workspace
+                    && (self.question_picker.is_some() || self.plan_approval.is_some())
+                {
                     UiMode::Overlay
                 } else {
                     UiMode::Normal
@@ -1244,6 +1267,31 @@ impl UiModel {
         )]
     }
 
+    fn dispatch_plan_approval_key(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
+        let outcome = self
+            .plan_approval
+            .as_mut()
+            .map(|overlay| overlay.handle_key(key_event))
+            .unwrap_or(PlanApprovalOutcome::None);
+        match outcome {
+            PlanApprovalOutcome::None => Vec::new(),
+            PlanApprovalOutcome::Respond(response) => {
+                let Some(overlay) = self.plan_approval.take() else {
+                    return Vec::new();
+                };
+                self.mode = UiMode::Normal;
+                self.focus = FocusTarget::Transcript;
+                vec![self.effect(
+                    EffectContext::ServerRequest,
+                    UiEffectKind::RespondPlanApproval {
+                        request_id: overlay.request_id,
+                        response,
+                    },
+                )]
+            }
+        }
+    }
+
     fn handle_server_request(&mut self, request: ServerRequest) -> Vec<UiEffect> {
         if let Some(effects) = self.reject_inactive_server_request(&request) {
             return effects;
@@ -1257,13 +1305,18 @@ impl UiModel {
                 self.focus = FocusTarget::Overlay;
                 Vec::new()
             }
-            ServerRequest::RequestPlanApproval { request_id, .. } => {
-                // Placeholder until the plan-approval overlay lands; core does
-                // not send this request yet.
-                self.fail_server_request(
-                    request_id,
-                    "plan approval UI is not available in this client".to_string(),
-                )
+            ServerRequest::RequestPlanApproval { request_id, params } => {
+                if self.plan_approval.is_some() || self.question_picker.is_some() {
+                    return self.fail_server_request(
+                        request_id,
+                        "another interactive request is already pending".to_string(),
+                    );
+                }
+                self.screen = Screen::Workspace;
+                self.plan_approval = Some(PlanApprovalOverlay::new(request_id, params));
+                self.mode = UiMode::Overlay;
+                self.focus = FocusTarget::Overlay;
+                Vec::new()
             }
         }
     }
@@ -1507,6 +1560,7 @@ impl UiModel {
                 self.is_turn_cancelling = false;
                 self.running_tools.clear();
                 self.question_picker = None;
+                self.plan_approval = None;
                 if self.mode == UiMode::Overlay {
                     self.mode = UiMode::Normal;
                     self.focus = FocusTarget::Transcript;
@@ -2225,6 +2279,11 @@ impl UiModel {
             .as_ref()
             .map(|picker| picker.desired_height(area.width).min(20))
             .unwrap_or(0);
+        let approval_height = self
+            .plan_approval
+            .as_ref()
+            .map(|overlay| overlay.desired_height(area.width).min(30))
+            .unwrap_or(0);
         let command_height = if self.mode == UiMode::Command { 1 } else { 0 };
         let composer_height = self.composer_height();
 
@@ -2232,6 +2291,9 @@ impl UiModel {
         constraints.push(Constraint::Min(5));
         if picker_height > 0 {
             constraints.push(Constraint::Length(picker_height));
+        }
+        if approval_height > 0 {
+            constraints.push(Constraint::Length(approval_height));
         }
         constraints.push(Constraint::Length(1));
         constraints.push(Constraint::Length(composer_height));
@@ -2252,6 +2314,12 @@ impl UiModel {
         if picker_height > 0 {
             if let Some(picker) = &self.question_picker {
                 picker.render(frame, chunks[idx]);
+            }
+            idx += 1;
+        }
+        if approval_height > 0 {
+            if let Some(overlay) = &self.plan_approval {
+                overlay.render(frame, chunks[idx]);
             }
             idx += 1;
         }
@@ -2536,9 +2604,15 @@ impl UiModel {
             .as_ref()
             .map(|picker| picker.desired_height(width).min(20))
             .unwrap_or(0);
+        let approval_height = self
+            .plan_approval
+            .as_ref()
+            .map(|overlay| overlay.desired_height(width).min(30))
+            .unwrap_or(0);
         let command_height = if self.mode == UiMode::Command { 1 } else { 0 };
         height
             .saturating_sub(picker_height)
+            .saturating_sub(approval_height)
             .saturating_sub(1)
             .saturating_sub(1)
             .saturating_sub(command_height)
@@ -2782,7 +2856,10 @@ fn agent_status_label(status: &AgentStatus) -> String {
 mod tests {
     use super::*;
     use crate::streaming::StreamController;
-    use app_server_protocol::{AskUserQuestion, AskUserQuestionOption, AskUserQuestionParams};
+    use app_server_protocol::{
+        AskUserQuestion, AskUserQuestionOption, AskUserQuestionParams, PlanApprovalDecision,
+        RequestPlanApprovalParams,
+    };
     use ratatui::{Terminal, backend::TestBackend};
     use smooth_protocol::{
         AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
@@ -4823,6 +4900,169 @@ mod tests {
         assert_eq!(model.focus, FocusTarget::Transcript);
         assert!(!model.is_turn_running);
         assert!(!model.is_turn_cancelling);
+    }
+
+    fn plan_approval_params(thread_id: &str) -> RequestPlanApprovalParams {
+        RequestPlanApprovalParams {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            call_id: "call-1".to_string(),
+            plan: "# The plan\n\n1. Refactor the module.".to_string(),
+        }
+    }
+
+    #[test]
+    fn active_plan_approval_request_opens_overlay_and_renders_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+
+        let effects = model.update(UiEvent::ServerRequest(ServerRequest::RequestPlanApproval {
+            request_id: RequestId(50),
+            params: plan_approval_params(&thread_id.to_string()),
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(model.screen, Screen::Workspace);
+        assert_eq!(model.mode, UiMode::Overlay);
+        assert!(model.plan_approval.is_some());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        terminal.draw(|frame| model.render(frame))?;
+        let rendered = rendered_buffer_text(&terminal);
+        assert!(rendered.contains("Plan approval"), "{rendered}");
+        assert!(rendered.contains("The plan"), "{rendered}");
+        assert!(rendered.contains("Refactor the module."), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn plan_approval_request_from_inactive_thread_is_failed() {
+        let mut model = UiModel::new();
+        model.current_thread_id = Some(ThreadId::new());
+        let stale_thread = ThreadId::new();
+
+        let effects = model.update(UiEvent::ServerRequest(ServerRequest::RequestPlanApproval {
+            request_id: RequestId(51),
+            params: plan_approval_params(&stale_thread.to_string()),
+        }));
+
+        assert_eq!(effects.len(), 1);
+        assert!(model.plan_approval.is_none());
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::FailServerRequest { request_id, error }
+                if *request_id == RequestId(51)
+                    && error.message.contains("inactive thread")
+        ));
+    }
+
+    #[test]
+    fn plan_approval_request_while_picker_pending_is_failed() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.question_picker = Some(QuestionPicker::new(
+            RequestId(1),
+            AskUserQuestionParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".into(),
+                call_id: "c".into(),
+                questions: Vec::new(),
+            },
+        ));
+
+        let effects = model.update(UiEvent::ServerRequest(ServerRequest::RequestPlanApproval {
+            request_id: RequestId(52),
+            params: plan_approval_params(&thread_id.to_string()),
+        }));
+
+        assert!(model.plan_approval.is_none());
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::FailServerRequest { request_id, error }
+                if *request_id == RequestId(52)
+                    && error.message.contains("already pending")
+        ));
+    }
+
+    #[test]
+    fn approving_plan_emits_respond_effect_and_closes_overlay() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        let _ = model.update(UiEvent::ServerRequest(ServerRequest::RequestPlanApproval {
+            request_id: RequestId(53),
+            params: plan_approval_params(&thread_id.to_string()),
+        }));
+
+        let effects = model.handle_key_event(key(KeyCode::Char('a')));
+
+        assert!(model.plan_approval.is_none());
+        assert_eq!(model.mode, UiMode::Normal);
+        assert_eq!(model.focus, FocusTarget::Transcript);
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::RespondPlanApproval { request_id, response }
+                if *request_id == RequestId(53)
+                    && response.decision == PlanApprovalDecision::Approved
+                    && response.feedback.is_none()
+        ));
+    }
+
+    #[test]
+    fn rejecting_plan_with_feedback_emits_respond_effect() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        let _ = model.update(UiEvent::ServerRequest(ServerRequest::RequestPlanApproval {
+            request_id: RequestId(54),
+            params: plan_approval_params(&thread_id.to_string()),
+        }));
+
+        let _ = model.handle_key_event(key(KeyCode::Char('r')));
+        for ch in "no tests".chars() {
+            let _ = model.handle_key_event(key(KeyCode::Char(ch)));
+        }
+        let effects = model.handle_key_event(key(KeyCode::Enter));
+
+        assert!(model.plan_approval.is_none());
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::RespondPlanApproval { request_id, response }
+                if *request_id == RequestId(54)
+                    && response.decision == PlanApprovalDecision::Rejected
+                    && response.feedback.as_deref() == Some("no tests")
+        ));
+    }
+
+    #[test]
+    fn turn_interrupted_closes_plan_approval_overlay() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.screen = Screen::Workspace;
+        model.mode = UiMode::Overlay;
+        model.focus = FocusTarget::Overlay;
+        model.is_turn_running = true;
+        model.plan_approval = Some(PlanApprovalOverlay::new(
+            RequestId(55),
+            plan_approval_params(&thread_id.to_string()),
+        ));
+
+        model.apply_protocol_event(event(
+            "interrupted",
+            EventMsg::TurnInterrupted(TurnInterruptedEvent {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                reason: "interrupted".to_string(),
+            }),
+        ));
+
+        assert!(model.plan_approval.is_none());
+        assert_eq!(model.mode, UiMode::Normal);
+        assert_eq!(model.focus, FocusTarget::Transcript);
     }
 
     trait JoinLines {

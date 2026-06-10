@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+use app_server_protocol::{PlanApprovalDecision, RequestPlanApprovalParams};
 use futures_util::{FutureExt, StreamExt, future::select_all, stream::FuturesUnordered};
 use indexmap::IndexMap;
 use rig::{
@@ -957,8 +958,13 @@ async fn dispatch_tool_calls(
     )
     .await?;
 
-    let exit_plan_results =
-        execute_exit_plan_mode_calls(Arc::clone(&session), Arc::clone(&ctx), exit_plan_calls).await;
+    let exit_plan_results = execute_exit_plan_mode_calls(
+        Arc::clone(&session),
+        Arc::clone(&ctx),
+        exit_plan_calls,
+        cancellation_token,
+    )
+    .await?;
 
     let has_immediate_results = !normal_results.is_empty() || !exit_plan_results.is_empty();
     let (deferred, immediate_spawn_results) = split_started_and_immediate(started_spawns);
@@ -1014,15 +1020,18 @@ fn partition_pending_tool_calls(
     (normal, spawn, exit_plan)
 }
 
-/// Handle one queued `exit_plan_mode` tool call: flip plan mode off, swap in
-/// the non-plan-mode model so subsequent tool calls in this turn (or the next)
-/// see the full tool set, emit the `ToolCallCompleted` event, and return a
-/// tool-result the model can read.
+/// Handle one queued `exit_plan_mode` tool call: read the plan written by
+/// `plan_write`, present it to the user for approval, and only on an explicit
+/// approval flip plan mode off so the rest of this turn (and the next) sees
+/// the full tool set. A rejection keeps the session in plan mode and surfaces
+/// the user's feedback to the model as the tool result. Returns `None` only
+/// on cancellation.
 async fn execute_exit_plan_mode_call(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     pending: PendingToolCall,
-) -> ExecutedToolCall {
+    cancellation_token: &CancellationToken,
+) -> Option<ExecutedToolCall> {
     let PendingToolCall {
         index,
         assistant_tool_call: _,
@@ -1030,46 +1039,132 @@ async fn execute_exit_plan_mode_call(
         internal_call_id,
     } = pending;
 
-    let (tool_output, success, error) = match session.apply_plan_mode_unchecked(false).await {
-        Ok(_) => (
-            "Plan mode exited. Implement the approved plan now using the full tool set."
-                .to_string(),
-            true,
-            None,
-        ),
-        Err(err) => {
-            let message = err.to_string();
-            (message.clone(), false, Some(message))
+    let (tool_output, success, error) = exit_plan_mode_outcome(
+        &session,
+        &ctx,
+        internal_call_id.clone(),
+        cancellation_token,
+    )
+    .await?;
+
+    Some(
+        complete_tool_call(
+            session,
+            ctx,
+            index,
+            tool_call.id,
+            tool_call.call_id,
+            internal_call_id,
+            "exit_plan_mode".to_string(),
+            tool_output,
+            success,
+            error,
+        )
+        .await,
+    )
+}
+
+/// Decide the `exit_plan_mode` result: `(output, success, error)`. Returns
+/// `None` only on cancellation while waiting for the user's decision.
+async fn exit_plan_mode_outcome(
+    session: &Arc<Session>,
+    ctx: &Arc<TurnContext>,
+    internal_call_id: String,
+    cancellation_token: &CancellationToken,
+) -> Option<(String, bool, Option<String>)> {
+    let failure = |message: String| Some((message.clone(), false, Some(message)));
+
+    if !session.plan_mode() {
+        return failure("exit_plan_mode failed: the session is not in plan mode".to_string());
+    }
+
+    let plan_path = tools::plan_file_path(&session.cwd, session.id);
+    let plan = match tokio::fs::read_to_string(&plan_path).await {
+        Ok(plan) if !plan.trim().is_empty() => plan,
+        Ok(_) | Err(_) => {
+            return failure(
+                "exit_plan_mode failed: no plan found — write your plan with `plan_write` \
+                 before exiting plan mode"
+                    .to_string(),
+            );
         }
     };
 
-    complete_tool_call(
-        session,
-        ctx,
-        index,
-        tool_call.id,
-        tool_call.call_id,
-        internal_call_id,
-        "exit_plan_mode".to_string(),
-        tool_output,
-        success,
-        error,
-    )
-    .await
+    let Some(ask_user_client) = session.ask_user_client() else {
+        return failure(
+            "exit_plan_mode failed: plan approval requires an interactive client".to_string(),
+        );
+    };
+
+    let params = RequestPlanApprovalParams {
+        thread_id: session.id.to_string(),
+        turn_id: ctx.sub_id.clone(),
+        call_id: internal_call_id,
+        plan,
+    };
+    let decision = tokio::select! {
+        _ = cancellation_token.cancelled() => return None,
+        decision = ask_user_client.request_plan_approval(params) => decision,
+    };
+
+    match decision {
+        Ok(response) => match response.decision {
+            PlanApprovalDecision::Approved => {
+                match session.apply_plan_mode_unchecked(false).await {
+                    Ok(_) => Some((
+                        "Plan approved by the user. Plan mode is off — implement the plan now \
+                         with the full tool set."
+                            .to_string(),
+                        true,
+                        None,
+                    )),
+                    Err(err) => failure(err.to_string()),
+                }
+            }
+            // A rejection is a valid outcome, not a tool failure: the model
+            // should revise the plan, not treat the call as errored.
+            PlanApprovalDecision::Rejected => {
+                let feedback = response
+                    .feedback
+                    .as_deref()
+                    .unwrap_or("(none provided)")
+                    .to_string();
+                Some((
+                    format!(
+                        "The user rejected the plan. You are still in plan mode. Revise the \
+                         plan per the feedback, update it with `plan_write`, then call \
+                         `exit_plan_mode` again.\nUser feedback: {feedback}"
+                    ),
+                    true,
+                    None,
+                ))
+            }
+        },
+        Err(err) => failure(format!("exit_plan_mode failed: {}", err.message)),
+    }
 }
 
+/// Run the queued `exit_plan_mode` calls sequentially (a second call in the
+/// same batch sees the state left by the first). Returns `None` only on
+/// cancellation.
 async fn execute_exit_plan_mode_calls(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     exit_plan_calls: Vec<PendingToolCall>,
-) -> Vec<ExecutedToolCall> {
+    cancellation_token: &CancellationToken,
+) -> Option<Vec<ExecutedToolCall>> {
     let mut resolved = Vec::with_capacity(exit_plan_calls.len());
     for pending in exit_plan_calls {
-        let executed =
-            execute_exit_plan_mode_call(Arc::clone(&session), Arc::clone(&ctx), pending).await;
+        let executed = execute_exit_plan_mode_call(
+            Arc::clone(&session),
+            Arc::clone(&ctx),
+            pending,
+            cancellation_token,
+        )
+        .await?;
         resolved.push(executed);
     }
-    resolved
+    Some(resolved)
 }
 
 /// Start every queued `spawn_agent` call concurrently and wait for all starts

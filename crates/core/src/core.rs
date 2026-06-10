@@ -68,12 +68,10 @@ pub(crate) struct Session {
     pub(crate) project_instructions: Option<ProjectInstructions>,
     pub(crate) agent_control: AgentControl,
     current_turn_id: Arc<RwLock<Option<String>>>,
-    #[allow(dead_code)]
     ask_user_client: Option<AskUserClient>,
     next_internal_sub_id: AtomicU64,
     models: SessionModels,
     plan_mode: AtomicBool,
-    #[allow(dead_code)]
     pub(crate) cwd: PathBuf,
     rollout: RolloutRecorder,
 }
@@ -533,6 +531,10 @@ impl Session {
 
     pub(crate) fn model(&self) -> SessionModel {
         self.models.for_mode(self.plan_mode()).clone()
+    }
+
+    pub(crate) fn ask_user_client(&self) -> Option<&AskUserClient> {
+        self.ask_user_client.as_ref()
     }
 
     pub(crate) fn plan_mode(&self) -> bool {

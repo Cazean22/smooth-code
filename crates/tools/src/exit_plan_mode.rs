@@ -4,11 +4,12 @@ use serde::Deserialize;
 
 use crate::ToolError;
 
-const DESCRIPTION: &str = r#"Leave plan mode now that the plan is ready.
+const DESCRIPTION: &str = r#"Submit your plan for user approval.
 
 Usage:
-- Call this tool from inside plan mode after you have written your plan with `plan_write`.
-- Plan mode turns off automatically on success; subsequent turns will see the full tool set and may implement the plan.
+- Call this tool from inside plan mode after writing your plan with `plan_write`; the latest plan file content is presented to the user for review.
+- If the user approves, plan mode turns off and you implement the plan with the full tool set.
+- If the user rejects, you stay in plan mode; revise the plan per their feedback with `plan_write`, then call this tool again.
 - Optionally pass a short `reason` describing why you are exiting (e.g., "plan ready"); this is for the transcript only."#;
 
 #[derive(Clone, Default)]

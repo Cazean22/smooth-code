@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
@@ -13,7 +13,17 @@ Usage:
 - Call this tool while in plan mode to record the agreed-upon plan as markdown.
 - The file is always written to `<workspace>/.smooth-code/plans/<thread_id>.md`; you do not choose the path.
 - The previous contents (if any) are replaced. Call this tool again to refine the plan.
-- After the plan is ready, call `exit_plan_mode` to leave plan mode and start implementing."#;
+- After the plan is ready, call `exit_plan_mode` to submit it for user approval."#;
+
+/// Absolute path of the per-thread plan file under the workspace root. Single
+/// source of the plan-file location for both `plan_write` and the core
+/// `exit_plan_mode` approval flow.
+pub fn plan_file_path(workspace_root: &Path, thread_id: ThreadId) -> PathBuf {
+    workspace_root
+        .join(".smooth-code")
+        .join("plans")
+        .join(format!("{thread_id}.md"))
+}
 
 #[derive(Clone)]
 pub struct PlanWriteTool {
@@ -30,10 +40,7 @@ impl PlanWriteTool {
     }
 
     fn plan_path(&self) -> PathBuf {
-        self.workspace_root
-            .join(".smooth-code")
-            .join("plans")
-            .join(format!("{}.md", self.thread_id))
+        plan_file_path(&self.workspace_root, self.thread_id)
     }
 }
 

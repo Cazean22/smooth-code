@@ -24,7 +24,7 @@ use crate::{
     provider::SessionModelFactory,
 };
 
-const AGENT_MAX_DEPTH: i32 = 8;
+pub(crate) const AGENT_MAX_DEPTH: i32 = 8;
 const AGENT_MAX_THREADS: usize = 16;
 
 /// Shared in-process handle for agent lifecycle and inter-agent coordination.

@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     ThreadSummary,
     agent::{
-        AgentControl, SystemPromptKind,
+        AGENT_MAX_DEPTH, AgentControl, SystemPromptKind,
         registry::AgentMetadata,
         status::{agent_status_from_event, last_assistant_message},
     },
@@ -518,10 +518,10 @@ impl ThreadManagerState {
                 thread_id: parent_thread_id,
             })?;
         let depth = parent_depth + 1;
-        if depth > 8 {
+        if depth > AGENT_MAX_DEPTH {
             return Err(CoreError::AgentDepthLimitExceeded {
                 depth,
-                max_depth: 8,
+                max_depth: AGENT_MAX_DEPTH,
             });
         }
         let agent_path = agent_path.ok_or(CoreError::MissingAgentPath {

@@ -49,7 +49,7 @@ use tools::{
 };
 
 use crate::agent::{
-    AgentControl, PLAN_MODE_INSTRUCTIONS, SystemPromptKind,
+    AgentControl, SystemPromptKind, plan_mode_instructions,
     prompt::{render_spawn_agent_tool_description, system_prompt_for_kind},
 };
 use crate::environment::EnvironmentContext;
@@ -338,7 +338,7 @@ fn compose_session_preamble(
     };
     let mut preamble = environment_context.apply(&base_preamble);
     if plan_mode {
-        preamble = format!("{}\n\n{PLAN_MODE_INSTRUCTIONS}", preamble.trim_end());
+        preamble = format!("{}\n\n{}", preamble.trim_end(), plan_mode_instructions());
     }
     preamble
 }
@@ -1703,7 +1703,10 @@ mod tests {
 
     use super::{build_agent, compose_session_preamble};
     use crate::{
-        agent::{AgentControl, PLAN_MODE_INSTRUCTIONS, SystemPromptKind},
+        agent::{
+            AgentControl, SystemPromptKind, plan_mode_instructions,
+            plan_mode::plan_mode_tool_names,
+        },
         environment::EnvironmentContext,
     };
 
@@ -2160,7 +2163,7 @@ mod tests {
 
         assert_eq!(
             preamble,
-            format!("Base prompt.\n\n{PLAN_MODE_INSTRUCTIONS}")
+            format!("Base prompt.\n\n{}", plan_mode_instructions())
         );
     }
 
@@ -2239,7 +2242,7 @@ mod tests {
             AgentBuilder::new(DummyModel),
             workspace.path().to_path_buf(),
             smooth_protocol::ThreadId::new(),
-            None,
+            Some(stub_ask_user_client()),
             Arc::new(RwLock::new(None)),
             SystemPromptKind::Root,
             AgentControl::new(),
@@ -2254,19 +2257,12 @@ mod tests {
             .map(|definition| definition.name)
             .collect::<HashSet<_>>();
 
-        // File reads, shell inspection, and sub-agent tools remain available.
-        assert!(tool_names.contains("read"));
-        assert!(tool_names.contains("run_command"));
-        assert!(tool_names.contains("spawn_agent"));
-        assert!(!tool_names.contains("explore"));
-        assert!(!tool_names.contains("list_dir"));
-        // Plan-mode planning tools are registered.
-        assert!(tool_names.contains("plan_write"));
-        assert!(tool_names.contains("exit_plan_mode"));
-        // Mutating tools must be stripped.
-        assert!(!tool_names.contains("edit"));
-        assert!(!tool_names.contains("delete"));
-        assert!(!tool_names.contains("write"));
+        // The registered tool set must match the advertised plan-mode list
+        // exactly — it is the single source of truth for the instructions.
+        let expected = plan_mode_tool_names()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        assert_eq!(tool_names, expected);
         Ok(())
     }
 

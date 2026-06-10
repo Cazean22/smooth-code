@@ -10,5 +10,5 @@ pub(crate) mod subagent_result;
 
 pub use control::AgentControl;
 pub(crate) use control::{AGENT_MAX_DEPTH, InlineChildCompletionReceiver};
-pub(crate) use plan_mode::PLAN_MODE_INSTRUCTIONS;
+pub(crate) use plan_mode::plan_mode_instructions;
 pub use prompt::SystemPromptKind;

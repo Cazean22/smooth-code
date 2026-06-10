@@ -1654,7 +1654,7 @@ impl UiModel {
             EventMsg::PlanModeChanged(event) => {
                 self.plan_mode = event.enabled;
                 let message = if event.enabled {
-                    "plan mode enabled — agent restricted to read/list/spawn/plan_write/exit_plan_mode"
+                    "plan mode enabled — file mutations are locked while the agent plans"
                 } else {
                     "plan mode disabled — agent back to the full tool set"
                 };

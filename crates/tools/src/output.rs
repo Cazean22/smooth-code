@@ -1,4 +1,4 @@
-use smooth_protocol::FileChangeOutput;
+use smooth_protocol::{FileChangeOutput, TodoItem};
 
 const STRUCTURED_TOOL_OUTPUT_PREFIX: &str = "__smooth_tool_output_v1__\n";
 pub const MAX_FILE_CHANGE_BYTES: usize = 512 * 1024;
@@ -11,6 +11,8 @@ pub struct StructuredToolOutput {
     pub file_change: Option<FileChangeOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_changes: Vec<FileChangeOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<TodoItem>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,11 +20,12 @@ pub struct DecodedToolOutput {
     pub model_output: String,
     pub file_change: Option<FileChangeOutput>,
     pub file_changes: Vec<FileChangeOutput>,
+    pub todos: Vec<TodoItem>,
 }
 
 pub fn encode_tool_output(model_output: String, file_change: Option<FileChangeOutput>) -> String {
     let file_changes = file_change.iter().cloned().collect::<Vec<_>>();
-    encode_structured_tool_output(model_output, file_change, file_changes)
+    encode_structured_tool_output(model_output, file_change, file_changes, Vec::new())
 }
 
 pub fn encode_tool_output_with_file_changes(
@@ -30,15 +33,20 @@ pub fn encode_tool_output_with_file_changes(
     file_changes: Vec<FileChangeOutput>,
 ) -> String {
     let file_change = file_changes.first().cloned();
-    encode_structured_tool_output(model_output, file_change, file_changes)
+    encode_structured_tool_output(model_output, file_change, file_changes, Vec::new())
+}
+
+pub fn encode_tool_output_with_todos(model_output: String, todos: Vec<TodoItem>) -> String {
+    encode_structured_tool_output(model_output, None, Vec::new(), todos)
 }
 
 fn encode_structured_tool_output(
     model_output: String,
     file_change: Option<FileChangeOutput>,
     file_changes: Vec<FileChangeOutput>,
+    todos: Vec<TodoItem>,
 ) -> String {
-    if file_change.is_none() && file_changes.is_empty() {
+    if file_change.is_none() && file_changes.is_empty() && todos.is_empty() {
         return model_output;
     }
 
@@ -46,6 +54,7 @@ fn encode_structured_tool_output(
         model_output,
         file_change,
         file_changes,
+        todos,
     };
     match serde_json::to_string(&output) {
         Ok(json) => format!("{STRUCTURED_TOOL_OUTPUT_PREFIX}{json}"),
@@ -58,7 +67,7 @@ pub fn decode_tool_output_for_tool(
     raw_output: String,
     success: bool,
 ) -> DecodedToolOutput {
-    if success && matches!(tool_name, "delete" | "edit" | "write") {
+    if success && matches!(tool_name, "delete" | "edit" | "write" | "todo_write") {
         return decode_tool_output(raw_output);
     }
 
@@ -66,6 +75,7 @@ pub fn decode_tool_output_for_tool(
         model_output: raw_output,
         file_change: None,
         file_changes: Vec::new(),
+        todos: Vec::new(),
     }
 }
 
@@ -75,6 +85,7 @@ fn decode_tool_output(raw_output: String) -> DecodedToolOutput {
             model_output: raw_output,
             file_change: None,
             file_changes: Vec::new(),
+            todos: Vec::new(),
         };
     };
 
@@ -91,19 +102,21 @@ fn decode_tool_output(raw_output: String) -> DecodedToolOutput {
                 model_output: output.model_output,
                 file_change,
                 file_changes,
+                todos: output.todos,
             }
         }
         Err(_) => DecodedToolOutput {
             model_output: raw_output,
             file_change: None,
             file_changes: Vec::new(),
+            todos: Vec::new(),
         },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use smooth_protocol::{FileChange, FileChangeOutput};
+    use smooth_protocol::{FileChange, FileChangeOutput, TodoItem, TodoStatus};
 
     use super::*;
 
@@ -115,6 +128,7 @@ mod tests {
                 model_output: "done".to_string(),
                 file_change: None,
                 file_changes: Vec::new(),
+                todos: Vec::new(),
             }
         );
     }
@@ -138,6 +152,7 @@ mod tests {
                 model_output: "wrote 5 bytes to a.txt".to_string(),
                 file_change: Some(file_change.clone()),
                 file_changes: vec![file_change],
+                todos: Vec::new(),
             }
         );
     }
@@ -161,6 +176,7 @@ mod tests {
                 model_output: "deleted a.txt (5 bytes)".to_string(),
                 file_change: Some(file_change.clone()),
                 file_changes: vec![file_change],
+                todos: Vec::new(),
             }
         );
     }
@@ -190,6 +206,7 @@ mod tests {
                 model_output: "applied patch".to_string(),
                 file_change: file_changes.first().cloned(),
                 file_changes,
+                todos: Vec::new(),
             }
         );
     }
@@ -216,6 +233,33 @@ mod tests {
                 model_output: "legacy".to_string(),
                 file_change: Some(file_change.clone()),
                 file_changes: vec![file_change],
+                todos: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn structured_outputs_round_trip_todos() {
+        let todos = vec![
+            TodoItem {
+                content: "step one".to_string(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "step two".to_string(),
+                status: TodoStatus::InProgress,
+            },
+        ];
+        let encoded =
+            encode_tool_output_with_todos("Todo list updated: 2 items".to_string(), todos.clone());
+
+        assert_eq!(
+            decode_tool_output_for_tool("todo_write", encoded, true),
+            DecodedToolOutput {
+                model_output: "Todo list updated: 2 items".to_string(),
+                file_change: None,
+                file_changes: Vec::new(),
+                todos,
             }
         );
     }
@@ -239,6 +283,7 @@ mod tests {
                 model_output: spoofed,
                 file_change: None,
                 file_changes: Vec::new(),
+                todos: Vec::new(),
             }
         );
     }
@@ -256,6 +301,7 @@ mod tests {
                 model_output: spoofed,
                 file_change: None,
                 file_changes: Vec::new(),
+                todos: Vec::new(),
             }
         );
     }

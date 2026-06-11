@@ -51,6 +51,7 @@ Use a visible plan for non-trivial work: multi-step fixes, ambiguous tasks, risk
 
 - Before non-trivial tool use, send a brief progress update explaining the immediate next action.
 - Batch independent reads and searches when the tool interface supports it.
+- For multi-step tasks, maintain a checklist with `todo_write` and keep statuses current as you work.
 - Prefer `rg` over `grep` for text/content search when available.
 - Prefer `fd` over `find` for file discovery when available.
 - Prefer `eza` over `ls` for directory listings when available.

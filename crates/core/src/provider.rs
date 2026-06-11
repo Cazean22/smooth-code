@@ -45,7 +45,7 @@ use tokio_tungstenite::{
 };
 use tools::{
     AskUserClient, AskUserQuestionTool, DeleteTool, EditTool, ExitPlanModeTool, PlanWriteTool,
-    ReadTool, RunCommandTool, SpawnAgentTool, WriteTool,
+    ReadTool, RunCommandTool, SpawnAgentTool, TodoWriteTool, WriteTool,
 };
 
 use crate::agent::{
@@ -364,6 +364,8 @@ where
     if matches!(system_prompt_kind, SystemPromptKind::Explore) {
         return builder.default_max_turns(99999).build();
     }
+    // Progress tracking is available everywhere except read-only Explore agents.
+    let builder = builder.tool(TodoWriteTool::new());
     // File-mutating tools are only registered outside plan mode;
     // plan-mode-specific tools (`plan_write`, `exit_plan_mode`) are only
     // registered inside plan mode.
@@ -2191,6 +2193,7 @@ mod tests {
         assert!(tool_names.contains("spawn_agent"));
         assert!(!tool_names.contains("explore"));
         assert!(tool_names.contains("delete"));
+        assert!(tool_names.contains("todo_write"));
         assert!(!tool_names.contains("list_dir"));
         assert!(!tool_names.contains("send_message"));
         assert!(!tool_names.contains("list_agents"));
@@ -2229,6 +2232,7 @@ mod tests {
         assert!(tool_names.contains("delete"));
         assert!(tool_names.contains("edit"));
         assert!(tool_names.contains("write"));
+        assert!(tool_names.contains("todo_write"));
         assert!(!tool_names.contains("apply_patch"));
         assert!(!tool_names.contains("explore"));
         Ok(())

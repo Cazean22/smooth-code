@@ -12,6 +12,7 @@ mod plan_write;
 mod read;
 mod run_command;
 mod shared;
+mod todo_write;
 mod write;
 
 pub use ask_user_question::{
@@ -25,9 +26,10 @@ pub use exit_plan_mode::{ExitPlanModeArgs, ExitPlanModeTool};
 pub use multi_agents::{SpawnAgentTool, SubagentArgs};
 pub use output::{
     DecodedToolOutput, MAX_FILE_CHANGE_BYTES, decode_tool_output_for_tool, encode_tool_output,
-    encode_tool_output_with_file_changes,
+    encode_tool_output_with_file_changes, encode_tool_output_with_todos,
 };
 pub use plan_write::{PlanWriteArgs, PlanWriteTool, plan_file_path};
 pub use read::{ReadArgs, ReadTool};
 pub use run_command::{RunCommandArgs, RunCommandTool};
+pub use todo_write::{TodoInput, TodoWriteArgs, TodoWriteTool};
 pub use write::{WriteArgs, WriteTool};

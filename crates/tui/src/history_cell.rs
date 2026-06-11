@@ -3,7 +3,7 @@ use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
 };
-use smooth_protocol::FileChangeOutput;
+use smooth_protocol::{FileChangeOutput, TodoItem, TodoStatus};
 
 use crate::{diff_render::create_diff_summary, wrap};
 
@@ -116,6 +116,16 @@ impl TranscriptItem {
         }
     }
 
+    /// Checklist snapshot left in the transcript by a successful `todo_write`
+    /// call, replacing the generic tool row.
+    pub(crate) fn todo_list(id: TranscriptItemId, todos: Vec<TodoItem>) -> Self {
+        Self {
+            id,
+            version: 0,
+            kind: TranscriptItemKind::TodoList { todos },
+        }
+    }
+
     pub(crate) fn tool_group(id: TranscriptItemId, cell: ToolCallGroupCell) -> Self {
         Self {
             id,
@@ -176,6 +186,9 @@ impl TranscriptItem {
                     .collect()
             }
             TranscriptItemKind::Patch { file_change } => create_diff_summary(file_change, width),
+            TranscriptItemKind::TodoList { todos } => {
+                render_todo_list(todos, usize::from(width.max(1)))
+            }
             TranscriptItemKind::ToolCallGroup(cell) => {
                 cell.display_lines(usize::from(width.max(1)))
             }
@@ -191,6 +204,11 @@ impl TranscriptItem {
 
     pub(crate) fn replace_with_patch(&mut self, file_change: FileChangeOutput) {
         self.kind = TranscriptItemKind::Patch { file_change };
+        self.version = self.version.saturating_add(1);
+    }
+
+    pub(crate) fn replace_with_todos(&mut self, todos: Vec<TodoItem>) {
+        self.kind = TranscriptItemKind::TodoList { todos };
         self.version = self.version.saturating_add(1);
     }
 
@@ -218,6 +236,9 @@ enum TranscriptItemKind {
     },
     Patch {
         file_change: FileChangeOutput,
+    },
+    TodoList {
+        todos: Vec<TodoItem>,
     },
     ToolCallGroup(ToolCallGroupCell),
 }
@@ -330,6 +351,34 @@ impl ToolCallGroupCell {
         }
         lines
     }
+}
+
+/// Render a `todo_write` checklist snapshot: one glyph-prefixed row per todo,
+/// continuation rows hang-indented under the content.
+fn render_todo_list(todos: &[TodoItem], width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(todos.len());
+    for todo in todos {
+        let (glyph, content_style) = match todo.status {
+            TodoStatus::Pending => (
+                Span::styled("☐ ", Style::default().dim()),
+                Style::default().dim(),
+            ),
+            TodoStatus::InProgress => (
+                Span::styled("◐ ", Style::default().fg(Color::Cyan).bold()),
+                Style::default().bold(),
+            ),
+            TodoStatus::Completed => (
+                Span::styled("☑ ", Style::default().fg(Color::Green)),
+                Style::default().dim().crossed_out(),
+            ),
+        };
+        let line = Line::from(vec![
+            glyph,
+            Span::styled(todo.content.clone(), content_style),
+        ]);
+        lines.extend(wrap::wrap_line_hanging(line, width, 2));
+    }
+    lines
 }
 
 /// Build a tool-call row and report the column at which its args content starts,
@@ -642,6 +691,52 @@ mod tests {
             );
         }
         within_width(&lines, 20);
+    }
+
+    #[test]
+    fn todo_list_renders_status_glyphs_and_wraps() {
+        let item = TranscriptItem::todo_list(
+            1,
+            vec![
+                TodoItem {
+                    content: "a finished step".to_string(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "the step currently being worked on right now".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    content: "a future step".to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+        );
+        let lines = item.display_lines(24);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(texts[0].starts_with("☑ "));
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Green));
+        assert!(
+            lines[0].spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::CROSSED_OUT)
+        );
+
+        assert!(texts[1].starts_with("◐ "));
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Cyan));
+
+        // The long in-progress item wraps with a hanging indent.
+        assert!(texts.len() > 3, "expected wrapping: {texts:?}");
+        assert!(
+            texts[2].starts_with("  "),
+            "continuation not hung: {:?}",
+            texts[2]
+        );
+
+        assert!(texts.last().is_some_and(|t| t.starts_with("☐ ")));
+        within_width(&lines, 24);
     }
 
     #[test]

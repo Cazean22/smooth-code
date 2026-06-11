@@ -14,7 +14,8 @@ use ratatui::{
     widgets::Paragraph,
 };
 use smooth_protocol::{
-    AgentStatus, ErrorInfo, Event, EventMsg, FileChangeOutput, ThreadId, ToolCallResultKind,
+    AgentStatus, ErrorInfo, Event, EventMsg, FileChangeOutput, ThreadId, TodoItem,
+    ToolCallResultKind,
 };
 
 use crate::{
@@ -1402,18 +1403,22 @@ impl UiModel {
                 }
 
                 self.running_tools.remove(&tool.call_id);
-                let handled_file_change = if tool.success {
-                    let file_changes = if tool.file_changes.is_empty() {
-                        tool.file_change.into_iter().collect()
+                let handled_structured = if tool.success {
+                    if tool.todos.is_empty() {
+                        let file_changes = if tool.file_changes.is_empty() {
+                            tool.file_change.into_iter().collect()
+                        } else {
+                            tool.file_changes
+                        };
+                        self.replace_tool_call_with_file_changes(&tool.call_id, file_changes)
                     } else {
-                        tool.file_changes
-                    };
-                    self.replace_tool_call_with_file_changes(&tool.call_id, file_changes)
+                        self.replace_tool_call_with_todo_list(&tool.call_id, tool.todos)
+                    }
                 } else {
                     false
                 };
 
-                if !handled_file_change {
+                if !handled_structured {
                     let new_state = if tool.success {
                         ToolCallState::Success
                     } else {
@@ -1708,6 +1713,40 @@ impl UiModel {
             let id = self.next_item_id();
             self.push_history(TranscriptItem::patch(id, file_change));
         }
+        true
+    }
+
+    /// Replace a completed `todo_write` tool row with a checklist snapshot,
+    /// mirroring `replace_tool_call_with_file_changes`.
+    fn replace_tool_call_with_todo_list(&mut self, call_id: &str, todos: Vec<TodoItem>) -> bool {
+        if todos.is_empty() {
+            return false;
+        }
+
+        let Some((cell_idx, entry_idx)) = self.tool_call_rows.remove(call_id) else {
+            let id = self.next_item_id();
+            self.push_history(TranscriptItem::todo_list(id, todos));
+            return true;
+        };
+
+        if self.tool_group_mut(cell_idx).entry_count() == 1 {
+            self.transcript_items[cell_idx].replace_with_todos(todos);
+            if self
+                .pending_tool_group
+                .as_ref()
+                .is_some_and(|(idx, _)| *idx == cell_idx)
+            {
+                self.pending_tool_group = None;
+            }
+            self.mark_item_mutated(cell_idx);
+            return true;
+        }
+
+        self.tool_group_mut(cell_idx)
+            .set_entry_outcome(entry_idx, ToolCallState::Success, None);
+        self.mark_item_mutated(cell_idx);
+        let id = self.next_item_id();
+        self.push_history(TranscriptItem::todo_list(id, todos));
         true
     }
 
@@ -2739,6 +2778,7 @@ mod tests {
                     related_thread_id: None,
                     file_change: None,
                     file_changes: Vec::new(),
+                    todos: Vec::new(),
                 }),
             ),
             20,
@@ -3148,6 +3188,7 @@ mod tests {
                         },
                     }),
                     file_changes: Vec::new(),
+                    todos: Vec::new(),
                 }),
             ),
             20,
@@ -3170,6 +3211,47 @@ mod tests {
         assert!(rendered.contains("1 + new"), "{rendered}");
         assert!(!rendered.contains("Selected Diff"), "{rendered}");
         Ok(())
+    }
+
+    #[test]
+    fn todo_write_completion_renders_checklist_in_transcript() {
+        let mut app = App::new();
+
+        start_turn(&mut app);
+        start_tool_call(&mut app, "2", "c1", "todo_write", "{\"todos\":[...]}");
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("Todo list updated: 2 items")),
+                    error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
+                    file_change: None,
+                    file_changes: Vec::new(),
+                    todos: vec![
+                        TodoItem {
+                            content: String::from("add module"),
+                            status: smooth_protocol::TodoStatus::Completed,
+                        },
+                        TodoItem {
+                            content: String::from("register tool"),
+                            status: smooth_protocol::TodoStatus::InProgress,
+                        },
+                    ],
+                }),
+            ),
+            80,
+        );
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("☑ add module"), "{joined}");
+        assert!(joined.contains("◐ register tool"), "{joined}");
+        assert!(!joined.contains("todo_write"), "{joined}");
     }
 
     #[test]
@@ -3198,6 +3280,7 @@ mod tests {
                         },
                     }),
                     file_changes: Vec::new(),
+                    todos: Vec::new(),
                 }),
             ),
             20,
@@ -3256,6 +3339,7 @@ mod tests {
                             },
                         },
                     ],
+                    todos: Vec::new(),
                 }),
             ),
             20,
@@ -3297,6 +3381,7 @@ mod tests {
                         },
                     }),
                     file_changes: Vec::new(),
+                    todos: Vec::new(),
                 }),
             ),
             viewport_height,
@@ -3348,6 +3433,7 @@ mod tests {
                         },
                     }),
                     file_changes: Vec::new(),
+                    todos: Vec::new(),
                 }),
             ),
             8,
@@ -3394,6 +3480,7 @@ mod tests {
                     related_thread_id: Some(child_thread_id),
                     file_change: None,
                     file_changes: Vec::new(),
+                    todos: Vec::new(),
                 }),
             ),
             20,

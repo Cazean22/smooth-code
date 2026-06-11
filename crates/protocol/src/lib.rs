@@ -341,6 +341,21 @@ pub struct FileChangeOutput {
     pub change: FileChange,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
 #[derive(Debug, Clone, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallCompletedEvent {
@@ -358,6 +373,8 @@ pub struct ToolCallCompletedEvent {
     pub file_change: Option<FileChangeOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_changes: Vec<FileChangeOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<TodoItem>,
 }
 
 impl Serialize for ToolCallCompletedEvent {
@@ -380,6 +397,8 @@ impl Serialize for ToolCallCompletedEvent {
             file_change: Option<&'a FileChangeOutput>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             file_changes: &'a Vec<FileChangeOutput>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            todos: &'a Vec<TodoItem>,
         }
 
         let file_change = self
@@ -398,6 +417,7 @@ impl Serialize for ToolCallCompletedEvent {
             related_thread_id: &self.related_thread_id,
             file_change,
             file_changes: &self.file_changes,
+            todos: &self.todos,
         }
         .serialize(serializer)
     }
@@ -425,6 +445,8 @@ impl<'de> Deserialize<'de> for ToolCallCompletedEvent {
             file_change: Option<FileChangeOutput>,
             #[serde(default)]
             file_changes: Vec<FileChangeOutput>,
+            #[serde(default)]
+            todos: Vec<TodoItem>,
         }
 
         let mut wire = ToolCallCompletedEventWire::deserialize(deserializer)?;
@@ -448,6 +470,7 @@ impl<'de> Deserialize<'de> for ToolCallCompletedEvent {
             related_thread_id: wire.related_thread_id,
             file_change: wire.file_change,
             file_changes: wire.file_changes,
+            todos: wire.todos,
         })
     }
 }
@@ -544,8 +567,8 @@ pub enum AgentStatus {
 mod tests {
     use super::{
         AgentPath, AgentStatus, ErrorEvent, ErrorInfo, EventMsg, FileChange, FileChangeOperation,
-        FileChangeOutput, Op, SessionSource, SubAgentSource, ThreadId, ToolCallCompletedEvent,
-        ToolCallResultKind,
+        FileChangeOutput, Op, SessionSource, SubAgentSource, ThreadId, TodoItem, TodoStatus,
+        ToolCallCompletedEvent, ToolCallResultKind,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -641,6 +664,40 @@ mod tests {
         assert_eq!(decoded.related_thread_id, None);
         assert_eq!(decoded.file_change, None);
         assert_eq!(decoded.file_changes, Vec::new());
+        assert_eq!(decoded.todos, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_completed_todos_round_trip() -> TestResult {
+        let event = ToolCallCompletedEvent {
+            thread_id: String::from("thread"),
+            turn_id: String::from("turn"),
+            call_id: String::from("call"),
+            success: true,
+            output_preview: Some(String::from("Todo list updated: 2 items")),
+            error: None,
+            result_kind: ToolCallResultKind::Final,
+            related_thread_id: None,
+            file_change: None,
+            file_changes: Vec::new(),
+            todos: vec![
+                TodoItem {
+                    content: "step one".to_string(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "step two".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+        };
+
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(value["todos"].as_array().map(Vec::len), Some(2));
+        assert_eq!(value["todos"][1]["status"], "in_progress");
+        let decoded: ToolCallCompletedEvent = serde_json::from_value(value)?;
+        assert_eq!(decoded, event);
         Ok(())
     }
 
@@ -658,6 +715,7 @@ mod tests {
             related_thread_id: Some(related_thread_id),
             file_change: None,
             file_changes: Vec::new(),
+            todos: Vec::new(),
         };
 
         let value = serde_json::to_value(&event)?;
@@ -688,6 +746,7 @@ mod tests {
             related_thread_id: None,
             file_change: Some(file_change.clone()),
             file_changes: vec![file_change],
+            todos: Vec::new(),
         };
 
         let value = serde_json::to_value(&event)?;
@@ -752,6 +811,7 @@ mod tests {
             related_thread_id: None,
             file_change: Some(first.clone()),
             file_changes: vec![first, second],
+            todos: Vec::new(),
         };
 
         let value = serde_json::to_value(&event)?;
@@ -780,6 +840,7 @@ mod tests {
             related_thread_id: None,
             file_change: None,
             file_changes: vec![file_change],
+            todos: Vec::new(),
         };
 
         let value = serde_json::to_value(&event)?;

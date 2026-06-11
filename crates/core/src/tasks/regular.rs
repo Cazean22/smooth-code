@@ -825,6 +825,7 @@ async fn complete_tool_call_with_kind(
                 related_thread_id,
                 file_change: decoded_output.file_change,
                 file_changes: decoded_output.file_changes,
+                todos: decoded_output.todos,
             }),
         )
         .await;

@@ -298,6 +298,9 @@ pub enum ToolCallResultKind {
     #[default]
     Final,
     StatusUpdate,
+    /// The call was interrupted before completing (turn cancelled); the
+    /// output is a placeholder, not real tool output.
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -665,6 +668,15 @@ mod tests {
         assert_eq!(decoded.file_change, None);
         assert_eq!(decoded.file_changes, Vec::new());
         assert_eq!(decoded.todos, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_result_kind_interrupted_round_trips() -> TestResult {
+        let value = serde_json::to_value(ToolCallResultKind::Interrupted)?;
+        assert_eq!(value, serde_json::json!("interrupted"));
+        let decoded: ToolCallResultKind = serde_json::from_value(value)?;
+        assert_eq!(decoded, ToolCallResultKind::Interrupted);
         Ok(())
     }
 

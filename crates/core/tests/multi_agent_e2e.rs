@@ -602,10 +602,14 @@ impl SessionModelDriver for MixedBatchDriver {
         }
     }
 
-    fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+    fn call_tool(
+        &self,
+        tool_name: &str,
+        args: &str,
+    ) -> futures_util::future::BoxFuture<'static, Result<String>> {
         assert_eq!(tool_name, "normal_tool");
         assert_eq!(args, r#"{"value":"ok"}"#);
-        Ok("tool-output".to_string())
+        Box::pin(async { Ok("tool-output".to_string()) })
     }
 }
 
@@ -738,10 +742,14 @@ impl SessionModelDriver for TwoRetainedDriver {
         }
     }
 
-    fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+    fn call_tool(
+        &self,
+        tool_name: &str,
+        args: &str,
+    ) -> futures_util::future::BoxFuture<'static, Result<String>> {
         assert_eq!(tool_name, "normal_tool");
         assert_eq!(args, r#"{"value":"ok"}"#);
-        Ok("tool-output".to_string())
+        Box::pin(async { Ok("tool-output".to_string()) })
     }
 }
 
@@ -1510,10 +1518,14 @@ impl SessionModelDriver for ReasoningToolLoopDriver {
         }
     }
 
-    fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+    fn call_tool(
+        &self,
+        tool_name: &str,
+        args: &str,
+    ) -> futures_util::future::BoxFuture<'static, Result<String>> {
         assert_eq!(tool_name, "normal_tool");
         assert_eq!(args, r#"{"value":"ok"}"#);
-        Ok("tool-output".to_string())
+        Box::pin(async { Ok("tool-output".to_string()) })
     }
 }
 
@@ -1625,10 +1637,14 @@ impl SessionModelDriver for PersistedToolLoopDriver {
         }
     }
 
-    fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+    fn call_tool(
+        &self,
+        tool_name: &str,
+        args: &str,
+    ) -> futures_util::future::BoxFuture<'static, Result<String>> {
         assert_eq!(tool_name, "normal_tool");
         assert_eq!(args, r#"{"value":"ok"}"#);
-        Ok("tool-output".to_string())
+        Box::pin(async { Ok("tool-output".to_string()) })
     }
 }
 

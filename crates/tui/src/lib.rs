@@ -42,12 +42,18 @@ pub async fn run() -> TuiResult<()> {
     let mut app_server = AppServerSession::new(AppServerClient::start(512).await?);
     let mut app = App::new();
     let mut event_stream = crossterm::event::EventStream::new();
+    // Raw mode delivers interactive Ctrl+C as a key event, so these streams
+    // only fire for external kills (`kill <pid>`, terminal teardown, session
+    // managers) — exactly the cases that previously left orphaned threads and
+    // tool subprocesses behind.
+    let mut signals = TerminateSignals::new()?;
     terminal.draw(|frame| app.render(frame))?;
     let viewport_height = app.viewport_height_for(&terminal)?;
     if matches!(
         app.startup(&mut app_server, viewport_height).await?,
         crate::app::AppRunControl::Exit
     ) {
+        shutdown_app_server(&mut app_server).await;
         return restore(Some(&mut terminal));
     }
     terminal.draw(|frame| app.render(frame))?;
@@ -90,10 +96,55 @@ pub async fn run() -> TuiResult<()> {
                     None => break,
                 }
             }
+            _ = signals.recv() => break,
         }
     }
 
+    // Single exit epilogue for every break path: shut the core down
+    // gracefully — cancel running turns, cascade to child agents, kill tool
+    // subprocess groups — before giving the terminal back.
+    shutdown_app_server(&mut app_server).await;
     restore(Some(&mut terminal))
+}
+
+/// Bounded graceful shutdown: a hung core must never wedge process exit.
+async fn shutdown_app_server(app_server: &mut AppServerSession) {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), app_server.shutdown()).await;
+}
+
+/// SIGINT/SIGTERM listener (no-op stream on non-unix platforms).
+struct TerminateSignals {
+    #[cfg(unix)]
+    sigint: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sigterm: tokio::signal::unix::Signal,
+}
+
+impl TerminateSignals {
+    fn new() -> TuiResult<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                sigint: signal(SignalKind::interrupt())?,
+                sigterm: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.sigint.recv() => {}
+                _ = self.sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await
+    }
 }
 
 fn init() -> TuiResult<Option<AppTerminal>> {

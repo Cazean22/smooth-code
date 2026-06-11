@@ -1,6 +1,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod ask_user_question;
+mod cancel;
 mod client;
 mod delete;
 mod edit;
@@ -18,6 +19,7 @@ mod write;
 pub use ask_user_question::{
     AskUserQuestionArgs, AskUserQuestionInput, AskUserQuestionOptionInput, AskUserQuestionTool,
 };
+pub use cancel::{tool_cancel_token, with_tool_cancel_scope};
 pub use client::AskUserClient;
 pub use delete::{DeleteArgs, DeleteTool};
 pub use edit::{EditArgs, EditTool};

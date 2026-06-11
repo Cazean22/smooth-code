@@ -1,8 +1,9 @@
 use app_server::in_process::InProcessServerEvent;
 use app_server_protocol::{
-    ClientRequest, RequestId, SetPlanModeParams, SetPlanModeResponse, ThreadListParams,
-    ThreadListResponse, ThreadResumeParams, ThreadResumeResponse, ThreadStartParams,
-    ThreadStartResponse, TurnCancelParams, TurnCancelResponse, TurnStartParams, TurnStartResponse,
+    ClientRequest, RequestId, SetPlanModeParams, SetPlanModeResponse, ShutdownParams,
+    ShutdownResponse, ThreadListParams, ThreadListResponse, ThreadResumeParams,
+    ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, TurnCancelParams,
+    TurnCancelResponse, TurnStartParams, TurnStartResponse,
 };
 use smooth_protocol::ThreadId;
 
@@ -69,6 +70,19 @@ impl AppServerSession {
             params: TurnCancelParams {
                 thread_id: thread_id.to_string(),
             },
+        };
+        self.next_request_id += 1;
+        let value = self.client.request(request).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Ask the server to shut every thread down gracefully (cancel turns,
+    /// kill tool subprocesses). Called once from the TUI's exit epilogue.
+    #[tracing::instrument(name = "tui.shutdown", skip(self))]
+    pub(crate) async fn shutdown(&mut self) -> TuiResult<ShutdownResponse> {
+        let request = ClientRequest::Shutdown {
+            request_id: RequestId(self.next_request_id as usize),
+            params: ShutdownParams {},
         };
         self.next_request_id += 1;
         let value = self.client.request(request).await?;

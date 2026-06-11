@@ -11,6 +11,8 @@ pub enum ToolError {
     #[error("{message}")]
     Unsupported { message: String },
     #[error("{message}")]
+    Interrupted { message: String },
+    #[error("{message}")]
     Other { message: String },
 }
 
@@ -53,6 +55,16 @@ impl ToolError {
         }
     }
 
+    pub fn interrupted(message: impl Into<String>) -> Self {
+        Self::Interrupted {
+            message: message.into(),
+        }
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self, Self::Interrupted { .. })
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::InvalidArguments { .. } => "invalid_arguments",
@@ -60,6 +72,7 @@ impl ToolError {
             Self::Io { .. } => "io",
             Self::Client { .. } => "client",
             Self::Unsupported { .. } => "unsupported",
+            Self::Interrupted { .. } => "interrupted",
             Self::Other { .. } => "tool_error",
         }
     }

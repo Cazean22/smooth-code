@@ -103,8 +103,12 @@ pub trait SessionModelDriver: Send + Sync {
         history: Vec<Message>,
     ) -> Result<SessionCompletionStream>;
 
-    fn call_tool(&self, _tool_name: &str, _args: &str) -> Result<String> {
-        Err(anyhow!("manual tool execution is not supported"))
+    fn call_tool(
+        &self,
+        _tool_name: &str,
+        _args: &str,
+    ) -> futures_util::future::BoxFuture<'static, Result<String>> {
+        Box::pin(async { Err(anyhow!("manual tool execution is not supported")) })
     }
 }
 
@@ -161,6 +165,14 @@ pub struct OpenAiSessionModel {
 
 impl SessionModel {
     pub(crate) fn requires_provider_reasoning_ids(&self) -> bool {
+        matches!(self, Self::OpenAi(_))
+    }
+
+    /// Whether a cancelled turn must keep polling the stream briefly: the
+    /// OpenAI WebSocket sends `response.cancel` and parks its socket from
+    /// inside the stream, which only makes progress while polled. The other
+    /// providers cancel by drop.
+    pub(crate) fn requires_stream_cancel_drain(&self) -> bool {
         matches!(self, Self::OpenAi(_))
     }
 
@@ -268,9 +280,15 @@ impl SessionModel {
         &self,
         prompt: Message,
         history: &[Message],
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<SessionCompletionStream> {
         match self {
-            Self::OpenAi(openai) => stream_openai_agent_completion(openai, prompt, history).await,
+            Self::OpenAi(openai) => {
+                stream_openai_agent_completion(openai, prompt, history, cancel).await
+            }
+            // The HTTP providers take no explicit cancel: dropping the
+            // response body aborts the underlying request at the transport
+            // layer, which is the cleanest cancel reqwest offers.
             Self::OpenRouter(agent) => stream_agent_completion(agent, prompt, history).await,
             Self::Anthropic(agent) => stream_agent_completion(agent, prompt, history).await,
             Self::Gemini(agent) => stream_agent_completion(agent, prompt, history).await,
@@ -284,9 +302,22 @@ impl SessionModel {
             Self::OpenRouter(agent) => call_agent_tool(agent, tool_name, args).await,
             Self::Anthropic(agent) => call_agent_tool(agent, tool_name, args).await,
             Self::Gemini(agent) => call_agent_tool(agent, tool_name, args).await,
-            Self::Stub(driver) => driver.call_tool(tool_name, args),
+            Self::Stub(driver) => driver.call_tool(tool_name, args).await,
         }
     }
+}
+
+/// Whether `err` (as surfaced by [`SessionModel::call_tool`]) carries an
+/// interrupted tool error. Rig wraps the tool's error as
+/// `ToolServerError::ToolsetError(ToolCallError(ToolCallError(Box<tools::ToolError>)))`,
+/// each layer exposing the next via `source()`, so the concrete `ToolError`
+/// is reachable through the anyhow chain.
+pub(crate) fn tool_error_is_interrupted(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tools::ToolError>()
+            .is_some_and(tools::ToolError::is_interrupted)
+    })
 }
 
 pub(crate) fn default_session_model_factory() -> Arc<dyn SessionModelFactory> {
@@ -467,6 +498,12 @@ type OpenAiWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 pub(crate) const OPENAI_WEBSOCKET_RETRY_BUDGET: usize = 8;
 const OPENAI_WEBSOCKET_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const OPENAI_WEBSOCKET_RETRY_MAX_DELAY: Duration = Duration::from_secs(3);
+/// After sending `response.cancel`, how long the read loop keeps consuming
+/// frames hoping for a clean protocol terminal (which lets the socket be
+/// parked for the next turn). Past the deadline the socket is dropped, which
+/// is exactly the pre-cancel behavior — a proxy that ignores the cancel frame
+/// costs nothing.
+const OPENAI_WEBSOCKET_CANCEL_DRAIN: Duration = Duration::from_millis(1500);
 
 struct OpenAiParkedWebSocket {
     socket: OpenAiWebSocket,
@@ -493,6 +530,7 @@ async fn stream_openai_agent_completion(
     openai: &Arc<OpenAiSessionModel>,
     prompt: Message,
     history: &[Message],
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<SessionCompletionStream> {
     let completion_request = openai
         .agent
@@ -504,7 +542,7 @@ async fn stream_openai_agent_completion(
     Ok(Box::pin(async_stream::try_stream! {
         let mut retry_count = 0;
         loop {
-            let mut stream = match openai_websocket_completion_stream(&openai, completion_request.clone()).await {
+            let mut stream = match openai_websocket_completion_stream(&openai, completion_request.clone(), cancel.clone()).await {
                 Ok(stream) => stream,
                 Err(error)
                     if retry_count < OPENAI_WEBSOCKET_RETRY_BUDGET
@@ -572,6 +610,7 @@ async fn stream_openai_agent_completion(
 async fn openai_websocket_completion_stream(
     openai: &Arc<OpenAiSessionModel>,
     completion_request: CompletionRequest,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> std::result::Result<
     RigStreamingCompletionResponse<OpenAiStreamingCompletionResponse>,
     CompletionError,
@@ -609,6 +648,7 @@ async fn openai_websocket_completion_stream(
         Arc::clone(openai),
         socket,
         trailing_done_response_id,
+        cancel,
     ))
 }
 
@@ -616,6 +656,7 @@ fn openai_websocket_stream(
     openai: Arc<OpenAiSessionModel>,
     socket: OpenAiWebSocket,
     mut stale_done_response_id: Option<String>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> RigStreamingCompletionResponse<OpenAiStreamingCompletionResponse> {
     let raw_stream = async_stream::try_stream! {
         let mut socket = Some(socket);
@@ -623,9 +664,46 @@ fn openai_websocket_stream(
         let mut terminal_error = None;
         let mut terminal_response_id = None;
         let mut clean_terminal = false;
+        let mut cancel_sent = false;
+        let mut drain_deadline = tokio::time::Instant::now();
 
         while let Some(socket) = socket.as_mut() {
-            let message = socket.next().await;
+            let message = if cancel_sent {
+                // Cancel already sent: keep consuming, hoping the provider
+                // answers with a clean terminal so the socket can be parked,
+                // but never wait past the drain deadline.
+                tokio::select! {
+                    message = socket.next() => message,
+                    _ = tokio::time::sleep_until(drain_deadline) => {
+                        tracing::debug!(
+                            "OpenAI WebSocket cancel drain deadline expired; dropping socket"
+                        );
+                        terminal_error = Some(CompletionError::ProviderError(
+                            "turn cancelled".to_string(),
+                        ));
+                        break;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    message = socket.next() => message,
+                    _ = cancel.cancelled() => {
+                        // Tell the provider to stop generating instead of
+                        // silently dropping the connection. Frame per the
+                        // Responses-over-WebSocket dialect; a proxy that does
+                        // not understand it just runs into the drain deadline.
+                        let _ = socket
+                            .send(TungsteniteMessage::Text(
+                                r#"{"type":"response.cancel"}"#.to_string(),
+                            ))
+                            .await;
+                        cancel_sent = true;
+                        drain_deadline =
+                            tokio::time::Instant::now() + OPENAI_WEBSOCKET_CANCEL_DRAIN;
+                        continue;
+                    }
+                }
+            };
             match message {
                 Some(Ok(message)) => {
                     let payload = match openai_websocket_message_to_text(message) {
@@ -2851,6 +2929,7 @@ mod tests {
         let stream = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("first")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
 
@@ -2858,6 +2937,103 @@ mod tests {
 
         assert_eq!(handshakes.load(Ordering::SeqCst), 1);
         assert!(model.session_ws.lock().await.is_some());
+        server.abort();
+        Ok(())
+    }
+
+    /// Server for the cancellation flow: answers `response.create` with one
+    /// text delta and then waits; when (and only when) it receives a
+    /// `response.cancel` frame, it answers with the clean `response.completed`
+    /// terminal. Records whether the cancel frame arrived.
+    async fn start_openai_websocket_cancel_server() -> Result<(
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let cancel_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_cancel_received = Arc::clone(&cancel_received);
+        let handle = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            let mut saw_create = false;
+            while let Some(message) = socket.next().await {
+                let Ok(message) = message else {
+                    break;
+                };
+                if !(message.is_text() || message.is_binary()) {
+                    continue;
+                }
+                let text = message.into_text().unwrap_or_default();
+                if !saw_create {
+                    saw_create = true;
+                    if socket
+                        .send(TestWebSocketMessage::Text(
+                            openai_websocket_text_delta_frame(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                if text.contains("response.cancel") {
+                    server_cancel_received.store(true, Ordering::SeqCst);
+                    let _ = socket
+                        .send(TestWebSocketMessage::Text(
+                            openai_websocket_completed_frame("resp_cancelled"),
+                        ))
+                        .await;
+                    // Keep the connection open so the client can park it.
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        Ok((format!("http://{address}/v1"), cancel_received, handle))
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_cancel_sends_cancel_frame_and_parks_socket() -> Result<()> {
+        let (base_url, cancel_received, server) = start_openai_websocket_cancel_server().await?;
+        let model = openai_websocket_test_model(&base_url).await?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut stream = super::openai_websocket_completion_stream(
+            &model,
+            openai_websocket_test_request("to-be-cancelled")?,
+            cancel.clone(),
+        )
+        .await?;
+
+        // Wait for the first streamed delta, then cancel mid-response.
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .context("timed out waiting for first delta")?;
+        assert!(matches!(first, Some(Ok(_))), "expected a streamed delta");
+        cancel.cancel();
+
+        // Keep polling: the stream sends `response.cancel`, receives the
+        // clean terminal, and parks the socket.
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(item) = stream.next().await {
+                let _ = item;
+            }
+        })
+        .await;
+
+        assert!(
+            cancel_received.load(Ordering::SeqCst),
+            "server should have received a response.cancel frame"
+        );
+        assert!(
+            model.session_ws.lock().await.is_some(),
+            "socket should be parked after a clean post-cancel terminal"
+        );
         server.abort();
         Ok(())
     }
@@ -2871,6 +3047,7 @@ mod tests {
         let stream = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("failed")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
 
@@ -2895,6 +3072,7 @@ mod tests {
         let stream = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("incomplete")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
 
@@ -2922,6 +3100,7 @@ mod tests {
         let stream = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("transport error")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
 
@@ -2949,6 +3128,7 @@ mod tests {
         let mut stream = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("drop")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
 
@@ -2971,11 +3151,21 @@ mod tests {
                 .await?;
         let model = openai_websocket_test_model(&base_url).await?;
 
-        let first =
-            super::stream_openai_agent_completion(&model, Message::user("first"), &[]).await?;
+        let first = super::stream_openai_agent_completion(
+            &model,
+            Message::user("first"),
+            &[],
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
         drain_session_completion_stream(first).await?;
-        let second =
-            super::stream_openai_agent_completion(&model, Message::user("second"), &[]).await?;
+        let second = super::stream_openai_agent_completion(
+            &model,
+            Message::user("second"),
+            &[],
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
         drain_session_completion_stream(second).await?;
 
         assert_eq!(handshakes.load(Ordering::SeqCst), 1);
@@ -2995,6 +3185,7 @@ mod tests {
         let first = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("first")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
         assert_eq!(openai_websocket_final_total_tokens(first).await?, 100);
@@ -3002,6 +3193,7 @@ mod tests {
         let second = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("second")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
         assert_eq!(openai_websocket_final_total_tokens(second).await?, 200);
@@ -3028,6 +3220,7 @@ mod tests {
         let first = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("first")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
         assert_eq!(openai_websocket_final_total_tokens(first).await?, 100);
@@ -3035,6 +3228,7 @@ mod tests {
         let second = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("second")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
         assert_eq!(openai_websocket_final_total_tokens(second).await?, 200);
@@ -3056,6 +3250,7 @@ mod tests {
         let first = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("first")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
         assert_eq!(openai_websocket_final_total_tokens(first).await?, 100);
@@ -3065,6 +3260,7 @@ mod tests {
         let second = super::openai_websocket_completion_stream(
             &model,
             openai_websocket_test_request("second")?,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await?;
         assert_eq!(openai_websocket_final_total_tokens(second).await?, 200);
@@ -3082,11 +3278,21 @@ mod tests {
         .await?;
         let model = openai_websocket_test_model(&base_url).await?;
 
-        let first =
-            super::stream_openai_agent_completion(&model, Message::user("first"), &[]).await?;
+        let first = super::stream_openai_agent_completion(
+            &model,
+            Message::user("first"),
+            &[],
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
         drain_session_completion_stream(first).await?;
-        let second =
-            super::stream_openai_agent_completion(&model, Message::user("second"), &[]).await?;
+        let second = super::stream_openai_agent_completion(
+            &model,
+            Message::user("second"),
+            &[],
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
         drain_session_completion_stream(second).await?;
 
         assert_eq!(handshakes.load(Ordering::SeqCst), 2);

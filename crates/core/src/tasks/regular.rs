@@ -33,7 +33,7 @@ use crate::{
     provider::{
         OPENAI_WEBSOCKET_RETRY_BUDGET, SessionAssistantContent, SessionCompletionEvent,
         SessionTurnSummary, is_openai_websocket_transient_start_error,
-        openai_websocket_retry_delay,
+        openai_websocket_retry_delay, tool_error_is_interrupted,
     },
     state::TaskKind,
 };
@@ -107,6 +107,81 @@ struct PendingToolCall {
     assistant_tool_call: AssistantContent,
     tool_call: rig::message::ToolCall,
     internal_call_id: String,
+}
+
+/// Identity of a pending tool call, captured before the call's future takes
+/// ownership of it, so a call that never resolves (cancelled turn) can still
+/// be completed with a placeholder interrupted result.
+struct PendingCallDescriptor {
+    index: usize,
+    tool_call_id: String,
+    tool_call_call_id: Option<String>,
+    internal_call_id: String,
+    tool_name: String,
+}
+
+impl PendingCallDescriptor {
+    fn of(pending: &PendingToolCall) -> Self {
+        Self {
+            index: pending.index,
+            tool_call_id: pending.tool_call.id.clone(),
+            tool_call_call_id: pending.tool_call.call_id.clone(),
+            internal_call_id: pending.internal_call_id.clone(),
+            tool_name: pending.tool_call.function.name.clone(),
+        }
+    }
+}
+
+/// How long a cancelled tool batch keeps draining before outstanding calls are
+/// completed with placeholder interrupted results. Must exceed run_command's
+/// SIGTERM grace (2s) so a killed subprocess reports through its own future
+/// instead of the placeholder.
+const TOOL_CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+fn tool_cancel_grace() -> Duration {
+    std::env::var("SMOOTH_CODE_TOOL_CANCEL_GRACE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(TOOL_CANCEL_GRACE)
+}
+
+/// Complete a tool call that will never produce real output because the turn
+/// was cancelled: emits `ToolCallCompleted` with `Interrupted` and yields a
+/// placeholder result so the assistant tool-call message keeps a matching
+/// tool result (providers require a result for every call).
+async fn complete_interrupted_tool_call(
+    session: Arc<Session>,
+    ctx: Arc<TurnContext>,
+    descriptor: PendingCallDescriptor,
+) -> ExecutedToolCall {
+    let message = format!(
+        "{} was interrupted before completing (turn cancelled)",
+        descriptor.tool_name
+    );
+    complete_tool_call_with_kind(
+        session,
+        ctx,
+        descriptor.index,
+        descriptor.tool_call_id,
+        descriptor.tool_call_call_id,
+        descriptor.internal_call_id,
+        descriptor.tool_name,
+        message.clone(),
+        false,
+        Some(message),
+        ToolCallResultKind::Interrupted,
+        None,
+    )
+    .await
+}
+
+/// Result of running a tool batch: whatever results exist (real or placeholder
+/// interrupted ones — every call in the batch is represented) plus whether
+/// cancellation was observed along the way.
+struct ToolBatchOutcome {
+    executed: Vec<ExecutedToolCall>,
+    cancelled: bool,
 }
 
 struct StartedSpawnToolCall {
@@ -427,6 +502,13 @@ async fn run_manual_turn(
 
     'turn_loop: loop {
         if cancellation_token.is_cancelled() {
+            finalize_interrupted_turn(
+                &session,
+                history_before_turn,
+                new_messages,
+                &completions_by_index,
+            )
+            .await;
             return None;
         }
 
@@ -438,7 +520,7 @@ async fn run_manual_turn(
         )?;
         let model_for_stream = session.model();
         let mut stream = match model_for_stream
-            .stream_completion_turn(pending_prompt, &request_history)
+            .stream_completion_turn(pending_prompt, &request_history, cancellation_token.clone())
             .await
         {
             Ok(stream) => stream,
@@ -451,11 +533,33 @@ async fn run_manual_turn(
 
         loop {
             if cancellation_token.is_cancelled() {
+                drain_cancelled_stream(&session, &mut stream).await;
+                finalize_interrupted_attempt_and_turn(
+                    &session,
+                    &ctx,
+                    &mut attempt,
+                    history_before_turn,
+                    new_messages,
+                    &completions_by_index,
+                )
+                .await;
                 return None;
             }
 
             let item = tokio::select! {
-                _ = cancellation_token.cancelled() => return None,
+                _ = cancellation_token.cancelled() => {
+                    drain_cancelled_stream(&session, &mut stream).await;
+                    finalize_interrupted_attempt_and_turn(
+                        &session,
+                        &ctx,
+                        &mut attempt,
+                        history_before_turn,
+                        new_messages,
+                        &completions_by_index,
+                    )
+                    .await;
+                    return None;
+                }
                 Some(text) = next_retained_subagent_completion(&mut retained_subagents, &session.agent_control, &mut consumed_children),
                     if !retained_subagents.is_empty() => {
                     stream_phase_completions.push(text);
@@ -475,7 +579,7 @@ async fn run_manual_turn(
                         stream_retries,
                         attempt.saw_assistant_item_this_attempt,
                     ) {
-                        commit_attempt_messages(
+                        let batch_cancelled = commit_attempt_messages(
                             &session,
                             &ctx,
                             &mut attempt,
@@ -486,7 +590,7 @@ async fn run_manual_turn(
                             &mut stream_phase_completions,
                             &cancellation_token,
                         )
-                        .await?;
+                        .await;
                         if !attempt.accumulated_text.is_empty() {
                             session
                                 .emit_event(
@@ -499,6 +603,16 @@ async fn run_manual_turn(
                                     }),
                                 )
                                 .await;
+                        }
+                        if batch_cancelled {
+                            finalize_interrupted_turn(
+                                &session,
+                                history_before_turn,
+                                new_messages,
+                                &completions_by_index,
+                            )
+                            .await;
+                            return None;
                         }
 
                         let next_retry = stream_retries + 1;
@@ -516,7 +630,16 @@ async fn run_manual_turn(
                             .await;
                         stream_retries = next_retry;
                         tokio::select! {
-                            _ = cancellation_token.cancelled() => return None,
+                            _ = cancellation_token.cancelled() => {
+                                finalize_interrupted_turn(
+                                    &session,
+                                    history_before_turn,
+                                    new_messages,
+                                    &completions_by_index,
+                                )
+                                .await;
+                                return None;
+                            }
                             _ = tokio::time::sleep(openai_websocket_retry_delay(stream_retries)) => {}
                         }
                         continue 'turn_loop;
@@ -537,7 +660,7 @@ async fn run_manual_turn(
         attempt.finalize_reasoning();
 
         if attempt.saw_tool_call_this_attempt {
-            commit_attempt_messages(
+            let batch_cancelled = commit_attempt_messages(
                 &session,
                 &ctx,
                 &mut attempt,
@@ -548,7 +671,17 @@ async fn run_manual_turn(
                 &mut stream_phase_completions,
                 &cancellation_token,
             )
-            .await?;
+            .await;
+            if batch_cancelled {
+                finalize_interrupted_turn(
+                    &session,
+                    history_before_turn,
+                    new_messages,
+                    &completions_by_index,
+                )
+                .await;
+                return None;
+            }
             continue;
         }
 
@@ -567,7 +700,21 @@ async fn run_manual_turn(
 
         if !retained_subagents.is_empty() {
             let completion_entries = tokio::select! {
-                _ = cancellation_token.cancelled() => return None,
+                _ = cancellation_token.cancelled() => {
+                    // The attempt streamed no tool calls (handled above), so
+                    // its partial text has not been committed yet — fold it in
+                    // before finalizing the interrupted turn.
+                    finalize_interrupted_attempt_and_turn(
+                        &session,
+                        &ctx,
+                        &mut attempt,
+                        history_before_turn,
+                        new_messages,
+                        &completions_by_index,
+                    )
+                    .await;
+                    return None;
+                }
                 completions = drain_retained_subagent_completions(&mut retained_subagents, &session.agent_control, &mut consumed_children) => completions,
             };
             append_completion_texts_after_assistant_turn(
@@ -646,32 +793,41 @@ async fn run_manual_turn(
     }
 }
 
-/// Commit one stream attempt's output into the turn's `new_messages` (and the
-/// `completions_by_index` side-table). Shared by the mid-stream-retry path and
-/// the terminal tool-call path so the two cannot drift — the exact hazard this
-/// extraction removes.
-///
-/// The caller has already finalized reasoning (`AttemptState::finalize_reasoning`)
-/// before calling. This builds the attempt's assistant message, and — only when
-/// the attempt issued tool calls — executes them, appends the rendered
-/// `ToolResult` user message, and records the deferred-completion group. It is
-/// deliberately **emission-free**: the retry path emits
-/// `AgentMessageCompleted`/`StreamError` around this call, and the terminal
-/// tool-call path emits nothing here. Returns `None` only on cancellation
-/// (propagated from `execute_pending_tool_calls_for_turn`), which the caller
-/// forwards with `?`.
-#[allow(clippy::too_many_arguments)]
-async fn commit_attempt_messages(
+/// Keep polling the cancelled stream briefly so the provider-side cancel can
+/// make progress — the OpenAI WebSocket stream sends `response.cancel` and
+/// tries to park its socket from *inside* the stream, which only runs while
+/// someone polls it. No-op for providers that cancel by drop. Bounded well
+/// under the turn's drain grace.
+async fn drain_cancelled_stream(
+    session: &Arc<Session>,
+    stream: &mut crate::provider::SessionCompletionStream,
+) {
+    if !session.model().requires_stream_cancel_drain() {
+        return;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while stream.next().await.is_some() {}
+    })
+    .await;
+}
+
+/// Fold the cancelled attempt's partial output into `new_messages` and
+/// finalize the interrupted turn. Buffered tool calls that were never
+/// executed are completed with placeholder interrupted results so the
+/// persisted assistant tool-call message keeps a matched tool result.
+/// Only valid while the attempt's output has not been committed yet — paths
+/// that already ran `commit_attempt_messages` for this attempt must call
+/// [`finalize_interrupted_turn`] directly instead, or the attempt's text
+/// would be committed twice.
+async fn finalize_interrupted_attempt_and_turn(
     session: &Arc<Session>,
     ctx: &Arc<TurnContext>,
     attempt: &mut AttemptState,
-    new_messages: &mut Vec<Message>,
-    completions_by_index: &mut BTreeMap<usize, Vec<CompletionEntry>>,
-    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
-    consumed_children: &mut Vec<ThreadId>,
-    stream_phase_completions: &mut Vec<CompletionEntry>,
-    cancellation_token: &CancellationToken,
-) -> Option<()> {
+    history_before_turn: Vec<Message>,
+    mut new_messages: Vec<Message>,
+    completions_by_index: &BTreeMap<usize, Vec<CompletionEntry>>,
+) {
+    attempt.finalize_reasoning();
     let requires_provider_reasoning_ids = session.model().requires_provider_reasoning_ids();
     let assistant_message = if attempt.saw_tool_call_this_attempt {
         build_assistant_tool_message(
@@ -689,7 +845,98 @@ async fn commit_attempt_messages(
             requires_provider_reasoning_ids,
         )
     };
-    let tool_results = if attempt.saw_tool_call_this_attempt {
+    let mut interrupted_results = Vec::new();
+    for pending in std::mem::take(&mut attempt.pending_tool_calls) {
+        interrupted_results.push(
+            complete_interrupted_tool_call(
+                Arc::clone(session),
+                Arc::clone(ctx),
+                PendingCallDescriptor::of(&pending),
+            )
+            .await,
+        );
+    }
+    if let Some(message) = assistant_message {
+        new_messages.push(message);
+    }
+    if let Some(message) = tool_results_to_user_message(interrupted_results) {
+        new_messages.push(message);
+    }
+    finalize_interrupted_turn(
+        session,
+        history_before_turn,
+        new_messages,
+        completions_by_index,
+    )
+    .await;
+}
+
+/// Persist what the cancelled turn produced so far and swap it into in-memory
+/// history, mirroring the clean terminal path — except that
+/// `close_consumed_child_edges` is deliberately NOT called: an interrupted
+/// turn leaves consumed-child edges open so resume reaps the finished
+/// children (see the invariant comment on the terminal path in
+/// [`run_manual_turn`]). With the partial turn persisted, the model sees its
+/// own partial output and the interrupted tool results on the next turn.
+async fn finalize_interrupted_turn(
+    session: &Arc<Session>,
+    history_before_turn: Vec<Message>,
+    new_messages: Vec<Message>,
+    completions_by_index: &BTreeMap<usize, Vec<CompletionEntry>>,
+) {
+    let _ = session
+        .persist_turn_tail(&new_messages, completions_by_index)
+        .await;
+    let mut final_history = history_before_turn;
+    final_history.extend(new_messages);
+    session.replace_history(final_history).await;
+}
+
+/// Commit one stream attempt's output into the turn's `new_messages` (and the
+/// `completions_by_index` side-table). Shared by the mid-stream-retry path and
+/// the terminal tool-call path so the two cannot drift — the exact hazard this
+/// extraction removes.
+///
+/// The caller has already finalized reasoning (`AttemptState::finalize_reasoning`)
+/// before calling. This builds the attempt's assistant message, and — only when
+/// the attempt issued tool calls — executes them, appends the rendered
+/// `ToolResult` user message, and records the deferred-completion group. It is
+/// deliberately **emission-free**: the retry path emits
+/// `AgentMessageCompleted`/`StreamError` around this call, and the terminal
+/// tool-call path emits nothing here. Returns whether cancellation was
+/// observed while executing the batch — the committed messages are complete
+/// either way (interrupted calls carry placeholder results), so the caller's
+/// only job on `true` is to finalize the interrupted turn and stop.
+#[allow(clippy::too_many_arguments)]
+async fn commit_attempt_messages(
+    session: &Arc<Session>,
+    ctx: &Arc<TurnContext>,
+    attempt: &mut AttemptState,
+    new_messages: &mut Vec<Message>,
+    completions_by_index: &mut BTreeMap<usize, Vec<CompletionEntry>>,
+    retained_subagents: &mut Vec<RetainedSpawnCompletion>,
+    consumed_children: &mut Vec<ThreadId>,
+    stream_phase_completions: &mut Vec<CompletionEntry>,
+    cancellation_token: &CancellationToken,
+) -> bool {
+    let requires_provider_reasoning_ids = session.model().requires_provider_reasoning_ids();
+    let assistant_message = if attempt.saw_tool_call_this_attempt {
+        build_assistant_tool_message(
+            &attempt.turn_summary,
+            &attempt.accumulated_text,
+            &mut attempt.accumulated_reasoning,
+            &attempt.pending_tool_calls,
+            requires_provider_reasoning_ids,
+        )
+    } else {
+        build_assistant_text_reasoning_message(
+            &attempt.turn_summary,
+            &attempt.accumulated_text,
+            &mut attempt.accumulated_reasoning,
+            requires_provider_reasoning_ids,
+        )
+    };
+    let (tool_results, cancelled) = if attempt.saw_tool_call_this_attempt {
         execute_pending_tool_calls_for_turn(
             Arc::clone(session),
             Arc::clone(ctx),
@@ -699,9 +946,9 @@ async fn commit_attempt_messages(
             stream_phase_completions,
             cancellation_token,
         )
-        .await?
+        .await
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
     if let Some(message) = assistant_message {
         new_messages.push(message);
@@ -718,13 +965,14 @@ async fn commit_attempt_messages(
             std::mem::take(stream_phase_completions),
         );
     }
-    Some(())
+    cancelled
 }
 
 async fn execute_normal_tool_call(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     pending: PendingToolCall,
+    cancellation_token: &CancellationToken,
 ) -> ExecutedToolCall {
     let PendingToolCall {
         index,
@@ -734,22 +982,33 @@ async fn execute_normal_tool_call(
     } = pending;
 
     let model_for_call = session.model();
-    let (tool_output, success, error) = match model_for_call
-        .call_tool(
+    // A child token scopes this one call: cancelling the turn cancels the
+    // call, but the token handed to the tool can never outlive the turn it
+    // belongs to.
+    let call_token = cancellation_token.child_token();
+    let call_result = tools::with_tool_cancel_scope(
+        call_token,
+        model_for_call.call_tool(
             &tool_call.function.name,
             &tool_call.function.arguments.to_string(),
-        )
-        .await
-    {
-        Ok(output) => (output, true, None),
+        ),
+    )
+    .await;
+    let (tool_output, success, error, result_kind) = match call_result {
+        Ok(output) => (output, true, None, ToolCallResultKind::Final),
         Err(err) => {
+            let result_kind = if tool_error_is_interrupted(&err) {
+                ToolCallResultKind::Interrupted
+            } else {
+                ToolCallResultKind::Final
+            };
             let message = err.to_string();
-            (message.clone(), false, Some(message))
+            (message.clone(), false, Some(message), result_kind)
         }
     };
 
     let tool_name = tool_call.function.name.clone();
-    complete_tool_call(
+    complete_tool_call_with_kind(
         session,
         ctx,
         index,
@@ -760,6 +1019,8 @@ async fn execute_normal_tool_call(
         tool_output,
         success,
         error,
+        result_kind,
+        None,
     )
     .await
 }
@@ -849,30 +1110,88 @@ fn decode_completed_tool_output(
     )
 }
 
+/// Run the batch's immediate tools concurrently. On cancellation the in-flight
+/// futures are not dropped on the spot: their per-call child tokens are already
+/// cancelled, so cooperative tools (e.g. run_command killing its process group)
+/// resolve within [`tool_cancel_grace`]; anything still outstanding at the
+/// deadline is completed with a placeholder interrupted result so every call
+/// in the batch ends with a `ToolCallCompleted` event and a tool result.
 async fn execute_normal_tools_concurrently(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     normal_calls: Vec<PendingToolCall>,
     cancellation_token: &CancellationToken,
-) -> Option<Vec<ExecutedToolCall>> {
-    let mut pending_futures = normal_calls
-        .into_iter()
-        .map(|pending| execute_normal_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending))
-        .collect::<FuturesUnordered<_>>();
+) -> ToolBatchOutcome {
+    let mut outstanding = normal_calls
+        .iter()
+        .map(PendingCallDescriptor::of)
+        .collect::<Vec<_>>();
     let mut resolved = Vec::new();
-    while !pending_futures.is_empty() {
-        let next = tokio::select! {
-            _ = cancellation_token.cancelled() => return None,
-            next = pending_futures.next() => next,
-        };
-        let Some(executed) = next else {
-            break;
-        };
-        resolved.push(executed);
+    let mut cancelled = cancellation_token.is_cancelled();
+
+    if !cancelled {
+        let mut pending_futures = normal_calls
+            .into_iter()
+            .map(|pending| {
+                execute_normal_tool_call(
+                    Arc::clone(&session),
+                    Arc::clone(&ctx),
+                    pending,
+                    cancellation_token,
+                )
+            })
+            .collect::<FuturesUnordered<_>>();
+        while !pending_futures.is_empty() {
+            let next = tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                next = pending_futures.next() => next,
+            };
+            let Some(executed) = next else {
+                break;
+            };
+            outstanding.retain(|descriptor| descriptor.index != executed.index);
+            resolved.push(executed);
+        }
+        if cancelled {
+            let deadline = tokio::time::sleep(tool_cancel_grace());
+            tokio::pin!(deadline);
+            while !pending_futures.is_empty() {
+                let next = tokio::select! {
+                    _ = &mut deadline => break,
+                    next = pending_futures.next() => next,
+                };
+                let Some(executed) = next else {
+                    break;
+                };
+                outstanding.retain(|descriptor| descriptor.index != executed.index);
+                resolved.push(executed);
+            }
+        }
     }
-    Some(resolved)
+
+    if cancelled {
+        for descriptor in outstanding {
+            resolved.push(
+                complete_interrupted_tool_call(Arc::clone(&session), Arc::clone(&ctx), descriptor)
+                    .await,
+            );
+        }
+    }
+
+    ToolBatchOutcome {
+        executed: resolved,
+        cancelled,
+    }
 }
 
+/// Execute the attempt's tool calls. Always produces one result per call —
+/// real output, error, live spawn status, or a placeholder interrupted result
+/// when the turn was cancelled — so the assistant tool-call message persisted
+/// for this attempt keeps a matched tool result. The `cancelled` flag tells
+/// the caller to finalize the interrupted turn instead of looping.
 async fn execute_pending_tool_calls_for_turn(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
@@ -881,21 +1200,23 @@ async fn execute_pending_tool_calls_for_turn(
     consumed_children: &mut Vec<ThreadId>,
     stream_phase_completions: &mut Vec<CompletionEntry>,
     cancellation_token: &CancellationToken,
-) -> Option<Vec<ExecutedToolCall>> {
+) -> (Vec<ExecutedToolCall>, bool) {
     let DispatchedTools {
         immediate,
         deferred,
         has_immediate_results,
+        cancelled: dispatch_cancelled,
     } = dispatch_tool_calls(
         Arc::clone(&session),
         Arc::clone(&ctx),
         pending_tool_calls,
         cancellation_token,
     )
-    .await?;
+    .await;
 
     let surfacing = Surfacing::for_batch(has_immediate_results);
-    let deferred = wait_for_deferred(deferred, &surfacing, cancellation_token).await?;
+    let (deferred, wait_cancelled) =
+        wait_for_deferred(deferred, &surfacing, cancellation_token).await;
     let deferred_results = collect_spawn_results(
         Arc::clone(&session),
         Arc::clone(&ctx),
@@ -906,20 +1227,23 @@ async fn execute_pending_tool_calls_for_turn(
     .await;
 
     let executed_tool_calls = merge_in_index_order(immediate, deferred_results);
+    let mut cancelled = dispatch_cancelled || wait_cancelled;
 
     // A batch with no immediate results also blocks on every retained receiver
     // carried over from prior turns, so the model sees their completed JSON in
     // this same iteration. The drained completions ride along with anything
     // captured mid-stream and surface together as a single user-text message.
-    if matches!(surfacing, Surfacing::BlockInline) {
-        let drained = tokio::select! {
-            _ = cancellation_token.cancelled() => return None,
-            completions = drain_retained_subagent_completions(retained_subagents, &session.agent_control, consumed_children) => completions,
-        };
-        stream_phase_completions.extend(drained);
+    // A cancelled batch skips the drain — the turn is ending.
+    if matches!(surfacing, Surfacing::BlockInline) && !cancelled {
+        tokio::select! {
+            _ = cancellation_token.cancelled() => cancelled = true,
+            completions = drain_retained_subagent_completions(retained_subagents, &session.agent_control, consumed_children) => {
+                stream_phase_completions.extend(completions);
+            }
+        }
     }
 
-    Some(executed_tool_calls)
+    (executed_tool_calls, cancelled)
 }
 
 struct DispatchedTools {
@@ -931,54 +1255,77 @@ struct DispatchedTools {
     /// Whether the batch contained any non-deferred tool result — this, not
     /// whether a spawn happened to fail at start, is what decides `Surfacing`.
     has_immediate_results: bool,
+    /// Whether cancellation was observed while executing the batch.
+    cancelled: bool,
 }
 
 /// Run every tool call to the point where its outcome is known, preserving the
 /// phasing the rest of the loop relies on: deferred (`spawn_agent`) starts run
 /// first and are never cancelled mid-flight (their multi-await side effects must
 /// fully complete or never begin — see [`start_spawn_calls_concurrently`]), then
-/// the immediate tools run and observe cancellation. Returns `None` only on
-/// cancellation.
+/// the immediate tools run and observe cancellation. Every call gets a result
+/// even when cancellation interrupts the batch.
 async fn dispatch_tool_calls(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     pending_tool_calls: Vec<PendingToolCall>,
     cancellation_token: &CancellationToken,
-) -> Option<DispatchedTools> {
+) -> DispatchedTools {
     let (normal_calls, spawn_calls, exit_plan_calls) =
         partition_pending_tool_calls(pending_tool_calls);
 
     let started_spawns =
         start_spawn_calls_concurrently(Arc::clone(&session), Arc::clone(&ctx), spawn_calls).await;
 
-    let normal_results = execute_normal_tools_concurrently(
+    // Spawn starts are uncancellable (above), so a cancel that arrived while
+    // they ran produced children no subtree walk has seen — the cascade in
+    // `interrupt_turn_cascade` ran before these threads existed. Interrupt
+    // them here so they cannot outlive the cancelled turn.
+    if cancellation_token.is_cancelled() {
+        let started_child_ids = started_spawns
+            .iter()
+            .filter_map(|spawn| match spawn {
+                SpawnToolStart::Started(call) => Some(call.child_thread_id),
+                SpawnToolStart::Completed(_) => None,
+            })
+            .collect::<Vec<_>>();
+        session
+            .agent_control
+            .cancel_threads(&started_child_ids, crate::core::CancelReason::UserInterrupt)
+            .await;
+    }
+
+    let normal_outcome = execute_normal_tools_concurrently(
         Arc::clone(&session),
         Arc::clone(&ctx),
         normal_calls,
         cancellation_token,
     )
-    .await?;
+    .await;
 
-    let exit_plan_results = execute_exit_plan_mode_calls(
+    let exit_plan_outcome = execute_exit_plan_mode_calls(
         Arc::clone(&session),
         Arc::clone(&ctx),
         exit_plan_calls,
         cancellation_token,
     )
-    .await?;
+    .await;
 
-    let has_immediate_results = !normal_results.is_empty() || !exit_plan_results.is_empty();
+    let cancelled = normal_outcome.cancelled || exit_plan_outcome.cancelled;
+    let has_immediate_results =
+        !normal_outcome.executed.is_empty() || !exit_plan_outcome.executed.is_empty();
     let (deferred, immediate_spawn_results) = split_started_and_immediate(started_spawns);
 
-    let mut immediate = normal_results;
-    immediate.extend(exit_plan_results);
+    let mut immediate = normal_outcome.executed;
+    immediate.extend(exit_plan_outcome.executed);
     immediate.extend(immediate_spawn_results);
 
-    Some(DispatchedTools {
+    DispatchedTools {
         immediate,
         deferred,
         has_immediate_results,
-    })
+        cancelled,
+    }
 }
 
 /// How the turn loop runs a given tool call. The names of the built-in tools
@@ -1142,26 +1489,57 @@ async fn exit_plan_mode_outcome(
 }
 
 /// Run the queued `exit_plan_mode` calls sequentially (a second call in the
-/// same batch sees the state left by the first). Returns `None` only on
-/// cancellation.
+/// same batch sees the state left by the first). On cancellation, the call
+/// being waited on and any not yet started are completed with placeholder
+/// interrupted results.
 async fn execute_exit_plan_mode_calls(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     exit_plan_calls: Vec<PendingToolCall>,
     cancellation_token: &CancellationToken,
-) -> Option<Vec<ExecutedToolCall>> {
+) -> ToolBatchOutcome {
     let mut resolved = Vec::with_capacity(exit_plan_calls.len());
+    let mut cancelled = false;
     for pending in exit_plan_calls {
-        let executed = execute_exit_plan_mode_call(
+        if cancelled || cancellation_token.is_cancelled() {
+            cancelled = true;
+            resolved.push(
+                complete_interrupted_tool_call(
+                    Arc::clone(&session),
+                    Arc::clone(&ctx),
+                    PendingCallDescriptor::of(&pending),
+                )
+                .await,
+            );
+            continue;
+        }
+        let descriptor = PendingCallDescriptor::of(&pending);
+        match execute_exit_plan_mode_call(
             Arc::clone(&session),
             Arc::clone(&ctx),
             pending,
             cancellation_token,
         )
-        .await?;
-        resolved.push(executed);
+        .await
+        {
+            Some(executed) => resolved.push(executed),
+            None => {
+                cancelled = true;
+                resolved.push(
+                    complete_interrupted_tool_call(
+                        Arc::clone(&session),
+                        Arc::clone(&ctx),
+                        descriptor,
+                    )
+                    .await,
+                );
+            }
+        }
     }
-    Some(resolved)
+    ToolBatchOutcome {
+        executed: resolved,
+        cancelled,
+    }
 }
 
 /// Start every queued `spawn_agent` call concurrently and wait for all starts
@@ -1202,16 +1580,21 @@ fn split_started_and_immediate(
     (started, immediate)
 }
 
+/// Wait for the started spawns per the batch's surfacing policy. On
+/// cancellation the wait simply stops early — the spawns themselves stay
+/// valid: `collect_spawn_results` reports each child's live status as a
+/// `StatusUpdate` result, so the batch still produces a result per call.
+/// Returns the spawn calls plus whether cancellation cut the wait short.
 async fn wait_for_deferred(
     mut deferred: Vec<StartedSpawnToolCall>,
     surfacing: &Surfacing,
     cancellation_token: &CancellationToken,
-) -> Option<Vec<StartedSpawnToolCall>> {
+) -> (Vec<StartedSpawnToolCall>, bool) {
     if deferred.is_empty() {
-        return Some(deferred);
+        return (deferred, false);
     }
-    await_deferred_completions(&mut deferred, surfacing, cancellation_token).await?;
-    Some(deferred)
+    let cancelled = await_deferred_completions(&mut deferred, surfacing, cancellation_token).await;
+    (deferred, cancelled)
 }
 
 async fn collect_spawn_results(
@@ -1455,16 +1838,18 @@ impl Surfacing {
     }
 }
 
+/// Wait for spawn completions per the surfacing policy. Returns whether the
+/// wait was cut short by cancellation.
 async fn await_deferred_completions(
     spawn_tool_calls: &mut [StartedSpawnToolCall],
     surfacing: &Surfacing,
     cancellation_token: &CancellationToken,
-) -> Option<()> {
+) -> bool {
     match surfacing {
         Surfacing::BlockInline => {
             while spawn_tool_calls.iter().any(|call| call.waiter.is_some()) {
                 let completion = tokio::select! {
-                    _ = cancellation_token.cancelled() => return None,
+                    _ = cancellation_token.cancelled() => return true,
                     completion = next_started_spawn_completion(spawn_tool_calls) => completion,
                 };
                 let Some((index, completion)) = completion else {
@@ -1478,7 +1863,7 @@ async fn await_deferred_completions(
             tokio::pin!(deadline);
             while spawn_tool_calls.iter().any(|call| call.waiter.is_some()) {
                 let completion = tokio::select! {
-                    _ = cancellation_token.cancelled() => return None,
+                    _ = cancellation_token.cancelled() => return true,
                     _ = &mut deadline => break,
                     completion = next_started_spawn_completion(spawn_tool_calls) => completion,
                 };
@@ -1489,7 +1874,7 @@ async fn await_deferred_completions(
             }
         }
     }
-    Some(())
+    false
 }
 
 async fn next_started_spawn_completion(

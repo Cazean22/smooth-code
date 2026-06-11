@@ -3,8 +3,8 @@ use std::{collections::HashSet, sync::Arc};
 use app_server_protocol::{
     AskUserQuestionParams, AskUserQuestionResponse, ClientRequest, JsonRpcError,
     RequestPlanApprovalParams, RequestPlanApprovalResponse, ServerRequestPayload,
-    SetPlanModeResponse, ThreadListItem, ThreadListResponse, ThreadResumeResponse,
-    ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
+    SetPlanModeResponse, ShutdownResponse, ThreadListItem, ThreadListResponse,
+    ThreadResumeResponse, ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
 };
 use smooth_core::{AskUserClient, ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
@@ -193,6 +193,11 @@ impl CoreMessageProcessor {
                     cancelled_thread_ids,
                 })?)
             }
+            ClientRequest::Shutdown { .. } => {
+                tracing::debug!("processing shutdown request");
+                self.threads.shutdown_all().await?;
+                Ok(serde_json::to_value(ShutdownResponse {})?)
+            }
             ClientRequest::ThreadResume { params, .. } => {
                 tracing::debug!(
                     thread_id = %params.thread_id,
@@ -324,8 +329,8 @@ mod tests {
     use std::{path::PathBuf, sync::Arc, sync::LazyLock};
 
     use app_server_protocol::{
-        AskUserQuestionParams, ClientRequest, RequestId, ThreadStartParams, TurnCancelParams,
-        TurnCancelResponse, TurnStartParams,
+        AskUserQuestionParams, ClientRequest, RequestId, ShutdownParams, ShutdownResponse,
+        ThreadStartParams, TurnCancelParams, TurnCancelResponse, TurnStartParams,
     };
     use tokio::sync::{Mutex as TokioMutex, mpsc, mpsc::error::TryRecvError};
 
@@ -438,6 +443,52 @@ mod tests {
 
         assert_eq!(response.thread_id, started.thread_id);
         assert!(response.cancelled_thread_ids.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_resolves_and_clears_threads() -> TestResult {
+        let _cwd_guard = CWD_LOCK.lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+        let _cwd_restore = CwdRestore(original_cwd);
+
+        let (event_tx, _event_rx) = mpsc::channel::<InProcessServerEvent>(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
+        let processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        let started_value = processor
+            .process_request(ClientRequest::ThreadStart {
+                request_id: RequestId(1),
+                params: ThreadStartParams::default(),
+            })
+            .await?;
+        let started: app_server_protocol::ThreadStartResponse =
+            serde_json::from_value(started_value)?;
+
+        let value = processor
+            .process_request(ClientRequest::Shutdown {
+                request_id: RequestId(2),
+                params: ShutdownParams {},
+            })
+            .await?;
+        let _response: ShutdownResponse = serde_json::from_value(value)?;
+
+        // The thread map is cleared: the shut-down thread is gone.
+        let Err(error) = processor
+            .process_request(ClientRequest::TurnStart {
+                request_id: RequestId(3),
+                params: TurnStartParams {
+                    thread_id: started.thread_id,
+                    input: "hello".to_string(),
+                },
+            })
+            .await
+        else {
+            panic!("turn start after shutdown should fail");
+        };
+        let info = error.data.as_ref().ok_or("missing error data")?;
+        assert_eq!(info.kind, "unknown_thread");
         Ok(())
     }
 

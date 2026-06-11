@@ -31,14 +31,15 @@ pub(crate) enum TaskKind {
 }
 
 pub(crate) struct RunningTask {
-    #[allow(dead_code)]
+    /// Notified by the runner once the task's body (including terminal-event
+    /// emission) has finished; `drain_aborted_tasks` waits on this before
+    /// deciding to hard-abort.
     pub(crate) done: Arc<Notify>,
     #[allow(dead_code)]
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
-    #[allow(dead_code)]
-    pub(crate) handle: Arc<AbortOnDropHandle<()>>,
+    pub(crate) handle: AbortOnDropHandle<()>,
     pub(crate) turn_context: Arc<TurnContext>,
 }
 

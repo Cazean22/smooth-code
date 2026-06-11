@@ -19,7 +19,7 @@ smooth-protocol = { path = "../protocol" }
 smooth-state-db = { path = "../state-db" }
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 tokio-tungstenite.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 tools = { path = "../tools" }

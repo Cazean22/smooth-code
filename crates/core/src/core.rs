@@ -31,6 +31,76 @@ use crate::{
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Why a running turn is being cancelled. The reason picks the wire string of
+/// the `TurnInterrupted` event and how long the cancelled task gets for
+/// cooperative cleanup before the hard abort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CancelReason {
+    /// The user interrupted the turn (Ctrl+C / Esc / `:cancel`).
+    UserInterrupt,
+    /// A new turn replaces the running one.
+    Replaced,
+    /// The thread is shutting down.
+    Shutdown,
+    /// A child agent is being closed by its parent.
+    Closed,
+}
+
+impl CancelReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::UserInterrupt => "interrupted",
+            Self::Replaced => "replaced",
+            Self::Shutdown => "shutdown",
+            Self::Closed => "closed",
+        }
+    }
+
+    /// How long the cancelled task gets to run cooperative cleanup (tool
+    /// grace drain, subprocess kill, partial-turn persistence) before
+    /// `drain_aborted_tasks` hard-aborts it. Must exceed the turn loop's
+    /// tool-batch grace so cleanup normally wins; exit paths use a shorter
+    /// window so shutdown stays snappy.
+    pub(crate) fn drain_grace(self) -> std::time::Duration {
+        match self {
+            Self::UserInterrupt | Self::Replaced => std::time::Duration::from_secs(8),
+            Self::Shutdown | Self::Closed => std::time::Duration::from_secs(3),
+        }
+    }
+
+    /// The terminal status published for a thread whose turn this reason
+    /// cancelled.
+    pub(crate) fn agent_status(self) -> AgentStatus {
+        match self {
+            Self::UserInterrupt | Self::Replaced => AgentStatus::Interrupted,
+            Self::Shutdown | Self::Closed => AgentStatus::Shutdown,
+        }
+    }
+}
+
+/// Phase 2 of cancellation: wait — bounded by `grace` — for each cancelled
+/// task to finish its cooperative cleanup, hard-aborting whatever is still
+/// running at the deadline. Phase 1 ([`Session::abort_all_tasks`]) already
+/// cancelled the tokens, ran the abort hooks, and emitted `TurnInterrupted`.
+pub(crate) async fn drain_aborted_tasks(tasks: Vec<RunningTask>, grace: std::time::Duration) {
+    for task in tasks {
+        // Register interest before checking completion so a runner that
+        // notifies `done` between the check and the await is not missed.
+        let notified = task.done.notified();
+        if task.handle.is_finished() {
+            continue;
+        }
+        if tokio::time::timeout(grace, notified).await.is_err() {
+            tracing::warn!(
+                turn_id = %task.turn_context.sub_id,
+                grace_ms = grace.as_millis() as u64,
+                "cancelled task did not finish within the drain grace; hard-aborting"
+            );
+            task.handle.abort();
+        }
+    }
+}
+
 /// The session's models for both plan-mode states, built once at thread
 /// creation. Toggling plan mode selects between them instead of rebuilding
 /// from the environment, so provider state (e.g. the parked OpenAI websocket)
@@ -137,23 +207,56 @@ impl Core {
                 Ok(sub_id)
             }
             Op::Interrupt => {
-                if self.session.abort_all_tasks("interrupted").await {
-                    self.session
-                        .set_agent_status(AgentStatus::Interrupted, None)
-                        .await;
-                    Ok("interrupted".to_string())
-                } else {
+                let interrupted = self.interrupt_turn_cascade().await;
+                if interrupted.is_empty() {
                     Ok("idle".to_string())
+                } else {
+                    Ok("interrupted".to_string())
                 }
             }
             Op::Shutdown => {
-                self.session.abort_all_tasks("shutdown").await;
+                self.session
+                    .abort_and_drain_all_tasks(CancelReason::Shutdown)
+                    .await;
+                self.session
+                    .agent_control
+                    .cancel_descendants(self.session.id, CancelReason::Shutdown)
+                    .await;
                 self.session
                     .set_agent_status(AgentStatus::Shutdown, None)
                     .await;
                 Ok("shutdown".to_string())
             }
         }
+    }
+
+    /// Interrupt this thread's running turn and cascade to every live
+    /// descendant agent. Returns the thread ids (this thread included) that
+    /// actually had a turn interrupted. The cooperative-cleanup drains run in
+    /// the background — interruption must respond immediately.
+    pub(crate) async fn interrupt_turn_cascade(&self) -> Vec<ThreadId> {
+        let mut interrupted = Vec::new();
+        let tasks = self
+            .session
+            .abort_all_tasks(CancelReason::UserInterrupt)
+            .await;
+        if !tasks.is_empty() {
+            self.session
+                .set_agent_status(AgentStatus::Interrupted, None)
+                .await;
+            tokio::spawn(drain_aborted_tasks(
+                tasks,
+                CancelReason::UserInterrupt.drain_grace(),
+            ));
+            interrupted.push(self.session.id);
+        }
+        interrupted.extend(
+            self.session
+                .agent_control
+                .cancel_descendants(self.session.id, CancelReason::UserInterrupt)
+                .await,
+        );
+        interrupted
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -200,7 +303,19 @@ impl Session {
     ) -> BoxFuture<'_, CoreResult<()>> {
         Box::pin(async move {
             self.wait_for_finishing_turn().await;
-            self.abort_all_tasks("replaced").await;
+            // Replacement awaits the drain inline: the old task may still be
+            // writing history/rollout during its cooperative cleanup, and the
+            // new turn must not interleave with it.
+            let replaced = self.abort_and_drain_all_tasks(CancelReason::Replaced).await;
+            // Only an actually-replaced turn cascades to descendants — its
+            // in-flight children are now running against a superseded
+            // conversation. An idle session starting a fresh turn must leave
+            // retained subagents from completed turns alone.
+            if replaced {
+                self.agent_control
+                    .cancel_descendants(self.id, CancelReason::Replaced)
+                    .await;
+            }
             self.wait_for_finishing_turn().await;
             let cancellation_token = tokio_util::sync::CancellationToken::new();
             let done = Arc::new(tokio::sync::Notify::new());
@@ -362,7 +477,7 @@ impl Session {
                 kind: task_kind,
                 task,
                 cancellation_token,
-                handle: Arc::new(tokio_util::task::AbortOnDropHandle::new(handle)),
+                handle: tokio_util::task::AbortOnDropHandle::new(handle),
                 turn_context: Arc::clone(&turn_context),
             };
 
@@ -386,8 +501,11 @@ impl Session {
         })
     }
 
-    #[tracing::instrument(name = "core.session.abort_all_tasks", skip(self), fields(thread_id = %self.id, reason))]
-    pub(crate) async fn abort_all_tasks(self: &Arc<Self>, reason: &str) -> bool {
+    #[tracing::instrument(name = "core.session.abort_all_tasks", skip(self), fields(thread_id = %self.id, reason = reason.as_str()))]
+    pub(crate) async fn abort_all_tasks(
+        self: &Arc<Self>,
+        reason: CancelReason,
+    ) -> Vec<RunningTask> {
         let drained = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.as_ref().is_some_and(ActiveTurn::is_empty) {
@@ -398,9 +516,8 @@ impl Session {
         };
 
         if let Some(tasks) = drained {
-            let interrupted = !tasks.is_empty();
             *self.current_turn_id.write().await = None;
-            for task in tasks {
+            for task in &tasks {
                 task.cancellation_token.cancel();
                 task.task
                     .abort(Arc::clone(self), Arc::clone(&task.turn_context))
@@ -410,15 +527,25 @@ impl Session {
                     EventMsg::TurnInterrupted(TurnInterruptedEvent {
                         thread_id: self.id.to_string(),
                         turn_id: task.turn_context.sub_id.clone(),
-                        reason: reason.to_string(),
+                        reason: reason.as_str().to_string(),
                     }),
                 )
                 .await;
             }
             self.turn_closed.notify_waiters();
-            return interrupted;
+            return tasks;
         }
-        false
+        Vec::new()
+    }
+
+    /// Cancel the running turn and wait — bounded by the reason's grace — for
+    /// the task's cooperative cleanup to finish, hard-aborting at the
+    /// deadline. Returns whether anything was interrupted.
+    pub(crate) async fn abort_and_drain_all_tasks(self: &Arc<Self>, reason: CancelReason) -> bool {
+        let tasks = self.abort_all_tasks(reason).await;
+        let interrupted = !tasks.is_empty();
+        drain_aborted_tasks(tasks, reason.drain_grace()).await;
+        interrupted
     }
 
     async fn wait_for_finishing_turn(&self) {
@@ -628,7 +755,7 @@ mod tests {
         tasks::SessionTask,
     };
 
-    use super::{Core, Session, SessionModels, TurnContext};
+    use super::{CancelReason, Core, Session, SessionModels, TurnContext};
     use smooth_protocol::{AgentStatus, AgentStatusChangedEvent, EventMsg, SessionSource};
     use tokio_util::sync::CancellationToken;
 
@@ -755,11 +882,15 @@ mod tests {
             ])))
         }
 
-        fn call_tool(&self, tool_name: &str, args: &str) -> Result<String> {
+        fn call_tool(
+            &self,
+            tool_name: &str,
+            args: &str,
+        ) -> futures_util::future::BoxFuture<'static, Result<String>> {
             assert_eq!(tool_name, "test_tool");
             assert_eq!(args, r#"{"x":1}"#);
             self.tool_calls.fetch_add(1, Ordering::SeqCst);
-            Ok("tool-output".to_string())
+            Box::pin(async { Ok("tool-output".to_string()) })
         }
     }
 
@@ -791,6 +922,129 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }
+    }
+
+    /// A task that ignores its cancellation token entirely — the worst case
+    /// the drain's hard-abort deadline exists for.
+    struct StubbornTask;
+
+    impl SessionTask for StubbornTask {
+        fn kind(&self) -> TaskKind {
+            TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "test.stubborn_task"
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _session: Arc<Session>,
+            _ctx: Arc<TurnContext>,
+            _input: Vec<String>,
+            _cancellation_token: CancellationToken,
+        ) -> Option<String> {
+            let _ = self;
+            std::future::pending().await
+        }
+    }
+
+    /// Streams one tool call on the first attempt, then completes. The tool
+    /// either cooperates with cancellation (resolving with an interrupted
+    /// error once the ambient token cancels) or hangs forever, exercising the
+    /// synthesized-placeholder path.
+    struct InterruptibleToolDriver {
+        calls: AtomicUsize,
+        hang_forever: bool,
+    }
+
+    impl InterruptibleToolDriver {
+        fn new(hang_forever: bool) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                hang_forever,
+            }
+        }
+    }
+
+    impl SessionModelDriver for InterruptibleToolDriver {
+        fn stream_completion_turn(
+            &self,
+            _prompt: Message,
+            _history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                let tool_call = ToolCall::new(
+                    "tool-1".to_string(),
+                    ToolFunction::new("slow_tool".to_string(), serde_json::json!({})),
+                )
+                .with_call_id("call-1".to_string());
+                return Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                    SessionCompletionEvent::AssistantItem(
+                        crate::SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-tool-1".to_string(),
+                        },
+                    ),
+                )])));
+            }
+            Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-after-tool".to_string()),
+                    response: "after tool".to_string(),
+                }),
+            )])))
+        }
+
+        fn call_tool(
+            &self,
+            _tool_name: &str,
+            _args: &str,
+        ) -> futures_util::future::BoxFuture<'static, Result<String>> {
+            if self.hang_forever {
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(async {
+                    tools::tool_cancel_token().cancelled().await;
+                    Err(anyhow::Error::new(tools::ToolError::interrupted(
+                        "tool interrupted by cancellation",
+                    )))
+                })
+            }
+        }
+    }
+
+    async fn test_core_with_driver(
+        driver: Arc<dyn SessionModelDriver>,
+    ) -> Result<(
+        Core,
+        tokio::sync::broadcast::Receiver<smooth_protocol::Event>,
+        TempDir,
+    )> {
+        let workspace = TempDir::new()?;
+        let cwd = PathBuf::from(workspace.path());
+        let thread_id = smooth_protocol::ThreadId::new();
+        let current_turn_id = Arc::new(RwLock::new(None));
+        let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
+        let model = SessionModel::Stub(driver);
+        let core = Core::new(
+            thread_id,
+            SessionModels::new(model.clone(), model),
+            Vec::new(),
+            0,
+            rollout,
+            current_turn_id,
+            None,
+            SessionSource::Cli,
+            crate::agent::SystemPromptKind::Root,
+            None,
+            AgentControl::new(),
+            false,
+            cwd,
+        );
+        let rx = core.subscribe();
+        Ok((core, rx, workspace))
     }
 
     async fn test_core() -> Result<(
@@ -930,6 +1184,191 @@ mod tests {
 
         assert_eq!(interrupted, 1);
         Ok(())
+    }
+
+    /// Wait until the session history reaches `min_len`, bounded by a timeout.
+    /// The interrupted turn's persistence runs in the cancelled task's
+    /// cooperative-cleanup window, after the interrupt response returns.
+    async fn wait_for_history_len(core: &Core, min_len: usize) -> Vec<Message> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let history = core.session.history().await;
+            if history.len() >= min_len {
+                return history;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "history never reached {min_len} items; got {}",
+                    history.len()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_mid_tool_records_interrupted_result_and_persists_partial_turn() -> Result<()>
+    {
+        let (core, mut rx, _workspace) =
+            test_core_with_driver(Arc::new(InterruptibleToolDriver::new(false))).await?;
+        let turn_id = core.start_user_input("hello".to_string()).await?;
+
+        // Wait for the tool call to start before interrupting.
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await??;
+            if matches!(
+                event.msg,
+                EventMsg::ToolCallStarted(ref started) if started.turn_id == turn_id
+            ) {
+                break;
+            }
+        }
+
+        let result = core.submit(smooth_protocol::Op::Interrupt).await?;
+        assert_eq!(result, "interrupted");
+
+        // The cooperative tool resolves with an interrupted error once the
+        // token cancels; its completion event surfaces during the drain.
+        let mut saw_interrupted_completion = false;
+        let mut interrupted_events = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !saw_interrupted_completion && std::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+            else {
+                continue;
+            };
+            match event.msg {
+                EventMsg::ToolCallCompleted(completed) if completed.turn_id == turn_id => {
+                    assert!(!completed.success);
+                    assert_eq!(
+                        completed.result_kind,
+                        smooth_protocol::ToolCallResultKind::Interrupted
+                    );
+                    saw_interrupted_completion = true;
+                }
+                EventMsg::TurnInterrupted(turn) if turn.turn_id == turn_id => {
+                    interrupted_events += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_interrupted_completion,
+            "expected an interrupted ToolCallCompleted event"
+        );
+        assert_eq!(interrupted_events, 1);
+
+        // The partial turn — assistant tool-call message plus the interrupted
+        // tool result — is folded into history so the model sees what was cut
+        // short on the next turn.
+        let history = wait_for_history_len(&core, 3).await;
+        assert_eq!(user_message_text(&history[0]).as_deref(), Some("hello"));
+        assert_eq!(assistant_tool_call_count(&history[1]), Some(1));
+        assert_eq!(user_tool_result_count(&history[2]), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupt_with_hanging_tool_synthesizes_interrupted_result_after_grace() -> Result<()>
+    {
+        // Shrink the tool-batch grace so the synthesized-placeholder path runs
+        // quickly. Process-global, but the only other consumers resolve their
+        // tools cooperatively and never reach the deadline.
+        unsafe { std::env::set_var("SMOOTH_CODE_TOOL_CANCEL_GRACE_MS", "100") };
+        let (core, mut rx, _workspace) =
+            test_core_with_driver(Arc::new(InterruptibleToolDriver::new(true))).await?;
+        let turn_id = core.start_user_input("hello".to_string()).await?;
+
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await??;
+            if matches!(
+                event.msg,
+                EventMsg::ToolCallStarted(ref started) if started.turn_id == turn_id
+            ) {
+                break;
+            }
+        }
+
+        let result = core.submit(smooth_protocol::Op::Interrupt).await?;
+        assert_eq!(result, "interrupted");
+
+        // The tool never resolves; after the (shrunk) grace the batch
+        // completes it with a synthesized placeholder.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_placeholder = false;
+        while !saw_placeholder && std::time::Instant::now() < deadline {
+            let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+            else {
+                continue;
+            };
+            if let EventMsg::ToolCallCompleted(completed) = event.msg
+                && completed.turn_id == turn_id
+            {
+                assert!(!completed.success);
+                assert_eq!(
+                    completed.result_kind,
+                    smooth_protocol::ToolCallResultKind::Interrupted
+                );
+                assert!(
+                    completed
+                        .output_preview
+                        .as_deref()
+                        .is_some_and(|preview| preview.contains("interrupted")),
+                    "unexpected preview: {:?}",
+                    completed.output_preview
+                );
+                saw_placeholder = true;
+            }
+        }
+        assert!(
+            saw_placeholder,
+            "expected a synthesized interrupted ToolCallCompleted event"
+        );
+
+        let history = wait_for_history_len(&core, 3).await;
+        assert_eq!(assistant_tool_call_count(&history[1]), Some(1));
+        assert_eq!(user_tool_result_count(&history[2]), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stubborn_task_is_hard_aborted_after_grace_and_session_recovers() -> Result<()> {
+        let (core, mut rx) = test_core().await?;
+        let turn_context = Arc::new(core.session.fresh_turn_context());
+        core.session
+            .start_task(
+                turn_context,
+                vec!["hello".to_string()],
+                Arc::new(StubbornTask),
+                TaskKind::Regular,
+            )
+            .await?;
+
+        let tasks = core
+            .session
+            .abort_all_tasks(CancelReason::UserInterrupt)
+            .await;
+        assert_eq!(tasks.len(), 1);
+        // A tiny grace: the task ignores its token, so the drain must
+        // hard-abort it at the deadline instead of waiting forever.
+        super::drain_aborted_tasks(tasks, std::time::Duration::from_millis(50)).await;
+
+        // The session accepts and completes a follow-up turn.
+        let next_turn_id = core.start_user_input("again".to_string()).await?;
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await??;
+            if matches!(
+                event.msg,
+                EventMsg::TurnCompleted(ref turn) if turn.turn_id == next_turn_id
+            ) {
+                return Ok(());
+            }
+        }
     }
 
     #[tokio::test]
@@ -1227,7 +1666,9 @@ mod tests {
         assert!(result.is_err());
         assert!(!core.session.plan_mode());
 
-        core.session.abort_all_tasks("test cleanup").await;
+        core.session
+            .abort_and_drain_all_tasks(CancelReason::Shutdown)
+            .await;
         Ok(())
     }
 }

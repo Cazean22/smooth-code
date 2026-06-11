@@ -19,6 +19,7 @@ use crate::{
         registry::{AgentMetadata, AgentRegistry},
         status::{agent_status_from_event, is_final, last_assistant_message},
     },
+    core::{CancelReason, drain_aborted_tasks},
     core_thread::CoreThread,
     error::{CoreError, CoreResult},
     provider::SessionModelFactory,
@@ -26,6 +27,25 @@ use crate::{
 
 pub(crate) const AGENT_MAX_DEPTH: i32 = 8;
 const AGENT_MAX_THREADS: usize = 16;
+
+/// Whether `thread_id` sits inside `root_thread_id`'s agent subtree per the
+/// registry's parent edges (a thread is in its own subtree).
+pub(crate) fn is_metadata_in_subtree(
+    metadata_by_thread: &HashMap<ThreadId, &AgentMetadata>,
+    thread_id: ThreadId,
+    root_thread_id: ThreadId,
+) -> bool {
+    let mut current = Some(thread_id);
+    while let Some(current_thread_id) = current {
+        if current_thread_id == root_thread_id {
+            return true;
+        }
+        current = metadata_by_thread
+            .get(&current_thread_id)
+            .and_then(|metadata| metadata.parent_thread_id);
+    }
+    false
+}
 
 /// Shared in-process handle for agent lifecycle and inter-agent coordination.
 #[derive(Clone)]
@@ -157,6 +177,89 @@ impl AgentControl {
 
     pub(crate) fn registry(&self) -> AgentRegistry {
         self.state.registry.clone()
+    }
+
+    /// Live thread ids in `root`'s agent subtree (root included), computed
+    /// from the registry's parent edges.
+    pub(crate) fn live_subtree_thread_ids(&self, root_thread_id: ThreadId) -> Vec<ThreadId> {
+        let agents = self.state.registry.live_agents();
+        let metadata_by_thread = agents
+            .iter()
+            .filter_map(|metadata| metadata.agent_id.map(|thread_id| (thread_id, metadata)))
+            .collect::<HashMap<_, _>>();
+        let mut thread_ids = agents
+            .iter()
+            .filter_map(|metadata| {
+                let thread_id = metadata.agent_id?;
+                is_metadata_in_subtree(&metadata_by_thread, thread_id, root_thread_id)
+                    .then_some(thread_id)
+            })
+            .collect::<Vec<_>>();
+        if !thread_ids.contains(&root_thread_id) {
+            thread_ids.insert(0, root_thread_id);
+        }
+        thread_ids
+    }
+
+    /// Cancel the running turns of every live descendant of `root` (root
+    /// itself excluded). Internal cancellation paths — user interrupt, turn
+    /// replacement, shutdown — cascade through this so spawned child agents
+    /// never keep running against a superseded conversation. Returns the
+    /// descendants that actually had a turn interrupted.
+    pub(crate) async fn cancel_descendants(
+        &self,
+        root: ThreadId,
+        reason: CancelReason,
+    ) -> Vec<ThreadId> {
+        let descendants = self
+            .live_subtree_thread_ids(root)
+            .into_iter()
+            .filter(|thread_id| *thread_id != root)
+            .collect::<Vec<_>>();
+        self.cancel_threads(&descendants, reason).await
+    }
+
+    /// Phase-1 abort every listed thread's running turn, then drain them all
+    /// under one grace window — spawned for user interrupts (the caller must
+    /// not block on cleanup), awaited for exit paths.
+    pub(crate) async fn cancel_threads(
+        &self,
+        thread_ids: &[ThreadId],
+        reason: CancelReason,
+    ) -> Vec<ThreadId> {
+        if thread_ids.is_empty() {
+            return Vec::new();
+        }
+        let Ok(runtime) = self.runtime() else {
+            return Vec::new();
+        };
+        let mut interrupted = Vec::new();
+        let mut drained_tasks = Vec::new();
+        for thread_id in thread_ids {
+            let thread = runtime.threads.read().await.get(thread_id).cloned();
+            let Some(thread) = thread else {
+                continue;
+            };
+            let tasks = thread.core.session.abort_all_tasks(reason).await;
+            if !tasks.is_empty() {
+                thread
+                    .core
+                    .session
+                    .set_agent_status(reason.agent_status(), None)
+                    .await;
+                interrupted.push(*thread_id);
+                drained_tasks.extend(tasks);
+            }
+        }
+        match reason {
+            CancelReason::UserInterrupt => {
+                tokio::spawn(drain_aborted_tasks(drained_tasks, reason.drain_grace()));
+            }
+            CancelReason::Replaced | CancelReason::Shutdown | CancelReason::Closed => {
+                drain_aborted_tasks(drained_tasks, reason.drain_grace()).await;
+            }
+        }
+        interrupted
     }
 
     pub(crate) fn resolve_agent_reference(
@@ -401,7 +504,11 @@ impl AgentControl {
         drop(threads);
 
         let _ = thread.submit(Op::Shutdown).await?;
-        thread.core.session.abort_all_tasks("closed").await;
+        thread
+            .core
+            .session
+            .abort_and_drain_all_tasks(crate::core::CancelReason::Closed)
+            .await;
         runtime.threads.write().await.remove(&target_thread_id);
         self.state.registry.unregister_thread(target_thread_id);
         self.remove_status_sender(target_thread_id)?;

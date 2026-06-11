@@ -677,6 +677,10 @@ impl UiModel {
 
     fn handle_normal_key(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
         match key_event.code {
+            // Esc interrupts the running turn. Overlay dismissal keeps
+            // priority structurally: pickers and plan approval dispatch in
+            // `handle_key_event` before mode handling ever sees the key.
+            KeyCode::Esc if self.is_turn_running => self.request_turn_cancel(),
             KeyCode::Char('i') => {
                 self.mode = UiMode::Insert;
                 self.focus = FocusTarget::Composer;
@@ -4732,6 +4736,93 @@ mod tests {
             assert!(model.is_turn_cancelling);
             assert_eq!(model.status_line, "Cancelling turn");
         }
+    }
+
+    #[test]
+    fn esc_cancels_running_turn_in_normal_mode() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.screen = Screen::Workspace;
+        model.mode = UiMode::Normal;
+        model.is_turn_running = true;
+        model.current_turn_id = Some("turn-1".to_string());
+
+        let effects = model.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0].kind,
+            UiEffectKind::TurnCancel { thread_id: got } if got == thread_id
+        ));
+        assert!(model.is_turn_cancelling);
+        assert_eq!(model.status_line, "Cancelling turn");
+    }
+
+    #[test]
+    fn esc_dismisses_overlay_instead_of_cancelling_turn() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.screen = Screen::Workspace;
+        model.mode = UiMode::Overlay;
+        model.is_turn_running = true;
+        model.current_turn_id = Some("turn-1".to_string());
+        model.question_picker = Some(QuestionPicker::new(
+            RequestId(1),
+            AskUserQuestionParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".into(),
+                questions: vec![app_server_protocol::AskUserQuestion {
+                    question: "Proceed?".to_string(),
+                    header: "Choice".to_string(),
+                    options: vec![app_server_protocol::AskUserQuestionOption {
+                        label: "Yes".to_string(),
+                        description: "go ahead".to_string(),
+                        preview: None,
+                    }],
+                    multi_select: false,
+                }],
+            },
+        ));
+
+        let effects = model.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect.kind, UiEffectKind::TurnCancel { .. })),
+            "overlay Esc must dismiss the picker, not cancel the turn"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect.kind, UiEffectKind::FailQuestion { .. })),
+            "overlay Esc should decline the question"
+        );
+        assert!(!model.is_turn_cancelling);
+        assert!(model.question_picker.is_none());
+    }
+
+    #[test]
+    fn esc_in_insert_mode_returns_to_normal_even_while_turn_running() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.screen = Screen::Workspace;
+        model.mode = UiMode::Insert;
+        model.is_turn_running = true;
+
+        let effects = model.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect.kind, UiEffectKind::TurnCancel { .. })),
+            "insert-mode Esc must switch modes, not cancel the turn"
+        );
+        assert_eq!(model.mode, UiMode::Normal);
+        assert!(!model.is_turn_cancelling);
     }
 
     #[test]

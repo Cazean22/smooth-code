@@ -84,6 +84,14 @@ pub struct TurnCancelResponse {
     pub cancelled_thread_ids: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ShutdownParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ShutdownResponse {}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SetPlanModeParams {
@@ -201,6 +209,12 @@ pub enum ClientRequest {
         #[serde(rename = "id")]
         request_id: RequestId,
         params: TurnCancelParams,
+    },
+    #[doc = r" Shut every thread down gracefully (cancel turns, kill tool subprocesses) before the client exits."]
+    Shutdown {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: ShutdownParams,
     },
     ThreadResume {
         #[serde(rename = "id")]

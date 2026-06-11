@@ -191,15 +191,42 @@ impl ThreadManagerState {
     }
 
     pub async fn cancel_turn_subtree(&self, thread_id: ThreadId) -> CoreResult<Vec<ThreadId>> {
-        let _ = self.get(thread_id).await?;
-        let thread_ids = self.live_subtree_thread_ids(thread_id);
-        let mut interrupted_thread_ids = Vec::new();
-        for target_thread_id in &thread_ids {
-            if self.submit(*target_thread_id, Op::Interrupt).await? == "interrupted" {
-                interrupted_thread_ids.push(*target_thread_id);
+        let thread = self.get(thread_id).await?;
+        // `interrupt_turn_cascade` aborts the root's turn and every live
+        // descendant's — the same path `Op::Interrupt` takes — and reports
+        // which threads actually had a turn interrupted.
+        Ok(thread.core.interrupt_turn_cascade().await)
+    }
+
+    /// Shut every thread down gracefully: each root thread gets
+    /// `Op::Shutdown`, which cancels its running turn (killing tool
+    /// subprocesses via the cancellation chain) and cascades to its live
+    /// descendants, draining inline under the shutdown grace. The thread map
+    /// is cleared afterwards so nothing restarts.
+    #[tracing::instrument(name = "core.thread_manager.shutdown_all", skip(self))]
+    pub async fn shutdown_all(&self) -> CoreResult<()> {
+        let thread_ids = self
+            .threads
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let registry = self.agent_control.registry();
+        for thread_id in thread_ids {
+            let is_root = registry
+                .agent_metadata_for_thread(thread_id)
+                .is_none_or(|metadata| metadata.parent_thread_id.is_none());
+            if !is_root {
+                // Descendants are shut down by their root's cascade.
+                continue;
+            }
+            if let Ok(thread) = self.get(thread_id).await {
+                let _ = thread.submit(Op::Shutdown).await;
             }
         }
-        Ok(interrupted_thread_ids)
+        self.threads.write().await.clear();
+        Ok(())
     }
 
     /// Toggle plan mode for the given thread. Returns the new effective state.
@@ -279,11 +306,11 @@ impl ThreadManagerState {
     pub(crate) async fn shutdown_and_remove_thread(
         &self,
         thread_id: ThreadId,
-        reason: &str,
+        reason: crate::core::CancelReason,
     ) -> CoreResult<()> {
         if let Ok(thread) = self.get(thread_id).await {
             let _ = thread.submit(Op::Shutdown).await;
-            thread.core.session.abort_all_tasks(reason).await;
+            thread.core.session.abort_and_drain_all_tasks(reason).await;
         }
         self.remove_thread(thread_id).await;
         Ok(())
@@ -296,26 +323,6 @@ impl ThreadManagerState {
             .get(&thread_id)
             .cloned()
             .ok_or(CoreError::UnknownThread { thread_id })
-    }
-
-    fn live_subtree_thread_ids(&self, root_thread_id: ThreadId) -> Vec<ThreadId> {
-        let agents = self.agent_control.registry().live_agents();
-        let metadata_by_thread = agents
-            .iter()
-            .filter_map(|metadata| metadata.agent_id.map(|thread_id| (thread_id, metadata)))
-            .collect::<HashMap<_, _>>();
-        let mut thread_ids = agents
-            .iter()
-            .filter_map(|metadata| {
-                let thread_id = metadata.agent_id?;
-                is_metadata_in_subtree(&metadata_by_thread, thread_id, root_thread_id)
-                    .then_some(thread_id)
-            })
-            .collect::<Vec<_>>();
-        if !thread_ids.contains(&root_thread_id) {
-            thread_ids.insert(0, root_thread_id);
-        }
-        thread_ids
     }
 
     async fn resume_child_subtree(&self, root_thread_id: ThreadId) -> CoreResult<Vec<EventMsg>> {
@@ -578,23 +585,6 @@ impl ThreadManagerState {
         )?;
         Ok(())
     }
-}
-
-fn is_metadata_in_subtree(
-    metadata_by_thread: &HashMap<ThreadId, &AgentMetadata>,
-    thread_id: ThreadId,
-    root_thread_id: ThreadId,
-) -> bool {
-    let mut current = Some(thread_id);
-    while let Some(current_thread_id) = current {
-        if current_thread_id == root_thread_id {
-            return true;
-        }
-        current = metadata_by_thread
-            .get(&current_thread_id)
-            .and_then(|metadata| metadata.parent_thread_id);
-    }
-    false
 }
 
 fn agent_status_entry(
@@ -1098,6 +1088,73 @@ mod tests {
         assert_eq!(control.get_status(root_id), AgentStatus::PendingInit);
         assert_eq!(control.get_status(child_id), child_status);
         assert_ne!(control.get_status(child_id), AgentStatus::Interrupted);
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacing_running_turn_interrupts_live_descendants() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(None, Some(Arc::new(PendingFactory))).await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+        let control = manager.agent_control();
+
+        // Root has a running (never-ending) turn with a live child agent.
+        manager
+            .start_user_input(root_id, "first prompt".to_string())
+            .await?;
+        let child = control
+            .spawn_agent(root_id, "child task".to_string())
+            .await?;
+        let child_id = child.agent_id.ok_or_else(|| anyhow::anyhow!("child id"))?;
+
+        // A new turn replaces the running one: the superseded turn's live
+        // descendants must not keep running against the old conversation.
+        manager
+            .start_user_input(root_id, "second prompt".to_string())
+            .await?;
+
+        assert_eq!(control.get_status(child_id), AgentStatus::Interrupted);
+
+        manager.cancel_turn_subtree(root_id).await?;
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_cascades_to_live_descendants() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(None, Some(Arc::new(PendingFactory))).await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent(root_id, "child task".to_string())
+            .await?;
+        let child_id = child.agent_id.ok_or_else(|| anyhow::anyhow!("child id"))?;
+        let grandchild = control
+            .spawn_agent(child_id, "grandchild task".to_string())
+            .await?;
+        let grandchild_id = grandchild
+            .agent_id
+            .ok_or_else(|| anyhow::anyhow!("grandchild id"))?;
+
+        let result = manager
+            .submit(root_id, smooth_protocol::Op::Shutdown)
+            .await?;
+        assert_eq!(result, "shutdown");
+        assert_eq!(control.get_status(child_id), AgentStatus::Shutdown);
+        assert_eq!(control.get_status(grandchild_id), AgentStatus::Shutdown);
 
         std::env::set_current_dir(original_cwd)?;
         Ok(())

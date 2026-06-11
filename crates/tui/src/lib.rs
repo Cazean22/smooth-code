@@ -14,6 +14,7 @@ mod markdown_stream;
 mod plan_approval;
 mod project_instructions;
 mod question_picker;
+mod skill_popup;
 mod streaming;
 mod wrap;
 

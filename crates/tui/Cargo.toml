@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 smooth-core = { path = "../core" }
 smooth-protocol = { path = "../protocol" }
+tools = { path = "../tools" }
 syntect = { version = "5", default-features = false }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }

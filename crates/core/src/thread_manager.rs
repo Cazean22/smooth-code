@@ -960,6 +960,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skills_are_advertised_request_only_and_slash_input_expands() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let skill_dir = tools::skills_dir(workspace.path()).join("deploy");
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Deploy the app\n---\nRun make deploy.",
+        )?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(CapturingFactory {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await?;
+        let started = manager.start_thread_with_project_instructions(None).await?;
+        let control = manager.agent_control();
+
+        manager
+            .start_user_input(started.thread_id, "/deploy to staging".to_string())
+            .await?;
+        let _ = wait_for_final_status(&control, started.thread_id).await?;
+
+        {
+            let calls = lock_test_mutex(&calls, "captured_turns")?;
+            let turn = calls
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("missing captured turn"))?;
+            // The skills listing is a request-only synthetic message ahead of
+            // history.
+            assert_eq!(turn.history.len(), 1);
+            assert!(
+                user_message_text(&turn.history[0])
+                    .as_deref()
+                    .is_some_and(|text| {
+                        text.contains("# Available skills")
+                            && text.contains("- deploy: Deploy the app")
+                    })
+            );
+            // The slash invocation reaches the model expanded.
+            let prompt_text = user_message_text(&turn.prompt)
+                .ok_or_else(|| anyhow::anyhow!("prompt should be a user message"))?;
+            assert!(prompt_text.contains("<skill-invocation skill=\"deploy\">"));
+            assert!(prompt_text.contains("Run make deploy."));
+            assert!(prompt_text.ends_with("to staging"));
+        }
+
+        let state = load_resume_state(&started.rollout_path).await?;
+        // Persisted history holds the expanded text but never the listing.
+        assert!(
+            state
+                .history
+                .iter()
+                .filter_map(user_message_text)
+                .any(|text| text.contains("<skill-invocation skill=\"deploy\">"))
+        );
+        assert!(
+            state
+                .history
+                .iter()
+                .filter_map(user_message_text)
+                .all(|text| !text.contains("# Available skills"))
+        );
+        // The transcript event keeps the raw text the user typed.
+        assert!(state.initial_messages.iter().any(|event| {
+            matches!(
+                event,
+                EventMsg::UserMessage { text } if text == "/deploy to staging"
+            )
+        }));
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn resume_uses_project_instructions_from_rollout_metadata() -> Result<()> {
         let _cwd_guard = cwd_test_lock().lock().await;
         let workspace = TempDir::new()?;

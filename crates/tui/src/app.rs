@@ -27,6 +27,7 @@ use crate::{
     history_cell::{ToolCallGroupCell, ToolCallState, TranscriptItem, TranscriptItemId},
     plan_approval::{PlanApprovalOutcome, PlanApprovalOverlay},
     question_picker::{PickerOutcome, QuestionPicker},
+    skill_popup::SkillPopup,
     streaming::StreamController,
     wrap,
 };
@@ -381,6 +382,10 @@ struct UiModel {
     transcript_inner_width: u16,
     question_picker: Option<QuestionPicker>,
     plan_approval: Option<PlanApprovalOverlay>,
+    skill_popup: Option<SkillPopup>,
+    /// Root directory skills are discovered from when the composer holds a
+    /// leading `/token`; the process cwd outside of tests.
+    skills_root: std::path::PathBuf,
     effect_counter: u64,
     effect_contexts: HashMap<EffectId, EffectContext>,
     screen: Screen,
@@ -434,6 +439,8 @@ impl UiModel {
             transcript_inner_width: 78,
             question_picker: None,
             plan_approval: None,
+            skill_popup: None,
+            skills_root: std::env::current_dir().unwrap_or_default(),
             effect_counter: 0,
             effect_contexts: HashMap::new(),
             screen: Screen::Dashboard,
@@ -556,6 +563,7 @@ impl UiModel {
                 picker.handle_paste(&text);
             } else if self.mode == UiMode::Insert {
                 self.composer.insert_paste(&text);
+                self.sync_skill_popup();
             }
         }
         Vec::new()
@@ -749,7 +757,39 @@ impl UiModel {
     }
 
     fn handle_insert_key(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
-        match key_event.code {
+        // The skill popup is an Insert-mode adornment: it intercepts only
+        // navigation/accept/dismiss keys; everything else edits the composer
+        // as usual (followed by a popup resync below).
+        if self.skill_popup.is_some() {
+            match key_event.code {
+                _ if Self::is_submit_key(key_event) => {
+                    self.skill_popup = None;
+                    return self.request_turn_start();
+                }
+                KeyCode::Esc => {
+                    self.skill_popup = None;
+                    return Vec::new();
+                }
+                KeyCode::Up => {
+                    if let Some(popup) = self.skill_popup.as_mut() {
+                        popup.move_up();
+                    }
+                    return Vec::new();
+                }
+                KeyCode::Down => {
+                    if let Some(popup) = self.skill_popup.as_mut() {
+                        popup.move_down();
+                    }
+                    return Vec::new();
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.accept_skill_completion();
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+        let effects = match key_event.code {
             KeyCode::Esc => {
                 self.mode = UiMode::Normal;
                 self.focus = FocusTarget::Transcript;
@@ -803,7 +843,77 @@ impl UiModel {
                 Vec::new()
             }
             _ => Vec::new(),
+        };
+        self.sync_skill_popup();
+        effects
+    }
+
+    /// Query for the skill popup: `Some(text after the leading slash, up to
+    /// the cursor)` while the cursor sits inside a leading `/token` (no
+    /// whitespace between the slash and the cursor), `None` otherwise.
+    fn skill_popup_query(&self) -> Option<String> {
+        let text = self.composer.as_str();
+        let rest = text.strip_prefix('/')?;
+        let cursor = self.composer.cursor();
+        if cursor < 1 {
+            return None;
         }
+        let before_cursor = rest.get(..cursor - 1)?;
+        if before_cursor.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(before_cursor.to_string())
+    }
+
+    /// Open, refresh, or dismiss the skill popup to match the composer state.
+    /// Skills are rescanned from disk each time the popup transitions to open,
+    /// so newly added skills show up without restarting.
+    fn sync_skill_popup(&mut self) {
+        let Some(query) = self.skill_popup_query() else {
+            self.skill_popup = None;
+            return;
+        };
+        if self.skill_popup.is_none() {
+            let skills = tools::list_skills(&self.skills_root);
+            if skills.is_empty() {
+                return;
+            }
+            self.skill_popup = Some(SkillPopup::new(skills));
+        }
+        if let Some(popup) = self.skill_popup.as_mut() {
+            popup.set_query(&query);
+            if popup.is_empty() {
+                self.skill_popup = None;
+            }
+        }
+    }
+
+    /// Replace the leading `/token` in the composer with the selected skill
+    /// name and close the popup, leaving the cursor at the end of the text.
+    fn accept_skill_completion(&mut self) {
+        let Some(name) = self
+            .skill_popup
+            .as_ref()
+            .and_then(|popup| popup.selected_name())
+            .map(str::to_string)
+        else {
+            self.skill_popup = None;
+            return;
+        };
+        let text = self.composer.take_text();
+        let token_end = text
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len());
+        let remainder = &text[token_end..];
+        let replaced = if remainder.is_empty() {
+            format!("/{name} ")
+        } else {
+            format!("/{name}{remainder}")
+        };
+        self.composer.set_text(replaced);
+        self.skill_popup = None;
     }
 
     fn handle_command_key(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
@@ -2072,6 +2182,11 @@ impl UiModel {
             .unwrap_or(0);
         let command_height = if self.mode == UiMode::Command { 1 } else { 0 };
         let composer_height = self.composer_height();
+        let skill_popup_height = self
+            .skill_popup
+            .as_ref()
+            .map(|popup| popup.desired_height().min(8))
+            .unwrap_or(0);
 
         let mut constraints = Vec::new();
         constraints.push(Constraint::Min(5));
@@ -2080,6 +2195,9 @@ impl UiModel {
         }
         if approval_height > 0 {
             constraints.push(Constraint::Length(approval_height));
+        }
+        if skill_popup_height > 0 {
+            constraints.push(Constraint::Length(skill_popup_height));
         }
         constraints.push(Constraint::Length(1));
         constraints.push(Constraint::Length(composer_height));
@@ -2106,6 +2224,12 @@ impl UiModel {
         if approval_height > 0 {
             if let Some(overlay) = &self.plan_approval {
                 overlay.render(frame, chunks[idx]);
+            }
+            idx += 1;
+        }
+        if skill_popup_height > 0 {
+            if let Some(popup) = &self.skill_popup {
+                popup.render(frame, chunks[idx]);
             }
             idx += 1;
         }
@@ -3796,6 +3920,157 @@ mod tests {
         ));
         assert!(model.composer.is_empty());
         assert_eq!(model.composer.cursor(), 0);
+    }
+
+    fn skills_fixture() -> Result<(tempfile::TempDir, UiModel), Box<dyn std::error::Error>> {
+        let temp = tempfile::TempDir::new()?;
+        for (name, description) in [("deploy", "Deploy the app"), ("review", "Review a PR")] {
+            let dir = tools::skills_dir(temp.path()).join(name);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\ndescription: {description}\n---\nbody"),
+            )?;
+        }
+        let mut model = workspace_insert_model();
+        model.skills_root = temp.path().to_path_buf();
+        Ok((temp, model))
+    }
+
+    #[test]
+    fn typing_slash_opens_skill_popup_and_filters() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, mut model) = skills_fixture()?;
+
+        let _ = model.handle_key_event(key(KeyCode::Char('/')));
+        let Some(popup) = model.skill_popup.as_ref() else {
+            panic!("expected popup to open on '/'");
+        };
+        assert_eq!(popup.selected_name(), Some("deploy"));
+
+        let _ = model.handle_key_event(key(KeyCode::Char('r')));
+        let Some(popup) = model.skill_popup.as_ref() else {
+            panic!("expected popup to stay open while filtering");
+        };
+        assert_eq!(popup.selected_name(), Some("review"));
+
+        // No match closes the popup; backspacing back into a match reopens it.
+        let _ = model.handle_key_event(key(KeyCode::Char('z')));
+        assert!(model.skill_popup.is_none());
+        let _ = model.handle_key_event(key(KeyCode::Backspace));
+        assert!(model.skill_popup.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn slash_without_skills_does_not_open_popup() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::TempDir::new()?;
+        let mut model = workspace_insert_model();
+        model.skills_root = temp.path().to_path_buf();
+
+        let _ = model.handle_key_event(key(KeyCode::Char('/')));
+        assert!(model.skill_popup.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn slash_mid_text_does_not_open_popup() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, mut model) = skills_fixture()?;
+        for ch in "run /".chars() {
+            let _ = model.handle_key_event(key(KeyCode::Char(ch)));
+        }
+        assert!(model.skill_popup.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tab_accepts_selected_skill_completion() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, mut model) = skills_fixture()?;
+
+        let _ = model.handle_key_event(key(KeyCode::Char('/')));
+        let _ = model.handle_key_event(key(KeyCode::Down));
+        let _ = model.handle_key_event(key(KeyCode::Tab));
+
+        assert_eq!(model.composer.as_str(), "/review ");
+        assert!(model.skill_popup.is_none());
+        assert_eq!(model.mode, UiMode::Insert);
+        Ok(())
+    }
+
+    #[test]
+    fn enter_accepts_skill_completion_instead_of_newline() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temp, mut model) = skills_fixture()?;
+
+        for ch in "/dep".chars() {
+            let _ = model.handle_key_event(key(KeyCode::Char(ch)));
+        }
+        let _ = model.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(model.composer.as_str(), "/deploy ");
+        assert!(model.skill_popup.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn esc_closes_skill_popup_but_stays_in_insert_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, mut model) = skills_fixture()?;
+
+        let _ = model.handle_key_event(key(KeyCode::Char('/')));
+        assert!(model.skill_popup.is_some());
+
+        let _ = model.handle_key_event(key(KeyCode::Esc));
+        assert!(model.skill_popup.is_none());
+        assert_eq!(model.mode, UiMode::Insert);
+        assert_eq!(model.composer.as_str(), "/");
+
+        // A second Esc leaves Insert mode as usual.
+        let _ = model.handle_key_event(key(KeyCode::Esc));
+        assert_eq!(model.mode, UiMode::Normal);
+        Ok(())
+    }
+
+    #[test]
+    fn ctrl_enter_with_skill_popup_open_still_submits() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, mut model) = skills_fixture()?;
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+
+        for ch in "/deploy".chars() {
+            let _ = model.handle_key_event(key(KeyCode::Char(ch)));
+        }
+        assert!(model.skill_popup.is_some());
+        let effects = model.handle_key_event(modified_key(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::TurnStart { input, .. } if input == "/deploy"
+        ));
+        assert!(model.skill_popup.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn skill_popup_renders_above_composer() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, mut model) = skills_fixture()?;
+        let _ = model.handle_key_event(key(KeyCode::Char('/')));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 18))?;
+        terminal.draw(|frame| model.render(frame))?;
+
+        let rendered = rendered_buffer_text(&terminal);
+        let Some(deploy_idx) = rendered.find("/deploy  Deploy the app") else {
+            panic!("popup row missing:\n{rendered}");
+        };
+        let Some(review_idx) = rendered.find("/review  Review a PR") else {
+            panic!("popup row missing:\n{rendered}");
+        };
+        let Some(status_idx) = rendered.find("─ Status ") else {
+            panic!("status separator missing:\n{rendered}");
+        };
+        assert!(deploy_idx < review_idx, "{rendered}");
+        assert!(review_idx < status_idx, "{rendered}");
+        Ok(())
     }
 
     #[test]

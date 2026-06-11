@@ -28,6 +28,11 @@ pub(crate) const PLAN_MODE_TOOLS: &[(&str, &str)] = &[
         "todo_write",
         "track your progress through the planning phases with a visible checklist.",
     ),
+    (
+        "skill",
+        "load a project skill's instructions by name; only invoke skills listed in the \
+         Available Skills context block.",
+    ),
     ("plan_write", "write your plan to the per-thread plan file."),
     (
         "exit_plan_mode",

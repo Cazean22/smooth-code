@@ -45,7 +45,7 @@ use tokio_tungstenite::{
 };
 use tools::{
     AskUserClient, AskUserQuestionTool, DeleteTool, EditTool, ExitPlanModeTool, PlanWriteTool,
-    ReadTool, RunCommandTool, SpawnAgentTool, TodoWriteTool, WriteTool,
+    ReadTool, RunCommandTool, SkillTool, SpawnAgentTool, TodoWriteTool, WriteTool,
 };
 
 use crate::agent::{
@@ -396,7 +396,9 @@ where
         return builder.default_max_turns(99999).build();
     }
     // Progress tracking is available everywhere except read-only Explore agents.
-    let builder = builder.tool(TodoWriteTool::new());
+    let builder = builder
+        .tool(TodoWriteTool::new())
+        .tool(SkillTool::new(cwd.clone()));
     // File-mutating tools are only registered outside plan mode;
     // plan-mode-specific tools (`plan_write`, `exit_plan_mode`) are only
     // registered inside plan mode.

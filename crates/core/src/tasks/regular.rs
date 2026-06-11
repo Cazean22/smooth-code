@@ -17,7 +17,7 @@ use smooth_protocol::{
     StreamErrorEvent, ThreadId, ToolCallCompletedEvent, ToolCallResultKind, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
-use tools::{DecodedToolOutput, SubagentArgs, decode_tool_output_for_tool};
+use tools::{DecodedToolOutput, SkillMeta, SubagentArgs, decode_tool_output_for_tool};
 
 use crate::{
     agent::{
@@ -286,7 +286,12 @@ impl SessionTask for RegularTask {
             .filter(|item| !item.is_empty())
             .collect::<Vec<_>>();
         let prompt_text = prompt_parts.join("\n");
-        session.record_user_message(prompt_text.clone()).await;
+        // A leading `/skill-name` is expanded to the skill's instructions for
+        // the model and the persisted history, while the transcript event
+        // keeps the raw text the user typed.
+        let model_text = expand_skill_invocation(&session.cwd, &prompt_text)
+            .unwrap_or_else(|| prompt_text.clone());
+        session.record_user_message(model_text.clone()).await;
         session
             .emit_event(
                 &ctx,
@@ -297,15 +302,15 @@ impl SessionTask for RegularTask {
             .await;
 
         let prompt = Message::User {
-            content: OneOrMany::one(UserContent::Text(Text {
-                text: prompt_text.clone(),
-            })),
+            content: OneOrMany::one(UserContent::Text(Text { text: model_text })),
         };
+        let skills = tools::list_skills(&session.cwd);
         let result = run_manual_turn(
             Arc::clone(&session),
             Arc::clone(&ctx),
             prompt,
             history_before_turn,
+            skills,
             cancellation_token.clone(),
         )
         .await;
@@ -486,6 +491,7 @@ async fn run_manual_turn(
     ctx: Arc<TurnContext>,
     initial_prompt: Message,
     history_before_turn: Vec<Message>,
+    skills: Vec<SkillMeta>,
     cancellation_token: CancellationToken,
 ) -> Option<String> {
     let mut new_messages = vec![initial_prompt];
@@ -525,6 +531,7 @@ async fn run_manual_turn(
         let (pending_prompt, request_history) = build_request_parts(
             &history_before_turn,
             session.project_instructions.as_ref(),
+            &skills,
             &new_messages,
         )?;
         let model_for_stream = session.model();
@@ -2157,6 +2164,7 @@ fn build_assistant_text_reasoning_message(
 fn build_request_parts(
     history_before_turn: &[Message],
     project_instructions: Option<&ProjectInstructions>,
+    skills: &[SkillMeta],
     new_messages: &[Message],
 ) -> Option<(Message, Vec<Message>)> {
     let (pending_prompt, new_history) = new_messages.split_last()?;
@@ -2164,9 +2172,47 @@ fn build_request_parts(
     if let Some(message) = project_instructions_message(project_instructions) {
         request_history.push(message);
     }
+    if let Some(message) = skills_context_message(skills) {
+        request_history.push(message);
+    }
     request_history.extend_from_slice(history_before_turn);
     request_history.extend_from_slice(new_history);
     Some((pending_prompt.clone(), request_history))
+}
+
+/// Synthetic request-only user message advertising the project's skills, like
+/// `project_instructions_message` it is rebuilt per request and never
+/// persisted to history, so the list self-refreshes every turn.
+fn skills_context_message(skills: &[SkillMeta]) -> Option<Message> {
+    if skills.is_empty() {
+        return None;
+    }
+    let listing = skills
+        .iter()
+        .map(|skill| format!("- {}: {}", skill.name, skill.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = format!(
+        "# Available skills\n\nThe following user-defined skills exist in this project. When a request matches a skill's purpose, invoke the `skill` tool with its name and follow the returned instructions.\n\n{listing}"
+    );
+    Some(Message::User {
+        content: OneOrMany::one(UserContent::Text(Text { text })),
+    })
+}
+
+/// If the prompt starts with `/name` where `name` is a skill in
+/// `<cwd>/.smooth-code/skills`, return the expanded model-facing text (skill
+/// instructions + remaining text as arguments). Any other text — including
+/// unknown `/foo` commands — passes through unchanged.
+fn expand_skill_invocation(cwd: &std::path::Path, prompt_text: &str) -> Option<String> {
+    let trimmed = prompt_text.trim_start();
+    let candidate = trimmed.strip_prefix('/')?;
+    let name_end = candidate
+        .find(char::is_whitespace)
+        .unwrap_or(candidate.len());
+    let (name, args) = candidate.split_at(name_end);
+    let skill = tools::load_skill(cwd, name)?;
+    Some(tools::render_skill_invocation(&skill, Some(args)))
 }
 
 fn project_instructions_message(
@@ -2278,9 +2324,88 @@ mod tests {
     use crate::agent::SystemPromptKind;
 
     use super::{
-        PendingReasoningDeltas, decode_completed_tool_output, should_roundtrip_reasoning,
-        subagent_type_to_prompt_kind, tool_cancel_grace_with_override,
+        PendingReasoningDeltas, decode_completed_tool_output, expand_skill_invocation,
+        should_roundtrip_reasoning, skills_context_message, subagent_type_to_prompt_kind,
+        tool_cancel_grace_with_override,
     };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn write_skill(root: &std::path::Path, name: &str, content: &str) -> TestResult {
+        let dir = tools::skills_dir(root).join(name);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("SKILL.md"), content)?;
+        Ok(())
+    }
+
+    #[test]
+    fn expand_skill_invocation_expands_matching_skill() -> TestResult {
+        let temp = tempfile::TempDir::new()?;
+        write_skill(
+            temp.path(),
+            "deploy",
+            "---\ndescription: Deploy the app\n---\nRun make deploy.",
+        )?;
+
+        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy to staging") else {
+            panic!("expected /deploy to expand");
+        };
+        assert!(expanded.starts_with("<skill-invocation skill=\"deploy\">"));
+        assert!(expanded.contains("Run make deploy."));
+        assert!(expanded.ends_with("to staging"));
+
+        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy") else {
+            panic!("expected bare /deploy to expand");
+        };
+        assert!(expanded.ends_with("(no additional arguments)"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_skill_invocation_keeps_multiline_args() -> TestResult {
+        let temp = tempfile::TempDir::new()?;
+        write_skill(temp.path(), "deploy", "---\ndescription: Deploy\n---\nbody")?;
+
+        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy to staging\nwith care")
+        else {
+            panic!("expected /deploy to expand");
+        };
+        assert!(expanded.ends_with("to staging\nwith care"));
+        Ok(())
+    }
+
+    #[test]
+    fn expand_skill_invocation_passes_through_non_matches() -> TestResult {
+        let temp = tempfile::TempDir::new()?;
+        write_skill(temp.path(), "deploy", "---\ndescription: Deploy\n---\nbody")?;
+
+        // Unknown skill, plain text, and bare slash all pass through.
+        assert!(expand_skill_invocation(temp.path(), "/unknown args").is_none());
+        assert!(expand_skill_invocation(temp.path(), "deploy the app").is_none());
+        assert!(expand_skill_invocation(temp.path(), "/").is_none());
+        // A slash later in the text does not trigger expansion.
+        assert!(expand_skill_invocation(temp.path(), "run /deploy").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn skills_context_message_lists_skills_and_omits_when_empty() {
+        assert!(skills_context_message(&[]).is_none());
+
+        let skills = vec![tools::SkillMeta {
+            name: "deploy".to_string(),
+            description: "Deploy the app".to_string(),
+            path: std::path::PathBuf::from("SKILL.md"),
+        }];
+        let Some(rig::message::Message::User { content }) = skills_context_message(&skills) else {
+            panic!("expected a user message");
+        };
+        let rig::message::UserContent::Text(text) = content.first() else {
+            panic!("expected text content");
+        };
+        assert!(text.text.contains("# Available skills"));
+        assert!(text.text.contains("- deploy: Deploy the app"));
+    }
 
     #[test]
     fn tool_cancel_grace_override_is_clamped_under_the_drain_deadline() {

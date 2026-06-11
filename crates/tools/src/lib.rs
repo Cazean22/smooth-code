@@ -14,6 +14,8 @@ mod plan_write;
 mod read;
 mod run_command;
 mod shared;
+mod skill;
+mod skills;
 mod todo_write;
 mod write;
 
@@ -35,5 +37,7 @@ pub use output::{
 pub use plan_write::{PlanWriteArgs, PlanWriteTool, plan_file_path};
 pub use read::{ReadArgs, ReadTool};
 pub use run_command::{RunCommandArgs, RunCommandTool};
+pub use skill::{SkillArgs, SkillTool};
+pub use skills::{Skill, SkillMeta, list_skills, load_skill, render_skill_invocation, skills_dir};
 pub use todo_write::{TodoInput, TodoWriteArgs, TodoWriteTool};
 pub use write::{WriteArgs, WriteTool};

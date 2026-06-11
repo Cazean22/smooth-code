@@ -226,6 +226,11 @@ impl ThreadManagerState {
             }
         }
         self.threads.write().await.clear();
+        // Fire any kill sweeps still inside their SIGTERM grace: shutdown
+        // finishes faster than that grace by design, and the process is about
+        // to exit — a sweep that has not run yet would otherwise be lost with
+        // it, orphaning SIGTERM-ignoring subprocesses.
+        tools::sweep_pending_process_kills();
         Ok(())
     }
 

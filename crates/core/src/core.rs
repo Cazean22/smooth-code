@@ -57,14 +57,28 @@ impl CancelReason {
     }
 
     /// How long the cancelled task gets to run cooperative cleanup (tool
-    /// grace drain, subprocess kill, partial-turn persistence) before
-    /// `drain_aborted_tasks` hard-aborts it. Must exceed the turn loop's
-    /// tool-batch grace so cleanup normally wins; exit paths use a shorter
-    /// window so shutdown stays snappy.
+    /// grace drain, partial-turn persistence) before `drain_aborted_tasks`
+    /// hard-aborts it. Must exceed `tool_drain_grace()` for the same reason
+    /// so the tool-batch outcome and persistence land before the hard abort;
+    /// exit paths use a shorter window so shutdown stays snappy.
     pub(crate) fn drain_grace(self) -> std::time::Duration {
         match self {
             Self::UserInterrupt | Self::Replaced => std::time::Duration::from_secs(8),
             Self::Shutdown | Self::Closed => std::time::Duration::from_secs(3),
+        }
+    }
+
+    /// Budget a cancelled tool batch gets to let in-flight tool futures
+    /// resolve before placeholder interrupted results are synthesized. Kept
+    /// strictly under `drain_grace()` so the batch always finishes —
+    /// placeholders, `ToolCallCompleted` events, partial-turn persistence —
+    /// before the task's hard-abort deadline. `run_command` resolves
+    /// immediately on cancel (its process-group kill is detached), so even
+    /// the short exit-path budget is comfortable.
+    pub(crate) fn tool_drain_grace(self) -> std::time::Duration {
+        match self {
+            Self::UserInterrupt | Self::Replaced => std::time::Duration::from_secs(5),
+            Self::Shutdown | Self::Closed => std::time::Duration::from_millis(1500),
         }
     }
 
@@ -78,19 +92,25 @@ impl CancelReason {
     }
 }
 
-/// Phase 2 of cancellation: wait — bounded by `grace` — for each cancelled
-/// task to finish its cooperative cleanup, hard-aborting whatever is still
-/// running at the deadline. Phase 1 ([`Session::abort_all_tasks`]) already
+/// Phase 2 of cancellation: wait for each cancelled task to finish its
+/// cooperative cleanup, hard-aborting whatever is still running once `grace`
+/// elapses. The grace is one shared window for the whole batch — all tasks
+/// are drained concurrently against the same deadline, so N stubborn tasks
+/// cost one grace, not N. Phase 1 ([`Session::abort_all_tasks`]) already
 /// cancelled the tokens, ran the abort hooks, and emitted `TurnInterrupted`.
 pub(crate) async fn drain_aborted_tasks(tasks: Vec<RunningTask>, grace: std::time::Duration) {
-    for task in tasks {
+    if tasks.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + grace;
+    let drains = tasks.into_iter().map(|task| async move {
         // Register interest before checking completion so a runner that
         // notifies `done` between the check and the await is not missed.
         let notified = task.done.notified();
         if task.handle.is_finished() {
-            continue;
+            return;
         }
-        if tokio::time::timeout(grace, notified).await.is_err() {
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
             tracing::warn!(
                 turn_id = %task.turn_context.sub_id,
                 grace_ms = grace.as_millis() as u64,
@@ -98,7 +118,8 @@ pub(crate) async fn drain_aborted_tasks(tasks: Vec<RunningTask>, grace: std::tim
             );
             task.handle.abort();
         }
-    }
+    });
+    futures_util::future::join_all(drains).await;
 }
 
 /// The session's models for both plan-mode states, built once at thread
@@ -142,6 +163,11 @@ pub(crate) struct Session {
     next_internal_sub_id: AtomicU64,
     models: SessionModels,
     plan_mode: AtomicBool,
+    /// The most recent reason `abort_all_tasks` cancelled a turn with. The
+    /// turn task only holds a token, so follow-up cancellations it performs
+    /// itself — e.g. interrupting children whose spawn completed after the
+    /// cascade walk — read this to carry the same reason instead of guessing.
+    last_cancel_reason: std::sync::Mutex<CancelReason>,
     pub(crate) cwd: PathBuf,
     rollout: RolloutRecorder,
 }
@@ -190,6 +216,7 @@ impl Core {
             project_instructions,
             models,
             plan_mode: AtomicBool::new(plan_mode),
+            last_cancel_reason: std::sync::Mutex::new(CancelReason::UserInterrupt),
             cwd,
             rollout,
         });
@@ -215,13 +242,17 @@ impl Core {
                 }
             }
             Op::Shutdown => {
-                self.session
-                    .abort_and_drain_all_tasks(CancelReason::Shutdown)
-                    .await;
-                self.session
+                // Own tasks and descendants' tasks drain together under one
+                // shared shutdown window so N stubborn turns cost one grace,
+                // not N — the TUI exit epilogue budgets a single window.
+                let mut tasks = self.session.abort_all_tasks(CancelReason::Shutdown).await;
+                let (_descendants, descendant_tasks) = self
+                    .session
                     .agent_control
-                    .cancel_descendants(self.session.id, CancelReason::Shutdown)
+                    .abort_descendants(self.session.id, CancelReason::Shutdown)
                     .await;
+                tasks.extend(descendant_tasks);
+                drain_aborted_tasks(tasks, CancelReason::Shutdown.drain_grace()).await;
                 self.session
                     .set_agent_status(AgentStatus::Shutdown, None)
                     .await;
@@ -232,11 +263,12 @@ impl Core {
 
     /// Interrupt this thread's running turn and cascade to every live
     /// descendant agent. Returns the thread ids (this thread included) that
-    /// actually had a turn interrupted. The cooperative-cleanup drains run in
-    /// the background — interruption must respond immediately.
+    /// actually had a turn interrupted. The combined cooperative-cleanup
+    /// drain runs in the background under one shared grace window —
+    /// interruption must respond immediately.
     pub(crate) async fn interrupt_turn_cascade(&self) -> Vec<ThreadId> {
         let mut interrupted = Vec::new();
-        let tasks = self
+        let mut tasks = self
             .session
             .abort_all_tasks(CancelReason::UserInterrupt)
             .await;
@@ -244,18 +276,21 @@ impl Core {
             self.session
                 .set_agent_status(AgentStatus::Interrupted, None)
                 .await;
+            interrupted.push(self.session.id);
+        }
+        let (descendants, descendant_tasks) = self
+            .session
+            .agent_control
+            .abort_descendants(self.session.id, CancelReason::UserInterrupt)
+            .await;
+        interrupted.extend(descendants);
+        tasks.extend(descendant_tasks);
+        if !tasks.is_empty() {
             tokio::spawn(drain_aborted_tasks(
                 tasks,
                 CancelReason::UserInterrupt.drain_grace(),
             ));
-            interrupted.push(self.session.id);
         }
-        interrupted.extend(
-            self.session
-                .agent_control
-                .cancel_descendants(self.session.id, CancelReason::UserInterrupt)
-                .await,
-        );
         interrupted
     }
 
@@ -305,17 +340,21 @@ impl Session {
             self.wait_for_finishing_turn().await;
             // Replacement awaits the drain inline: the old task may still be
             // writing history/rollout during its cooperative cleanup, and the
-            // new turn must not interleave with it.
-            let replaced = self.abort_and_drain_all_tasks(CancelReason::Replaced).await;
-            // Only an actually-replaced turn cascades to descendants — its
-            // in-flight children are now running against a superseded
-            // conversation. An idle session starting a fresh turn must leave
-            // retained subagents from completed turns alone.
-            if replaced {
-                self.agent_control
-                    .cancel_descendants(self.id, CancelReason::Replaced)
+            // new turn must not interleave with it. Only an actually-replaced
+            // turn cascades to descendants — its in-flight children are now
+            // running against a superseded conversation; an idle session
+            // starting a fresh turn must leave retained subagents from
+            // completed turns alone. Own and descendant tasks drain together
+            // under one shared grace window.
+            let mut aborted = self.abort_all_tasks(CancelReason::Replaced).await;
+            if !aborted.is_empty() {
+                let (_descendants, descendant_tasks) = self
+                    .agent_control
+                    .abort_descendants(self.id, CancelReason::Replaced)
                     .await;
+                aborted.extend(descendant_tasks);
             }
+            drain_aborted_tasks(aborted, CancelReason::Replaced.drain_grace()).await;
             self.wait_for_finishing_turn().await;
             let cancellation_token = tokio_util::sync::CancellationToken::new();
             let done = Arc::new(tokio::sync::Notify::new());
@@ -516,6 +555,9 @@ impl Session {
         };
 
         if let Some(tasks) = drained {
+            if let Ok(mut last_reason) = self.last_cancel_reason.lock() {
+                *last_reason = reason;
+            }
             *self.current_turn_id.write().await = None;
             for task in &tasks {
                 task.cancellation_token.cancel();
@@ -546,6 +588,17 @@ impl Session {
         let interrupted = !tasks.is_empty();
         drain_aborted_tasks(tasks, reason.drain_grace()).await;
         interrupted
+    }
+
+    /// The reason of the most recent `abort_all_tasks` that drained a task;
+    /// defaults to `UserInterrupt` before any cancellation. Read by the turn
+    /// task, which only holds a token, when it must cancel something itself
+    /// after observing that token.
+    pub(crate) fn last_cancel_reason(&self) -> CancelReason {
+        self.last_cancel_reason
+            .lock()
+            .map(|reason| *reason)
+            .unwrap_or(CancelReason::UserInterrupt)
     }
 
     async fn wait_for_finishing_turn(&self) {
@@ -1369,6 +1422,119 @@ mod tests {
                 return Ok(());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn drain_grace_is_one_shared_window_for_the_whole_batch() -> Result<()> {
+        // Two sessions, each with a task that ignores its token: the batch
+        // must drain in ~one grace window, not one per stubborn task.
+        let mut tasks = Vec::new();
+        let mut cores = Vec::new();
+        for _ in 0..2 {
+            let (core, _rx) = test_core().await?;
+            let turn_context = Arc::new(core.session.fresh_turn_context());
+            core.session
+                .start_task(
+                    turn_context,
+                    vec!["hello".to_string()],
+                    Arc::new(StubbornTask),
+                    TaskKind::Regular,
+                )
+                .await?;
+            tasks.extend(
+                core.session
+                    .abort_all_tasks(CancelReason::UserInterrupt)
+                    .await,
+            );
+            cores.push(core);
+        }
+        assert_eq!(tasks.len(), 2);
+
+        let started = std::time::Instant::now();
+        super::drain_aborted_tasks(tasks, std::time::Duration::from_millis(500)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(900),
+            "drain took {elapsed:?}; per-task graces would take ~1s+"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abort_records_last_cancel_reason() -> Result<()> {
+        let (core, _rx) = test_core().await?;
+        assert_eq!(
+            core.session.last_cancel_reason(),
+            CancelReason::UserInterrupt
+        );
+
+        let turn_context = Arc::new(core.session.fresh_turn_context());
+        core.session
+            .start_task(
+                turn_context,
+                vec!["hello".to_string()],
+                Arc::new(CancellationAwareTask),
+                TaskKind::Regular,
+            )
+            .await?;
+        core.session
+            .abort_and_drain_all_tasks(CancelReason::Shutdown)
+            .await;
+
+        assert_eq!(core.session.last_cancel_reason(), CancelReason::Shutdown);
+        Ok(())
+    }
+
+    /// Shutdown awaits its drain inline, and the tool-batch grace for
+    /// `Shutdown` is kept under the drain grace — so by the time the
+    /// shutdown response returns, the hanging tool has a placeholder
+    /// interrupted result and the partial turn is in history, with no hard
+    /// abort cutting cleanup short.
+    #[tokio::test]
+    async fn shutdown_mid_hanging_tool_persists_partial_turn_before_hard_abort() -> Result<()> {
+        let (core, mut rx, _workspace) =
+            test_core_with_driver(Arc::new(InterruptibleToolDriver::new(true))).await?;
+        let turn_id = core.start_user_input("hello".to_string()).await?;
+
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await??;
+            if matches!(
+                event.msg,
+                EventMsg::ToolCallStarted(ref started) if started.turn_id == turn_id
+            ) {
+                break;
+            }
+        }
+
+        let result = core.submit(smooth_protocol::Op::Shutdown).await?;
+        assert_eq!(result, "shutdown");
+
+        // The inline drain returned, so the cancelled task already finished
+        // its cooperative cleanup: placeholder result emitted, partial turn
+        // persisted.
+        let mut saw_placeholder = false;
+        while let Ok(event) = rx.try_recv() {
+            if let EventMsg::ToolCallCompleted(completed) = event.msg
+                && completed.turn_id == turn_id
+            {
+                assert_eq!(
+                    completed.result_kind,
+                    smooth_protocol::ToolCallResultKind::Interrupted
+                );
+                saw_placeholder = true;
+            }
+        }
+        assert!(
+            saw_placeholder,
+            "expected the hanging tool's interrupted placeholder before shutdown returned"
+        );
+
+        let history = core.session.history().await;
+        assert!(history.len() >= 3, "partial turn should be in history");
+        assert_eq!(assistant_tool_call_count(&history[1]), Some(1));
+        assert_eq!(user_tool_result_count(&history[2]), Some(1));
+        Ok(())
     }
 
     #[tokio::test]

@@ -23,3 +23,4 @@ pub use provider::{
 pub use rollout::ThreadSummary;
 pub use thread_manager::{ResumedThread, StartedThread, ThreadManagerState};
 pub use tools::AskUserClient;
+pub use tools::sweep_pending_process_kills;

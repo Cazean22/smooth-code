@@ -110,6 +110,11 @@ pub async fn run() -> TuiResult<()> {
 /// Bounded graceful shutdown: a hung core must never wedge process exit.
 async fn shutdown_app_server(app_server: &mut AppServerSession) {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), app_server.shutdown()).await;
+    // The shutdown request normally fires pending kill sweeps itself; repeat
+    // here for the timeout path — if the core hung and we are exiting anyway,
+    // outstanding subprocess groups must still be SIGKILLed before the
+    // process (and the detached sweep tasks with it) goes away.
+    smooth_core::sweep_pending_process_kills();
 }
 
 /// SIGINT/SIGTERM listener (no-op stream on non-unix platforms).

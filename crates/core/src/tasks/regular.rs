@@ -29,7 +29,7 @@ use crate::{
             CompletionEntry, completion_entries_to_user_message, encode_spawn_agent_result,
         },
     },
-    core::{Session, TurnContext},
+    core::{CancelReason, Session, TurnContext},
     provider::{
         OPENAI_WEBSOCKET_RETRY_BUDGET, SessionAssistantContent, SessionCompletionEvent,
         SessionTurnSummary, is_openai_websocket_transient_start_error,
@@ -132,18 +132,27 @@ impl PendingCallDescriptor {
     }
 }
 
-/// How long a cancelled tool batch keeps draining before outstanding calls are
-/// completed with placeholder interrupted results. Must exceed run_command's
-/// SIGTERM grace (2s) so a killed subprocess reports through its own future
-/// instead of the placeholder.
-const TOOL_CANCEL_GRACE: Duration = Duration::from_secs(5);
-
-fn tool_cancel_grace() -> Duration {
-    std::env::var("SMOOTH_CODE_TOOL_CANCEL_GRACE_MS")
+/// How long a cancelled tool batch keeps draining before outstanding calls
+/// are completed with placeholder interrupted results. Reason-aware so the
+/// batch (and the partial-turn persistence after it) always finishes inside
+/// the cancelled task's `drain_grace()` hard-abort deadline — shutdown gives
+/// tools far less time than a user interrupt. The env var is a test/ops
+/// override, clamped below the deadline so no configuration can push the
+/// batch past the hard abort.
+fn tool_cancel_grace(reason: CancelReason) -> Duration {
+    let override_ms = std::env::var("SMOOTH_CODE_TOOL_CANCEL_GRACE_MS")
         .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(TOOL_CANCEL_GRACE)
+        .and_then(|raw| raw.parse::<u64>().ok());
+    tool_cancel_grace_with_override(reason, override_ms)
+}
+
+fn tool_cancel_grace_with_override(reason: CancelReason, override_ms: Option<u64>) -> Duration {
+    // Keep at least a second of headroom under the hard-abort deadline for
+    // placeholder synthesis and partial-turn persistence.
+    let ceiling = reason.drain_grace().saturating_sub(Duration::from_secs(1));
+    override_ms
+        .map(|ms| Duration::from_millis(ms).min(ceiling))
+        .unwrap_or_else(|| reason.tool_drain_grace())
 }
 
 /// Complete a tool call that will never produce real output because the turn
@@ -1156,7 +1165,7 @@ async fn execute_normal_tools_concurrently(
             resolved.push(executed);
         }
         if cancelled {
-            let deadline = tokio::time::sleep(tool_cancel_grace());
+            let deadline = tokio::time::sleep(tool_cancel_grace(session.last_cancel_reason()));
             tokio::pin!(deadline);
             while !pending_futures.is_empty() {
                 let next = tokio::select! {
@@ -1278,9 +1287,15 @@ async fn dispatch_tool_calls(
         start_spawn_calls_concurrently(Arc::clone(&session), Arc::clone(&ctx), spawn_calls).await;
 
     // Spawn starts are uncancellable (above), so a cancel that arrived while
-    // they ran produced children no subtree walk has seen — the cascade in
-    // `interrupt_turn_cascade` ran before these threads existed. Interrupt
-    // them here so they cannot outlive the cancelled turn.
+    // they ran produced children no subtree walk has seen — the cascade ran
+    // before these threads existed. Cancel them here, carrying the recorded
+    // reason of the abort that cancelled this turn so a shutdown/replacement
+    // labels these children the same way it labelled everything else. The
+    // children's drain is ALWAYS spawned, never awaited: this code runs
+    // inside the turn task that is itself being drained under the same
+    // deadline, so blocking on a stubborn child here would eat the parent's
+    // whole grace and cost it the spawn results and partial-turn persistence
+    // the grace exists to protect.
     if cancellation_token.is_cancelled() {
         let started_child_ids = started_spawns
             .iter()
@@ -1289,10 +1304,15 @@ async fn dispatch_tool_calls(
                 SpawnToolStart::Completed(_) => None,
             })
             .collect::<Vec<_>>();
-        session
+        let reason = session.last_cancel_reason();
+        let (_interrupted, child_tasks) = session
             .agent_control
-            .cancel_threads(&started_child_ids, crate::core::CancelReason::UserInterrupt)
+            .abort_threads(&started_child_ids, reason)
             .await;
+        tokio::spawn(crate::core::drain_aborted_tasks(
+            child_tasks,
+            reason.drain_grace(),
+        ));
     }
 
     let normal_outcome = execute_normal_tools_concurrently(
@@ -2259,8 +2279,35 @@ mod tests {
 
     use super::{
         PendingReasoningDeltas, decode_completed_tool_output, should_roundtrip_reasoning,
-        subagent_type_to_prompt_kind,
+        subagent_type_to_prompt_kind, tool_cancel_grace_with_override,
     };
+
+    #[test]
+    fn tool_cancel_grace_override_is_clamped_under_the_drain_deadline() {
+        use crate::core::CancelReason;
+        use std::time::Duration;
+
+        // No override: the reason's default budget.
+        assert_eq!(
+            tool_cancel_grace_with_override(CancelReason::Shutdown, None),
+            CancelReason::Shutdown.tool_drain_grace()
+        );
+        // A small override (tests shrink the grace) passes through.
+        assert_eq!(
+            tool_cancel_grace_with_override(CancelReason::Shutdown, Some(100)),
+            Duration::from_millis(100)
+        );
+        // An override above the hard-abort deadline is clamped below it —
+        // no configuration may push the batch past the hard abort.
+        assert_eq!(
+            tool_cancel_grace_with_override(CancelReason::Shutdown, Some(60_000)),
+            CancelReason::Shutdown.drain_grace() - Duration::from_secs(1)
+        );
+        assert_eq!(
+            tool_cancel_grace_with_override(CancelReason::UserInterrupt, Some(60_000)),
+            CancelReason::UserInterrupt.drain_grace() - Duration::from_secs(1)
+        );
+    }
 
     #[test]
     fn manual_subagent_args_accept_prompt_shape() -> Result<(), serde_json::Error> {

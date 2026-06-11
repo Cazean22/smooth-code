@@ -7,6 +7,7 @@ mod delete;
 mod edit;
 mod error;
 mod exit_plan_mode;
+mod kill_sweep;
 mod multi_agents;
 mod output;
 mod plan_write;
@@ -25,6 +26,7 @@ pub use delete::{DeleteArgs, DeleteTool};
 pub use edit::{EditArgs, EditTool};
 pub use error::{ToolError, ToolResult};
 pub use exit_plan_mode::{ExitPlanModeArgs, ExitPlanModeTool};
+pub use kill_sweep::sweep_pending_process_kills;
 pub use multi_agents::{SpawnAgentTool, SubagentArgs};
 pub use output::{
     DecodedToolOutput, MAX_FILE_CHANGE_BYTES, decode_tool_output_for_tool, encode_tool_output,

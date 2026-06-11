@@ -19,7 +19,7 @@ use crate::{
         registry::{AgentMetadata, AgentRegistry},
         status::{agent_status_from_event, is_final, last_assistant_message},
     },
-    core::{CancelReason, drain_aborted_tasks},
+    core::CancelReason,
     core_thread::CoreThread,
     error::{CoreError, CoreResult},
     provider::SessionModelFactory,
@@ -204,37 +204,39 @@ impl AgentControl {
     /// Cancel the running turns of every live descendant of `root` (root
     /// itself excluded). Internal cancellation paths — user interrupt, turn
     /// replacement, shutdown — cascade through this so spawned child agents
-    /// never keep running against a superseded conversation. Returns the
-    /// descendants that actually had a turn interrupted.
-    pub(crate) async fn cancel_descendants(
+    /// never keep running against a superseded conversation. Phase 1 only:
+    /// the caller drains the returned tasks together with its own under one
+    /// shared grace window. Returns the descendants that actually had a turn
+    /// interrupted alongside their drained tasks.
+    pub(crate) async fn abort_descendants(
         &self,
         root: ThreadId,
         reason: CancelReason,
-    ) -> Vec<ThreadId> {
+    ) -> (Vec<ThreadId>, Vec<crate::state::RunningTask>) {
         let descendants = self
             .live_subtree_thread_ids(root)
             .into_iter()
             .filter(|thread_id| *thread_id != root)
             .collect::<Vec<_>>();
-        self.cancel_threads(&descendants, reason).await
+        self.abort_threads(&descendants, reason).await
     }
 
-    /// Phase-1 abort every listed thread's running turn, then drain them all
-    /// under one grace window — spawned for user interrupts (the caller must
-    /// not block on cleanup), awaited for exit paths.
-    pub(crate) async fn cancel_threads(
+    /// Phase-1 abort every listed thread's running turn (cancel tokens, abort
+    /// hooks, `TurnInterrupted`, terminal status) and hand the drained tasks
+    /// back for the caller to drain under its grace window.
+    pub(crate) async fn abort_threads(
         &self,
         thread_ids: &[ThreadId],
         reason: CancelReason,
-    ) -> Vec<ThreadId> {
-        if thread_ids.is_empty() {
-            return Vec::new();
-        }
-        let Ok(runtime) = self.runtime() else {
-            return Vec::new();
-        };
+    ) -> (Vec<ThreadId>, Vec<crate::state::RunningTask>) {
         let mut interrupted = Vec::new();
         let mut drained_tasks = Vec::new();
+        if thread_ids.is_empty() {
+            return (interrupted, drained_tasks);
+        }
+        let Ok(runtime) = self.runtime() else {
+            return (interrupted, drained_tasks);
+        };
         for thread_id in thread_ids {
             let thread = runtime.threads.read().await.get(thread_id).cloned();
             let Some(thread) = thread else {
@@ -251,15 +253,7 @@ impl AgentControl {
                 drained_tasks.extend(tasks);
             }
         }
-        match reason {
-            CancelReason::UserInterrupt => {
-                tokio::spawn(drain_aborted_tasks(drained_tasks, reason.drain_grace()));
-            }
-            CancelReason::Replaced | CancelReason::Shutdown | CancelReason::Closed => {
-                drain_aborted_tasks(drained_tasks, reason.drain_grace()).await;
-            }
-        }
-        interrupted
+        (interrupted, drained_tasks)
     }
 
     pub(crate) fn resolve_agent_reference(

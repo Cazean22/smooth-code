@@ -685,10 +685,6 @@ impl UiModel {
 
     fn handle_normal_key(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
         match key_event.code {
-            // Esc interrupts the running turn. Overlay dismissal keeps
-            // priority structurally: pickers and plan approval dispatch in
-            // `handle_key_event` before mode handling ever sees the key.
-            KeyCode::Esc if self.is_turn_running => self.request_turn_cancel(),
             KeyCode::Char('i') => {
                 self.mode = UiMode::Insert;
                 self.focus = FocusTarget::Composer;
@@ -5014,7 +5010,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_cancels_running_turn_in_normal_mode() {
+    fn esc_does_not_cancel_running_turn_in_normal_mode() {
         let mut model = UiModel::new();
         let thread_id = ThreadId::new();
         model.current_thread_id = Some(thread_id);
@@ -5025,13 +5021,11 @@ mod tests {
 
         let effects = model.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(
-            effects[0].kind,
-            UiEffectKind::TurnCancel { thread_id: got } if got == thread_id
-        ));
-        assert!(model.is_turn_cancelling);
-        assert_eq!(model.status_line, "Cancelling turn");
+        assert!(
+            effects.is_empty(),
+            "interrupting is reserved for Ctrl-C; Esc must be a no-op"
+        );
+        assert!(!model.is_turn_cancelling);
     }
 
     #[test]

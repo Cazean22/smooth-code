@@ -286,10 +286,17 @@ impl SessionTask for RegularTask {
             .filter(|item| !item.is_empty())
             .collect::<Vec<_>>();
         let prompt_text = prompt_parts.join("\n");
+        // Skills are advertised (and `/name` expanded) only for sessions whose
+        // agent actually registers the `skill` tool; Explore agents are
+        // read-only and `build_agent` excludes the tool for them, so steering
+        // them toward it would only produce failed tool calls.
+        let skills_enabled = !matches!(session.system_prompt_kind, SystemPromptKind::Explore);
         // A leading `/skill-name` is expanded to the skill's instructions for
         // the model and the persisted history, while the transcript event
         // keeps the raw text the user typed.
-        let model_text = expand_skill_invocation(&session.cwd, &prompt_text)
+        let model_text = skills_enabled
+            .then(|| expand_skill_invocation(&session.cwd, &prompt_text))
+            .flatten()
             .unwrap_or_else(|| prompt_text.clone());
         session.record_user_message(model_text.clone()).await;
         session
@@ -304,7 +311,11 @@ impl SessionTask for RegularTask {
         let prompt = Message::User {
             content: OneOrMany::one(UserContent::Text(Text { text: model_text })),
         };
-        let skills = tools::list_skills(&session.cwd);
+        let skills = if skills_enabled {
+            tools::list_skills(&session.cwd)
+        } else {
+            Vec::new()
+        };
         let result = run_manual_turn(
             Arc::clone(&session),
             Arc::clone(&ctx),

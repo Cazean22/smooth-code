@@ -80,18 +80,8 @@ pub fn load_skill(cwd: &Path, name: &str) -> Option<Skill> {
 }
 
 fn load_skill_at(path: &Path, dir_name: &str) -> Option<Skill> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let raw = if raw.len() > MAX_SKILL_BYTES {
-        tracing::warn!(skill = %dir_name, "SKILL.md exceeds {MAX_SKILL_BYTES} bytes; truncating");
-        let mut end = MAX_SKILL_BYTES;
-        while !raw.is_char_boundary(end) {
-            end -= 1;
-        }
-        &raw[..end]
-    } else {
-        raw.as_str()
-    };
-    let (frontmatter_name, description, body) = parse_skill_md(raw)?;
+    let raw = read_bounded_utf8(path, dir_name)?;
+    let (frontmatter_name, description, body) = parse_skill_md(&raw)?;
     if let Some(frontmatter_name) = frontmatter_name
         && frontmatter_name != dir_name
     {
@@ -110,6 +100,41 @@ fn load_skill_at(path: &Path, dir_name: &str) -> Option<Skill> {
         },
         body,
     })
+}
+
+/// Read at most `MAX_SKILL_BYTES` of `path`, without ever pulling more than
+/// that into memory: a pathologically large SKILL.md must not stall callers
+/// (the TUI popup loads skills synchronously from key handling).
+///
+/// Returns `None` on IO errors or invalid UTF-8 — except a multi-byte
+/// character split by the cap itself, which is dropped to keep the valid
+/// prefix.
+fn read_bounded_utf8(path: &Path, dir_name: &str) -> Option<String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut raw = Vec::new();
+    file.take(MAX_SKILL_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    let truncated = raw.len() > MAX_SKILL_BYTES;
+    if truncated {
+        tracing::warn!(skill = %dir_name, "SKILL.md exceeds {MAX_SKILL_BYTES} bytes; truncating");
+        raw.truncate(MAX_SKILL_BYTES);
+    }
+    match String::from_utf8(raw) {
+        Ok(text) => Some(text),
+        // `error_len() == None` means the bytes end mid-character; that is
+        // only legitimate when the cap did the cutting. Anything else is a
+        // genuinely invalid file and is rejected like `read_to_string` did.
+        Err(err) if truncated && err.utf8_error().error_len().is_none() => {
+            let valid = err.utf8_error().valid_up_to();
+            let mut raw = err.into_bytes();
+            raw.truncate(valid);
+            String::from_utf8(raw).ok()
+        }
+        Err(_) => None,
+    }
 }
 
 /// Render the model-facing expansion of a skill invocation, shared by the
@@ -333,6 +358,41 @@ mod tests {
         };
         assert!(skill.body.len() <= MAX_SKILL_BYTES);
         assert!(skill.body.starts_with('x'));
+        Ok(())
+    }
+
+    #[test]
+    fn truncation_splitting_a_multibyte_char_keeps_valid_prefix() -> TestResult {
+        let temp = tempfile::TempDir::new()?;
+        // Pick a header length that puts the byte cap mid-character for a
+        // two-byte filler char, so the cut must drop the partial char.
+        let mut header = "---\ndescription: Big skill\n---\n".to_string();
+        if (MAX_SKILL_BYTES - header.len()) % 2 == 0 {
+            header.push('\n');
+        }
+        let fill_chars = (MAX_SKILL_BYTES - header.len()) / 2 + 16;
+        let body = "é".repeat(fill_chars);
+        write_skill(temp.path(), "split", &format!("{header}{body}"))?;
+
+        let Some(skill) = load_skill(temp.path(), "split") else {
+            panic!("expected truncated multibyte skill to load");
+        };
+        assert!(skill.body.len() < MAX_SKILL_BYTES);
+        assert!(skill.body.chars().all(|c| c == 'é'));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_utf8_skill_md_is_rejected() -> TestResult {
+        let temp = tempfile::TempDir::new()?;
+        let dir = skills_dir(temp.path()).join("binary");
+        std::fs::create_dir_all(&dir)?;
+        let mut bytes = b"---\ndescription: Binary\n---\n".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00]);
+        std::fs::write(dir.join("SKILL.md"), bytes)?;
+
+        assert!(load_skill(temp.path(), "binary").is_none());
+        assert!(list_skills(temp.path()).is_empty());
         Ok(())
     }
 

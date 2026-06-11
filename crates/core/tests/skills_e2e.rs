@@ -199,3 +199,179 @@ async fn skill_tool_call_returns_skill_instructions_to_the_model() -> Result<()>
     std::env::set_current_dir(original_cwd)?;
     Ok(())
 }
+
+fn first_user_text(message: &Message) -> Option<String> {
+    match message {
+        Message::User { content } => content.iter().find_map(|item| match item {
+            UserContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// Root-side driver: confirms the root itself IS advertised the skills, then
+/// spawns an Explore child whose prompt looks like a slash invocation.
+struct ExploreGateParentDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for ExploreGateParentDriver {
+    fn stream_completion_turn(
+        &self,
+        _prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("parent calls mutex"))?;
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                // The root session gets the request-only skills listing.
+                assert!(
+                    history.iter().filter_map(first_user_text).any(|text| {
+                        text.contains("# Available skills") && text.contains("- deploy:")
+                    }),
+                    "root session should be advertised the skills"
+                );
+                let tool_call = ToolCall::new(
+                    "spawn-explore".to_string(),
+                    ToolFunction::new(
+                        "spawn_agent".to_string(),
+                        serde_json::json!({
+                            "description": "explore deploy",
+                            "prompt": "/deploy now",
+                            "subagent_type": "Explore"
+                        }),
+                    ),
+                )
+                .with_call_id("call-explore".to_string());
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-spawn-explore".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-spawn".to_string()),
+                        response: String::new(),
+                    })),
+                ])))
+            }
+            1 => Ok(final_text_stream("parent done")),
+            other => panic!("unexpected parent completion turn {other}"),
+        }
+    }
+}
+
+/// Explore-side driver: records the prompt and history texts the child saw.
+struct ExploreGateChildDriver {
+    child_turns: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+}
+
+impl SessionModelDriver for ExploreGateChildDriver {
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let prompt_text =
+            first_user_text(&prompt).ok_or_else(|| anyhow::anyhow!("missing child prompt"))?;
+        let history_texts = history.iter().filter_map(first_user_text).collect();
+        self.child_turns
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child turns mutex"))?
+            .push((prompt_text, history_texts));
+        Ok(final_text_stream("explored"))
+    }
+}
+
+struct ExploreGateFactory {
+    child_turns: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+}
+
+impl SessionModelFactory for ExploreGateFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _ask_user_client: Option<AskUserClient>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        system_prompt_kind: SystemPromptKind,
+        _agent_control: AgentControl,
+        _plan_mode: bool,
+    ) -> Result<SessionModel> {
+        match system_prompt_kind {
+            SystemPromptKind::Explore => Ok(SessionModel::Stub(Arc::new(ExploreGateChildDriver {
+                child_turns: Arc::clone(&self.child_turns),
+            }))),
+            _ => Ok(SessionModel::Stub(Arc::new(ExploreGateParentDriver {
+                calls: Mutex::new(0),
+            }))),
+        }
+    }
+}
+
+#[tokio::test]
+async fn explore_children_get_no_skills_advertising_or_slash_expansion() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
+
+    let cwd = std::env::current_dir()?;
+    let skill_dir = tools::skills_dir(&cwd).join("deploy");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\ndescription: Deploy the app\n---\nRun make deploy.",
+    )?;
+
+    let child_turns = Arc::new(Mutex::new(Vec::new()));
+    let manager = ThreadManagerState::new(
+        None,
+        Some(Arc::new(ExploreGateFactory {
+            child_turns: Arc::clone(&child_turns),
+        })),
+    )
+    .await?;
+    let started = manager.start_thread().await?;
+    let mut events = manager.subscribe(started.thread_id).await?;
+
+    manager
+        .start_user_input(started.thread_id, "delegate exploration".to_string())
+        .await?;
+    loop {
+        let event =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await??;
+        if matches!(event.msg, smooth_protocol::EventMsg::TurnCompleted(_)) {
+            break;
+        }
+    }
+
+    let child_turns = child_turns
+        .lock()
+        .map_err(|_| anyhow::anyhow!("child turns mutex"))?
+        .clone();
+    let (prompt_text, history_texts) = child_turns
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing explore child turn"))?;
+    // Explore agents do not register the `skill` tool, so they must not be
+    // steered toward it: no advertising, and the slash prompt stays verbatim.
+    assert_eq!(prompt_text, "/deploy now");
+    assert!(
+        history_texts
+            .iter()
+            .all(|text| !text.contains("# Available skills")),
+        "explore child must not see the skills listing: {history_texts:?}"
+    );
+
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
+}

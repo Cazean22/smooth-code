@@ -28,6 +28,7 @@ use crossterm::{
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
+    style::Print,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
@@ -165,6 +166,11 @@ fn init() -> TuiResult<Option<AppTerminal>> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
+        // Alternate scroll mode (DECSET 1007): the terminal turns mouse wheel
+        // ticks into Up/Down arrow keys while on the alternate screen. This
+        // gives wheel scrolling without mouse capture, so native drag-to-select
+        // and copy keep working.
+        Print(concat!('\x1b', "[?1007h")),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
 
@@ -181,6 +187,7 @@ fn restore(terminal: Option<&mut AppTerminal>) -> TuiResult<()> {
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
+        Print(concat!('\x1b', "[?1007l")),
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;

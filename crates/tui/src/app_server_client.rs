@@ -33,6 +33,8 @@ impl AppServerClient {
             ClientRequest::TurnCancel { .. } => "turn_cancel",
             ClientRequest::Shutdown { .. } => "shutdown",
             ClientRequest::ThreadResume { .. } => "thread_resume",
+            ClientRequest::ThreadPreview { .. } => "thread_preview",
+            ClientRequest::ThreadUnwatch { .. } => "thread_unwatch",
             ClientRequest::ThreadList { .. } => "thread_list",
             ClientRequest::SetPlanMode { .. } => "set_plan_mode",
         };

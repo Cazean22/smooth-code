@@ -16,6 +16,7 @@ mod project_instructions;
 mod question_picker;
 mod skill_popup;
 mod streaming;
+mod subagent_preview;
 mod wrap;
 
 use std::io::{IsTerminal, Stdout};

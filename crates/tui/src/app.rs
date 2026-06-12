@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use app_server_protocol::{
     AskUserQuestionResponse, JsonRpcError, RequestId, RequestPlanApprovalResponse, ServerRequest,
-    SetPlanModeResponse, ThreadListItem, ThreadListResponse, ThreadResumeResponse,
-    ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
+    SetPlanModeResponse, ThreadListItem, ThreadListResponse, ThreadPreviewResponse,
+    ThreadResumeResponse, ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
 };
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -30,6 +30,7 @@ use crate::{
     question_picker::{PickerOutcome, QuestionPicker},
     skill_popup::SkillPopup,
     streaming::StreamController,
+    subagent_preview::SubagentPreviewView,
     wrap,
 };
 
@@ -43,6 +44,8 @@ pub(crate) enum AppRunControl {
 const DOUBLE_ESC_WINDOW: Duration = Duration::from_millis(500);
 /// Window within which a second `y` press upgrades a tool-result copy to args.
 const COPY_CHORD_WINDOW: Duration = Duration::from_millis(500);
+/// Window within which a `g` prefix completes as `gg` (top) or `gd` (subagent).
+const GOTO_CHORD_WINDOW: Duration = Duration::from_millis(500);
 /// Cap on the OSC 52 payload; terminals commonly reject larger sequences.
 const MAX_CLIPBOARD_BYTES: usize = 100_000;
 
@@ -136,6 +139,14 @@ impl App {
                     .thread_resume(thread_id)
                     .await
                     .map(UiEffectResult::ThreadResume),
+                UiEffectKind::ThreadPreview { thread_id } => app_server
+                    .thread_preview(thread_id)
+                    .await
+                    .map(|response| UiEffectResult::ThreadPreview(Box::new(response))),
+                UiEffectKind::ThreadUnwatch { thread_id } => app_server
+                    .thread_unwatch(thread_id)
+                    .await
+                    .map(|_| UiEffectResult::ThreadUnwatched),
                 UiEffectKind::TurnStart { thread_id, input } => app_server
                     .turn_start(thread_id, input)
                     .await
@@ -240,6 +251,12 @@ enum UiEffectKind {
     ThreadResume {
         thread_id: ThreadId,
     },
+    ThreadPreview {
+        thread_id: ThreadId,
+    },
+    ThreadUnwatch {
+        thread_id: ThreadId,
+    },
     TurnStart {
         thread_id: ThreadId,
         input: String,
@@ -278,6 +295,8 @@ enum UiEffectResult {
     ThreadStart(ThreadStartResponse),
     ThreadList(ThreadListResponse),
     ThreadResume(ThreadResumeResponse),
+    ThreadPreview(Box<ThreadPreviewResponse>),
+    ThreadUnwatched,
     TurnStart(TurnStartResponse),
     TurnCancel(TurnCancelResponse),
     SetPlanMode(SetPlanModeResponse),
@@ -290,6 +309,8 @@ enum EffectContext {
     ThreadStart,
     ThreadList,
     ThreadResume { thread_id: ThreadId },
+    ThreadPreview { thread_id: ThreadId },
+    ThreadUnwatch,
     TurnStart { thread_id: ThreadId, input: String },
     TurnCancel { thread_id: ThreadId },
     SetPlanMode { previous: bool, desired: bool },
@@ -371,6 +392,9 @@ struct RunningToolInfo {
 struct TranscriptSelectState {
     selected: usize,
     pending_args: Option<(usize, Instant)>,
+    /// Armed by `g`: a second `g` within the chord window jumps to the top
+    /// (`gg`), a `d` opens the selected row's subagent session (`gd`).
+    pending_g: Option<Instant>,
 }
 
 struct UiModel {
@@ -418,6 +442,9 @@ struct UiModel {
     focus: FocusTarget,
     dashboard: DashboardState,
     transcript_select: Option<TranscriptSelectState>,
+    /// Stacked full-screen subagent previews (`gd`); the top view receives
+    /// keys and is rendered, nesting pushes deeper.
+    preview_stack: Vec<SubagentPreviewView>,
     /// Timestamp of the last Esc press in Normal mode (or leaving Insert),
     /// armed for double-Esc detection.
     last_esc: Option<Instant>,
@@ -477,6 +504,7 @@ impl UiModel {
             focus: FocusTarget::Dashboard,
             dashboard: DashboardState::default(),
             transcript_select: None,
+            preview_stack: Vec::new(),
             last_esc: None,
             running_tools: HashMap::new(),
             recent_file_changes: Vec::new(),
@@ -514,6 +542,38 @@ impl UiModel {
                 viewport_height,
             } => {
                 self.viewport_height = viewport_height;
+                // A parent's CollabAgentCompleted names a previewed child by
+                // id, not by source thread: patch every matching view first,
+                // before source routing can consume the event (with a nested
+                // stack [A, B], B's completion arrives with source A).
+                if let EventMsg::CollabAgentCompleted(completed) = &event.msg {
+                    for view in &mut self.preview_stack {
+                        if view.thread_id == completed.child_thread_id {
+                            view.complete_from_parent(completed.status.clone());
+                        }
+                    }
+                }
+                // Events from previewed threads feed their stack views and
+                // never touch the main transcript.
+                if let Some(source) = source_thread_id
+                    && self
+                        .preview_stack
+                        .iter()
+                        .any(|view| view.thread_id == source)
+                {
+                    // Previews render full-screen, so wrap at terminal width.
+                    let width = self.terminal_width.max(1);
+                    for view in &mut self.preview_stack {
+                        if view.thread_id != source {
+                            continue;
+                        }
+                        view.apply_event(event.msg.clone(), width);
+                        if view.auto_scroll {
+                            view.scroll_to_bottom(width, viewport_height);
+                        }
+                    }
+                    return Vec::new();
+                }
                 if !self.should_apply_protocol_event(source_thread_id) {
                     return Vec::new();
                 }
@@ -531,12 +591,12 @@ impl UiModel {
                 viewport_height,
             } => {
                 self.viewport_height = viewport_height;
-                self.effect_contexts.remove(&effect_id);
-                self.apply_effect_result(effect_id, result);
+                let context = self.effect_contexts.remove(&effect_id);
+                let effects = self.apply_effect_result(effect_id, context, result);
                 if self.auto_scroll {
                     self.scroll_to_bottom(viewport_height);
                 }
-                Vec::new()
+                effects
             }
             UiEvent::EffectFailed {
                 effect_id,
@@ -544,11 +604,11 @@ impl UiModel {
                 viewport_height,
             } => {
                 self.viewport_height = viewport_height;
-                self.apply_effect_failure(effect_id, error);
+                let effects = self.apply_effect_failure(effect_id, error);
                 if self.auto_scroll {
                     self.scroll_to_bottom(viewport_height);
                 }
-                Vec::new()
+                effects
             }
         }
     }
@@ -621,6 +681,12 @@ impl UiModel {
                 return self.request_turn_cancel();
             }
             return vec![self.effect(EffectContext::Exit, UiEffectKind::Exit)];
+        }
+
+        // A stacked subagent preview owns the keyboard (server-driven
+        // overlays clear the stack on arrival, so they cannot coexist).
+        if self.screen == Screen::Workspace && !self.preview_stack.is_empty() {
+            return self.handle_preview_key(key_event, now);
         }
 
         if self.screen == Screen::Workspace && self.question_picker.is_some() {
@@ -813,6 +879,7 @@ impl UiModel {
         self.transcript_select = Some(TranscriptSelectState {
             selected: self.transcript_items.len().saturating_sub(1),
             pending_args: None,
+            pending_g: None,
         });
         self.transcript_select_ensure_visible(self.viewport_height);
         self.status_line = String::from("Transcript select");
@@ -845,25 +912,203 @@ impl UiModel {
             KeyCode::Up | KeyCode::Char('k') => {
                 state.selected = state.selected.saturating_sub(1);
                 state.pending_args = None;
+                state.pending_g = None;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 state.selected = state.selected.saturating_add(1).min(last);
                 state.pending_args = None;
+                state.pending_g = None;
             }
-            KeyCode::Home | KeyCode::Char('g') => {
+            // `g` is a prefix: `gg` jumps to the top, `gd` opens the selected
+            // row's subagent session. `Home` keeps the direct jump.
+            KeyCode::Char('g') => {
+                state.pending_args = None;
+                let chord = state
+                    .pending_g
+                    .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
+                if chord {
+                    state.pending_g = None;
+                    state.selected = 0;
+                } else {
+                    state.pending_g = Some(now);
+                    self.transcript_select = Some(state);
+                    return Vec::new();
+                }
+            }
+            KeyCode::Char('d') => {
+                let chord = state
+                    .pending_g
+                    .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
+                state.pending_g = None;
+                if chord {
+                    return self.goto_selected_subagent(state);
+                }
+                self.transcript_select = Some(state);
+                return Vec::new();
+            }
+            KeyCode::Home => {
                 state.selected = 0;
                 state.pending_args = None;
+                state.pending_g = None;
             }
             KeyCode::End | KeyCode::Char('G') => {
                 state.selected = last;
                 state.pending_args = None;
+                state.pending_g = None;
             }
-            KeyCode::Char('y') => return self.copy_selected_transcript_row(state, now),
+            KeyCode::Char('y') => {
+                state.pending_g = None;
+                return self.copy_selected_transcript_row(state, now);
+            }
             _ => return Vec::new(),
         }
         self.transcript_select = Some(state);
         self.transcript_select_ensure_visible(self.viewport_height);
         Vec::new()
+    }
+
+    /// `gd` in transcript-select mode: open the selected `spawn_agent` row's
+    /// subagent session as a live preview. The selection and scroll state are
+    /// left untouched, so closing the preview restores this view exactly.
+    fn goto_selected_subagent(&mut self, state: TranscriptSelectState) -> Vec<UiEffect> {
+        self.transcript_select = Some(state);
+        let group = self
+            .transcript_items
+            .get(state.selected)
+            .and_then(|item| item.tool_group_cell());
+        let Some(group) = group else {
+            self.status_line = String::from("Not a subagent row (gd opens spawn_agent sessions)");
+            return Vec::new();
+        };
+        let Some(thread_id) = group.subagent_thread_id() else {
+            self.status_line = if group.is_spawn_agent() {
+                String::from("Subagent not started yet — no session to open")
+            } else {
+                String::from("Not a subagent row (gd opens spawn_agent sessions)")
+            };
+            return Vec::new();
+        };
+        self.status_line = String::from("Opening subagent…");
+        vec![self.effect(
+            EffectContext::ThreadPreview { thread_id },
+            UiEffectKind::ThreadPreview { thread_id },
+        )]
+    }
+
+    /// Keys while a subagent preview is open. The top view is read-only:
+    /// j/k move its selection, `gg`/`G`/Home/End/PgUp/PgDn scroll, `gd` on a
+    /// spawn row nests another preview, `q`/Esc pops back (one `ThreadUnwatch`
+    /// per pop — the server refcounts watchers).
+    fn handle_preview_key(&mut self, key_event: KeyEvent, now: Instant) -> Vec<UiEffect> {
+        let width = self.terminal_width.max(1);
+        let viewport = self.viewport_height;
+        let Some(view) = self.preview_stack.last_mut() else {
+            return Vec::new();
+        };
+        let last = view.item_count().saturating_sub(1);
+        match key_event.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let Some(popped) = self.preview_stack.pop() else {
+                    return Vec::new();
+                };
+                self.status_line = match self.preview_stack.last() {
+                    Some(top) => format!("{} — q/Esc back", top.header_label()),
+                    None => String::from("Closed subagent preview"),
+                };
+                vec![self.effect(
+                    EffectContext::ThreadUnwatch,
+                    UiEffectKind::ThreadUnwatch {
+                        thread_id: popped.thread_id,
+                    },
+                )]
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                view.pending_g = None;
+                view.selected = view.selected.saturating_sub(1);
+                view.ensure_selected_visible(width, viewport);
+                Vec::new()
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                view.pending_g = None;
+                view.selected = view.selected.saturating_add(1).min(last);
+                view.ensure_selected_visible(width, viewport);
+                Vec::new()
+            }
+            KeyCode::Char('g') => {
+                let chord = view
+                    .pending_g
+                    .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
+                if chord {
+                    view.pending_g = None;
+                    view.selected = 0;
+                    view.ensure_selected_visible(width, viewport);
+                } else {
+                    view.pending_g = Some(now);
+                }
+                Vec::new()
+            }
+            KeyCode::Char('d') => {
+                let chord = view
+                    .pending_g
+                    .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
+                view.pending_g = None;
+                if !chord {
+                    return Vec::new();
+                }
+                let target = view
+                    .selected_tool_group()
+                    .map(|group| (group.is_spawn_agent(), group.subagent_thread_id()));
+                match target {
+                    Some((_, Some(thread_id))) => {
+                        self.status_line = String::from("Opening subagent…");
+                        vec![self.effect(
+                            EffectContext::ThreadPreview { thread_id },
+                            UiEffectKind::ThreadPreview { thread_id },
+                        )]
+                    }
+                    Some((true, None)) => {
+                        self.status_line =
+                            String::from("Subagent not started yet — no session to open");
+                        Vec::new()
+                    }
+                    _ => {
+                        self.status_line =
+                            String::from("Not a subagent row (gd opens spawn_agent sessions)");
+                        Vec::new()
+                    }
+                }
+            }
+            KeyCode::Home => {
+                view.pending_g = None;
+                view.selected = 0;
+                view.ensure_selected_visible(width, viewport);
+                Vec::new()
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                view.pending_g = None;
+                view.selected = last;
+                view.ensure_selected_visible(width, viewport);
+                view.auto_scroll = true;
+                Vec::new()
+            }
+            KeyCode::PageUp => {
+                view.pending_g = None;
+                view.scroll = view.scroll.saturating_sub(viewport);
+                view.auto_scroll = false;
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                view.pending_g = None;
+                let max = view.max_scroll(width, viewport);
+                view.scroll = view.scroll.saturating_add(viewport).min(max);
+                view.auto_scroll = view.scroll >= max;
+                Vec::new()
+            }
+            _ => {
+                view.pending_g = None;
+                Vec::new()
+            }
+        }
     }
 
     /// `y` in transcript-select mode. Tool rows copy their result first; a
@@ -1327,12 +1572,15 @@ impl UiModel {
                         "another interactive request is already pending".to_string(),
                     );
                 }
+                // Previewed subagents can ask questions too; close the stack
+                // so the overlay is visible and receives keys.
+                let effects = self.clear_preview_stack();
                 self.screen = Screen::Workspace;
                 self.exit_transcript_select();
                 self.question_picker = Some(QuestionPicker::new(request_id, params));
                 self.mode = UiMode::Overlay;
                 self.focus = FocusTarget::Overlay;
-                Vec::new()
+                effects
             }
             ServerRequest::RequestPlanApproval { request_id, params } => {
                 if self.plan_approval.is_some() || self.question_picker.is_some() {
@@ -1341,12 +1589,13 @@ impl UiModel {
                         "another interactive request is already pending".to_string(),
                     );
                 }
+                let effects = self.clear_preview_stack();
                 self.screen = Screen::Workspace;
                 self.exit_transcript_select();
                 self.plan_approval = Some(PlanApprovalOverlay::new(request_id, params));
                 self.mode = UiMode::Overlay;
                 self.focus = FocusTarget::Overlay;
-                Vec::new()
+                effects
             }
         }
     }
@@ -1372,6 +1621,15 @@ impl UiModel {
         if self.current_thread_id == Some(requested_thread_id) {
             return None;
         }
+        // Previewed subagents are interactive too: their questions and plan
+        // approvals are accepted (the preview stack is closed by the handler).
+        if self
+            .preview_stack
+            .iter()
+            .any(|view| view.thread_id == requested_thread_id)
+        {
+            return None;
+        }
 
         Some(self.fail_server_request(
             request_id,
@@ -1392,10 +1650,17 @@ impl UiModel {
         )]
     }
 
-    fn apply_effect_result(&mut self, effect_id: EffectId, result: UiEffectResult) {
+    fn apply_effect_result(
+        &mut self,
+        effect_id: EffectId,
+        context: Option<EffectContext>,
+        result: UiEffectResult,
+    ) -> Vec<UiEffect> {
         match result {
             UiEffectResult::ThreadStart(response) => {
+                let effects = self.clear_preview_stack();
                 self.apply_thread_start_response(response);
+                effects
             }
             UiEffectResult::ThreadList(response) => {
                 self.dashboard.loading = false;
@@ -1412,9 +1677,12 @@ impl UiModel {
                 } else {
                     format!("{} saved threads", self.dashboard.items.len())
                 };
+                Vec::new()
             }
             UiEffectResult::ThreadResume(response) => {
+                let effects = self.clear_preview_stack();
                 self.apply_thread_resume_response(effect_id, response);
+                effects
             }
             UiEffectResult::TurnStart(response) => {
                 if self.current_turn_id.as_deref() != Some(response.turn_id.as_str()) {
@@ -1423,6 +1691,7 @@ impl UiModel {
                     self.is_turn_cancelling = false;
                     self.status_line = format!("Running turn {}", response.turn_id);
                 }
+                Vec::new()
             }
             UiEffectResult::TurnCancel(response) => {
                 self.is_turn_cancelling = false;
@@ -1432,16 +1701,80 @@ impl UiModel {
                 } else {
                     format!("Cancel requested for {cancelled_count} threads")
                 };
+                Vec::new()
             }
             UiEffectResult::SetPlanMode(response) => {
                 self.plan_mode = response.enabled;
+                Vec::new()
             }
-            UiEffectResult::ServerRequestAnswered => {}
-            UiEffectResult::ClipboardWritten => {}
+            UiEffectResult::ServerRequestAnswered => Vec::new(),
+            UiEffectResult::ClipboardWritten => Vec::new(),
+            UiEffectResult::ThreadPreview(response) => {
+                self.apply_thread_preview(context, *response)
+            }
+            UiEffectResult::ThreadUnwatched => Vec::new(),
         }
     }
 
-    fn apply_effect_failure(&mut self, effect_id: EffectId, error: String) {
+    /// A successful `threadPreview` response: validate it against the
+    /// requested thread and push the view. Any mismatch fails defensively —
+    /// the server holds a watcher that only an unwatch will release, and no
+    /// view means no pop will ever send one.
+    fn apply_thread_preview(
+        &mut self,
+        context: Option<EffectContext>,
+        response: ThreadPreviewResponse,
+    ) -> Vec<UiEffect> {
+        let requested = match context {
+            Some(EffectContext::ThreadPreview { thread_id }) => Some(thread_id),
+            _ => None,
+        };
+        let response_thread = response.thread_id.parse::<ThreadId>().ok();
+        let valid = match (requested, response_thread) {
+            (Some(requested), Some(actual)) => requested == actual,
+            _ => false,
+        };
+        if !valid {
+            self.status_line = String::from("Could not open subagent: unexpected response");
+            // Unwatch whichever id the server may have taken a watcher for.
+            return requested
+                .or(response_thread)
+                .map(|thread_id| {
+                    vec![self.effect(
+                        EffectContext::ThreadUnwatch,
+                        UiEffectKind::ThreadUnwatch { thread_id },
+                    )]
+                })
+                .unwrap_or_default();
+        }
+
+        let width = self.terminal_width.max(1);
+        let mut view = SubagentPreviewView::from_preview_response(response, width);
+        view.scroll_to_bottom(width, self.viewport_height);
+        self.status_line = format!("{} — q/Esc back", view.header_label());
+        self.preview_stack.push(view);
+        Vec::new()
+    }
+
+    /// Pop every preview view, emitting one `ThreadUnwatch` per view — the
+    /// server refcounts watchers, so each successful preview needs exactly
+    /// one release, duplicates included.
+    fn clear_preview_stack(&mut self) -> Vec<UiEffect> {
+        let views = std::mem::take(&mut self.preview_stack);
+        views
+            .into_iter()
+            .map(|view| {
+                self.effect(
+                    EffectContext::ThreadUnwatch,
+                    UiEffectKind::ThreadUnwatch {
+                        thread_id: view.thread_id,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn apply_effect_failure(&mut self, effect_id: EffectId, error: String) -> Vec<UiEffect> {
         let context = self.effect_contexts.remove(&effect_id);
         match context {
             Some(EffectContext::SetPlanMode { previous, desired }) => {
@@ -1450,11 +1783,13 @@ impl UiModel {
                     "could not {} plan mode: {error}",
                     if desired { "enable" } else { "disable" }
                 ));
+                Vec::new()
             }
             Some(EffectContext::ThreadList) => {
                 self.dashboard.loading = false;
                 self.dashboard.error = Some(error.clone());
                 self.status_line = String::from("Could not list threads");
+                Vec::new()
             }
             Some(EffectContext::TurnStart { thread_id, input }) => {
                 self.is_turn_running = false;
@@ -1465,6 +1800,7 @@ impl UiModel {
                     self.focus = FocusTarget::Composer;
                 }
                 self.push_error(format!("could not start turn on {thread_id}: {error}"));
+                Vec::new()
             }
             Some(EffectContext::TurnCancel { thread_id }) => {
                 self.is_turn_cancelling = false;
@@ -1474,12 +1810,14 @@ impl UiModel {
                     .map(|turn_id| format!("Running turn {turn_id}"))
                     .unwrap_or_else(|| String::from("Running turn"));
                 self.push_error(format!("could not cancel turn on {thread_id}: {error}"));
+                Vec::new()
             }
             Some(EffectContext::ThreadStart) => {
                 self.dashboard.loading = false;
                 self.dashboard.error = Some(format!("could not start thread: {error}"));
                 self.status_line = String::from("Could not start thread");
                 self.push_error(format!("could not start thread: {error}"));
+                Vec::new()
             }
             Some(EffectContext::ThreadResume { thread_id }) => {
                 self.dashboard.loading = false;
@@ -1487,15 +1825,32 @@ impl UiModel {
                     Some(format!("could not resume thread {thread_id}: {error}"));
                 self.status_line = String::from("Could not resume thread");
                 self.push_error(format!("could not resume thread {thread_id}: {error}"));
+                Vec::new()
             }
             Some(EffectContext::ServerRequest) => {
                 self.push_error(format!("could not answer server request: {error}"));
+                Vec::new()
             }
+            Some(EffectContext::ThreadPreview { thread_id }) => {
+                self.status_line = format!("Could not open subagent {thread_id}");
+                self.push_error(format!("could not open subagent {thread_id}: {error}"));
+                // The server may have taken a preview watcher before the
+                // failure surfaced client-side; no view was pushed, so no pop
+                // will release it. Unwatching with no watcher is a no-op.
+                vec![self.effect(
+                    EffectContext::ThreadUnwatch,
+                    UiEffectKind::ThreadUnwatch { thread_id },
+                )]
+            }
+            // Releasing a watcher is best-effort; a stale server-side
+            // subscription only forwards events the TUI will drop.
+            Some(EffectContext::ThreadUnwatch) => Vec::new(),
             Some(EffectContext::Clipboard) => {
                 self.status_line = String::from("Copy failed");
                 self.push_error(format!("could not copy to clipboard: {error}"));
+                Vec::new()
             }
-            Some(EffectContext::Exit) | None => {}
+            Some(EffectContext::Exit) | None => Vec::new(),
         }
     }
 
@@ -1680,6 +2035,17 @@ impl UiModel {
             }
             EventMsg::ToolCallCompleted(tool) => {
                 self.finalize_assistant_stream(None);
+                // Record the spawned child on the tool row (both the live
+                // StatusUpdate and the fast-finish Final paths carry it), so
+                // `gd` can resolve the row to a subagent session later.
+                if let Some(thread_id) = tool.related_thread_id
+                    && let Some((cell_idx, entry_idx)) =
+                        self.tool_call_rows.get(&tool.call_id).copied()
+                {
+                    self.tool_group_mut(cell_idx)
+                        .set_entry_related_thread(entry_idx, thread_id);
+                    self.mark_item_mutated(cell_idx);
+                }
                 if tool.result_kind == ToolCallResultKind::StatusUpdate && tool.success {
                     if let Some(thread_id) = tool.related_thread_id {
                         self.subagent_tool_calls
@@ -2301,8 +2667,64 @@ impl UiModel {
         self.terminal_width = frame.area().width;
         match self.screen {
             Screen::Dashboard => self.render_dashboard(frame, frame.area()),
+            Screen::Workspace if !self.preview_stack.is_empty() => {
+                self.render_preview(frame, frame.area());
+            }
             Screen::Workspace => self.render_workspace(frame, frame.area()),
         }
+    }
+
+    /// Full-screen subagent preview: a header naming the agent and its live
+    /// status, the read-only transcript, and a key-hint footer.
+    fn render_preview(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let depth = self.preview_stack.len();
+        let Some(view) = self.preview_stack.last_mut() else {
+            return;
+        };
+        let width = chunks[1].width.max(1);
+        let viewport = chunks[1].height.max(1);
+
+        let mut header = view.header_label();
+        if depth > 1 {
+            header = format!("{header} · nested ×{}", depth - 1);
+        }
+        frame.render_widget(
+            Paragraph::new(separator_line(
+                area.width,
+                &header,
+                Style::default().fg(Color::Cyan),
+            )),
+            chunks[0],
+        );
+
+        if view.auto_scroll {
+            view.scroll_to_bottom(width, viewport);
+        }
+        let lines = view.visible_lines(width, viewport);
+        frame.render_widget(Paragraph::new(Text::from(lines)), chunks[1]);
+
+        // The status line stays visible inside the preview: in-preview
+        // feedback ("Subagent not started yet", failed nested opens) would
+        // otherwise be invisible until the user exits.
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(self.status_line.clone()),
+                Span::raw("  "),
+                Span::styled(
+                    "j/k move  gg top  G bottom  gd nested  q/Esc back",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])),
+            chunks[2],
+        );
     }
 
     fn render_dashboard(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -2628,7 +3050,7 @@ impl UiModel {
         if self.mode == UiMode::TranscriptSelect {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
-                "j/k move  y copy  yy copy args  Esc exit",
+                "j/k move  y copy  yy copy args  gg top  G bottom  gd subagent  Esc exit",
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -2730,6 +3152,11 @@ impl UiModel {
     fn transcript_viewport_height(&self, width: u16, height: u16) -> u16 {
         if self.screen == Screen::Dashboard {
             return height.max(1);
+        }
+        // Full-screen subagent preview: everything except its header and the
+        // key-hint footer.
+        if !self.preview_stack.is_empty() {
+            return height.saturating_sub(2).max(1);
         }
 
         let picker_height = self
@@ -2951,7 +3378,7 @@ fn render_vertical_separator(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn separator_line(width: u16, label: &str, style: Style) -> Line<'static> {
+pub(crate) fn separator_line(width: u16, label: &str, style: Style) -> Line<'static> {
     let width = usize::from(width);
     if width == 0 {
         return Line::default();
@@ -2971,7 +3398,7 @@ fn separator_line(width: u16, label: &str, style: Style) -> Line<'static> {
     Line::from(Span::styled(text, style))
 }
 
-fn append_visible_line(
+pub(crate) fn append_visible_line(
     lines: &mut Vec<Line<'static>>,
     line: Line<'static>,
     row: usize,
@@ -2992,15 +3419,15 @@ struct RenderCacheKey {
 
 /// Wrapped active assistant/reasoning streams cached for one `(width, version)`.
 #[derive(Debug, Clone)]
-struct ActiveWrap {
-    width: u16,
-    version: u64,
-    reasoning: Vec<Line<'static>>,
-    assistant: Vec<Line<'static>>,
+pub(crate) struct ActiveWrap {
+    pub(crate) width: u16,
+    pub(crate) version: u64,
+    pub(crate) reasoning: Vec<Line<'static>>,
+    pub(crate) assistant: Vec<Line<'static>>,
 }
 
 #[derive(Debug, Default)]
-struct RenderedTranscriptCache {
+pub(crate) struct RenderedTranscriptCache {
     entries: HashMap<RenderCacheKey, CachedRenderedRows>,
     width: Option<u16>,
 }
@@ -3011,11 +3438,11 @@ struct CachedRenderedRows {
 }
 
 impl RenderedTranscriptCache {
-    fn item_lines(&mut self, item: &TranscriptItem, width: u16) -> Vec<Line<'static>> {
+    pub(crate) fn item_lines(&mut self, item: &TranscriptItem, width: u16) -> Vec<Line<'static>> {
         self.item_entry(item, width).lines.clone()
     }
 
-    fn item_height(&mut self, item: &TranscriptItem, width: u16) -> usize {
+    pub(crate) fn item_height(&mut self, item: &TranscriptItem, width: u16) -> usize {
         self.item_entry(item, width).lines.len()
     }
 
@@ -3032,7 +3459,7 @@ impl RenderedTranscriptCache {
             })
     }
 
-    fn evict_stale_widths(&mut self, width: u16) {
+    pub(crate) fn evict_stale_widths(&mut self, width: u16) {
         if self.width == Some(width) {
             return;
         }
@@ -3046,7 +3473,7 @@ impl RenderedTranscriptCache {
     }
 }
 
-fn agent_status_label(status: &AgentStatus) -> String {
+pub(crate) fn agent_status_label(status: &AgentStatus) -> String {
     match status {
         AgentStatus::PendingInit => String::from("pending"),
         AgentStatus::Running => String::from("running"),
@@ -3935,6 +4362,177 @@ mod tests {
         assert!(!joined.contains("Sub-agent"));
         assert!(!joined.contains("Done"));
         Ok(())
+    }
+
+    #[test]
+    fn final_spawn_completion_records_related_thread_on_entry() {
+        let mut app = App::new();
+        let child_thread_id = ThreadId::new();
+
+        start_turn(&mut app);
+        start_tool_call(
+            &mut app,
+            "2",
+            "c1",
+            "spawn_agent",
+            "{\"description\":\"inspect\",\"prompt\":\"inspect\"}",
+        );
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("{\"status\":\"completed\"}")),
+                    error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: Some(child_thread_id),
+                    file_change: None,
+                    file_changes: Vec::new(),
+                    todos: Vec::new(),
+                }),
+            ),
+            20,
+        );
+
+        let group = app
+            .model
+            .transcript_items
+            .iter()
+            .find_map(|item| item.tool_group_cell())
+            .expect("spawn tool row");
+        assert_eq!(group.subagent_thread_id(), Some(child_thread_id));
+        assert!(group.is_spawn_agent());
+
+        let joined = transcript_strings(&app).join("\n");
+        assert!(joined.contains("↳ subagent"), "{joined}");
+    }
+
+    #[test]
+    fn gd_on_subagent_row_emits_one_preview_effect_and_preserves_selection() {
+        let mut app = App::new();
+        let child_thread_id = ThreadId::new();
+
+        start_turn(&mut app);
+        start_tool_call(
+            &mut app,
+            "2",
+            "c1",
+            "spawn_agent",
+            "{\"description\":\"inspect\",\"prompt\":\"inspect\"}",
+        );
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: String::from("c1"),
+                    success: true,
+                    output_preview: Some(String::from("{\"status\":\"running\"}")),
+                    error: None,
+                    result_kind: ToolCallResultKind::StatusUpdate,
+                    related_thread_id: Some(child_thread_id),
+                    file_change: None,
+                    file_changes: Vec::new(),
+                    todos: Vec::new(),
+                }),
+            ),
+            20,
+        );
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        assert_eq!(app.model.mode, UiMode::TranscriptSelect);
+        let tool_row = app
+            .model
+            .transcript_items
+            .iter()
+            .position(|item| item.tool_group_cell().is_some())
+            .expect("spawn tool row index");
+        if let Some(state) = app.model.transcript_select.as_mut() {
+            state.selected = tool_row;
+        }
+
+        let t = t0 + Duration::from_millis(300);
+        let effects = app.model.handle_key_event_at(key(KeyCode::Char('g')), t);
+        assert!(effects.is_empty(), "g alone arms the chord");
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('d')), t + Duration::from_millis(100));
+
+        let preview_targets: Vec<ThreadId> = effects
+            .iter()
+            .filter_map(|effect| match effect.kind {
+                UiEffectKind::ThreadPreview { thread_id } => Some(thread_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(preview_targets, vec![child_thread_id]);
+        assert_eq!(app.model.mode, UiMode::TranscriptSelect);
+        assert_eq!(
+            app.model.transcript_select.map(|state| state.selected),
+            Some(tool_row),
+            "gd leaves the parent selection untouched"
+        );
+    }
+
+    #[test]
+    fn gd_on_plain_row_is_noop_with_status() {
+        let mut model = select_model_with_items(3);
+        let t0 = Instant::now();
+        enter_select(&mut model, t0);
+
+        let t = t0 + Duration::from_millis(300);
+        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t);
+        let effects =
+            model.handle_key_event_at(key(KeyCode::Char('d')), t + Duration::from_millis(100));
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            model.status_line,
+            "Not a subagent row (gd opens spawn_agent sessions)"
+        );
+        assert_eq!(model.mode, UiMode::TranscriptSelect);
+    }
+
+    #[test]
+    fn gd_on_spawn_row_without_child_id_reports_pending() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        start_tool_call(
+            &mut app,
+            "2",
+            "c1",
+            "spawn_agent",
+            "{\"description\":\"inspect\",\"prompt\":\"inspect\"}",
+        );
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        let tool_row = app
+            .model
+            .transcript_items
+            .iter()
+            .position(|item| item.tool_group_cell().is_some())
+            .expect("spawn tool row index");
+        if let Some(state) = app.model.transcript_select.as_mut() {
+            state.selected = tool_row;
+        }
+
+        let t = t0 + Duration::from_millis(300);
+        let _ = app.model.handle_key_event_at(key(KeyCode::Char('g')), t);
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('d')), t + Duration::from_millis(100));
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.model.status_line,
+            "Subagent not started yet — no session to open"
+        );
     }
 
     #[test]
@@ -5774,7 +6372,12 @@ mod tests {
         );
 
         let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t);
-        assert_eq!(model.transcript_select.map(|state| state.selected), Some(0));
+        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t);
+        assert_eq!(
+            model.transcript_select.map(|state| state.selected),
+            Some(0),
+            "gg jumps to the first item"
+        );
         assert_eq!(model.scroll, 0, "jumping to the first item scrolls to top");
 
         let _ = model.handle_key_event_at(key(KeyCode::Char('k')), t);
@@ -5959,5 +6562,473 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(separator)
         }
+    }
+
+    // --- subagent preview stack ---
+
+    fn preview_response(
+        thread_id: ThreadId,
+        initial_messages: Vec<EventMsg>,
+    ) -> ThreadPreviewResponse {
+        ThreadPreviewResponse {
+            thread_id: thread_id.to_string(),
+            agent_path: Some("/root/worker".to_string()),
+            agent_nickname: Some("worker".to_string()),
+            status: AgentStatus::Running,
+            is_live: true,
+            initial_messages,
+        }
+    }
+
+    fn open_preview(model: &mut UiModel, thread_id: ThreadId, messages: Vec<EventMsg>) {
+        let effect = model.effect(
+            EffectContext::ThreadPreview { thread_id },
+            UiEffectKind::ThreadPreview { thread_id },
+        );
+        let effects = model.update(UiEvent::EffectCompleted {
+            effect_id: effect.effect_id,
+            result: UiEffectResult::ThreadPreview(Box::new(preview_response(thread_id, messages))),
+            viewport_height: 20,
+        });
+        assert!(effects.is_empty(), "a valid preview push emits no effects");
+    }
+
+    fn unwatch_targets(effects: &[UiEffect]) -> Vec<ThreadId> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect.kind {
+                UiEffectKind::ThreadUnwatch { thread_id } => Some(thread_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn child_event(id: &str, msg: EventMsg) -> Event {
+        Event {
+            id: id.to_owned(),
+            msg,
+        }
+    }
+
+    #[test]
+    fn preview_effect_result_pushes_view_and_replays_initial_messages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(
+            &mut model,
+            child,
+            vec![
+                EventMsg::UserMessage {
+                    text: String::from("inspect the rollout"),
+                },
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    thread_id: child.to_string(),
+                    turn_id: String::from("0"),
+                }),
+            ],
+        );
+
+        assert_eq!(model.preview_stack.len(), 1);
+        let view = model.preview_stack.last().ok_or("view")?;
+        assert_eq!(view.thread_id, child);
+        assert_eq!(view.item_count(), 1, "the user message becomes one item");
+        // The response status wins over replayed turn-lifecycle events.
+        assert_eq!(view.status, AgentStatus::Running);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12))?;
+        terminal.draw(|frame| model.render(frame))?;
+        let rendered = rendered_buffer_text(&terminal);
+        assert!(rendered.contains("subagent worker"), "{rendered}");
+        assert!(rendered.contains("running"), "{rendered}");
+        assert!(rendered.contains("inspect the rollout"), "{rendered}");
+        assert!(rendered.contains("q/Esc back"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn preview_renders_status_line_for_in_preview_gd_failures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(
+            &mut model,
+            child,
+            vec![EventMsg::UserMessage {
+                text: String::from("not a tool row"),
+            }],
+        );
+
+        // `gd` on a non-subagent row inside the preview: the feedback must be
+        // visible without leaving the preview.
+        let t0 = Instant::now();
+        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0);
+        let effects =
+            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(100));
+        assert!(effects.is_empty());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12))?;
+        terminal.draw(|frame| model.render(frame))?;
+        let rendered = rendered_buffer_text(&terminal);
+        assert!(rendered.contains("Not a subagent row"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn child_events_route_to_every_matching_preview_not_main_transcript() {
+        let mut model = workspace_normal_model();
+        let parent = ThreadId::new();
+        let child = ThreadId::new();
+        model.current_thread_id = Some(parent);
+        let main_items_before = model.transcript_items.len();
+
+        // The same thread pushed twice: both views must receive the event.
+        open_preview(&mut model, child, Vec::new());
+        open_preview(&mut model, child, Vec::new());
+
+        let effects = model.update(UiEvent::Protocol {
+            source_thread_id: Some(child),
+            event: Box::new(child_event(
+                "c1",
+                EventMsg::UserMessage {
+                    text: String::from("child input"),
+                },
+            )),
+            viewport_height: 20,
+        });
+        assert!(effects.is_empty());
+        for view in &model.preview_stack {
+            assert_eq!(view.item_count(), 1, "both duplicate views update");
+        }
+        assert_eq!(
+            model.transcript_items.len(),
+            main_items_before,
+            "child events must not leak into the main transcript"
+        );
+
+        // Current-thread events still reach the main transcript.
+        let _ = model.update(UiEvent::Protocol {
+            source_thread_id: Some(parent),
+            event: Box::new(child_event(
+                "p1",
+                EventMsg::UserMessage {
+                    text: String::from("parent input"),
+                },
+            )),
+            viewport_height: 20,
+        });
+        assert_eq!(model.transcript_items.len(), main_items_before + 1);
+    }
+
+    #[test]
+    fn nested_parent_completion_patches_child_view_status() {
+        let mut model = workspace_normal_model();
+        let parent = ThreadId::new();
+        let view_a = ThreadId::new();
+        let view_b = ThreadId::new();
+        model.current_thread_id = Some(parent);
+        open_preview(&mut model, view_a, Vec::new());
+        open_preview(&mut model, view_b, Vec::new());
+
+        // B's completion arrives on A's channel (A spawned B): view B's
+        // status must be patched even though source routing feeds view A.
+        let _ = model.update(UiEvent::Protocol {
+            source_thread_id: Some(view_a),
+            event: Box::new(child_event(
+                "done",
+                EventMsg::CollabAgentCompleted(smooth_protocol::CollabAgentCompletedEvent {
+                    parent_thread_id: view_a,
+                    child_thread_id: view_b,
+                    agent_path: smooth_protocol::AgentPath::try_from("/root/a/b")
+                        .unwrap_or_else(|_| panic!("agent path")),
+                    agent_nickname: Some(String::from("b")),
+                    status: AgentStatus::Completed(Some(String::from("done"))),
+                    last_assistant_message: Some(String::from("done")),
+                }),
+            )),
+            viewport_height: 20,
+        });
+
+        let b = model
+            .preview_stack
+            .iter()
+            .find(|view| view.thread_id == view_b)
+            .unwrap_or_else(|| panic!("view B"));
+        assert_eq!(b.status, AgentStatus::Completed(Some(String::from("done"))));
+        assert!(!b.is_live);
+        let a = model
+            .preview_stack
+            .iter()
+            .find(|view| view.thread_id == view_a)
+            .unwrap_or_else(|| panic!("view A"));
+        assert_eq!(a.item_count(), 1, "view A renders the completion info row");
+    }
+
+    #[test]
+    fn preview_pop_emits_one_unwatch_per_view_and_preserves_parent_state() {
+        let mut model = select_model_with_items(4);
+        let t0 = Instant::now();
+        enter_select(&mut model, t0);
+        if let Some(state) = model.transcript_select.as_mut() {
+            state.selected = 2;
+        }
+        let parent_scroll = model.scroll;
+
+        let child = ThreadId::new();
+        open_preview(&mut model, child, Vec::new());
+        open_preview(&mut model, child, Vec::new());
+
+        let t = t0 + Duration::from_millis(300);
+        let effects = model.handle_key_event_at(key(KeyCode::Char('q')), t);
+        assert_eq!(
+            unwatch_targets(&effects),
+            vec![child],
+            "first pop unwatches"
+        );
+        assert_eq!(model.preview_stack.len(), 1);
+
+        let effects = model.handle_key_event_at(key(KeyCode::Esc), t);
+        assert_eq!(
+            unwatch_targets(&effects),
+            vec![child],
+            "second pop unwatches again — the server refcount drains to zero"
+        );
+        assert!(model.preview_stack.is_empty());
+
+        assert_eq!(model.mode, UiMode::TranscriptSelect);
+        assert_eq!(model.transcript_select.map(|state| state.selected), Some(2));
+        assert_eq!(model.scroll, parent_scroll);
+    }
+
+    #[test]
+    fn nested_gd_pushes_second_view_and_duplicates_are_dropped() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        let grandchild = ThreadId::new();
+        let started = EventMsg::ToolCallStarted(ToolCallStartedEvent {
+            thread_id: child.to_string(),
+            turn_id: String::from("0"),
+            call_id: String::from("spawn-1"),
+            tool_name: String::from("spawn_agent"),
+            args_preview: String::from("{\"prompt\":\"dig deeper\"}"),
+        });
+        let completed = EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+            thread_id: child.to_string(),
+            turn_id: String::from("0"),
+            call_id: String::from("spawn-1"),
+            success: true,
+            output_preview: Some(String::from("{\"status\":\"completed\"}")),
+            error: None,
+            result_kind: ToolCallResultKind::Final,
+            related_thread_id: Some(grandchild),
+            file_change: None,
+            file_changes: Vec::new(),
+            todos: Vec::new(),
+        });
+        open_preview(&mut model, child, vec![started.clone(), completed.clone()]);
+        let items_after_replay = model
+            .preview_stack
+            .last()
+            .map(SubagentPreviewView::item_count)
+            .unwrap_or_default();
+
+        // The subscribe-then-snapshot overlap can replay both events again.
+        for (id, msg) in [("dup-1", started), ("dup-2", completed)] {
+            let _ = model.update(UiEvent::Protocol {
+                source_thread_id: Some(child),
+                event: Box::new(child_event(id, msg)),
+                viewport_height: 20,
+            });
+        }
+        let view = model
+            .preview_stack
+            .last()
+            .unwrap_or_else(|| panic!("preview view"));
+        assert_eq!(
+            view.item_count(),
+            items_after_replay,
+            "duplicate started/completed events must not add rows"
+        );
+
+        // `gd` on the spawn row nests a second preview.
+        let t0 = Instant::now();
+        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0);
+        let effects =
+            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(100));
+        let targets: Vec<ThreadId> = effects
+            .iter()
+            .filter_map(|effect| match effect.kind {
+                UiEffectKind::ThreadPreview { thread_id } => Some(thread_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, vec![grandchild]);
+        open_preview(&mut model, grandchild, Vec::new());
+        assert_eq!(model.preview_stack.len(), 2);
+    }
+
+    #[test]
+    fn server_request_for_previewed_child_is_accepted_and_clears_stack() {
+        let mut model = workspace_normal_model();
+        let parent = ThreadId::new();
+        let child = ThreadId::new();
+        model.current_thread_id = Some(parent);
+        open_preview(&mut model, child, Vec::new());
+
+        let request = ServerRequest::AskUserQuestion {
+            request_id: RequestId(7),
+            params: AskUserQuestionParams {
+                thread_id: child.to_string(),
+                turn_id: String::from("0"),
+                questions: vec![AskUserQuestion {
+                    question: String::from("Proceed?"),
+                    header: String::from("Confirm"),
+                    multi_select: false,
+                    options: vec![
+                        AskUserQuestionOption {
+                            label: String::from("Yes"),
+                            description: String::from("go"),
+                            preview: None,
+                        },
+                        AskUserQuestionOption {
+                            label: String::from("No"),
+                            description: String::from("stop"),
+                            preview: None,
+                        },
+                    ],
+                }],
+            },
+        };
+        let effects = model.update(UiEvent::ServerRequest(request));
+        assert!(model.question_picker.is_some(), "the picker is shown");
+        assert!(model.preview_stack.is_empty(), "the stack is closed first");
+        assert_eq!(unwatch_targets(&effects), vec![child]);
+
+        // A request for an unrelated thread is still rejected.
+        let unrelated = ServerRequest::AskUserQuestion {
+            request_id: RequestId(8),
+            params: AskUserQuestionParams {
+                thread_id: ThreadId::new().to_string(),
+                turn_id: String::from("0"),
+                questions: Vec::new(),
+            },
+        };
+        model.question_picker = None;
+        let effects = model.update(UiEvent::ServerRequest(unrelated));
+        assert!(model.question_picker.is_none());
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect.kind, UiEffectKind::FailServerRequest { .. }))
+        );
+    }
+
+    #[test]
+    fn preview_mid_stream_completion_uses_full_text_not_tail() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(&mut model, child, Vec::new());
+
+        // The preview joined mid-stream: only the tail delta arrives.
+        let _ = model.update(UiEvent::Protocol {
+            source_thread_id: Some(child),
+            event: Box::new(child_event(
+                "d1",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: child.to_string(),
+                    turn_id: String::from("0"),
+                    item_id: String::from("m1"),
+                    delta: String::from("tail of the message"),
+                }),
+            )),
+            viewport_height: 20,
+        });
+        let _ = model.update(UiEvent::Protocol {
+            source_thread_id: Some(child),
+            event: Box::new(child_event(
+                "c1",
+                EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
+                    thread_id: child.to_string(),
+                    turn_id: String::from("0"),
+                    item_id: String::from("m1"),
+                    text: String::from("the full message including the tail of the message"),
+                }),
+            )),
+            viewport_height: 20,
+        });
+
+        let view = model
+            .preview_stack
+            .last()
+            .unwrap_or_else(|| panic!("preview view"));
+        assert_eq!(view.item_count(), 1, "one assistant item, not tail + full");
+        let raw = view.items()[0]
+            .copy_text()
+            .unwrap_or_else(|| panic!("assistant raw text"));
+        assert_eq!(
+            raw, "the full message including the tail of the message",
+            "the completed full text wins over the streamed tail"
+        );
+    }
+
+    #[test]
+    fn mismatched_preview_response_pushes_no_view_and_unwatches() {
+        let mut model = workspace_normal_model();
+        let requested = ThreadId::new();
+        let other = ThreadId::new();
+
+        let effect = model.effect(
+            EffectContext::ThreadPreview {
+                thread_id: requested,
+            },
+            UiEffectKind::ThreadPreview {
+                thread_id: requested,
+            },
+        );
+        let effects = model.update(UiEvent::EffectCompleted {
+            effect_id: effect.effect_id,
+            result: UiEffectResult::ThreadPreview(Box::new(preview_response(other, Vec::new()))),
+            viewport_height: 20,
+        });
+
+        assert!(model.preview_stack.is_empty());
+        assert_eq!(unwatch_targets(&effects), vec![requested]);
+        assert!(model.status_line.contains("Could not open subagent"));
+    }
+
+    #[test]
+    fn preview_effect_failure_defensively_unwatches() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        let effect = model.effect(
+            EffectContext::ThreadPreview { thread_id: child },
+            UiEffectKind::ThreadPreview { thread_id: child },
+        );
+        let effects = model.update(UiEvent::EffectFailed {
+            effect_id: effect.effect_id,
+            error: String::from("rollout missing"),
+            viewport_height: 20,
+        });
+        assert!(model.preview_stack.is_empty());
+        assert_eq!(unwatch_targets(&effects), vec![child]);
+    }
+
+    #[test]
+    fn thread_switch_clears_preview_stack_with_unwatches() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(&mut model, child, Vec::new());
+
+        let effect = model.effect(EffectContext::ThreadStart, UiEffectKind::ThreadStart);
+        let effects = model.update(UiEvent::EffectCompleted {
+            effect_id: effect.effect_id,
+            result: UiEffectResult::ThreadStart(ThreadStartResponse {
+                thread_id: ThreadId::new().to_string(),
+                rollout_path: String::from("rollout.jsonl"),
+            }),
+            viewport_height: 20,
+        });
+        assert!(model.preview_stack.is_empty());
+        assert_eq!(unwatch_targets(&effects), vec![child]);
     }
 }

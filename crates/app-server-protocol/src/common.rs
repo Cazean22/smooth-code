@@ -32,13 +32,45 @@ pub struct ThreadResumeResponse {
     pub initial_messages: Vec<smooth_protocol::EventMsg>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadPreviewParams {
+    pub thread_id: String,
+}
+
+/// Read-only snapshot of a thread plus a live event subscription while it
+/// runs; unlike `threadResume` it never registers or mutates the thread.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadPreviewResponse {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
+    pub status: smooth_protocol::AgentStatus,
+    pub is_live: bool,
+    pub initial_messages: Vec<smooth_protocol::EventMsg>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUnwatchParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUnwatchResponse {
+    pub thread_id: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListParams {
     pub cursor: Option<String>,
     pub limit: Option<u32>,
 }
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListItem {
@@ -221,6 +253,18 @@ pub enum ClientRequest {
         request_id: RequestId,
         params: ThreadResumeParams,
     },
+    #[doc = r" Read-only thread snapshot plus a live event subscription (see `ThreadPreviewResponse`)."]
+    ThreadPreview {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: ThreadPreviewParams,
+    },
+    #[doc = r" Release one preview watcher taken by a successful `threadPreview`."]
+    ThreadUnwatch {
+        #[serde(rename = "id")]
+        request_id: RequestId,
+        params: ThreadUnwatchParams,
+    },
     ThreadList {
         #[serde(rename = "id")]
         request_id: RequestId,
@@ -385,6 +429,97 @@ mod tests {
         );
         let decoded: TurnCancelResponse = serde_json::from_value(value)?;
         assert_eq!(decoded, response);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_preview_request_round_trips_and_is_in_schema() -> TestResult {
+        let request = ClientRequest::ThreadPreview {
+            request_id: RequestId(21),
+            params: ThreadPreviewParams {
+                thread_id: "018f6f32-7a31-7c22-8c95-3c3dfb63dce1".to_string(),
+            },
+        };
+
+        let value = serde_json::to_value(&request)?;
+        assert_eq!(
+            value,
+            json!({
+                "method": "threadPreview",
+                "id": 21,
+                "params": {
+                    "threadId": "018f6f32-7a31-7c22-8c95-3c3dfb63dce1",
+                },
+            })
+        );
+        let decoded: ClientRequest = serde_json::from_value(value)?;
+        assert_eq!(decoded, request);
+
+        let schema = serde_json::to_value(schemars::schema_for!(ClientRequest))?;
+        assert!(schema.to_string().contains("threadPreview"));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_preview_response_round_trips() -> TestResult {
+        let response = ThreadPreviewResponse {
+            thread_id: "018f6f32-7a31-7c22-8c95-3c3dfb63dce1".to_string(),
+            agent_path: Some("/root/worker".to_string()),
+            agent_nickname: Some("worker".to_string()),
+            status: smooth_protocol::AgentStatus::Running,
+            is_live: true,
+            initial_messages: vec![smooth_protocol::EventMsg::UserMessage {
+                text: "inspect".to_string(),
+            }],
+        };
+
+        let value = serde_json::to_value(&response)?;
+        assert_eq!(
+            value,
+            json!({
+                "threadId": "018f6f32-7a31-7c22-8c95-3c3dfb63dce1",
+                "agentPath": "/root/worker",
+                "agentNickname": "worker",
+                "status": "running",
+                "isLive": true,
+                "initialMessages": [
+                    {
+                        "type": "user_message",
+                        "text": "inspect",
+                    },
+                ],
+            })
+        );
+        let decoded: ThreadPreviewResponse = serde_json::from_value(value)?;
+        assert_eq!(decoded, response);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_unwatch_request_round_trips_and_is_in_schema() -> TestResult {
+        let request = ClientRequest::ThreadUnwatch {
+            request_id: RequestId(22),
+            params: ThreadUnwatchParams {
+                thread_id: "018f6f32-7a31-7c22-8c95-3c3dfb63dce1".to_string(),
+            },
+        };
+
+        let value = serde_json::to_value(&request)?;
+        assert_eq!(
+            value,
+            json!({
+                "method": "threadUnwatch",
+                "id": 22,
+                "params": {
+                    "threadId": "018f6f32-7a31-7c22-8c95-3c3dfb63dce1",
+                },
+            })
+        );
+        let decoded: ClientRequest = serde_json::from_value(value)?;
+        assert_eq!(decoded, request);
+
+        let schema = serde_json::to_value(schemars::schema_for!(ClientRequest))?;
+        assert!(schema.to_string().contains("threadUnwatch"));
         Ok(())
     }
 

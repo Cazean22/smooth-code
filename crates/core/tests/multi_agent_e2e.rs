@@ -323,7 +323,40 @@ async fn spawn_agent_subagent_type_explore_routes_to_explore_prompt_kind() -> Re
     let turn_id = manager
         .start_user_input(root_id, "route explore".to_string())
         .await?;
-    wait_for_turn_completion(&mut root_events, &turn_id).await;
+
+    let mut spawn_completion = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = match tokio::time::timeout(remaining, root_events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(err)) => panic!("root event channel closed: {err}"),
+            Err(_) => panic!("timed out waiting for turn {turn_id} to complete"),
+        };
+        match event.msg {
+            EventMsg::ToolCallCompleted(event) if event.call_id == "internal-call-explore" => {
+                spawn_completion = Some(event);
+            }
+            EventMsg::TurnCompleted(TurnCompletedEvent {
+                turn_id: completed_id,
+                ..
+            }) if completed_id == turn_id => break,
+            _ => {}
+        }
+    }
+
+    let spawn_completion = spawn_completion.expect("spawn_agent tool completion event");
+    assert_eq!(spawn_completion.result_kind, ToolCallResultKind::Final);
+    let related_thread_id = spawn_completion
+        .related_thread_id
+        .expect("final spawn completion should carry the child thread id");
+    let parsed: TestAgentInfo = serde_json::from_str(
+        spawn_completion
+            .output_preview
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("spawn_agent output preview"))?,
+    )?;
+    assert_eq!(related_thread_id.to_string(), parsed.thread_id);
 
     let builds = builds
         .lock()

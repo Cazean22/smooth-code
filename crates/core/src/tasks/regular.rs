@@ -1664,7 +1664,7 @@ async fn collect_spawn_results(
                     success,
                     error,
                     ToolCallResultKind::Final,
-                    None,
+                    Some(child_thread_id),
                     true,
                 )
             } else {
@@ -1686,7 +1686,7 @@ async fn collect_spawn_results(
                         success,
                         error,
                         ToolCallResultKind::Final,
-                        None,
+                        Some(child_thread_id),
                         true,
                     )
                 } else {

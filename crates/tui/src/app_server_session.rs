@@ -1,8 +1,9 @@
 use app_server::in_process::InProcessServerEvent;
 use app_server_protocol::{
     ClientRequest, RequestId, SetPlanModeParams, SetPlanModeResponse, ShutdownParams,
-    ShutdownResponse, ThreadListParams, ThreadListResponse, ThreadResumeParams,
-    ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, TurnCancelParams,
+    ShutdownResponse, ThreadListParams, ThreadListResponse, ThreadPreviewParams,
+    ThreadPreviewResponse, ThreadResumeParams, ThreadResumeResponse, ThreadStartParams,
+    ThreadStartResponse, ThreadUnwatchParams, ThreadUnwatchResponse, TurnCancelParams,
     TurnCancelResponse, TurnStartParams, TurnStartResponse,
 };
 use smooth_protocol::ThreadId;
@@ -138,6 +139,38 @@ impl AppServerSession {
         let request = ClientRequest::ThreadList {
             request_id: RequestId(self.next_request_id as usize),
             params: ThreadListParams { cursor, limit },
+        };
+        self.next_request_id += 1;
+        let value = self.client.request(request).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    #[tracing::instrument(name = "tui.thread_preview", skip(self), fields(thread_id = %thread_id))]
+    pub(crate) async fn thread_preview(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> TuiResult<ThreadPreviewResponse> {
+        let request = ClientRequest::ThreadPreview {
+            request_id: RequestId(self.next_request_id as usize),
+            params: ThreadPreviewParams {
+                thread_id: thread_id.to_string(),
+            },
+        };
+        self.next_request_id += 1;
+        let value = self.client.request(request).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    #[tracing::instrument(name = "tui.thread_unwatch", skip(self), fields(thread_id = %thread_id))]
+    pub(crate) async fn thread_unwatch(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> TuiResult<ThreadUnwatchResponse> {
+        let request = ClientRequest::ThreadUnwatch {
+            request_id: RequestId(self.next_request_id as usize),
+            params: ThreadUnwatchParams {
+                thread_id: thread_id.to_string(),
+            },
         };
         self.next_request_id += 1;
         let value = self.client.request(request).await?;

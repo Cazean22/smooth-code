@@ -1,12 +1,13 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use app_server_protocol::{
     AskUserQuestionParams, AskUserQuestionResponse, ClientRequest, JsonRpcError,
     RequestPlanApprovalParams, RequestPlanApprovalResponse, ServerRequestPayload,
     SetPlanModeResponse, ShutdownResponse, ThreadListItem, ThreadListResponse,
-    ThreadResumeResponse, ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
+    ThreadPreviewResponse, ThreadResumeResponse, ThreadStartResponse, ThreadUnwatchResponse,
+    TurnCancelResponse, TurnStartResponse,
 };
-use smooth_core::{AskUserClient, ThreadManagerState, ThreadSummary};
+use smooth_core::{AskUserClient, CoreError, ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
@@ -18,10 +19,34 @@ use crate::{
     outgoing_message::OutgoingMessageSender,
 };
 
+/// A live event-forwarding task for one thread, with the owners that keep it
+/// alive: the root session (never released by preview cleanup) and/or a
+/// refcount of preview watchers.
+struct ThreadSubscription {
+    abort: tokio::task::AbortHandle,
+    root: bool,
+    preview_watchers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionOwner {
+    Root,
+    Preview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionOutcome {
+    Subscribed,
+    AlreadySubscribed,
+    /// The thread has no live event channel (`CoreError::UnknownThread`).
+    /// Expected for previews of completed threads; an error for roots.
+    NotLive,
+}
+
 pub(crate) struct CoreMessageProcessor {
     threads: ThreadManagerState,
     event_tx: mpsc::Sender<InProcessServerEvent>,
-    subscribed_threads: Mutex<HashSet<ThreadId>>,
+    subscribed_threads: Mutex<HashMap<ThreadId, ThreadSubscription>>,
 }
 
 fn ask_user_client(outgoing: Arc<OutgoingMessageSender>) -> AskUserClient {
@@ -119,7 +144,7 @@ impl CoreMessageProcessor {
         Ok(Self {
             threads: ThreadManagerState::new(Some(ask_user_client(outgoing)), None).await?,
             event_tx,
-            subscribed_threads: Mutex::new(HashSet::new()),
+            subscribed_threads: Mutex::new(HashMap::new()),
         })
     }
 
@@ -143,7 +168,7 @@ impl CoreMessageProcessor {
                     .threads
                     .start_thread_with_project_instructions(params.project_instructions)
                     .await?;
-                self.ensure_thread_subscription(started.thread_id).await;
+                self.ensure_root_subscription(started.thread_id).await?;
                 self.threads
                     .emit_session_configured(started.thread_id)
                     .await?;
@@ -162,7 +187,7 @@ impl CoreMessageProcessor {
                     .thread_id
                     .parse::<ThreadId>()
                     .map_err(AppServerError::invalid_thread_id)?;
-                self.ensure_thread_subscription(thread_id).await;
+                self.ensure_root_subscription(thread_id).await?;
                 let turn_id = self
                     .threads
                     .start_user_input(thread_id, params.input)
@@ -208,11 +233,62 @@ impl CoreMessageProcessor {
                     .parse::<ThreadId>()
                     .map_err(AppServerError::invalid_thread_id)?;
                 let resumed = self.threads.resume_thread(thread_id).await?;
-                self.ensure_thread_subscription(thread_id).await;
+                self.ensure_root_subscription(thread_id).await?;
                 Ok(serde_json::to_value(ThreadResumeResponse {
                     thread_id: resumed.thread_id.to_string(),
                     rollout_path: resumed.rollout_path.display().to_string(),
                     initial_messages: resumed.initial_messages,
+                })?)
+            }
+            ClientRequest::ThreadPreview { params, .. } => {
+                tracing::debug!(
+                    thread_id = %params.thread_id,
+                    "processing thread preview request"
+                );
+                let thread_id = params
+                    .thread_id
+                    .parse::<ThreadId>()
+                    .map_err(AppServerError::invalid_thread_id)?;
+                // Subscribe before snapshotting: core persists events before
+                // broadcasting, so this ordering can only duplicate persisted
+                // events (the client dedupes), never lose them. `NotLive` is
+                // the expected static-preview path for completed threads.
+                let outcome = self
+                    .ensure_thread_subscription(thread_id, SubscriptionOwner::Preview)
+                    .await?;
+                let watcher_taken = outcome != SubscriptionOutcome::NotLive;
+                let preview = match self.threads.preview_thread(thread_id).await {
+                    Ok(preview) => preview,
+                    Err(err) => {
+                        // No view will be pushed client-side, so no unwatch
+                        // would ever release the watcher we just took.
+                        if watcher_taken {
+                            self.release_preview_watcher(thread_id).await;
+                        }
+                        return Err(err.into());
+                    }
+                };
+                Ok(serde_json::to_value(ThreadPreviewResponse {
+                    thread_id: preview.thread_id.to_string(),
+                    agent_path: preview.agent_path,
+                    agent_nickname: preview.agent_nickname,
+                    status: preview.status,
+                    is_live: preview.is_live,
+                    initial_messages: preview.initial_messages,
+                })?)
+            }
+            ClientRequest::ThreadUnwatch { params, .. } => {
+                tracing::debug!(
+                    thread_id = %params.thread_id,
+                    "processing thread unwatch request"
+                );
+                let thread_id = params
+                    .thread_id
+                    .parse::<ThreadId>()
+                    .map_err(AppServerError::invalid_thread_id)?;
+                self.release_preview_watcher(thread_id).await;
+                Ok(serde_json::to_value(ThreadUnwatchResponse {
+                    thread_id: thread_id.to_string(),
                 })?)
             }
             ClientRequest::ThreadList { params, .. } => {
@@ -262,23 +338,37 @@ impl CoreMessageProcessor {
         }
     }
 
-    async fn ensure_thread_subscription(&self, thread_id: ThreadId) {
-        {
-            let mut subscribed = self.subscribed_threads.lock().await;
-            if !subscribed.insert(thread_id) {
-                return;
+    /// Subscribe to a thread's event channel and forward its events to the
+    /// client, tracking who owns the subscription. The map entry is inserted
+    /// only after both the core subscription and the forward-task spawn
+    /// succeed (the lock is held across the attempt so concurrent calls
+    /// cannot race); a thread with no live channel is reported as `NotLive`
+    /// rather than silently ignored.
+    async fn ensure_thread_subscription(
+        &self,
+        thread_id: ThreadId,
+        owner: SubscriptionOwner,
+    ) -> AppServerResult<SubscriptionOutcome> {
+        let mut subscribed = self.subscribed_threads.lock().await;
+        if let Some(entry) = subscribed.get_mut(&thread_id) {
+            match owner {
+                SubscriptionOwner::Root => entry.root = true,
+                SubscriptionOwner::Preview => entry.preview_watchers += 1,
             }
+            return Ok(SubscriptionOutcome::AlreadySubscribed);
         }
 
-        let Ok(mut rx) = self.threads.subscribe(thread_id).await else {
-            return;
+        let mut rx = match self.threads.subscribe(thread_id).await {
+            Ok(rx) => rx,
+            Err(CoreError::UnknownThread { .. }) => return Ok(SubscriptionOutcome::NotLive),
+            Err(err) => return Err(err.into()),
         };
         let event_tx = self.event_tx.clone();
         let subscription_span = tracing::info_span!(
             "app_server.session_event_subscription",
             thread_id = %thread_id,
         );
-        if let Err(err) = tokio::task::Builder::new()
+        let task = tokio::task::Builder::new()
             .name("app_server.session_subscription")
             .spawn(
                 async move {
@@ -303,12 +393,49 @@ impl CoreMessageProcessor {
                 }
                 .instrument(subscription_span),
             )
+            .map_err(|err| {
+                AppServerError::Core(CoreError::TaskSpawn {
+                    task_name: "app_server.session_subscription",
+                    source: err,
+                })
+            })?;
+
+        subscribed.insert(
+            thread_id,
+            ThreadSubscription {
+                abort: task.abort_handle(),
+                root: owner == SubscriptionOwner::Root,
+                preview_watchers: usize::from(owner == SubscriptionOwner::Preview),
+            },
+        );
+        Ok(SubscriptionOutcome::Subscribed)
+    }
+
+    /// Subscribe with root ownership; the thread was just started or resumed,
+    /// so a missing live channel is an error rather than an expected outcome.
+    async fn ensure_root_subscription(&self, thread_id: ThreadId) -> AppServerResult<()> {
+        match self
+            .ensure_thread_subscription(thread_id, SubscriptionOwner::Root)
+            .await?
         {
-            tracing::error!(
-                thread_id = %thread_id,
-                error = %err,
-                "failed to spawn session event subscription task"
-            );
+            SubscriptionOutcome::Subscribed | SubscriptionOutcome::AlreadySubscribed => Ok(()),
+            SubscriptionOutcome::NotLive => {
+                Err(AppServerError::Core(CoreError::UnknownThread { thread_id }))
+            }
+        }
+    }
+
+    /// Release one preview watcher; the subscription is dropped only when no
+    /// preview watcher remains and the root session does not own it.
+    async fn release_preview_watcher(&self, thread_id: ThreadId) {
+        let mut subscribed = self.subscribed_threads.lock().await;
+        let Some(entry) = subscribed.get_mut(&thread_id) else {
+            return;
+        };
+        entry.preview_watchers = entry.preview_watchers.saturating_sub(1);
+        if entry.preview_watchers == 0 && !entry.root {
+            entry.abort.abort();
+            subscribed.remove(&thread_id);
         }
     }
 }
@@ -326,21 +453,20 @@ fn map_thread_summary(summary: ThreadSummary) -> ThreadListItem {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc, sync::LazyLock};
+    use std::{path::PathBuf, sync::Arc};
 
     use app_server_protocol::{
         AskUserQuestionParams, ClientRequest, RequestId, ShutdownParams, ShutdownResponse,
-        ThreadStartParams, TurnCancelParams, TurnCancelResponse, TurnStartParams,
+        ThreadPreviewParams, ThreadPreviewResponse, ThreadStartParams, ThreadUnwatchParams,
+        TurnCancelParams, TurnCancelResponse, TurnStartParams,
     };
-    use tokio::sync::{Mutex as TokioMutex, mpsc, mpsc::error::TryRecvError};
+    use tokio::sync::{mpsc, mpsc::error::TryRecvError};
 
     use super::{CoreMessageProcessor, ask_user_client};
     use crate::{
         error_code::INVALID_PARAMS_ERROR_CODE, in_process::InProcessServerEvent,
         outgoing_message::OutgoingMessageSender,
     };
-
-    static CWD_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -354,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_thread_id_request_preserves_structured_error_info() -> TestResult {
-        let _cwd_guard = CWD_LOCK.lock().await;
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
         let workspace = tempfile::TempDir::new()?;
         let original_cwd = std::env::current_dir()?;
         std::env::set_current_dir(workspace.path())?;
@@ -384,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_turn_cancel_thread_id_preserves_structured_error_info() -> TestResult {
-        let _cwd_guard = CWD_LOCK.lock().await;
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
         let workspace = tempfile::TempDir::new()?;
         let original_cwd = std::env::current_dir()?;
         std::env::set_current_dir(workspace.path())?;
@@ -413,7 +539,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_cancel_returns_cancelled_thread_ids() -> TestResult {
-        let _cwd_guard = CWD_LOCK.lock().await;
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
         let workspace = tempfile::TempDir::new()?;
         let original_cwd = std::env::current_dir()?;
         std::env::set_current_dir(workspace.path())?;
@@ -448,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_resolves_and_clears_threads() -> TestResult {
-        let _cwd_guard = CWD_LOCK.lock().await;
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
         let workspace = tempfile::TempDir::new()?;
         let original_cwd = std::env::current_dir()?;
         std::env::set_current_dir(workspace.path())?;
@@ -511,6 +637,203 @@ mod tests {
 
         assert_eq!(error.code, INVALID_PARAMS_ERROR_CODE);
         assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+        Ok(())
+    }
+
+    type TestResult2<T> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Returns the processor plus the live event receiver — the receiver must
+    /// stay alive or the forward tasks exit as soon as they send.
+    async fn test_processor()
+    -> TestResult2<(CoreMessageProcessor, mpsc::Receiver<InProcessServerEvent>)> {
+        let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(64);
+        let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
+        Ok((
+            CoreMessageProcessor::new(event_tx, outgoing).await?,
+            event_rx,
+        ))
+    }
+
+    async fn preview(
+        processor: &CoreMessageProcessor,
+        thread_id: &str,
+    ) -> Result<ThreadPreviewResponse, app_server_protocol::JsonRpcError> {
+        let value = processor
+            .process_request(ClientRequest::ThreadPreview {
+                request_id: RequestId(90),
+                params: ThreadPreviewParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await?;
+        serde_json::from_value(value).map_err(|err| {
+            app_server_protocol::JsonRpcError::new(
+                -32000,
+                smooth_protocol::ErrorInfo::new("test_decode", err.to_string()),
+            )
+        })
+    }
+
+    async fn unwatch(processor: &CoreMessageProcessor, thread_id: &str) -> TestResult {
+        processor
+            .process_request(ClientRequest::ThreadUnwatch {
+                request_id: RequestId(91),
+                params: ThreadUnwatchParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_preview_live_thread_takes_watcher_and_unwatch_never_aborts_root() -> TestResult
+    {
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+        let _cwd_restore = CwdRestore(original_cwd);
+
+        let (processor, _event_rx) = test_processor().await?;
+        let started_value = processor
+            .process_request(ClientRequest::ThreadStart {
+                request_id: RequestId(1),
+                params: ThreadStartParams::default(),
+            })
+            .await?;
+        let started: app_server_protocol::ThreadStartResponse =
+            serde_json::from_value(started_value)?;
+        let thread_id = started.thread_id.parse::<smooth_protocol::ThreadId>()?;
+
+        let response = preview(&processor, &started.thread_id).await?;
+        assert_eq!(response.thread_id, started.thread_id);
+        assert!(response.is_live);
+
+        {
+            let subscribed = processor.subscribed_threads.lock().await;
+            let entry = subscribed.get(&thread_id).ok_or("missing subscription")?;
+            assert!(entry.root, "root start owns the subscription");
+            assert_eq!(entry.preview_watchers, 1);
+        }
+
+        unwatch(&processor, &started.thread_id).await?;
+        let subscribed = processor.subscribed_threads.lock().await;
+        let entry = subscribed
+            .get(&thread_id)
+            .ok_or("root subscription must survive preview unwatch")?;
+        assert!(entry.root);
+        assert_eq!(entry.preview_watchers, 0);
+        assert!(!entry.abort.is_finished());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_preview_refcounts_and_last_unwatch_drops_preview_only_subscription()
+    -> TestResult {
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+        let _cwd_restore = CwdRestore(original_cwd);
+
+        let (processor, _event_rx) = test_processor().await?;
+        // Live thread with no root subscription: created directly on the
+        // thread manager, not via the ThreadStart request.
+        let started = processor.threads.start_thread().await?;
+        let thread_id = started.thread_id;
+        let thread_id_str = thread_id.to_string();
+
+        let first = preview(&processor, &thread_id_str).await?;
+        assert!(first.is_live);
+        let _second = preview(&processor, &thread_id_str).await?;
+        {
+            let subscribed = processor.subscribed_threads.lock().await;
+            let entry = subscribed.get(&thread_id).ok_or("missing subscription")?;
+            assert!(!entry.root);
+            assert_eq!(entry.preview_watchers, 2);
+        }
+
+        unwatch(&processor, &thread_id_str).await?;
+        {
+            let subscribed = processor.subscribed_threads.lock().await;
+            let entry = subscribed
+                .get(&thread_id)
+                .ok_or("subscription must survive while a watcher remains")?;
+            assert_eq!(entry.preview_watchers, 1);
+        }
+
+        unwatch(&processor, &thread_id_str).await?;
+        let subscribed = processor.subscribed_threads.lock().await;
+        assert!(
+            !subscribed.contains_key(&thread_id),
+            "last unwatch drops a preview-only subscription"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_preview_completed_thread_is_static_without_subscription() -> TestResult {
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+        let _cwd_restore = CwdRestore(original_cwd);
+
+        let (processor, _event_rx) = test_processor().await?;
+        // Force the static path: the thread is fully gone from the live map
+        // before the preview request, leaving only its rollout.
+        let started = processor.threads.start_thread().await?;
+        let thread_id = started.thread_id;
+        processor.threads.shutdown_all().await?;
+
+        let response = preview(&processor, &thread_id.to_string()).await?;
+        assert!(!response.is_live);
+        let subscribed = processor.subscribed_threads.lock().await;
+        assert!(
+            !subscribed.contains_key(&thread_id),
+            "static preview must not leave a subscription entry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_preview_failure_rolls_back_just_taken_watcher() -> TestResult {
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+        let _cwd_restore = CwdRestore(original_cwd);
+
+        let (processor, _event_rx) = test_processor().await?;
+        let started = processor.threads.start_thread().await?;
+        let thread_id = started.thread_id;
+        // Live thread whose rollout cannot be read: subscribe succeeds, the
+        // snapshot fails, and the watcher must be rolled back.
+        std::fs::remove_file(&started.rollout_path)?;
+
+        assert!(preview(&processor, &thread_id.to_string()).await.is_err());
+        let subscribed = processor.subscribed_threads.lock().await;
+        assert!(
+            !subscribed.contains_key(&thread_id),
+            "failed preview must roll back the watcher it took"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_preview_unknown_thread_errors_without_leaking_subscription() -> TestResult {
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+        let _cwd_restore = CwdRestore(original_cwd);
+
+        let (processor, _event_rx) = test_processor().await?;
+        let unknown = smooth_protocol::ThreadId::new();
+        assert!(preview(&processor, &unknown.to_string()).await.is_err());
+        let subscribed = processor.subscribed_threads.lock().await;
+        assert!(subscribed.is_empty());
         Ok(())
     }
 }

@@ -23,7 +23,9 @@ use crate::{
     core_thread::CoreThread,
     error::{CoreError, CoreResult},
     provider::SessionModelFactory,
-    rollout::{find_thread_path, list_threads, load_resume_state, workspace_root},
+    rollout::{
+        RecoveryMode, find_thread_path, list_threads, load_resume_state, load_state, workspace_root,
+    },
 };
 
 pub struct StartedThread {
@@ -35,6 +37,18 @@ pub struct ResumedThread {
     pub thread_id: ThreadId,
     pub rollout_path: PathBuf,
     pub initial_messages: Vec<smooth_protocol::EventMsg>,
+}
+
+/// Read-only snapshot of a thread's transcript, taken without registering,
+/// resuming, or otherwise mutating the thread (unlike `resume_thread`).
+pub struct PreviewedThread {
+    pub thread_id: ThreadId,
+    pub rollout_path: PathBuf,
+    pub initial_messages: Vec<smooth_protocol::EventMsg>,
+    pub agent_path: Option<String>,
+    pub agent_nickname: Option<String>,
+    pub status: AgentStatus,
+    pub is_live: bool,
 }
 
 pub struct ThreadManagerState {
@@ -163,6 +177,72 @@ impl ThreadManagerState {
             thread_id,
             rollout_path,
             initial_messages,
+        })
+    }
+
+    /// Read-only preview of a thread: snapshot its transcript from the rollout
+    /// and report its identity/status, without constructing a `CoreThread`,
+    /// registering it as a root, or touching its children (see `resume_thread`
+    /// for the mutating path).
+    #[tracing::instrument(name = "core.thread_manager.preview_thread", skip(self), fields(thread_id = %thread_id))]
+    pub async fn preview_thread(&self, thread_id: ThreadId) -> CoreResult<PreviewedThread> {
+        let live_thread = self.threads.read().await.get(&thread_id).cloned();
+        let is_live = live_thread.is_some();
+        let rollout_path = match &live_thread {
+            Some(thread) => thread.rollout_path().clone(),
+            None => {
+                let workspace_root = workspace_root().map_err(CoreError::rollout)?;
+                find_thread_path(&workspace_root, thread_id)
+                    .await
+                    .map_err(CoreError::rollout)?
+            }
+        };
+        let recovery = if is_live {
+            RecoveryMode::PreviewLive
+        } else {
+            RecoveryMode::Resume
+        };
+        let state = load_state(&rollout_path, recovery)
+            .await
+            .map_err(CoreError::rollout)?;
+
+        let derived_status = || {
+            state
+                .initial_messages
+                .iter()
+                .filter_map(agent_status_from_event)
+                .next_back()
+                .unwrap_or(AgentStatus::PendingInit)
+        };
+        let status = if is_live {
+            match self.agent_control.get_status(thread_id) {
+                // Roots have no agent status entry; fold the replayed events
+                // chronologically (a `TurnStarted` means running, any later
+                // status-bearing event — completion, interruption, error —
+                // supersedes it).
+                AgentStatus::NotFound => folded_live_status(&state.initial_messages),
+                status => status,
+            }
+        } else {
+            derived_status()
+        };
+
+        // Identity metadata is best-effort: older rollouts and plain roots may
+        // have no state-db row, and the rollout alone is enough to preview.
+        let (agent_path, agent_nickname) =
+            match self.state_db.get_thread(&thread_id.to_string()).await {
+                Ok(Some(row)) => (row.agent_path, row.agent_nickname),
+                Ok(None) | Err(_) => (None, None),
+            };
+
+        Ok(PreviewedThread {
+            thread_id,
+            rollout_path,
+            initial_messages: state.initial_messages,
+            agent_path,
+            agent_nickname,
+            status,
+            is_live,
         })
     }
 
@@ -607,6 +687,23 @@ fn agent_status_entry(
         last_assistant_message: last_assistant_message(&status),
         status,
     })
+}
+
+/// Status of a live thread without an agent-control entry (a root), folded
+/// chronologically from its replayed events: `TurnStarted` means running,
+/// and any later status-bearing event (completion, interruption, error,
+/// explicit status change) supersedes it. The fold is order-sensitive on
+/// purpose — an earlier turn's completion must not mask a later open turn,
+/// and a persisted error inside an open turn must not be reported as running.
+fn folded_live_status(events: &[EventMsg]) -> AgentStatus {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EventMsg::TurnStarted(_) => Some(AgentStatus::Running),
+            other => agent_status_from_event(other),
+        })
+        .next_back()
+        .unwrap_or(AgentStatus::PendingInit)
 }
 
 #[cfg(test)]
@@ -1590,5 +1687,190 @@ mod tests {
 
         std::env::set_current_dir(original_cwd)?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_thread_snapshots_completed_child_without_mutation() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "child done".to_string(),
+                })),
+            })),
+        )
+        .await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+        let control = manager.agent_control();
+        let child = control
+            .spawn_agent(root_id, "child task".to_string())
+            .await?;
+        let child_id = child.agent_id.ok_or_else(|| anyhow::anyhow!("child id"))?;
+        wait_for_final_status(&control, child_id).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(manager);
+
+        // Fresh manager: the child is not live, so the preview must come from
+        // its rollout alone.
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "unused".to_string(),
+                })),
+            })),
+        )
+        .await?;
+        let live_before = manager.agent_control().registry().live_agents().len();
+
+        let preview = manager.preview_thread(child_id).await?;
+        assert_eq!(preview.thread_id, child_id);
+        assert!(!preview.is_live);
+        assert!(matches!(preview.status, AgentStatus::Completed(_)));
+        assert!(
+            preview.initial_messages.iter().any(
+                |event| matches!(event, EventMsg::UserMessage { text } if text == "child task")
+            )
+        );
+        assert!(
+            preview
+                .initial_messages
+                .iter()
+                .any(|event| matches!(event, EventMsg::TurnCompleted(_)))
+        );
+
+        // Previewing must not register, resume, or otherwise mutate the thread.
+        assert_eq!(
+            manager.agent_control().registry().live_agents().len(),
+            live_before
+        );
+        assert!(!manager.threads.read().await.contains_key(&child_id));
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_thread_unknown_thread_errors() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "done".to_string(),
+                })),
+            })),
+        )
+        .await?;
+        assert!(manager.preview_thread(ThreadId::new()).await.is_err());
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_thread_live_open_turn_has_no_synthetic_interruption() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        // The pending driver never completes, so the turn stays open while the
+        // thread is live.
+        let manager = ThreadManagerState::new(None, Some(Arc::new(PendingFactory))).await?;
+        let started = manager.start_thread().await?;
+        let root_id = started.thread_id;
+        manager
+            .start_user_input(root_id, "long running".to_string())
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let preview = manager.preview_thread(root_id).await?;
+        assert!(preview.is_live);
+        assert_eq!(preview.status, AgentStatus::Running);
+        assert!(
+            preview
+                .initial_messages
+                .iter()
+                .any(|event| matches!(event, EventMsg::TurnStarted(_)))
+        );
+        assert!(
+            !preview
+                .initial_messages
+                .iter()
+                .any(|event| matches!(event, EventMsg::TurnInterrupted(_))),
+            "a live open turn must not be replayed as interrupted"
+        );
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[test]
+    fn folded_live_status_is_order_sensitive() {
+        use smooth_protocol::{
+            ErrorEvent, ErrorInfo, TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
+        };
+
+        let turn_started = |turn: &str| {
+            EventMsg::TurnStarted(TurnStartedEvent {
+                thread_id: String::from("t"),
+                turn_id: turn.to_string(),
+            })
+        };
+        let turn_completed = |turn: &str| {
+            EventMsg::TurnCompleted(TurnCompletedEvent {
+                thread_id: String::from("t"),
+                turn_id: turn.to_string(),
+                last_assistant_message: Some(String::from("done")),
+            })
+        };
+        let error = EventMsg::Error(ErrorEvent {
+            error: ErrorInfo::new("provider", "boom"),
+        });
+
+        assert_eq!(
+            super::folded_live_status(&[]),
+            AgentStatus::PendingInit,
+            "no events: nothing has happened yet"
+        );
+        assert_eq!(
+            super::folded_live_status(&[turn_started("0")]),
+            AgentStatus::Running,
+            "an open turn on a live thread is running"
+        );
+        assert_eq!(
+            super::folded_live_status(&[turn_started("0"), error.clone()]),
+            AgentStatus::Errored(ErrorInfo::new("provider", "boom")),
+            "a persisted error inside an open turn must not read as running"
+        );
+        assert_eq!(
+            super::folded_live_status(
+                &[turn_started("0"), turn_completed("0"), turn_started("1"),]
+            ),
+            AgentStatus::Running,
+            "an earlier turn's completion must not mask a later open turn"
+        );
+        assert_eq!(
+            super::folded_live_status(&[
+                turn_started("0"),
+                EventMsg::TurnInterrupted(TurnInterruptedEvent {
+                    thread_id: String::from("t"),
+                    turn_id: String::from("0"),
+                    reason: String::from("user"),
+                }),
+            ]),
+            AgentStatus::Interrupted,
+        );
     }
 }

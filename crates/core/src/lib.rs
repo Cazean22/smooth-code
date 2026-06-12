@@ -21,6 +21,6 @@ pub use provider::{
     SessionTurnSummary,
 };
 pub use rollout::ThreadSummary;
-pub use thread_manager::{ResumedThread, StartedThread, ThreadManagerState};
+pub use thread_manager::{PreviewedThread, ResumedThread, StartedThread, ThreadManagerState};
 pub use tools::AskUserClient;
 pub use tools::sweep_pending_process_kills;

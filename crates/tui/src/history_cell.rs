@@ -329,6 +329,9 @@ pub(crate) struct ToolCallEntry {
     state: ToolCallState,
     error: Option<String>,
     output: Option<String>,
+    /// The child thread spawned by this call (`spawn_agent` only), recorded
+    /// from `ToolCallCompletedEvent::related_thread_id`. The `gd` target.
+    related_thread_id: Option<smooth_protocol::ThreadId>,
 }
 
 #[derive(Debug, Clone)]
@@ -346,12 +349,17 @@ impl ToolCallGroupCell {
                 state: ToolCallState::Running,
                 error: None,
                 output: None,
+                related_thread_id: None,
             }],
         }
     }
 
     pub(crate) fn tool_name(&self) -> &str {
         &self.tool_name
+    }
+
+    pub(crate) fn is_spawn_agent(&self) -> bool {
+        self.tool_name == "spawn_agent"
     }
 
     pub(crate) fn push_entry(&mut self, args_preview: String) -> usize {
@@ -361,12 +369,32 @@ impl ToolCallGroupCell {
             state: ToolCallState::Running,
             error: None,
             output: None,
+            related_thread_id: None,
         });
         entry_idx
     }
 
     pub(crate) fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn set_entry_related_thread(
+        &mut self,
+        entry_idx: usize,
+        thread_id: smooth_protocol::ThreadId,
+    ) {
+        if let Some(entry) = self.entries.get_mut(entry_idx) {
+            entry.related_thread_id = Some(thread_id);
+        }
+    }
+
+    /// The subagent session this cell opens with `gd`: the first entry that
+    /// recorded a child thread id (grouped consecutive `spawn_agent` calls
+    /// share one cell).
+    pub(crate) fn subagent_thread_id(&self) -> Option<smooth_protocol::ThreadId> {
+        self.entries
+            .iter()
+            .find_map(|entry| entry.related_thread_id)
     }
 
     pub(crate) fn set_entry_outcome(
@@ -436,8 +464,11 @@ impl ToolCallGroupCell {
         let mut lines = Vec::new();
         if self.entries.len() == 1 {
             let entry = &self.entries[0];
-            let (line, indent) =
+            let (mut line, indent) =
                 tool_call_line("", entry.state, Some(self.tool_name()), &entry.args_preview);
+            if entry.related_thread_id.is_some() {
+                line.spans.push(subagent_suffix());
+            }
             lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
             if matches!(entry.state, ToolCallState::Failure)
                 && let Some(error) = entry.error.as_deref()
@@ -451,7 +482,11 @@ impl ToolCallGroupCell {
         let (header, indent) = tool_call_line("", header_state, Some(self.tool_name()), "");
         lines.extend(wrap::wrap_line_char_hanging(header, width, indent));
         for entry in &self.entries {
-            let (line, indent) = tool_call_line("      ", entry.state, None, &entry.args_preview);
+            let (mut line, indent) =
+                tool_call_line("      ", entry.state, None, &entry.args_preview);
+            if entry.related_thread_id.is_some() {
+                line.spans.push(subagent_suffix());
+            }
             lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
             if matches!(entry.state, ToolCallState::Failure)
                 && let Some(error) = entry.error.as_deref()
@@ -549,6 +584,12 @@ fn tool_call_glyph(state: ToolCallState) -> Span<'static> {
         ToolCallState::Failure => ("✗ ", Style::default().fg(Color::Red).bold()),
     };
     Span::styled(glyph, glyph_style)
+}
+
+/// Marker appended to a tool row whose entry spawned a subagent: the row can
+/// be entered with `gd` in transcript-select mode.
+fn subagent_suffix() -> Span<'static> {
+    Span::styled(" ↳ subagent", Style::default().dim())
 }
 
 /// Build a tool failure row and report the column after the `! ` marker so

@@ -190,7 +190,23 @@ pub(crate) fn persisted_event_item(event: &EventMsg) -> Option<PersistedItem> {
     }
 }
 
+/// How `load_state` should treat a rollout whose last turn is still open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryMode {
+    /// The thread is being brought back to life (or inspected post-mortem):
+    /// synthesize a trailing `TurnInterrupted` so a crashed open turn is
+    /// surfaced as interrupted.
+    Resume,
+    /// The thread is still running elsewhere; an open turn is live, not
+    /// crashed, so replay events verbatim.
+    PreviewLive,
+}
+
 pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
+    load_state(path, RecoveryMode::Resume).await
+}
+
+pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<ResumeState> {
     let contents = fs::read_to_string(path).await?;
     let mut meta: Option<SessionMeta> = None;
     let mut history = Vec::new();
@@ -256,7 +272,7 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
     }
 
     let meta = meta.with_context(|| format!("missing session metadata in {}", path.display()))?;
-    if has_open_turn && !has_terminal_turn {
+    if recovery == RecoveryMode::Resume && has_open_turn && !has_terminal_turn {
         initial_messages.push(EventMsg::TurnInterrupted(TurnInterruptedEvent {
             thread_id: meta.thread_id.to_string(),
             turn_id: max_turn_index.unwrap_or(0).to_string(),

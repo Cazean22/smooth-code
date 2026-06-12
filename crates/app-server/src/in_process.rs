@@ -131,6 +131,20 @@ mod tests {
 
     #[tokio::test]
     async fn server_request_round_trip_resolves_waiter() -> TestResult {
+        // The processor opens the state DB under the cwd; hold the crate-wide
+        // cwd lock and pin a temp cwd so cwd-switching tests in other modules
+        // cannot interfere.
+        let _cwd_guard = crate::cwd_test_lock().lock().await;
+        let workspace = tempfile::TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let result = run_round_trip().await;
+        std::env::set_current_dir(original_cwd)?;
+        result
+    }
+
+    async fn run_round_trip() -> TestResult {
         let (mut handle, outgoing) = start_internal(InProcessStartArgs {
             channel_capacity: 8,
         })

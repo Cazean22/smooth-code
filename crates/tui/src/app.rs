@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use app_server_protocol::{
     AskUserQuestionResponse, JsonRpcError, RequestId, RequestPlanApprovalResponse, ServerRequest,
@@ -37,6 +38,13 @@ pub(crate) enum AppRunControl {
     Continue,
     Exit,
 }
+
+/// Window within which a second Esc press enters transcript-select mode.
+const DOUBLE_ESC_WINDOW: Duration = Duration::from_millis(500);
+/// Window within which a second `y` press upgrades a tool-result copy to args.
+const COPY_CHORD_WINDOW: Duration = Duration::from_millis(500);
+/// Cap on the OSC 52 payload; terminals commonly reject larger sequences.
+const MAX_CLIPBOARD_BYTES: usize = 100_000;
 
 pub(crate) struct App {
     model: UiModel,
@@ -168,6 +176,9 @@ impl App {
                     .fail_server_request(request_id, error)
                     .await
                     .map(|_| UiEffectResult::ServerRequestAnswered),
+                UiEffectKind::CopyToClipboard { content } => {
+                    write_clipboard_osc52(&content).map(|()| UiEffectResult::ClipboardWritten)
+                }
             };
 
             let next = match result {
@@ -256,6 +267,9 @@ enum UiEffectKind {
         request_id: RequestId,
         error: JsonRpcError,
     },
+    CopyToClipboard {
+        content: String,
+    },
     Exit,
 }
 
@@ -268,6 +282,7 @@ enum UiEffectResult {
     TurnCancel(TurnCancelResponse),
     SetPlanMode(SetPlanModeResponse),
     ServerRequestAnswered,
+    ClipboardWritten,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +294,7 @@ enum EffectContext {
     TurnCancel { thread_id: ThreadId },
     SetPlanMode { previous: bool, desired: bool },
     ServerRequest,
+    Clipboard,
     Exit,
 }
 
@@ -321,6 +337,7 @@ enum UiMode {
     Insert,
     Command,
     Overlay,
+    TranscriptSelect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +363,14 @@ struct DashboardState {
 struct RunningToolInfo {
     tool_name: String,
     args_preview: String,
+}
+
+/// State for transcript-select mode: which row is selected and, after a `y` on
+/// a tool row, the pending chance to upgrade the copy to the tool args.
+#[derive(Debug, Clone, Copy)]
+struct TranscriptSelectState {
+    selected: usize,
+    pending_args: Option<(usize, Instant)>,
 }
 
 struct UiModel {
@@ -392,6 +417,10 @@ struct UiModel {
     mode: UiMode,
     focus: FocusTarget,
     dashboard: DashboardState,
+    transcript_select: Option<TranscriptSelectState>,
+    /// Timestamp of the last Esc press in Normal mode (or leaving Insert),
+    /// armed for double-Esc detection.
+    last_esc: Option<Instant>,
     running_tools: HashMap<String, RunningToolInfo>,
     recent_file_changes: Vec<FileChangeOutput>,
     render_cache: RenderedTranscriptCache,
@@ -447,6 +476,8 @@ impl UiModel {
             mode: UiMode::Normal,
             focus: FocusTarget::Dashboard,
             dashboard: DashboardState::default(),
+            transcript_select: None,
+            last_esc: None,
             running_tools: HashMap::new(),
             recent_file_changes: Vec::new(),
             render_cache: RenderedTranscriptCache::default(),
@@ -570,8 +601,17 @@ impl UiModel {
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
+        self.handle_key_event_at(key_event, Instant::now())
+    }
+
+    fn handle_key_event_at(&mut self, key_event: KeyEvent, now: Instant) -> Vec<UiEffect> {
         if key_event.kind != crossterm::event::KeyEventKind::Press {
             return Vec::new();
+        }
+
+        // Any non-Esc key breaks the double-Esc chord.
+        if key_event.code != KeyCode::Esc {
+            self.last_esc = None;
         }
 
         if matches!(key_event.code, KeyCode::Char('c'))
@@ -597,7 +637,7 @@ impl UiModel {
 
         match self.screen {
             Screen::Dashboard => self.handle_dashboard_key(key_event),
-            Screen::Workspace => self.handle_workspace_key(key_event),
+            Screen::Workspace => self.handle_workspace_key(key_event, now),
         }
     }
 
@@ -675,15 +715,16 @@ impl UiModel {
         }
     }
 
-    fn handle_workspace_key(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
+    fn handle_workspace_key(&mut self, key_event: KeyEvent, now: Instant) -> Vec<UiEffect> {
         match self.mode {
-            UiMode::Normal => self.handle_normal_key(key_event),
-            UiMode::Insert => self.handle_insert_key(key_event),
+            UiMode::Normal => self.handle_normal_key(key_event, now),
+            UiMode::Insert => self.handle_insert_key(key_event, now),
+            UiMode::TranscriptSelect => self.handle_transcript_select_key(key_event, now),
             UiMode::Command | UiMode::Overlay => Vec::new(),
         }
     }
 
-    fn handle_normal_key(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
+    fn handle_normal_key(&mut self, key_event: KeyEvent, now: Instant) -> Vec<UiEffect> {
         match key_event.code {
             KeyCode::Char('i') => {
                 self.mode = UiMode::Insert;
@@ -739,8 +780,141 @@ impl UiModel {
                 self.scroll_to_bottom(self.viewport_height);
                 Vec::new()
             }
+            KeyCode::Esc => {
+                if self
+                    .last_esc
+                    .is_some_and(|t| now.duration_since(t) <= DOUBLE_ESC_WINDOW)
+                {
+                    self.last_esc = None;
+                    self.enter_transcript_select();
+                } else {
+                    self.last_esc = Some(now);
+                }
+                Vec::new()
+            }
             _ => Vec::new(),
         }
+    }
+
+    /// Enter transcript-select mode (double-Esc). Selection starts on the last
+    /// transcript row; follow-mode is suspended so streaming output doesn't
+    /// yank the view while the user navigates.
+    fn enter_transcript_select(&mut self) {
+        if self.screen != Screen::Workspace || self.mode != UiMode::Normal {
+            return;
+        }
+        if self.transcript_items.is_empty() {
+            self.status_line = String::from("Transcript is empty");
+            return;
+        }
+        self.mode = UiMode::TranscriptSelect;
+        self.focus = FocusTarget::Transcript;
+        self.auto_scroll = false;
+        self.transcript_select = Some(TranscriptSelectState {
+            selected: self.transcript_items.len().saturating_sub(1),
+            pending_args: None,
+        });
+        self.transcript_select_ensure_visible(self.viewport_height);
+        self.status_line = String::from("Transcript select");
+    }
+
+    /// Leave transcript-select mode. Safe to call when not in it (no-op apart
+    /// from clearing any stale selection state).
+    fn exit_transcript_select(&mut self) {
+        self.transcript_select = None;
+        if self.mode == UiMode::TranscriptSelect {
+            self.mode = UiMode::Normal;
+            self.focus = FocusTarget::Transcript;
+            let max_scroll = self.max_scroll(self.viewport_height);
+            self.auto_scroll = self.scroll >= max_scroll;
+        }
+    }
+
+    fn handle_transcript_select_key(&mut self, key_event: KeyEvent, now: Instant) -> Vec<UiEffect> {
+        let Some(mut state) = self.transcript_select else {
+            self.exit_transcript_select();
+            return Vec::new();
+        };
+        let last = self.transcript_items.len().saturating_sub(1);
+        match key_event.code {
+            // Unlike Normal mode, `q` exits the selection, not the app.
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.exit_transcript_select();
+                return Vec::new();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.selected = state.selected.saturating_sub(1);
+                state.pending_args = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.selected = state.selected.saturating_add(1).min(last);
+                state.pending_args = None;
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                state.selected = 0;
+                state.pending_args = None;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                state.selected = last;
+                state.pending_args = None;
+            }
+            KeyCode::Char('y') => return self.copy_selected_transcript_row(state, now),
+            _ => return Vec::new(),
+        }
+        self.transcript_select = Some(state);
+        self.transcript_select_ensure_visible(self.viewport_height);
+        Vec::new()
+    }
+
+    /// `y` in transcript-select mode. Tool rows copy their result first; a
+    /// second `y` within the chord window upgrades the clipboard to the tool
+    /// arguments. Rows with nothing finished yet fall back to the arguments.
+    fn copy_selected_transcript_row(
+        &mut self,
+        mut state: TranscriptSelectState,
+        now: Instant,
+    ) -> Vec<UiEffect> {
+        let idx = state.selected;
+        let Some(item) = self.transcript_items.get(idx) else {
+            self.transcript_select = Some(state);
+            return Vec::new();
+        };
+        let (payload, status) = if let Some(group) = item.tool_group_cell() {
+            let chord = state
+                .pending_args
+                .is_some_and(|(p, t)| p == idx && now.duration_since(t) <= COPY_CHORD_WINDOW);
+            if chord {
+                state.pending_args = None;
+                (group.copy_args(), "Copied tool arguments")
+            } else if let Some(result) = group.copy_result() {
+                state.pending_args = Some((idx, now));
+                (result, "Copied tool result — y again for arguments")
+            } else {
+                state.pending_args = None;
+                (group.copy_args(), "No result yet — copied tool arguments")
+            }
+        } else {
+            state.pending_args = None;
+            match item.copy_text() {
+                Some(text) => (text, "Copied"),
+                None => {
+                    self.transcript_select = Some(state);
+                    self.status_line = String::from("Nothing to copy");
+                    return Vec::new();
+                }
+            }
+        };
+        self.transcript_select = Some(state);
+        let (payload, truncated) = clip_for_clipboard(payload);
+        self.status_line = if truncated {
+            format!("{status} ({} bytes, truncated)", payload.len())
+        } else {
+            format!("{status} ({} bytes)", payload.len())
+        };
+        vec![self.effect(
+            EffectContext::Clipboard,
+            UiEffectKind::CopyToClipboard { content: payload },
+        )]
     }
 
     /// Enter submits only with Ctrl. Cmd/Super is intentionally not accepted:
@@ -752,7 +926,7 @@ impl UiModel {
         key_event.code == KeyCode::Enter && key_event.modifiers.contains(KeyModifiers::CONTROL)
     }
 
-    fn handle_insert_key(&mut self, key_event: KeyEvent) -> Vec<UiEffect> {
+    fn handle_insert_key(&mut self, key_event: KeyEvent, now: Instant) -> Vec<UiEffect> {
         // The skill popup is an Insert-mode adornment: it intercepts only
         // navigation/accept/dismiss keys; everything else edits the composer
         // as usual (followed by a popup resync below).
@@ -789,6 +963,9 @@ impl UiModel {
             KeyCode::Esc => {
                 self.mode = UiMode::Normal;
                 self.focus = FocusTarget::Transcript;
+                // Arm the chord so Esc-Esc from the composer reaches
+                // transcript-select mode.
+                self.last_esc = Some(now);
                 Vec::new()
             }
             _ if Self::is_submit_key(key_event) => self.request_turn_start(),
@@ -969,6 +1146,7 @@ impl UiModel {
                         self.mode = UiMode::Insert;
                     }
                     "dashboard" => {
+                        self.exit_transcript_select();
                         self.focus = FocusTarget::Dashboard;
                         self.screen = Screen::Dashboard;
                     }
@@ -1150,6 +1328,7 @@ impl UiModel {
                     );
                 }
                 self.screen = Screen::Workspace;
+                self.exit_transcript_select();
                 self.question_picker = Some(QuestionPicker::new(request_id, params));
                 self.mode = UiMode::Overlay;
                 self.focus = FocusTarget::Overlay;
@@ -1163,6 +1342,7 @@ impl UiModel {
                     );
                 }
                 self.screen = Screen::Workspace;
+                self.exit_transcript_select();
                 self.plan_approval = Some(PlanApprovalOverlay::new(request_id, params));
                 self.mode = UiMode::Overlay;
                 self.focus = FocusTarget::Overlay;
@@ -1257,6 +1437,7 @@ impl UiModel {
                 self.plan_mode = response.enabled;
             }
             UiEffectResult::ServerRequestAnswered => {}
+            UiEffectResult::ClipboardWritten => {}
         }
     }
 
@@ -1309,6 +1490,10 @@ impl UiModel {
             }
             Some(EffectContext::ServerRequest) => {
                 self.push_error(format!("could not answer server request: {error}"));
+            }
+            Some(EffectContext::Clipboard) => {
+                self.status_line = String::from("Copy failed");
+                self.push_error(format!("could not copy to clipboard: {error}"));
             }
             Some(EffectContext::Exit) | None => {}
         }
@@ -1411,6 +1596,7 @@ impl UiModel {
                 self.running_tools.clear();
                 self.question_picker = None;
                 self.plan_approval = None;
+                self.exit_transcript_select();
                 if self.mode == UiMode::Overlay {
                     self.mode = UiMode::Normal;
                     self.focus = FocusTarget::Transcript;
@@ -1513,6 +1699,7 @@ impl UiModel {
                 }
 
                 self.running_tools.remove(&tool.call_id);
+                let output_preview = tool.output_preview;
                 let handled_structured = if tool.success {
                     if tool.todos.is_empty() {
                         let file_changes = if tool.file_changes.is_empty() {
@@ -1541,6 +1728,10 @@ impl UiModel {
                     };
 
                     if let Some((cell_idx, entry_idx)) = self.tool_call_rows.remove(&tool.call_id) {
+                        if let Some(output) = output_preview {
+                            self.tool_group_mut(cell_idx)
+                                .set_entry_output(entry_idx, output);
+                        }
                         self.tool_group_mut(cell_idx)
                             .set_entry_outcome(entry_idx, new_state, error);
                         self.mark_item_mutated(cell_idx);
@@ -1647,12 +1838,18 @@ impl UiModel {
         let reasoning = self
             .active_reasoning_lines
             .as_ref()
-            .map(|lines| TranscriptItem::reasoning(0, lines.clone(), true).display_lines(width))
+            .map(|lines| {
+                TranscriptItem::reasoning(0, lines.clone(), true, String::new())
+                    .display_lines(width)
+            })
             .unwrap_or_default();
         let assistant = self
             .active_assistant_lines
             .as_ref()
-            .map(|lines| TranscriptItem::assistant(0, lines.clone(), true).display_lines(width))
+            .map(|lines| {
+                TranscriptItem::assistant(0, lines.clone(), true, String::new())
+                    .display_lines(width)
+            })
             .unwrap_or_default();
         self.active_wrap = Some(ActiveWrap {
             width,
@@ -1670,9 +1867,9 @@ impl UiModel {
     fn commit_assistant_stream(&mut self, item_id: Option<&str>) -> bool {
         if let Some(controller) = self.assistant_stream.take() {
             self.pending_tool_group = None;
-            if let Some(lines) = controller.finalize_lines() {
+            if let Some((lines, raw)) = controller.finalize_parts() {
                 let id = self.next_item_id();
-                self.push_history(TranscriptItem::assistant(id, lines, true));
+                self.push_history(TranscriptItem::assistant(id, lines, true, raw));
                 self.committed_assistant_item_id = item_id.map(ToOwned::to_owned);
                 self.committed_assistant_for_current_turn = true;
                 self.set_active_assistant_lines(None);
@@ -1688,10 +1885,10 @@ impl UiModel {
             self.reasoning_stream.is_some() || self.active_reasoning_lines.is_some();
         let in_flight_id = self.in_flight_reasoning_item_id.take();
         if let Some(controller) = self.reasoning_stream.take()
-            && let Some(lines) = controller.finalize_lines()
+            && let Some((lines, raw)) = controller.finalize_parts()
         {
             let id = self.next_item_id();
-            self.push_history(TranscriptItem::reasoning(id, lines, true));
+            self.push_history(TranscriptItem::reasoning(id, lines, true, raw));
             self.set_active_reasoning_lines(None);
             if in_flight_id.is_some() {
                 self.committed_reasoning_item_id = in_flight_id;
@@ -1708,13 +1905,23 @@ impl UiModel {
     fn push_rendered_assistant_message(&mut self, message: &str) {
         let lines = self.render_markdown_lines(message);
         let id = self.next_item_id();
-        self.push_history(TranscriptItem::assistant(id, lines, true));
+        self.push_history(TranscriptItem::assistant(
+            id,
+            lines,
+            true,
+            message.to_owned(),
+        ));
     }
 
     fn push_rendered_reasoning_message(&mut self, message: &str) {
         let lines = self.render_markdown_lines(message);
         let id = self.next_item_id();
-        self.push_history(TranscriptItem::reasoning(id, lines, true));
+        self.push_history(TranscriptItem::reasoning(
+            id,
+            lines,
+            true,
+            message.to_owned(),
+        ));
     }
 
     fn render_markdown_lines(&self, message: &str) -> Vec<Line<'static>> {
@@ -1883,6 +2090,7 @@ impl UiModel {
     }
 
     fn clear_transcript(&mut self) {
+        self.exit_transcript_select();
         self.transcript_items.clear();
         self.set_active_assistant_lines(None);
         self.set_active_reasoning_lines(None);
@@ -1957,6 +2165,11 @@ impl UiModel {
 
         let item_count = self.transcript_items.len();
         let has_active_below = self.has_active_stream_lines();
+        let selected_idx = if self.mode == UiMode::TranscriptSelect {
+            self.transcript_select.map(|state| state.selected)
+        } else {
+            None
+        };
         self.render_cache.evict_stale_widths(width);
         for (idx, item) in self.transcript_items.iter().enumerate() {
             if idx > 0 {
@@ -1976,6 +2189,13 @@ impl UiModel {
             let mut item_lines = self.render_cache.item_lines(item, width);
             if omit_bottom {
                 item_lines.pop();
+            }
+            // Highlight the selected row by patching the per-frame clone of
+            // the cached lines; the cache itself stays untouched.
+            if selected_idx == Some(idx) {
+                for line in &mut item_lines {
+                    line.style = line.style.patch(Style::default().bg(Color::DarkGray));
+                }
             }
             for line in item_lines {
                 append_visible_line(&mut lines, line, all_rows, start, end);
@@ -2022,14 +2242,14 @@ impl UiModel {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
-            let item = TranscriptItem::reasoning(0, active_lines.clone(), true);
+            let item = TranscriptItem::reasoning(0, active_lines.clone(), true, String::new());
             lines.extend(item.display_lines(width));
         }
         if let Some(active_lines) = self.active_assistant_lines.as_ref() {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
-            let item = TranscriptItem::assistant(0, active_lines.clone(), true);
+            let item = TranscriptItem::assistant(0, active_lines.clone(), true, String::new());
             lines.extend(item.display_lines(width));
         }
     }
@@ -2405,6 +2625,13 @@ impl UiModel {
             format!("{:?}", self.mode),
             Style::default().fg(Color::Cyan),
         ));
+        if self.mode == UiMode::TranscriptSelect {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                "j/k move  y copy  yy copy args  Esc exit",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         if self.plan_mode {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
@@ -2608,6 +2835,53 @@ impl UiModel {
         self.auto_scroll = false;
     }
 
+    /// Row range `(start, height)` of the item at `target_idx`, walking items
+    /// exactly like `total_transcript_rows`: one separator row before each
+    /// idx>0 item, cached heights, and the trailing user rule omitted when
+    /// nothing streams below it.
+    fn transcript_item_row_extent(&mut self, target_idx: usize, width: u16) -> (usize, usize) {
+        let item_count = self.transcript_items.len();
+        let has_active_below = self.has_active_stream_lines();
+        self.render_cache.evict_stale_widths(width);
+        let mut rows = 0usize;
+        for (idx, item) in self.transcript_items.iter().enumerate() {
+            if idx > 0 {
+                rows += 1;
+            }
+            let omit_bottom = idx + 1 == item_count && !has_active_below && item.is_user();
+            let mut height = self.render_cache.item_height(item, width);
+            if omit_bottom {
+                height = height.saturating_sub(1);
+            }
+            if idx == target_idx {
+                return (rows, height);
+            }
+            rows += height;
+        }
+        (rows, 0)
+    }
+
+    /// Scroll just enough that the selected transcript row is on screen;
+    /// items taller than the viewport pin to their top.
+    fn transcript_select_ensure_visible(&mut self, viewport_height: u16) {
+        let Some(state) = self.transcript_select else {
+            return;
+        };
+        let (start, height) =
+            self.transcript_item_row_extent(state.selected, self.transcript_inner_width);
+        let vp = usize::from(viewport_height.max(1));
+        let scroll = usize::from(self.scroll);
+        let mut new_scroll = if start < scroll {
+            start
+        } else if start.saturating_add(height) > scroll.saturating_add(vp) {
+            start.saturating_add(height).saturating_sub(vp).min(start)
+        } else {
+            scroll
+        };
+        new_scroll = new_scroll.min(usize::from(self.max_scroll(viewport_height)));
+        self.scroll = u16::try_from(new_scroll).unwrap_or(u16::MAX);
+    }
+
     fn scroll_down(&mut self, amount: u16, viewport_height: u16) {
         let max_scroll = self.max_scroll(viewport_height);
         self.scroll = self.scroll.saturating_add(amount).min(max_scroll);
@@ -2628,6 +2902,33 @@ impl UiModel {
 
 fn muted_separator_style() -> Style {
     Style::default().fg(Color::DarkGray)
+}
+
+/// Copy `content` to the system clipboard via the OSC 52 escape sequence.
+/// Written straight to stdout: an OSC sequence does not disturb the ratatui
+/// cell grid, and support is up to the terminal (unsupported ones ignore it).
+fn write_clipboard_osc52(content: &str) -> TuiResult<()> {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::style::Print(format!("\x1b]52;c;{encoded}\x07"))
+    )?;
+    Ok(())
+}
+
+/// Cap clipboard payloads at `MAX_CLIPBOARD_BYTES` on a char boundary; returns
+/// whether anything was dropped.
+fn clip_for_clipboard(mut content: String) -> (String, bool) {
+    if content.len() <= MAX_CLIPBOARD_BYTES {
+        return (content, false);
+    }
+    let mut cut = MAX_CLIPBOARD_BYTES;
+    while !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    content.truncate(cut);
+    (content, true)
 }
 
 fn render_horizontal_separator(frame: &mut Frame<'_>, area: Rect, label: &str, style: Style) {
@@ -5373,6 +5674,273 @@ mod tests {
         assert!(model.plan_approval.is_none());
         assert_eq!(model.mode, UiMode::Normal);
         assert_eq!(model.focus, FocusTarget::Transcript);
+    }
+
+    fn select_model_with_items(count: usize) -> UiModel {
+        let mut model = workspace_normal_model();
+        for idx in 0..count {
+            let id = model.next_item_id();
+            model.push_history(TranscriptItem::info(id, format!("item {idx}")));
+        }
+        model
+    }
+
+    fn enter_select(model: &mut UiModel, t0: Instant) {
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(100));
+    }
+
+    fn clipboard_content(effects: &[UiEffect]) -> Option<&str> {
+        effects.iter().find_map(|effect| match &effect.kind {
+            UiEffectKind::CopyToClipboard { content } => Some(content.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn double_esc_within_window_enters_transcript_select() {
+        let mut model = select_model_with_items(3);
+        enter_select(&mut model, Instant::now());
+
+        assert_eq!(model.mode, UiMode::TranscriptSelect);
+        assert!(!model.auto_scroll);
+        assert_eq!(model.transcript_select.map(|state| state.selected), Some(2));
+    }
+
+    #[test]
+    fn slow_double_esc_stays_normal() {
+        let mut model = select_model_with_items(1);
+        let t0 = Instant::now();
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(600));
+
+        assert_eq!(model.mode, UiMode::Normal);
+        assert!(model.transcript_select.is_none());
+    }
+
+    #[test]
+    fn esc_from_insert_then_esc_enters_select() {
+        let mut model = workspace_insert_model();
+        let id = model.next_item_id();
+        model.push_history(TranscriptItem::info(id, "row"));
+
+        let t0 = Instant::now();
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
+        assert_eq!(model.mode, UiMode::Normal);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(100));
+
+        assert_eq!(model.mode, UiMode::TranscriptSelect);
+    }
+
+    #[test]
+    fn key_between_escs_breaks_chord() {
+        let mut model = select_model_with_items(1);
+        let t0 = Instant::now();
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Char('j')), t0 + Duration::from_millis(50));
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(100));
+
+        assert_eq!(model.mode, UiMode::Normal);
+    }
+
+    #[test]
+    fn double_esc_on_empty_transcript_stays_normal() {
+        let mut model = workspace_normal_model();
+        enter_select(&mut model, Instant::now());
+
+        assert_eq!(model.mode, UiMode::Normal);
+        assert!(model.transcript_select.is_none());
+        assert_eq!(model.status_line, "Transcript is empty");
+    }
+
+    #[test]
+    fn select_navigation_clamps_and_scrolls() {
+        let mut model = select_model_with_items(8);
+        model.viewport_height = 4;
+        model.transcript_inner_width = 40;
+        let t0 = Instant::now();
+        enter_select(&mut model, t0);
+
+        // Starts on the last item, scrolled so it is visible.
+        assert_eq!(model.transcript_select.map(|state| state.selected), Some(7));
+        assert!(model.scroll > 0);
+
+        let t = t0 + Duration::from_millis(200);
+        let _ = model.handle_key_event_at(key(KeyCode::Char('j')), t);
+        assert_eq!(
+            model.transcript_select.map(|state| state.selected),
+            Some(7),
+            "j clamps at the last item"
+        );
+
+        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t);
+        assert_eq!(model.transcript_select.map(|state| state.selected), Some(0));
+        assert_eq!(model.scroll, 0, "jumping to the first item scrolls to top");
+
+        let _ = model.handle_key_event_at(key(KeyCode::Char('k')), t);
+        assert_eq!(
+            model.transcript_select.map(|state| state.selected),
+            Some(0),
+            "k clamps at the first item"
+        );
+    }
+
+    #[test]
+    fn select_esc_and_q_exit_without_app_exit() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut model = select_model_with_items(2);
+            let t0 = Instant::now();
+            enter_select(&mut model, t0);
+            assert_eq!(model.mode, UiMode::TranscriptSelect);
+
+            let effects = model.handle_key_event_at(key(code), t0 + Duration::from_secs(2));
+            assert!(effects.is_empty(), "{code:?} must not exit the app");
+            assert_eq!(model.mode, UiMode::Normal);
+            assert!(model.transcript_select.is_none());
+        }
+    }
+
+    #[test]
+    fn y_copies_tool_result_then_second_y_copies_args() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        start_tool_call(&mut app, "1", "call-1", "run_command", "{\"cmd\":\"ls\"}");
+        complete_tool_call(&mut app, "2", "call-1", true, None);
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        assert_eq!(app.model.mode, UiMode::TranscriptSelect);
+
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(200));
+        assert_eq!(clipboard_content(&effects), Some("BIG CONTENT"));
+
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(300));
+        assert_eq!(clipboard_content(&effects), Some("{\"cmd\":\"ls\"}"));
+
+        // After the chord window the next y copies the result again.
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(1200));
+        assert_eq!(clipboard_content(&effects), Some("BIG CONTENT"));
+    }
+
+    #[test]
+    fn y_on_running_tool_falls_back_to_args() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        start_tool_call(
+            &mut app,
+            "1",
+            "call-1",
+            "run_command",
+            "{\"cmd\":\"sleep\"}",
+        );
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(200));
+        assert_eq!(clipboard_content(&effects), Some("{\"cmd\":\"sleep\"}"));
+    }
+
+    #[test]
+    fn y_copies_user_message_and_assistant_raw_markdown() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        app.handle_session_event(
+            event(
+                "1",
+                EventMsg::UserMessage {
+                    text: String::from("hello there"),
+                },
+            ),
+            20,
+        );
+        let markdown = "answer:\n\n```rust\nlet x = 1;\n```";
+        complete_agent_message(&mut app, "2", "assistant-1", markdown);
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        // Last item is the assistant message.
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(200));
+        assert_eq!(clipboard_content(&effects), Some(markdown));
+
+        let t = t0 + Duration::from_secs(2);
+        let _ = app.model.handle_key_event_at(key(KeyCode::Char('k')), t);
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t + Duration::from_millis(100));
+        assert_eq!(clipboard_content(&effects), Some("hello there"));
+    }
+
+    #[test]
+    fn selected_item_lines_get_background_highlight() {
+        let mut model = select_model_with_items(2);
+        model.transcript_inner_width = 40;
+        enter_select(&mut model, Instant::now());
+
+        let lines = model.visible_transcript_lines(40, 10);
+        // Layout: item0 row, separator, item1 row (selected).
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].style.bg, None);
+        assert_eq!(lines[2].style.bg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn turn_interrupted_exits_select_mode() {
+        let mut model = select_model_with_items(2);
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        enter_select(&mut model, Instant::now());
+        assert_eq!(model.mode, UiMode::TranscriptSelect);
+
+        model.apply_protocol_event(event(
+            "interrupted",
+            EventMsg::TurnInterrupted(TurnInterruptedEvent {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                reason: "interrupted".to_string(),
+            }),
+        ));
+
+        assert_eq!(model.mode, UiMode::Normal);
+        assert!(model.transcript_select.is_none());
+    }
+
+    #[test]
+    fn tool_output_is_stored_on_completion() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        start_tool_call(&mut app, "1", "call-1", "run_command", "{}");
+        complete_tool_call(&mut app, "2", "call-1", true, None);
+
+        let stored = app
+            .model
+            .transcript_items
+            .iter()
+            .find_map(|item| item.tool_group_cell())
+            .and_then(|cell| cell.copy_result());
+        assert_eq!(stored.as_deref(), Some("BIG CONTENT"));
+    }
+
+    #[test]
+    fn clipboard_payload_truncates_on_char_boundary() {
+        let long = "é".repeat(MAX_CLIPBOARD_BYTES);
+        let (clipped, truncated) = clip_for_clipboard(long);
+        assert!(truncated);
+        assert!(clipped.len() <= MAX_CLIPBOARD_BYTES);
+        assert!(clipped.chars().all(|c| c == 'é'));
+
+        let (kept, truncated) = clip_for_clipboard(String::from("short"));
+        assert!(!truncated);
+        assert_eq!(kept, "short");
     }
 
     trait JoinLines {

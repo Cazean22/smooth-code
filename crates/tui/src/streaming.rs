@@ -5,6 +5,7 @@ use crate::markdown_stream::MarkdownStreamCollector;
 pub(crate) struct StreamController {
     collector: MarkdownStreamCollector,
     committed_lines: Vec<Line<'static>>,
+    raw: String,
 }
 
 impl StreamController {
@@ -12,10 +13,12 @@ impl StreamController {
         Self {
             collector: MarkdownStreamCollector::new(width),
             committed_lines: Vec::new(),
+            raw: String::new(),
         }
     }
 
     pub(crate) fn push(&mut self, delta: &str) -> bool {
+        self.raw.push_str(delta);
         self.collector.push_delta(delta);
         let new_lines = self.collector.commit_complete_lines();
         if new_lines.is_empty() {
@@ -34,10 +37,11 @@ impl StreamController {
         (!lines.is_empty()).then_some(lines)
     }
 
-    pub(crate) fn finalize_lines(mut self) -> Option<Vec<Line<'static>>> {
+    /// Final rendered lines paired with the raw markdown that produced them.
+    pub(crate) fn finalize_parts(mut self) -> Option<(Vec<Line<'static>>, String)> {
         let remaining = self.collector.finalize_and_drain();
         self.committed_lines.extend(remaining);
-        (!self.committed_lines.is_empty()).then_some(self.committed_lines)
+        (!self.committed_lines.is_empty()).then_some((self.committed_lines, self.raw))
     }
 }
 

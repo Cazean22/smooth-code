@@ -3144,6 +3144,7 @@ dependencies = [
  "anyhow",
  "app-server",
  "app-server-protocol",
+ "base64 0.22.1",
  "console-subscriber",
  "crossterm",
  "diffy",

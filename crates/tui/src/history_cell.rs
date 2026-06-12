@@ -3,7 +3,7 @@ use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
 };
-use smooth_protocol::{FileChangeOutput, TodoItem, TodoStatus};
+use smooth_protocol::{FileChange, FileChangeOutput, TodoItem, TodoStatus};
 
 use crate::{diff_render::create_diff_summary, wrap};
 
@@ -29,6 +29,7 @@ impl TranscriptItem {
         id: TranscriptItemId,
         lines: Vec<Line<'static>>,
         is_first_line: bool,
+        raw: String,
     ) -> Self {
         Self {
             id,
@@ -36,6 +37,7 @@ impl TranscriptItem {
             kind: TranscriptItemKind::Assistant {
                 lines,
                 is_first_line,
+                raw,
             },
         }
     }
@@ -44,6 +46,7 @@ impl TranscriptItem {
         id: TranscriptItemId,
         lines: Vec<Line<'static>>,
         is_first_line: bool,
+        raw: String,
     ) -> Self {
         Self {
             id,
@@ -51,6 +54,7 @@ impl TranscriptItem {
             kind: TranscriptItemKind::Reasoning {
                 lines,
                 is_first_line,
+                raw,
             },
         }
     }
@@ -152,6 +156,7 @@ impl TranscriptItem {
             TranscriptItemKind::Assistant {
                 lines,
                 is_first_line,
+                ..
             } => {
                 let first_prefix = if *is_first_line {
                     "• ".green().bold()
@@ -163,6 +168,7 @@ impl TranscriptItem {
             TranscriptItemKind::Reasoning {
                 lines,
                 is_first_line,
+                ..
             } => {
                 let first_prefix = if *is_first_line {
                     Span::styled("… ", Style::default().fg(Color::Magenta).dim().bold())
@@ -202,6 +208,71 @@ impl TranscriptItem {
         }
     }
 
+    pub(crate) fn tool_group_cell(&self) -> Option<&ToolCallGroupCell> {
+        match &self.kind {
+            TranscriptItemKind::ToolCallGroup(cell) => Some(cell),
+            _ => None,
+        }
+    }
+
+    /// The real (unrendered) content of this row for copying to the clipboard.
+    /// Tool groups yield their result; the args variant is reached separately
+    /// through [`ToolCallGroupCell::copy_args`].
+    pub(crate) fn copy_text(&self) -> Option<String> {
+        match &self.kind {
+            TranscriptItemKind::User { message } => Some(message.clone()),
+            TranscriptItemKind::Assistant { lines, raw, .. }
+            | TranscriptItemKind::Reasoning { lines, raw, .. } => {
+                if raw.is_empty() {
+                    Some(flatten_lines(lines))
+                } else {
+                    Some(raw.clone())
+                }
+            }
+            TranscriptItemKind::Plain { lines, .. } => Some(flatten_lines(lines)),
+            TranscriptItemKind::Patch { file_change } => {
+                let path = file_change.path.display();
+                Some(match &file_change.change {
+                    FileChange::Add { content } => format!("add {path}\n{content}"),
+                    FileChange::Delete { content } => format!("delete {path}\n{content}"),
+                    FileChange::Update {
+                        unified_diff,
+                        move_path,
+                    } => match move_path {
+                        Some(move_path) => {
+                            format!("rename to {}\n{unified_diff}", move_path.display())
+                        }
+                        None => unified_diff.clone(),
+                    },
+                    FileChange::Omitted {
+                        operation,
+                        reason,
+                        added,
+                        removed,
+                        bytes,
+                    } => format!(
+                        "{operation:?} {path}: omitted ({reason}, +{added}/-{removed}, {bytes} bytes)"
+                    ),
+                })
+            }
+            TranscriptItemKind::TodoList { todos } => Some(
+                todos
+                    .iter()
+                    .map(|todo| {
+                        let marker = match todo.status {
+                            TodoStatus::Pending => "- [ ] ",
+                            TodoStatus::InProgress => "- [~] ",
+                            TodoStatus::Completed => "- [x] ",
+                        };
+                        format!("{marker}{}", todo.content)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            TranscriptItemKind::ToolCallGroup(cell) => cell.copy_result(),
+        }
+    }
+
     pub(crate) fn replace_with_patch(&mut self, file_change: FileChangeOutput) {
         self.kind = TranscriptItemKind::Patch { file_change };
         self.version = self.version.saturating_add(1);
@@ -225,10 +296,12 @@ enum TranscriptItemKind {
     Assistant {
         lines: Vec<Line<'static>>,
         is_first_line: bool,
+        raw: String,
     },
     Reasoning {
         lines: Vec<Line<'static>>,
         is_first_line: bool,
+        raw: String,
     },
     Plain {
         lines: Vec<Line<'static>>,
@@ -255,6 +328,7 @@ pub(crate) struct ToolCallEntry {
     args_preview: String,
     state: ToolCallState,
     error: Option<String>,
+    output: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +345,7 @@ impl ToolCallGroupCell {
                 args_preview,
                 state: ToolCallState::Running,
                 error: None,
+                output: None,
             }],
         }
     }
@@ -285,6 +360,7 @@ impl ToolCallGroupCell {
             args_preview,
             state: ToolCallState::Running,
             error: None,
+            output: None,
         });
         entry_idx
     }
@@ -303,6 +379,41 @@ impl ToolCallGroupCell {
             entry.state = state;
             entry.error = error;
         }
+    }
+
+    pub(crate) fn set_entry_output(&mut self, entry_idx: usize, output: String) {
+        if let Some(entry) = self.entries.get_mut(entry_idx) {
+            entry.output = Some(output);
+        }
+    }
+
+    /// The real tool results for copying: each finished entry contributes its
+    /// stored output (or its error), running entries are skipped. `None` when
+    /// no entry has anything to report yet.
+    pub(crate) fn copy_result(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|entry| match (&entry.output, &entry.error) {
+                (Some(output), _) => Some(output.clone()),
+                (None, Some(error)) => Some(format!("error: {error}")),
+                (None, None) => None,
+            })
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
+    }
+
+    /// The real tool parameters for copying: the full JSON args of every entry.
+    pub(crate) fn copy_args(&self) -> String {
+        self.entries
+            .iter()
+            .map(|entry| entry.args_preview.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     pub(crate) fn display_lines(&self, width: usize) -> Vec<Line<'static>> {
@@ -351,6 +462,21 @@ impl ToolCallGroupCell {
         }
         lines
     }
+}
+
+/// Flatten rendered lines to plain text: spans concatenated per line, lines
+/// joined with newlines.
+fn flatten_lines(lines: &[Line<'static>]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Render a `todo_write` checklist snapshot: one glyph-prefixed row per todo,
@@ -544,6 +670,7 @@ fn user_separator(width: u16) -> Line<'static> {
 mod tests {
     use super::*;
     use crate::markdown_render::CODE_COLOR;
+    use smooth_protocol::FileChangeOperation;
 
     #[test]
     fn fenced_code_line_marker_is_preformatted() {
@@ -737,6 +864,138 @@ mod tests {
 
         assert!(texts.last().is_some_and(|t| t.starts_with("☐ ")));
         within_width(&lines, 24);
+    }
+
+    #[test]
+    fn copy_text_returns_user_message_verbatim() {
+        let item = TranscriptItem::user(1, "hello\nworld".to_string());
+        assert_eq!(item.copy_text().as_deref(), Some("hello\nworld"));
+    }
+
+    #[test]
+    fn copy_text_returns_assistant_raw_markdown() {
+        let raw = "# Title\n\n```rust\nlet x = 1;\n```";
+        let item = TranscriptItem::assistant(1, vec![Line::from("Title")], true, raw.to_string());
+        assert_eq!(item.copy_text().as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn copy_text_falls_back_to_flattened_lines_when_raw_empty() {
+        let item = TranscriptItem::assistant(
+            1,
+            vec![
+                Line::from(vec![Span::raw("first "), Span::raw("line")]),
+                Line::from("second"),
+            ],
+            true,
+            String::new(),
+        );
+        assert_eq!(item.copy_text().as_deref(), Some("first line\nsecond"));
+    }
+
+    #[test]
+    fn copy_text_flattens_plain_rows() {
+        let item = TranscriptItem::info(1, "something happened");
+        assert_eq!(item.copy_text().as_deref(), Some("i something happened"));
+    }
+
+    #[test]
+    fn copy_text_renders_todo_checkboxes() {
+        let item = TranscriptItem::todo_list(
+            1,
+            vec![
+                TodoItem {
+                    content: "done".to_string(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "doing".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    content: "later".to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+        );
+        assert_eq!(
+            item.copy_text().as_deref(),
+            Some("- [x] done\n- [~] doing\n- [ ] later")
+        );
+    }
+
+    #[test]
+    fn copy_text_returns_patch_content_with_header() {
+        let item = TranscriptItem::patch(
+            1,
+            FileChangeOutput {
+                path: "src/new.rs".into(),
+                change: FileChange::Add {
+                    content: "fn main() {}".to_string(),
+                },
+            },
+        );
+        assert_eq!(
+            item.copy_text().as_deref(),
+            Some("add src/new.rs\nfn main() {}")
+        );
+
+        let item = TranscriptItem::patch(
+            1,
+            FileChangeOutput {
+                path: "src/lib.rs".into(),
+                change: FileChange::Update {
+                    unified_diff: "@@ -1 +1 @@\n-a\n+b".to_string(),
+                    move_path: None,
+                },
+            },
+        );
+        assert_eq!(item.copy_text().as_deref(), Some("@@ -1 +1 @@\n-a\n+b"));
+
+        let item = TranscriptItem::patch(
+            1,
+            FileChangeOutput {
+                path: "big.bin".into(),
+                change: FileChange::Omitted {
+                    operation: FileChangeOperation::Update,
+                    reason: "too large".to_string(),
+                    added: 10,
+                    removed: 2,
+                    bytes: 4096,
+                },
+            },
+        );
+        assert_eq!(
+            item.copy_text().as_deref(),
+            Some("Update big.bin: omitted (too large, +10/-2, 4096 bytes)")
+        );
+    }
+
+    #[test]
+    fn tool_copy_result_joins_outputs_and_errors() {
+        let mut cell = ToolCallGroupCell::new("run".to_string(), "{\"a\":1}".to_string());
+        cell.set_entry_output(0, "first output".to_string());
+        cell.set_entry_outcome(0, ToolCallState::Success, None);
+        let second = cell.push_entry("{\"b\":2}".to_string());
+        cell.set_entry_outcome(second, ToolCallState::Failure, Some("boom".to_string()));
+
+        assert_eq!(
+            cell.copy_result().as_deref(),
+            Some("first output\n\nerror: boom")
+        );
+    }
+
+    #[test]
+    fn tool_copy_result_is_none_while_running() {
+        let cell = ToolCallGroupCell::new("run".to_string(), "{}".to_string());
+        assert_eq!(cell.copy_result(), None);
+    }
+
+    #[test]
+    fn tool_copy_args_joins_full_json_args() {
+        let mut cell = ToolCallGroupCell::new("run".to_string(), "{\"a\":1}".to_string());
+        cell.push_entry("{\"b\":2}".to_string());
+        assert_eq!(cell.copy_args(), "{\"a\":1}\n\n{\"b\":2}");
     }
 
     #[test]

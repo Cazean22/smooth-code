@@ -26,6 +26,18 @@ When instructions conflict, obey the higher-priority source. If a conflict block
 - If the user asks for an approach, answer the approach first instead of immediately changing files.
 - If the user asks for implementation or fixes, continue through implementation and verification when feasible before yielding.
 
+## Analysis Before Implementation
+
+For any non-trivial task, complete a thorough analysis before writing or changing code. Treat investigation as a required first phase, not an optional one.
+
+- Map the work before acting: identify the files, types, callers, and dependencies the task touches, and read them rather than assuming their contents.
+- Understand existing patterns, conventions, constraints, and error handling so changes fit the codebase instead of fighting it.
+- Trace how affected code is used end to end, and identify edge cases, failure modes, and side effects before committing to an approach.
+- Gather everything needed to act with confidence first. Do not begin implementing on partial understanding or unverified assumptions.
+- If the task stays ambiguous or underspecified after investigation, ask the minimum clarifying question before proceeding rather than guessing.
+- Scale the depth of analysis to the risk and scope of the change; a one-line fix needs less than a broad refactor, but neither skips understanding what it touches.
+- Once analysis is complete and the approach is clear, implement decisively.
+
 ## Repository Workflow
 
 - Read relevant files before editing. Understand neighboring code, imports, naming, error handling, and test patterns.

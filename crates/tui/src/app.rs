@@ -445,6 +445,9 @@ struct UiModel {
     /// Stacked full-screen subagent previews (`gd`); the top view receives
     /// keys and is rendered, nesting pushes deeper.
     preview_stack: Vec<SubagentPreviewView>,
+    /// Subagent previews popped with Ctrl-O, newest last. Ctrl-I reopens these
+    /// by issuing fresh preview requests, preserving server watcher refcounts.
+    preview_forward_stack: Vec<ThreadId>,
     /// Timestamp of the last Esc press in Normal mode (or leaving Insert),
     /// armed for double-Esc detection.
     last_esc: Option<Instant>,
@@ -505,6 +508,7 @@ impl UiModel {
             dashboard: DashboardState::default(),
             transcript_select: None,
             preview_stack: Vec::new(),
+            preview_forward_stack: Vec::new(),
             last_esc: None,
             running_tools: HashMap::new(),
             recent_file_changes: Vec::new(),
@@ -664,6 +668,33 @@ impl UiModel {
         self.handle_key_event_at(key_event, Instant::now())
     }
 
+    fn is_ctrl_o(key_event: KeyEvent) -> bool {
+        matches!(key_event.code, KeyCode::Char('o') | KeyCode::Char('O'))
+            && key_event.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
+    fn is_disambiguated_ctrl_i(key_event: KeyEvent) -> bool {
+        matches!(key_event.code, KeyCode::Char('i') | KeyCode::Char('I'))
+            && key_event.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
+    fn is_preview_forward_key(&self, key_event: KeyEvent) -> bool {
+        Self::is_disambiguated_ctrl_i(key_event)
+            || (!self.preview_forward_stack.is_empty()
+                && matches!(key_event.code, KeyCode::Tab)
+                && (key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::CONTROL))
+    }
+
+    fn preview_forward_allowed_in_current_context(&self) -> bool {
+        self.screen == Screen::Workspace
+            && self.question_picker.is_none()
+            && self.plan_approval.is_none()
+            && !matches!(
+                self.mode,
+                UiMode::Command | UiMode::Insert | UiMode::Overlay
+            )
+    }
+
     fn handle_key_event_at(&mut self, key_event: KeyEvent, now: Instant) -> Vec<UiEffect> {
         if key_event.kind != crossterm::event::KeyEventKind::Press {
             return Vec::new();
@@ -681,6 +712,13 @@ impl UiModel {
                 return self.request_turn_cancel();
             }
             return vec![self.effect(EffectContext::Exit, UiEffectKind::Exit)];
+        }
+
+        if self.preview_forward_allowed_in_current_context()
+            && !self.preview_forward_stack.is_empty()
+            && self.is_preview_forward_key(key_event)
+        {
+            return self.reopen_forward_preview();
         }
 
         // A stacked subagent preview owns the keyboard (server-driven
@@ -792,12 +830,14 @@ impl UiModel {
 
     fn handle_normal_key(&mut self, key_event: KeyEvent, now: Instant) -> Vec<UiEffect> {
         match key_event.code {
-            KeyCode::Char('i') => {
+            KeyCode::Char('i') if key_event.modifiers.is_empty() => {
                 self.mode = UiMode::Insert;
                 self.focus = FocusTarget::Composer;
                 Vec::new()
             }
-            KeyCode::Char('I') => {
+            KeyCode::Char('I')
+                if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
+            {
                 self.toggle_inspector_visible();
                 Vec::new()
             }
@@ -988,6 +1028,34 @@ impl UiModel {
             };
             return Vec::new();
         };
+        self.preview_forward_stack.clear();
+        self.status_line = String::from("Opening subagent…");
+        vec![self.effect(
+            EffectContext::ThreadPreview { thread_id },
+            UiEffectKind::ThreadPreview { thread_id },
+        )]
+    }
+
+    fn pop_preview_back(&mut self) -> Vec<UiEffect> {
+        let Some(popped) = self.preview_stack.pop() else {
+            return Vec::new();
+        };
+        let thread_id = popped.thread_id;
+        self.preview_forward_stack.push(thread_id);
+        self.status_line = match self.preview_stack.last() {
+            Some(top) => format!("{} — Ctrl-O back, Ctrl-I forward", top.header_label()),
+            None => String::from("Returned to parent session — Ctrl-I forward"),
+        };
+        vec![self.effect(
+            EffectContext::ThreadUnwatch,
+            UiEffectKind::ThreadUnwatch { thread_id },
+        )]
+    }
+
+    fn reopen_forward_preview(&mut self) -> Vec<UiEffect> {
+        let Some(thread_id) = self.preview_forward_stack.pop() else {
+            return Vec::new();
+        };
         self.status_line = String::from("Opening subagent…");
         vec![self.effect(
             EffectContext::ThreadPreview { thread_id },
@@ -1013,8 +1081,8 @@ impl UiModel {
     }
 
     /// A preview's default sub-mode: Normal-like line/page scrolling with no
-    /// selection highlight. `q` pops the preview (one `ThreadUnwatch` per pop —
-    /// the server refcounts watchers); `Esc Esc` enters the select sub-mode.
+    /// selection highlight. `Ctrl-O` pops the preview (one `ThreadUnwatch` per
+    /// pop — the server refcounts watchers); `Esc Esc` enters the select sub-mode.
     fn handle_preview_scroll_key(
         &mut self,
         key_event: KeyEvent,
@@ -1022,25 +1090,13 @@ impl UiModel {
         width: u16,
         viewport: u16,
     ) -> Vec<UiEffect> {
+        if Self::is_ctrl_o(key_event) {
+            return self.pop_preview_back();
+        }
         let Some(view) = self.preview_stack.last_mut() else {
             return Vec::new();
         };
         match key_event.code {
-            KeyCode::Char('q') => {
-                let Some(popped) = self.preview_stack.pop() else {
-                    return Vec::new();
-                };
-                self.status_line = match self.preview_stack.last() {
-                    Some(top) => format!("{} — q back", top.header_label()),
-                    None => String::from("Closed subagent preview"),
-                };
-                vec![self.effect(
-                    EffectContext::ThreadUnwatch,
-                    UiEffectKind::ThreadUnwatch {
-                        thread_id: popped.thread_id,
-                    },
-                )]
-            }
             KeyCode::Esc => {
                 let chord = view
                     .pending_esc
@@ -1051,8 +1107,9 @@ impl UiModel {
                     view.select_mode = true;
                     view.selected = view.first_visible_item(width);
                     view.ensure_selected_visible(width, viewport);
-                    self.status_line =
-                        String::from("Subagent select — j/k move, gd open, Esc back");
+                    self.status_line = String::from(
+                        "Subagent select — j/k move, gd open, Esc scroll, Ctrl-O back",
+                    );
                 } else {
                     view.pending_esc = Some(now);
                 }
@@ -1138,7 +1195,8 @@ impl UiModel {
 
     /// A preview's transcript-select sub-mode (entered with `Esc Esc`): a
     /// highlighted row, `j`/`k` move the selection, `gg`/`G`/Home/End move it,
-    /// `gd` nests a deeper preview, `y`/`yy` copy. `Esc`/`q` return to scroll.
+    /// `gd` nests a deeper preview, `y`/`yy` copy. `Esc` returns to scroll and
+    /// `Ctrl-O` returns to the parent preview/session.
     fn handle_preview_select_key(
         &mut self,
         key_event: KeyEvent,
@@ -1146,17 +1204,21 @@ impl UiModel {
         width: u16,
         viewport: u16,
     ) -> Vec<UiEffect> {
+        if Self::is_ctrl_o(key_event) {
+            return self.pop_preview_back();
+        }
         let Some(view) = self.preview_stack.last_mut() else {
             return Vec::new();
         };
         let last = view.item_count().saturating_sub(1);
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc => {
                 view.select_mode = false;
                 view.pending_g = None;
                 view.pending_esc = None;
                 view.pending_args = None;
-                self.status_line = String::from("Subagent preview — q back, Esc Esc select");
+                self.status_line =
+                    String::from("Subagent preview — Ctrl-O back, Ctrl-I forward, Esc Esc select");
                 Vec::new()
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1200,6 +1262,7 @@ impl UiModel {
                     .map(|group| (group.is_spawn_agent(), group.subagent_thread_id()));
                 match target {
                     Some((_, Some(thread_id))) => {
+                        self.preview_forward_stack.clear();
                         self.status_line = String::from("Opening subagent…");
                         vec![self.effect(
                             EffectContext::ThreadPreview { thread_id },
@@ -1969,7 +2032,11 @@ impl UiModel {
         let width = self.terminal_width.max(1);
         let mut view = SubagentPreviewView::from_preview_response(response, width);
         view.scroll_to_bottom(width, self.viewport_height);
-        self.status_line = format!("{} — q back", view.header_label());
+        self.status_line = if self.preview_forward_stack.is_empty() {
+            format!("{} — Ctrl-O back", view.header_label())
+        } else {
+            format!("{} — Ctrl-O back, Ctrl-I forward", view.header_label())
+        };
         self.preview_stack.push(view);
         Vec::new()
     }
@@ -1978,6 +2045,7 @@ impl UiModel {
     /// server refcounts watchers, so each successful preview needs exactly
     /// one release, duplicates included.
     fn clear_preview_stack(&mut self) -> Vec<UiEffect> {
+        self.preview_forward_stack.clear();
         let views = std::mem::take(&mut self.preview_stack);
         views
             .into_iter()
@@ -2943,9 +3011,9 @@ impl UiModel {
         // feedback ("Subagent not started yet", failed nested opens) would
         // otherwise be invisible until the user exits.
         let hint = if select_mode {
-            "j/k move  gg/G top/bottom  gd nested  y copy  Esc back"
+            "j/k move  gg/G top/bottom  gd nested  y copy  Esc scroll  Ctrl-O back"
         } else {
-            "j/k scroll  gg/G top/bottom  Esc Esc select  q back"
+            "j/k scroll  gg/G top/bottom  Esc Esc select  Ctrl-O back  Ctrl-I forward"
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -4685,6 +4753,7 @@ mod tests {
         if let Some(state) = app.model.transcript_select.as_mut() {
             state.selected = tool_row;
         }
+        app.model.preview_forward_stack.push(ThreadId::new());
 
         let t = t0 + Duration::from_millis(300);
         let effects = app.model.handle_key_event_at(key(KeyCode::Char('g')), t);
@@ -4701,6 +4770,7 @@ mod tests {
             })
             .collect();
         assert_eq!(preview_targets, vec![child_thread_id]);
+        assert!(app.model.preview_forward_stack.is_empty());
         assert_eq!(app.model.mode, UiMode::TranscriptSelect);
         assert_eq!(
             app.model.transcript_select.map(|state| state.selected),
@@ -6897,6 +6967,16 @@ mod tests {
             .collect()
     }
 
+    fn preview_targets(effects: &[UiEffect]) -> Vec<ThreadId> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect.kind {
+                UiEffectKind::ThreadPreview { thread_id } => Some(thread_id),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn child_event(id: &str, msg: EventMsg) -> Event {
         Event {
             id: id.to_owned(),
@@ -6936,7 +7016,7 @@ mod tests {
         assert!(rendered.contains("subagent worker"), "{rendered}");
         assert!(rendered.contains("running"), "{rendered}");
         assert!(rendered.contains("inspect the rollout"), "{rendered}");
-        assert!(rendered.contains("q back"), "{rendered}");
+        assert!(rendered.contains("Ctrl-O back"), "{rendered}");
         Ok(())
     }
 
@@ -7062,7 +7142,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_pop_emits_one_unwatch_per_view_and_preserves_parent_state() {
+    fn preview_ctrl_o_pops_one_view_and_ctrl_i_reopens_forward() {
         let mut model = select_model_with_items(4);
         let t0 = Instant::now();
         enter_select(&mut model, t0);
@@ -7076,25 +7156,47 @@ mod tests {
         open_preview(&mut model, child, Vec::new());
 
         let t = t0 + Duration::from_millis(300);
-        let effects = model.handle_key_event_at(key(KeyCode::Char('q')), t);
+        let ctrl_o = modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let ctrl_i = modified_key(KeyCode::Char('i'), KeyModifiers::CONTROL);
+        let effects = model.handle_key_event_at(ctrl_o, t);
         assert_eq!(
             unwatch_targets(&effects),
             vec![child],
-            "first pop unwatches"
+            "first back unwatches"
+        );
+        assert_eq!(model.preview_stack.len(), 1);
+        assert_eq!(model.preview_forward_stack, vec![child]);
+
+        let effects = model.handle_key_event_at(ctrl_i, t + Duration::from_millis(50));
+        assert_eq!(preview_targets(&effects), vec![child]);
+        assert!(model.preview_forward_stack.is_empty());
+        open_preview(&mut model, child, Vec::new());
+        assert_eq!(model.preview_stack.len(), 2);
+
+        let effects = model.handle_key_event_at(ctrl_o, t + Duration::from_millis(100));
+        assert_eq!(
+            unwatch_targets(&effects),
+            vec![child],
+            "second back unwatches"
         );
         assert_eq!(model.preview_stack.len(), 1);
 
-        let effects = model.handle_key_event_at(key(KeyCode::Char('q')), t);
+        let effects = model.handle_key_event_at(ctrl_o, t + Duration::from_millis(150));
         assert_eq!(
             unwatch_targets(&effects),
             vec![child],
-            "second pop unwatches again — the server refcount drains to zero"
+            "third back unwatches again — the server refcount drains to zero"
         );
         assert!(model.preview_stack.is_empty());
 
         assert_eq!(model.mode, UiMode::TranscriptSelect);
         assert_eq!(model.transcript_select.map(|state| state.selected), Some(2));
         assert_eq!(model.scroll, parent_scroll);
+        assert_eq!(model.preview_forward_stack, vec![child, child]);
+
+        let effects = model.handle_key_event_at(ctrl_i, t + Duration::from_millis(200));
+        assert_eq!(preview_targets(&effects), vec![child]);
+        assert_eq!(model.preview_forward_stack, vec![child]);
     }
 
     #[test]
@@ -7148,21 +7250,18 @@ mod tests {
         );
 
         // `gd` on the spawn row nests a second preview. `gd` lives in the
-        // select sub-mode, reached with `Esc Esc`.
+        // select sub-mode, reached with `Esc Esc`. A fresh `gd` branch clears
+        // any Ctrl-I forward history left by prior back navigation.
+        model.preview_forward_stack.push(ThreadId::new());
         let t0 = Instant::now();
         let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
         let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(50));
         let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0 + Duration::from_millis(100));
         let effects =
             model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(150));
-        let targets: Vec<ThreadId> = effects
-            .iter()
-            .filter_map(|effect| match effect.kind {
-                UiEffectKind::ThreadPreview { thread_id } => Some(thread_id),
-                _ => None,
-            })
-            .collect();
+        let targets = preview_targets(&effects);
         assert_eq!(targets, vec![grandchild]);
+        assert!(model.preview_forward_stack.is_empty());
         open_preview(&mut model, grandchild, Vec::new());
         assert_eq!(model.preview_stack.len(), 2);
     }
@@ -7281,7 +7380,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_esc_exits_select_to_scroll_while_q_pops() {
+    fn preview_esc_exits_select_to_scroll_while_ctrl_o_pops_and_q_is_noop() {
         let mut model = workspace_normal_model();
         let child = ThreadId::new();
         open_preview(
@@ -7306,9 +7405,17 @@ mod tests {
             "Esc in select must not pop the preview"
         );
 
-        // `q` in scroll mode pops the preview with exactly one unwatch.
+        // `q` no longer pops the preview.
         let effects =
             model.handle_key_event_at(key(KeyCode::Char('q')), t0 + Duration::from_millis(150));
+        assert!(effects.is_empty());
+        assert_eq!(model.preview_stack.len(), 1);
+
+        // `Ctrl-O` in scroll mode pops the preview with exactly one unwatch.
+        let effects = model.handle_key_event_at(
+            modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            t0 + Duration::from_millis(200),
+        );
         assert!(model.preview_stack.is_empty());
         assert_eq!(unwatch_targets(&effects), vec![child]);
     }

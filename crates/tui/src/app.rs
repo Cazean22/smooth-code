@@ -1179,7 +1179,7 @@ impl UiModel {
             match key_event.code {
                 _ if Self::is_submit_key(key_event) => {
                     self.skill_popup = None;
-                    return self.request_turn_start();
+                    return self.request_insert_turn_start();
                 }
                 KeyCode::Esc => {
                     self.skill_popup = None;
@@ -1213,7 +1213,7 @@ impl UiModel {
                 self.last_esc = Some(now);
                 Vec::new()
             }
-            _ if Self::is_submit_key(key_event) => self.request_turn_start(),
+            _ if Self::is_submit_key(key_event) => self.request_insert_turn_start(),
             KeyCode::Enter => {
                 self.composer.insert_char('\n');
                 Vec::new()
@@ -1468,6 +1468,15 @@ impl UiModel {
                 ]
             }
         }
+    }
+
+    fn request_insert_turn_start(&mut self) -> Vec<UiEffect> {
+        let effects = self.request_turn_start();
+        if !effects.is_empty() {
+            self.mode = UiMode::Normal;
+            self.focus = FocusTarget::Transcript;
+        }
+        effects
     }
 
     fn request_turn_start(&mut self) -> Vec<UiEffect> {
@@ -4887,6 +4896,8 @@ mod tests {
         ));
         assert!(model.composer.is_empty());
         assert_eq!(model.composer.cursor(), 0);
+        assert_eq!(model.mode, UiMode::Normal);
+        assert_eq!(model.focus, FocusTarget::Transcript);
     }
 
     fn skills_fixture() -> Result<(tempfile::TempDir, UiModel), Box<dyn std::error::Error>> {
@@ -5014,6 +5025,8 @@ mod tests {
             UiEffectKind::TurnStart { input, .. } if input == "/deploy"
         ));
         assert!(model.skill_popup.is_none());
+        assert_eq!(model.mode, UiMode::Normal);
+        assert_eq!(model.focus, FocusTarget::Transcript);
         Ok(())
     }
 

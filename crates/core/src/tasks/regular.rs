@@ -1798,7 +1798,12 @@ async fn start_spawn_tool_call(
 
     match session
         .agent_control
-        .spawn_agent_for_tool(session.id, prompt, system_prompt_kind)
+        .spawn_agent_for_tool(
+            session.id,
+            prompt,
+            system_prompt_kind,
+            internal_call_id.clone(),
+        )
         .await
     {
         Ok((metadata, initial_status, waiter)) => {

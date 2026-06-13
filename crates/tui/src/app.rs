@@ -2124,7 +2124,16 @@ impl UiModel {
                 self.push_info(error.message);
             }
             EventMsg::CollabAgentSpawnBegin(_event) => {}
-            EventMsg::CollabAgentSpawnEnd(_event) => {}
+            EventMsg::CollabAgentSpawnEnd(event) => {
+                if let Some(thread_id) = event.new_thread_id
+                    && let Some((cell_idx, entry_idx)) =
+                        self.tool_call_rows.get(&event.call_id).copied()
+                {
+                    self.tool_group_mut(cell_idx)
+                        .set_entry_related_thread(entry_idx, thread_id);
+                    self.mark_item_mutated(cell_idx);
+                }
+            }
             EventMsg::CollabAgentCompleted(event) => {
                 self.complete_subagent_tool_call(event.child_thread_id, &event.status);
             }
@@ -4536,6 +4545,66 @@ mod tests {
             app.model.status_line,
             "Subagent not started yet — no session to open"
         );
+    }
+
+    #[test]
+    fn gd_on_spawn_row_after_spawn_end_opens_before_tool_result() {
+        let mut app = App::new();
+        let child_thread_id = ThreadId::new();
+
+        start_turn(&mut app);
+        start_tool_call(
+            &mut app,
+            "2",
+            "c1",
+            "spawn_agent",
+            "{\"description\":\"inspect\",\"prompt\":\"inspect\"}",
+        );
+        app.handle_session_event(
+            event(
+                "3",
+                EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: String::from("c1"),
+                    sender_thread_id: ThreadId::new(),
+                    new_thread_id: Some(child_thread_id),
+                    new_agent_nickname: Some(String::from("child")),
+                    prompt: String::from("inspect"),
+                    model: None,
+                    status: AgentStatus::Running,
+                }),
+            ),
+            20,
+        );
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        let Some(tool_row) = app
+            .model
+            .transcript_items
+            .iter()
+            .position(|item| item.tool_group_cell().is_some())
+        else {
+            panic!("spawn tool row index");
+        };
+        if let Some(state) = app.model.transcript_select.as_mut() {
+            state.selected = tool_row;
+        }
+
+        let t = t0 + Duration::from_millis(300);
+        let _ = app.model.handle_key_event_at(key(KeyCode::Char('g')), t);
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('d')), t + Duration::from_millis(100));
+
+        let preview_targets: Vec<ThreadId> = effects
+            .iter()
+            .filter_map(|effect| match effect.kind {
+                UiEffectKind::ThreadPreview { thread_id } => Some(thread_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(preview_targets, vec![child_thread_id]);
+        assert_eq!(app.model.status_line, "Opening subagent…");
     }
 
     #[test]

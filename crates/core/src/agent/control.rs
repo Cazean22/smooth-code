@@ -10,7 +10,6 @@ use smooth_protocol::{
 use smooth_state_db::StateDbHandle;
 use tokio::sync::{RwLock, oneshot, watch};
 use tools::AskUserClient;
-use uuid::Uuid;
 
 use crate::{
     agent::{
@@ -344,8 +343,8 @@ impl AgentControl {
         parent_thread_id: ThreadId,
         prompt: String,
         system_prompt_kind: SystemPromptKind,
+        call_id: String,
     ) -> CoreResult<(AgentMetadata, AgentStatus, InlineChildCompletionReceiver)> {
-        let call_id = Uuid::now_v7().to_string();
         self.emit_collab_event(
             parent_thread_id,
             EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {

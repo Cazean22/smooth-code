@@ -274,6 +274,17 @@ impl SubagentPreviewView {
                 let message = format_args_completed(&event);
                 self.push_history(TranscriptItem::info(id, message));
             }
+            EventMsg::CollabAgentSpawnEnd(event) => {
+                if let Some(thread_id) = event.new_thread_id
+                    && let Some((cell_idx, entry_idx)) =
+                        self.tool_call_rows.get(&event.call_id).copied()
+                {
+                    if let Some(group) = self.tool_group_mut(cell_idx) {
+                        group.set_entry_related_thread(entry_idx, thread_id);
+                    }
+                    self.mark_item_mutated(cell_idx);
+                }
+            }
             // UI-global or cosmetic events have no preview rendering.
             _ => {}
         }

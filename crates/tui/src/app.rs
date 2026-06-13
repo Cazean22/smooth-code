@@ -995,24 +995,43 @@ impl UiModel {
         )]
     }
 
-    /// Keys while a subagent preview is open. The top view is read-only:
-    /// j/k move its selection, `gg`/`G`/Home/End/PgUp/PgDn scroll, `gd` on a
-    /// spawn row nests another preview, `q`/Esc pops back (one `ThreadUnwatch`
-    /// per pop — the server refcounts watchers).
+    /// Keys while a subagent preview is open. The top view owns the keyboard
+    /// and starts in a Normal-like scroll sub-mode; `Esc Esc` switches it into
+    /// a transcript-select sub-mode (mirroring the main view) for `gd`/copy.
     fn handle_preview_key(&mut self, key_event: KeyEvent, now: Instant) -> Vec<UiEffect> {
         let width = self.terminal_width.max(1);
         let viewport = self.viewport_height;
+        let select_mode = match self.preview_stack.last() {
+            Some(view) => view.select_mode,
+            None => return Vec::new(),
+        };
+        if select_mode {
+            self.handle_preview_select_key(key_event, now, width, viewport)
+        } else {
+            self.handle_preview_scroll_key(key_event, now, width, viewport)
+        }
+    }
+
+    /// A preview's default sub-mode: Normal-like line/page scrolling with no
+    /// selection highlight. `q` pops the preview (one `ThreadUnwatch` per pop —
+    /// the server refcounts watchers); `Esc Esc` enters the select sub-mode.
+    fn handle_preview_scroll_key(
+        &mut self,
+        key_event: KeyEvent,
+        now: Instant,
+        width: u16,
+        viewport: u16,
+    ) -> Vec<UiEffect> {
         let Some(view) = self.preview_stack.last_mut() else {
             return Vec::new();
         };
-        let last = view.item_count().saturating_sub(1);
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Char('q') => {
                 let Some(popped) = self.preview_stack.pop() else {
                     return Vec::new();
                 };
                 self.status_line = match self.preview_stack.last() {
-                    Some(top) => format!("{} — q/Esc back", top.header_label()),
+                    Some(top) => format!("{} — q back", top.header_label()),
                     None => String::from("Closed subagent preview"),
                 };
                 vec![self.effect(
@@ -1022,19 +1041,140 @@ impl UiModel {
                     },
                 )]
             }
+            KeyCode::Esc => {
+                let chord = view
+                    .pending_esc
+                    .is_some_and(|t| now.duration_since(t) <= DOUBLE_ESC_WINDOW);
+                if chord {
+                    view.pending_esc = None;
+                    view.pending_g = None;
+                    view.select_mode = true;
+                    view.selected = view.first_visible_item(width);
+                    view.ensure_selected_visible(width, viewport);
+                    self.status_line =
+                        String::from("Subagent select — j/k move, gd open, Esc back");
+                } else {
+                    view.pending_esc = Some(now);
+                }
+                Vec::new()
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                view.pending_esc = None;
+                view.pending_g = None;
+                view.scroll = view.scroll.saturating_sub(1);
+                view.auto_scroll = false;
+                Vec::new()
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                view.pending_esc = None;
+                view.pending_g = None;
+                let max = view.max_scroll(width, viewport);
+                view.scroll = view.scroll.saturating_add(1).min(max);
+                view.auto_scroll = view.scroll >= max;
+                Vec::new()
+            }
+            KeyCode::Char('g') => {
+                view.pending_esc = None;
+                let chord = view
+                    .pending_g
+                    .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
+                if chord {
+                    view.pending_g = None;
+                    view.scroll = 0;
+                    view.auto_scroll = false;
+                } else {
+                    view.pending_g = Some(now);
+                }
+                Vec::new()
+            }
+            KeyCode::Char('d') => {
+                view.pending_esc = None;
+                let chord = view
+                    .pending_g
+                    .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
+                view.pending_g = None;
+                if chord {
+                    self.status_line =
+                        String::from("Press Esc Esc to select a row, then gd to open it");
+                }
+                Vec::new()
+            }
+            KeyCode::Home => {
+                view.pending_esc = None;
+                view.pending_g = None;
+                view.scroll = 0;
+                view.auto_scroll = false;
+                Vec::new()
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                view.pending_esc = None;
+                view.pending_g = None;
+                view.auto_scroll = true;
+                view.scroll_to_bottom(width, viewport);
+                Vec::new()
+            }
+            KeyCode::PageUp => {
+                view.pending_esc = None;
+                view.pending_g = None;
+                view.scroll = view.scroll.saturating_sub(viewport);
+                view.auto_scroll = false;
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                view.pending_esc = None;
+                view.pending_g = None;
+                let max = view.max_scroll(width, viewport);
+                view.scroll = view.scroll.saturating_add(viewport).min(max);
+                view.auto_scroll = view.scroll >= max;
+                Vec::new()
+            }
+            _ => {
+                view.pending_esc = None;
+                view.pending_g = None;
+                Vec::new()
+            }
+        }
+    }
+
+    /// A preview's transcript-select sub-mode (entered with `Esc Esc`): a
+    /// highlighted row, `j`/`k` move the selection, `gg`/`G`/Home/End move it,
+    /// `gd` nests a deeper preview, `y`/`yy` copy. `Esc`/`q` return to scroll.
+    fn handle_preview_select_key(
+        &mut self,
+        key_event: KeyEvent,
+        now: Instant,
+        width: u16,
+        viewport: u16,
+    ) -> Vec<UiEffect> {
+        let Some(view) = self.preview_stack.last_mut() else {
+            return Vec::new();
+        };
+        let last = view.item_count().saturating_sub(1);
+        match key_event.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                view.select_mode = false;
+                view.pending_g = None;
+                view.pending_esc = None;
+                view.pending_args = None;
+                self.status_line = String::from("Subagent preview — q back, Esc Esc select");
+                Vec::new()
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 view.pending_g = None;
+                view.pending_args = None;
                 view.selected = view.selected.saturating_sub(1);
                 view.ensure_selected_visible(width, viewport);
                 Vec::new()
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 view.pending_g = None;
+                view.pending_args = None;
                 view.selected = view.selected.saturating_add(1).min(last);
                 view.ensure_selected_visible(width, viewport);
                 Vec::new()
             }
             KeyCode::Char('g') => {
+                view.pending_args = None;
                 let chord = view
                     .pending_g
                     .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
@@ -1078,14 +1218,17 @@ impl UiModel {
                     }
                 }
             }
+            KeyCode::Char('y') => self.copy_preview_selected_row(now),
             KeyCode::Home => {
                 view.pending_g = None;
+                view.pending_args = None;
                 view.selected = 0;
                 view.ensure_selected_visible(width, viewport);
                 Vec::new()
             }
             KeyCode::End | KeyCode::Char('G') => {
                 view.pending_g = None;
+                view.pending_args = None;
                 view.selected = last;
                 view.ensure_selected_visible(width, viewport);
                 view.auto_scroll = true;
@@ -1093,12 +1236,14 @@ impl UiModel {
             }
             KeyCode::PageUp => {
                 view.pending_g = None;
+                view.pending_args = None;
                 view.scroll = view.scroll.saturating_sub(viewport);
                 view.auto_scroll = false;
                 Vec::new()
             }
             KeyCode::PageDown => {
                 view.pending_g = None;
+                view.pending_args = None;
                 let max = view.max_scroll(width, viewport);
                 view.scroll = view.scroll.saturating_add(viewport).min(max);
                 view.auto_scroll = view.scroll >= max;
@@ -1106,9 +1251,70 @@ impl UiModel {
             }
             _ => {
                 view.pending_g = None;
+                view.pending_args = None;
                 Vec::new()
             }
         }
+    }
+
+    /// `y` in a preview's select sub-mode. A reduced mirror of
+    /// `copy_selected_transcript_row` over the active view's own items: tool
+    /// rows copy their result first, a second `y` upgrades to the arguments.
+    fn copy_preview_selected_row(&mut self, now: Instant) -> Vec<UiEffect> {
+        // (payload, status message, next `pending_args`) resolved from the
+        // selected item before the immutable borrow is released.
+        type Resolved = (String, &'static str, Option<(usize, Instant)>);
+        let Some(view) = self.preview_stack.last_mut() else {
+            return Vec::new();
+        };
+        view.pending_g = None;
+        let idx = view.selected;
+        let prev_pending = view.pending_args;
+        // Resolve the payload from an immutable borrow of the view's items,
+        // then release it before mutating `view`/`self`.
+        let resolved: Option<Resolved> = {
+            let Some(item) = view.selected_item() else {
+                view.pending_args = None;
+                return Vec::new();
+            };
+            if let Some(group) = item.tool_group_cell() {
+                let chord = prev_pending
+                    .is_some_and(|(p, t)| p == idx && now.duration_since(t) <= COPY_CHORD_WINDOW);
+                Some(if chord {
+                    (group.copy_args(), "Copied tool arguments", None)
+                } else if let Some(result) = group.copy_result() {
+                    (
+                        result,
+                        "Copied tool result — y again for arguments",
+                        Some((idx, now)),
+                    )
+                } else {
+                    (
+                        group.copy_args(),
+                        "No result yet — copied tool arguments",
+                        None,
+                    )
+                })
+            } else {
+                item.copy_text().map(|text| (text, "Copied", None))
+            }
+        };
+        let Some((payload, status, next_pending)) = resolved else {
+            view.pending_args = None;
+            self.status_line = String::from("Nothing to copy");
+            return Vec::new();
+        };
+        view.pending_args = next_pending;
+        let (payload, truncated) = clip_for_clipboard(payload);
+        self.status_line = if truncated {
+            format!("{status} ({} bytes, truncated)", payload.len())
+        } else {
+            format!("{status} ({} bytes)", payload.len())
+        };
+        vec![self.effect(
+            EffectContext::Clipboard,
+            UiEffectKind::CopyToClipboard { content: payload },
+        )]
     }
 
     /// `y` in transcript-select mode. Tool rows copy their result first; a
@@ -1763,7 +1969,7 @@ impl UiModel {
         let width = self.terminal_width.max(1);
         let mut view = SubagentPreviewView::from_preview_response(response, width);
         view.scroll_to_bottom(width, self.viewport_height);
-        self.status_line = format!("{} — q/Esc back", view.header_label());
+        self.status_line = format!("{} — q back", view.header_label());
         self.preview_stack.push(view);
         Vec::new()
     }
@@ -2712,6 +2918,7 @@ impl UiModel {
         };
         let width = chunks[1].width.max(1);
         let viewport = chunks[1].height.max(1);
+        let select_mode = view.select_mode;
 
         let mut header = view.header_label();
         if depth > 1 {
@@ -2735,14 +2942,16 @@ impl UiModel {
         // The status line stays visible inside the preview: in-preview
         // feedback ("Subagent not started yet", failed nested opens) would
         // otherwise be invisible until the user exits.
+        let hint = if select_mode {
+            "j/k move  gg/G top/bottom  gd nested  y copy  Esc back"
+        } else {
+            "j/k scroll  gg/G top/bottom  Esc Esc select  q back"
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw(self.status_line.clone()),
                 Span::raw("  "),
-                Span::styled(
-                    "j/k move  gg top  G bottom  gd nested  q/Esc back",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(hint, Style::default().fg(Color::DarkGray)),
             ])),
             chunks[2],
         );
@@ -6727,7 +6936,7 @@ mod tests {
         assert!(rendered.contains("subagent worker"), "{rendered}");
         assert!(rendered.contains("running"), "{rendered}");
         assert!(rendered.contains("inspect the rollout"), "{rendered}");
-        assert!(rendered.contains("q/Esc back"), "{rendered}");
+        assert!(rendered.contains("q back"), "{rendered}");
         Ok(())
     }
 
@@ -6745,11 +6954,14 @@ mod tests {
         );
 
         // `gd` on a non-subagent row inside the preview: the feedback must be
-        // visible without leaving the preview.
+        // visible without leaving the preview. `gd` lives in the select
+        // sub-mode, reached with `Esc Esc`.
         let t0 = Instant::now();
-        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(50));
+        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0 + Duration::from_millis(100));
         let effects =
-            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(100));
+            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(150));
         assert!(effects.is_empty());
 
         let mut terminal = Terminal::new(TestBackend::new(80, 12))?;
@@ -6872,7 +7084,7 @@ mod tests {
         );
         assert_eq!(model.preview_stack.len(), 1);
 
-        let effects = model.handle_key_event_at(key(KeyCode::Esc), t);
+        let effects = model.handle_key_event_at(key(KeyCode::Char('q')), t);
         assert_eq!(
             unwatch_targets(&effects),
             vec![child],
@@ -6935,11 +7147,14 @@ mod tests {
             "duplicate started/completed events must not add rows"
         );
 
-        // `gd` on the spawn row nests a second preview.
+        // `gd` on the spawn row nests a second preview. `gd` lives in the
+        // select sub-mode, reached with `Esc Esc`.
         let t0 = Instant::now();
-        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(50));
+        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0 + Duration::from_millis(100));
         let effects =
-            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(100));
+            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(150));
         let targets: Vec<ThreadId> = effects
             .iter()
             .filter_map(|effect| match effect.kind {
@@ -6950,6 +7165,152 @@ mod tests {
         assert_eq!(targets, vec![grandchild]);
         open_preview(&mut model, grandchild, Vec::new());
         assert_eq!(model.preview_stack.len(), 2);
+    }
+
+    #[test]
+    fn preview_opens_in_scroll_mode_and_jk_keeps_selection() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(
+            &mut model,
+            child,
+            vec![
+                EventMsg::UserMessage {
+                    text: String::from("first"),
+                },
+                EventMsg::AgentMessage {
+                    text: String::from("second"),
+                },
+                EventMsg::UserMessage {
+                    text: String::from("third"),
+                },
+            ],
+        );
+        let view = model.preview_stack.last().expect("view");
+        assert!(!view.select_mode, "preview opens in the scroll sub-mode");
+        let selected_before = view.selected;
+
+        let t0 = Instant::now();
+        let _ = model.handle_key_event_at(key(KeyCode::Char('k')), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Char('j')), t0 + Duration::from_millis(10));
+        let view = model.preview_stack.last().expect("view");
+        assert!(!view.select_mode);
+        assert_eq!(
+            view.selected, selected_before,
+            "scroll-mode j/k must not move the selection cursor"
+        );
+    }
+
+    #[test]
+    fn preview_double_esc_enters_select_mode_and_jk_moves_selection() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(
+            &mut model,
+            child,
+            vec![
+                EventMsg::UserMessage {
+                    text: String::from("first"),
+                },
+                EventMsg::AgentMessage {
+                    text: String::from("second"),
+                },
+                EventMsg::UserMessage {
+                    text: String::from("third"),
+                },
+            ],
+        );
+
+        let t0 = Instant::now();
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(50));
+        let view = model.preview_stack.last().expect("view");
+        assert!(view.select_mode, "double-Esc enters the select sub-mode");
+        let selected_after_enter = view.selected;
+
+        let _ = model.handle_key_event_at(key(KeyCode::Char('j')), t0 + Duration::from_millis(100));
+        let view = model.preview_stack.last().expect("view");
+        assert!(view.select_mode);
+        assert_eq!(
+            view.selected,
+            selected_after_enter + 1,
+            "select-mode j moves the selection down"
+        );
+    }
+
+    #[test]
+    fn preview_gd_in_scroll_mode_does_not_open_nested() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        let grandchild = ThreadId::new();
+        let started = EventMsg::ToolCallStarted(ToolCallStartedEvent {
+            thread_id: child.to_string(),
+            turn_id: String::from("0"),
+            call_id: String::from("spawn-1"),
+            tool_name: String::from("spawn_agent"),
+            args_preview: String::from("{\"prompt\":\"dig\"}"),
+        });
+        let completed = EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+            thread_id: child.to_string(),
+            turn_id: String::from("0"),
+            call_id: String::from("spawn-1"),
+            success: true,
+            output_preview: Some(String::from("{\"status\":\"completed\"}")),
+            error: None,
+            result_kind: ToolCallResultKind::Final,
+            related_thread_id: Some(grandchild),
+            file_change: None,
+            file_changes: Vec::new(),
+            todos: Vec::new(),
+        });
+        open_preview(&mut model, child, vec![started, completed]);
+
+        // In scroll mode `gd` must not open the nested subagent (it lives in
+        // the select sub-mode); the preview stack is unchanged.
+        let t0 = Instant::now();
+        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0);
+        let effects =
+            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(50));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect.kind, UiEffectKind::ThreadPreview { .. })),
+            "gd in scroll mode must not emit a ThreadPreview effect"
+        );
+        assert_eq!(model.preview_stack.len(), 1);
+    }
+
+    #[test]
+    fn preview_esc_exits_select_to_scroll_while_q_pops() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(
+            &mut model,
+            child,
+            vec![EventMsg::UserMessage {
+                text: String::from("hi"),
+            }],
+        );
+
+        let t0 = Instant::now();
+        // Enter select, then Esc back to scroll — the preview stays open.
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(50));
+        assert!(model.preview_stack.last().expect("view").select_mode);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(100));
+        let view = model.preview_stack.last().expect("view");
+        assert!(!view.select_mode, "Esc in select returns to scroll");
+        assert_eq!(
+            model.preview_stack.len(),
+            1,
+            "Esc in select must not pop the preview"
+        );
+
+        // `q` in scroll mode pops the preview with exactly one unwatch.
+        let effects =
+            model.handle_key_event_at(key(KeyCode::Char('q')), t0 + Duration::from_millis(150));
+        assert!(model.preview_stack.is_empty());
+        assert_eq!(unwatch_targets(&effects), vec![child]);
     }
 
     #[test]

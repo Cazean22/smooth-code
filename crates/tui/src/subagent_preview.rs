@@ -43,8 +43,18 @@ pub(crate) struct SubagentPreviewView {
     active_version: u64,
     active_wrap: Option<ActiveWrap>,
     pub(crate) selected: usize,
+    /// Whether the view is in the transcript-select sub-mode (entered with
+    /// `Esc Esc`): a highlighted row, `j`/`k` move the selection, `gd` nests,
+    /// `y` copies. Defaults to the Normal-like scroll sub-mode.
+    pub(crate) select_mode: bool,
     /// Armed by `g` for the `gg`/`gd` chord inside the preview.
     pub(crate) pending_g: Option<Instant>,
+    /// Armed by `Esc` in scroll mode for the `Esc Esc` chord that enters the
+    /// select sub-mode.
+    pub(crate) pending_esc: Option<Instant>,
+    /// Armed by `y` on a tool row in select mode: a second `y` within the
+    /// chord window upgrades the copy from the result to the arguments.
+    pub(crate) pending_args: Option<(usize, Instant)>,
     pub(crate) scroll: u16,
     pub(crate) auto_scroll: bool,
     render_cache: RenderedTranscriptCache,
@@ -76,7 +86,10 @@ impl SubagentPreviewView {
             active_version: 0,
             active_wrap: None,
             selected: 0,
+            select_mode: false,
             pending_g: None,
+            pending_esc: None,
+            pending_args: None,
             scroll: 0,
             auto_scroll: true,
             render_cache: RenderedTranscriptCache::default(),
@@ -106,6 +119,12 @@ impl SubagentPreviewView {
         self.items
             .get(self.selected)
             .and_then(|i| i.tool_group_cell())
+    }
+
+    /// The transcript item under the selection cursor — the copy target in
+    /// the select sub-mode.
+    pub(crate) fn selected_item(&self) -> Option<&TranscriptItem> {
+        self.items.get(self.selected)
     }
 
     pub(crate) fn item_count(&self) -> usize {
@@ -497,6 +516,26 @@ impl SubagentPreviewView {
         (rows, 0)
     }
 
+    /// Index of the first item at least partially visible at the current
+    /// scroll. Used to anchor the selection when entering the select sub-mode
+    /// so the highlight lands on screen.
+    pub(crate) fn first_visible_item(&mut self, width: u16) -> usize {
+        self.render_cache.evict_stale_widths(width);
+        let scroll = usize::from(self.scroll);
+        let mut rows = 0usize;
+        for (idx, item) in self.items.iter().enumerate() {
+            if idx > 0 {
+                rows += 1;
+            }
+            let height = self.render_cache.item_height(item, width);
+            if rows + height > scroll {
+                return idx;
+            }
+            rows += height;
+        }
+        self.items.len().saturating_sub(1)
+    }
+
     pub(crate) fn ensure_selected_visible(&mut self, width: u16, viewport_height: u16) {
         let (start, height) = self.item_row_extent(self.selected, width);
         let vp = usize::from(viewport_height.max(1));
@@ -519,6 +558,7 @@ impl SubagentPreviewView {
         let mut all_rows = 0usize;
         let mut lines = Vec::new();
         let selected_idx = self.selected;
+        let show_selection = self.select_mode;
 
         self.render_cache.evict_stale_widths(width);
         for (idx, item) in self.items.iter().enumerate() {
@@ -532,7 +572,7 @@ impl SubagentPreviewView {
                 continue;
             }
             let mut item_lines = self.render_cache.item_lines(item, width);
-            if selected_idx == idx {
+            if show_selection && selected_idx == idx {
                 for line in &mut item_lines {
                     line.style = line.style.patch(Style::default().bg(Color::DarkGray));
                 }

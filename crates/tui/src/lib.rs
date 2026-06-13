@@ -4,6 +4,7 @@ mod app;
 mod app_server_client;
 mod app_server_session;
 mod composer;
+mod config_state;
 mod diff_render;
 mod error;
 mod highlight;
@@ -40,9 +41,13 @@ pub use error::{TuiError, TuiResult};
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 #[tracing::instrument(name = "tui.run", skip_all)]
-pub async fn run() -> TuiResult<()> {
+pub async fn run(config: std::sync::Arc<smooth_config::Config>) -> TuiResult<()> {
+    // Make appearance settings available to the render layer, and reject an
+    // unknown highlight theme before entering raw mode / the alternate screen.
+    config_state::install(std::sync::Arc::clone(&config));
+    validate_tui_config(&config)?;
     let mut terminal = init()?.ok_or(TuiError::TtyRequired)?;
-    let mut app_server = AppServerSession::new(AppServerClient::start(512).await?);
+    let mut app_server = AppServerSession::new(AppServerClient::start(512, config).await?);
     let mut app = App::new();
     let mut event_stream = crossterm::event::EventStream::new();
     // Raw mode delivers interactive Ctrl+C as a key event, so these streams
@@ -108,6 +113,19 @@ pub async fn run() -> TuiResult<()> {
     // subprocess groups — before giving the terminal back.
     shutdown_app_server(&mut app_server).await;
     restore(Some(&mut terminal))
+}
+
+/// Reject configuration the render layer can't honor before terminal setup.
+/// The highlight theme is validated here (not in the leaf config crate, which
+/// is two-face-free); `highlight::theme` still falls back defensively.
+fn validate_tui_config(config: &smooth_config::Config) -> TuiResult<()> {
+    let theme = &config.tui.highlight_theme;
+    if highlight::embedded_theme_name(theme).is_none() {
+        return Err(TuiError::Config(format!(
+            "unknown highlight_theme '{theme}' (set tui.highlight_theme to a known two-face theme, e.g. \"CatppuccinMocha\")"
+        )));
+    }
+    Ok(())
 }
 
 /// Bounded graceful shutdown: a hung core must never wedge process exit.

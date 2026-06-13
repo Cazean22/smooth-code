@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use app_server_protocol::{ClientCommand, JsonRpcError};
+use smooth_config::Config;
 use smooth_protocol::{ErrorInfo, Event, ThreadId};
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -15,6 +16,16 @@ use crate::{
 #[derive(Clone)]
 pub struct InProcessStartArgs {
     pub channel_capacity: usize,
+    pub config: Arc<Config>,
+}
+
+impl InProcessStartArgs {
+    pub fn new(channel_capacity: usize, config: Arc<Config>) -> Self {
+        Self {
+            channel_capacity,
+            config,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +60,7 @@ async fn start_internal(
     let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
     let runtime_outgoing = Arc::clone(&outgoing_message_sender);
     let processor = Arc::new(
-        MessageProcessor::new(event_tx.clone(), Arc::clone(&runtime_outgoing))
+        MessageProcessor::new(event_tx.clone(), Arc::clone(&runtime_outgoing), args.config)
             .await
             .map_err(|err| {
                 AppServerError::Internal(format!("failed to initialize message processor: {err}"))
@@ -145,10 +156,8 @@ mod tests {
     }
 
     async fn run_round_trip() -> TestResult {
-        let (mut handle, outgoing) = start_internal(InProcessStartArgs {
-            channel_capacity: 8,
-        })
-        .await?;
+        let (mut handle, outgoing) =
+            start_internal(InProcessStartArgs::new(8, Arc::new(Config::default()))).await?;
         let thread_id = ThreadId::new();
         let (request_id, response_rx) = outgoing
             .send_request(ServerRequestPayload::AskUserQuestion(

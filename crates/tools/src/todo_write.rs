@@ -43,19 +43,35 @@ pub struct TodoInput {
     pub status: TodoStatus,
 }
 
-#[derive(Clone, Default)]
-pub struct TodoWriteTool;
+#[derive(Clone)]
+pub struct TodoWriteTool {
+    max_todos: usize,
+}
 
 impl TodoWriteTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            max_todos: MAX_TODOS,
+        }
+    }
+
+    /// Override the maximum todo count (from the resolved app config).
+    pub fn with_max_todos(mut self, max_todos: usize) -> Self {
+        self.max_todos = max_todos;
+        self
     }
 }
 
-fn validate_args(args: &TodoWriteArgs) -> Result<(), ToolError> {
-    if args.todos.len() > MAX_TODOS {
+impl Default for TodoWriteTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn validate_args(args: &TodoWriteArgs, max_todos: usize) -> Result<(), ToolError> {
+    if args.todos.len() > max_todos {
         return Err(ToolError::invalid_arguments(format!(
-            "todo list has {} items; the maximum is {MAX_TODOS}",
+            "todo list has {} items; the maximum is {max_todos}",
             args.todos.len()
         )));
     }
@@ -109,7 +125,7 @@ impl Tool for TodoWriteTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        validate_args(&args)?;
+        validate_args(&args, self.max_todos)?;
         if args.todos.is_empty() {
             return Ok("Todo list cleared.".to_string());
         }

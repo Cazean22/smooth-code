@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use smooth_config::Config;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
     EnvFilter,
@@ -15,14 +16,12 @@ pub(crate) struct TelemetryGuard {
     _log_writer_guard: Option<WorkerGuard>,
 }
 
-pub(crate) fn init() -> Result<TelemetryGuard> {
+pub(crate) fn init(config: &Config) -> Result<TelemetryGuard> {
     let interactive_tui = std::io::stdout().is_terminal();
-    let force_terminal_logs = std::env::var_os("SMOOTH_TRACE_STDERR")
-        .as_deref()
-        .is_some_and(is_truthy);
+    let force_terminal_logs = config.telemetry.force_stderr;
 
     let (writer, log_writer_guard) = if interactive_tui && !force_terminal_logs {
-        let log_path = preferred_log_path()?;
+        let log_path = preferred_log_path(&config.telemetry.log_file_name)?;
         let log_dir = log_path
             .parent()
             .context("telemetry log path is missing a parent directory")?;
@@ -47,9 +46,8 @@ pub(crate) fn init() -> Result<TelemetryGuard> {
     let console_layer = console_subscriber::ConsoleLayer::builder()
         .with_default_env()
         .spawn();
-    let log_filter = EnvFilter::try_from_default_env().or_else(|_| {
-        EnvFilter::try_new("info,smooth_tui=debug,app_server=debug,smooth_core=debug")
-    })?;
+    let log_filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(&config.telemetry.log_filter))?;
     let log_layer = fmt::layer()
         .with_writer(writer)
         .with_ansi(false)
@@ -71,26 +69,12 @@ pub(crate) fn init() -> Result<TelemetryGuard> {
     })
 }
 
-fn preferred_log_path() -> Result<PathBuf> {
+fn preferred_log_path(file_name: &str) -> Result<PathBuf> {
     let cwd =
         std::env::current_dir().context("failed to determine current directory for telemetry")?;
-    Ok(log_path_in(&cwd))
+    Ok(log_path_in(&cwd, file_name))
 }
 
-fn log_path_in(root: &Path) -> PathBuf {
-    root.join(".smooth-code")
-        .join("logs")
-        .join("smooth-tui.log")
-}
-
-fn is_truthy(value: &std::ffi::OsStr) -> bool {
-    value
-        .to_str()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+fn log_path_in(root: &Path, file_name: &str) -> PathBuf {
+    root.join(".smooth-code").join("logs").join(file_name)
 }

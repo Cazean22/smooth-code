@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 app-server-protocol = { path = "../app-server-protocol" }
 futures-util.workspace = true
+smooth-config = { path = "../config" }
 smooth-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true

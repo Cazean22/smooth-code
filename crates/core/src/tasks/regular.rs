@@ -31,9 +31,8 @@ use crate::{
     },
     core::{CancelReason, Session, TurnContext},
     provider::{
-        OPENAI_WEBSOCKET_RETRY_BUDGET, SessionAssistantContent, SessionCompletionEvent,
-        SessionTurnSummary, is_openai_websocket_transient_start_error,
-        openai_websocket_retry_delay, tool_error_is_interrupted,
+        SessionAssistantContent, SessionCompletionEvent, SessionTurnSummary,
+        is_openai_websocket_transient_start_error, tool_error_is_interrupted,
     },
     state::TaskKind,
 };
@@ -295,7 +294,13 @@ impl SessionTask for RegularTask {
         // the model and the persisted history, while the transcript event
         // keeps the raw text the user typed.
         let model_text = skills_enabled
-            .then(|| expand_skill_invocation(&session.cwd, &prompt_text))
+            .then(|| {
+                expand_skill_invocation(
+                    &session.cwd,
+                    &prompt_text,
+                    session.agent_control.max_skill_bytes(),
+                )
+            })
             .flatten()
             .unwrap_or_else(|| prompt_text.clone());
         session.record_user_message(model_text.clone()).await;
@@ -312,7 +317,7 @@ impl SessionTask for RegularTask {
             content: OneOrMany::one(UserContent::Text(Text { text: model_text })),
         };
         let skills = if skills_enabled {
-            tools::list_skills(&session.cwd)
+            tools::list_skills(&session.cwd, session.agent_control.max_skill_bytes())
         } else {
             Vec::new()
         };
@@ -604,6 +609,7 @@ async fn run_manual_turn(
                     if should_continue_after_stream_error(
                         &err,
                         stream_retries,
+                        session.model().websocket_retry_budget(),
                         attempt.saw_assistant_item_this_attempt,
                     ) {
                         let batch_cancelled = commit_attempt_messages(
@@ -643,15 +649,14 @@ async fn run_manual_turn(
                         }
 
                         let next_retry = stream_retries + 1;
+                        let retry_budget = session.model().websocket_retry_budget();
                         session
                             .emit_event(
                                 &ctx,
                                 EventMsg::StreamError(StreamErrorEvent {
                                     thread_id: session.id.to_string(),
                                     turn_id: ctx.sub_id.clone(),
-                                    message: format!(
-                                        "Reconnecting… {next_retry}/{OPENAI_WEBSOCKET_RETRY_BUDGET}"
-                                    ),
+                                    message: format!("Reconnecting… {next_retry}/{retry_budget}"),
                                 }),
                             )
                             .await;
@@ -667,7 +672,7 @@ async fn run_manual_turn(
                                 .await;
                                 return None;
                             }
-                            _ = tokio::time::sleep(openai_websocket_retry_delay(stream_retries)) => {}
+                            _ = tokio::time::sleep(session.model().websocket_retry_delay(stream_retries)) => {}
                         }
                         continue 'turn_loop;
                     }
@@ -2130,10 +2135,11 @@ fn assistant_item_id_for_attempt(ctx: &TurnContext, stream_retries: usize) -> St
 fn should_continue_after_stream_error(
     err: &anyhow::Error,
     stream_retries: usize,
+    retry_budget: usize,
     saw_assistant_item_this_attempt: bool,
 ) -> bool {
     saw_assistant_item_this_attempt
-        && stream_retries < OPENAI_WEBSOCKET_RETRY_BUDGET
+        && stream_retries < retry_budget
         && err
             .downcast_ref::<CompletionError>()
             .is_some_and(is_openai_websocket_transient_start_error)
@@ -2215,14 +2221,18 @@ fn skills_context_message(skills: &[SkillMeta]) -> Option<Message> {
 /// `<cwd>/.smooth-code/skills`, return the expanded model-facing text (skill
 /// instructions + remaining text as arguments). Any other text — including
 /// unknown `/foo` commands — passes through unchanged.
-fn expand_skill_invocation(cwd: &std::path::Path, prompt_text: &str) -> Option<String> {
+fn expand_skill_invocation(
+    cwd: &std::path::Path,
+    prompt_text: &str,
+    max_skill_bytes: usize,
+) -> Option<String> {
     let trimmed = prompt_text.trim_start();
     let candidate = trimmed.strip_prefix('/')?;
     let name_end = candidate
         .find(char::is_whitespace)
         .unwrap_or(candidate.len());
     let (name, args) = candidate.split_at(name_end);
-    let skill = tools::load_skill(cwd, name)?;
+    let skill = tools::load_skill(cwd, name, max_skill_bytes)?;
     Some(tools::render_skill_invocation(&skill, Some(args)))
 }
 
@@ -2358,14 +2368,15 @@ mod tests {
             "---\ndescription: Deploy the app\n---\nRun make deploy.",
         )?;
 
-        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy to staging") else {
+        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy to staging", 64 * 1024)
+        else {
             panic!("expected /deploy to expand");
         };
         assert!(expanded.starts_with("<skill-invocation skill=\"deploy\">"));
         assert!(expanded.contains("Run make deploy."));
         assert!(expanded.ends_with("to staging"));
 
-        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy") else {
+        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy", 64 * 1024) else {
             panic!("expected bare /deploy to expand");
         };
         assert!(expanded.ends_with("(no additional arguments)"));
@@ -2377,7 +2388,8 @@ mod tests {
         let temp = tempfile::TempDir::new()?;
         write_skill(temp.path(), "deploy", "---\ndescription: Deploy\n---\nbody")?;
 
-        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy to staging\nwith care")
+        let Some(expanded) =
+            expand_skill_invocation(temp.path(), "/deploy to staging\nwith care", 64 * 1024)
         else {
             panic!("expected /deploy to expand");
         };
@@ -2391,11 +2403,11 @@ mod tests {
         write_skill(temp.path(), "deploy", "---\ndescription: Deploy\n---\nbody")?;
 
         // Unknown skill, plain text, and bare slash all pass through.
-        assert!(expand_skill_invocation(temp.path(), "/unknown args").is_none());
-        assert!(expand_skill_invocation(temp.path(), "deploy the app").is_none());
-        assert!(expand_skill_invocation(temp.path(), "/").is_none());
+        assert!(expand_skill_invocation(temp.path(), "/unknown args", 64 * 1024).is_none());
+        assert!(expand_skill_invocation(temp.path(), "deploy the app", 64 * 1024).is_none());
+        assert!(expand_skill_invocation(temp.path(), "/", 64 * 1024).is_none());
         // A slash later in the text does not trigger expansion.
-        assert!(expand_skill_invocation(temp.path(), "run /deploy").is_none());
+        assert!(expand_skill_invocation(temp.path(), "run /deploy", 64 * 1024).is_none());
         Ok(())
     }
 

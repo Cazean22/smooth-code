@@ -1,0 +1,15 @@
+[package]
+name = "smooth-config"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "smooth_config"
+
+[dependencies]
+etcetera.workspace = true
+serde = { workspace = true }
+thiserror.workspace = true
+toml.workspace = true

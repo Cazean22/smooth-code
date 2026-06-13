@@ -7,6 +7,7 @@ use app_server_protocol::{
     ThreadPreviewResponse, ThreadResumeResponse, ThreadStartResponse, ThreadUnwatchResponse,
     TurnCancelResponse, TurnStartResponse,
 };
+use smooth_config::Config;
 use smooth_core::{AskUserClient, CoreError, ThreadManagerState, ThreadSummary};
 use smooth_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
@@ -140,9 +141,15 @@ impl CoreMessageProcessor {
     pub async fn new(
         event_tx: mpsc::Sender<InProcessServerEvent>,
         outgoing: Arc<OutgoingMessageSender>,
+        config: Arc<Config>,
     ) -> AppServerResult<Self> {
         Ok(Self {
-            threads: ThreadManagerState::new(Some(ask_user_client(outgoing)), None).await?,
+            threads: ThreadManagerState::new_with_config(
+                Some(ask_user_client(outgoing)),
+                None,
+                config,
+            )
+            .await?,
             event_tx,
             subscribed_threads: Mutex::new(HashMap::new()),
         })
@@ -462,7 +469,7 @@ mod tests {
     };
     use tokio::sync::{mpsc, mpsc::error::TryRecvError};
 
-    use super::{CoreMessageProcessor, ask_user_client};
+    use super::{Config, CoreMessageProcessor, ask_user_client};
     use crate::{
         error_code::INVALID_PARAMS_ERROR_CODE, in_process::InProcessServerEvent,
         outgoing_message::OutgoingMessageSender,
@@ -488,7 +495,8 @@ mod tests {
 
         let (event_tx, _event_rx) = mpsc::channel::<InProcessServerEvent>(8);
         let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
-        let processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        let processor =
+            CoreMessageProcessor::new(event_tx, outgoing, Arc::new(Config::default())).await?;
         let request = ClientRequest::TurnStart {
             request_id: RequestId(1),
             params: TurnStartParams {
@@ -518,7 +526,8 @@ mod tests {
 
         let (event_tx, _event_rx) = mpsc::channel::<InProcessServerEvent>(8);
         let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
-        let processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        let processor =
+            CoreMessageProcessor::new(event_tx, outgoing, Arc::new(Config::default())).await?;
         let request = ClientRequest::TurnCancel {
             request_id: RequestId(1),
             params: TurnCancelParams {
@@ -547,7 +556,8 @@ mod tests {
 
         let (event_tx, _event_rx) = mpsc::channel::<InProcessServerEvent>(8);
         let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
-        let processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        let processor =
+            CoreMessageProcessor::new(event_tx, outgoing, Arc::new(Config::default())).await?;
         let started_value = processor
             .process_request(ClientRequest::ThreadStart {
                 request_id: RequestId(1),
@@ -582,7 +592,8 @@ mod tests {
 
         let (event_tx, _event_rx) = mpsc::channel::<InProcessServerEvent>(8);
         let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
-        let processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        let processor =
+            CoreMessageProcessor::new(event_tx, outgoing, Arc::new(Config::default())).await?;
         let started_value = processor
             .process_request(ClientRequest::ThreadStart {
                 request_id: RequestId(1),
@@ -649,7 +660,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(64);
         let outgoing = Arc::new(OutgoingMessageSender::new(event_tx.clone()));
         Ok((
-            CoreMessageProcessor::new(event_tx, outgoing).await?,
+            CoreMessageProcessor::new(event_tx, outgoing, Arc::new(Config::default())).await?,
             event_rx,
         ))
     }

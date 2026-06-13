@@ -18,11 +18,21 @@ Usage:
 #[derive(Clone)]
 pub struct WriteTool {
     cwd: PathBuf,
+    max_file_change_bytes: usize,
 }
 
 impl WriteTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            max_file_change_bytes: MAX_FILE_CHANGE_BYTES,
+        }
+    }
+
+    /// Override the file-change byte cap (from the resolved app config).
+    pub fn with_max_file_change_bytes(mut self, max_file_change_bytes: usize) -> Self {
+        self.max_file_change_bytes = max_file_change_bytes;
+        self
     }
 }
 
@@ -70,12 +80,12 @@ impl Tool for WriteTool {
                 let unified_diff =
                     diffy::create_patch(&previous_content, &args.content).to_string();
                 let (added, removed) = diff_line_counts(&unified_diff);
-                if unified_diff.len() > MAX_FILE_CHANGE_BYTES {
+                if unified_diff.len() > self.max_file_change_bytes {
                     FileChange::Omitted {
                         operation: FileChangeOperation::Update,
                         reason: format!(
                             "diff omitted because it exceeds {} bytes",
-                            MAX_FILE_CHANGE_BYTES
+                            self.max_file_change_bytes
                         ),
                         added,
                         removed,
@@ -89,12 +99,12 @@ impl Tool for WriteTool {
                 }
             }
             PreviousContent::Missing => {
-                if args.content.len() > MAX_FILE_CHANGE_BYTES {
+                if args.content.len() > self.max_file_change_bytes {
                     FileChange::Omitted {
                         operation: FileChangeOperation::Add,
                         reason: format!(
                             "new file content omitted because it exceeds {} bytes",
-                            MAX_FILE_CHANGE_BYTES
+                            self.max_file_change_bytes
                         ),
                         added: args.content.lines().count(),
                         removed: 0,

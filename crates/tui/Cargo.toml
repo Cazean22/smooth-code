@@ -18,6 +18,7 @@ pulldown-cmark = "0.13.0"
 ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
 serde.workspace = true
 serde_json.workspace = true
+smooth-config = { path = "../config" }
 smooth-core = { path = "../core" }
 smooth-protocol = { path = "../protocol" }
 tools = { path = "../tools" }

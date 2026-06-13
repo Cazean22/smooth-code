@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use app_server::in_process::{
     self, InProcessClientHandle, InProcessServerEvent, InProcessStartArgs,
 };
 use app_server_protocol::{ClientCommand, ClientRequest, JsonRpcError};
+use smooth_config::Config;
 use smooth_protocol::ErrorInfo;
 use tokio::sync::oneshot;
 
@@ -12,9 +15,9 @@ pub(crate) struct AppServerClient {
 }
 
 impl AppServerClient {
-    pub(crate) async fn start(channel_capacity: usize) -> TuiResult<Self> {
+    pub(crate) async fn start(channel_capacity: usize, config: Arc<Config>) -> TuiResult<Self> {
         Ok(Self {
-            handle: in_process::start(InProcessStartArgs { channel_capacity }).await?,
+            handle: in_process::start(InProcessStartArgs::new(channel_capacity, config)).await?,
         })
     }
 

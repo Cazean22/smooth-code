@@ -1292,7 +1292,10 @@ impl UiModel {
             return;
         };
         if self.skill_popup.is_none() {
-            let skills = tools::list_skills(&self.skills_root);
+            let skills = tools::list_skills(
+                &self.skills_root,
+                crate::config_state::current().tools.max_skill_bytes,
+            );
             if skills.is_empty() {
                 return;
             }

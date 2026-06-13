@@ -12,6 +12,8 @@ pub enum TuiError {
     Terminal(#[from] std::io::Error),
     #[error("telemetry error: {0}")]
     Telemetry(String),
+    #[error("invalid TUI config: {0}")]
+    Config(String),
 }
 
 pub type TuiResult<T> = Result<T, TuiError>;

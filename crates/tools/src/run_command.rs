@@ -6,7 +6,7 @@ use rig::{completion::ToolDefinition, tool::Tool};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
-use crate::{ToolError, shared::truncate_output, tool_cancel_token};
+use crate::{ToolError, shared::MAX_TOOL_OUTPUT_BYTES, shared::truncate_output, tool_cancel_token};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const MAX_TIMEOUT_SECS: u64 = 3600;
@@ -15,11 +15,36 @@ const TERM_GRACE: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct RunCommandTool {
     cwd: PathBuf,
+    default_timeout_secs: u64,
+    max_timeout_secs: u64,
+    term_grace: Duration,
+    max_output_bytes: usize,
 }
 
 impl RunCommandTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            default_timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_timeout_secs: MAX_TIMEOUT_SECS,
+            term_grace: TERM_GRACE,
+            max_output_bytes: MAX_TOOL_OUTPUT_BYTES,
+        }
+    }
+
+    /// Override the configured limits (from the resolved app config).
+    pub fn with_limits(
+        mut self,
+        default_timeout_secs: u64,
+        max_timeout_secs: u64,
+        term_grace_ms: u64,
+        max_output_bytes: usize,
+    ) -> Self {
+        self.default_timeout_secs = default_timeout_secs;
+        self.max_timeout_secs = max_timeout_secs;
+        self.term_grace = Duration::from_millis(term_grace_ms);
+        self.max_output_bytes = max_output_bytes;
+        self
     }
 }
 
@@ -28,14 +53,6 @@ pub struct RunCommandArgs {
     command: String,
     #[serde(default)]
     timeout_secs: Option<u64>,
-}
-
-fn default_timeout_secs() -> u64 {
-    std::env::var("SMOOTH_CODE_RUN_COMMAND_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
 }
 
 /// Terminate the command's process group: SIGTERM now, then an unconditional
@@ -49,14 +66,14 @@ fn default_timeout_secs() -> u64 {
 /// [`crate::sweep_pending_process_kills`] so process exit cannot outrun the
 /// kill. The child was spawned with `process_group(0)`, so the group id
 /// equals the child pid and the kill reaches everything the shell spawned.
-fn kill_group_detached(child: &mut tokio::process::Child) {
+fn kill_group_detached(child: &mut tokio::process::Child, term_grace: Duration) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         let pgid = pid as libc::pid_t;
         unsafe {
             libc::killpg(pgid, libc::SIGTERM);
         }
-        crate::kill_sweep::schedule_kill_sweep(pgid, TERM_GRACE);
+        crate::kill_sweep::schedule_kill_sweep(pgid, term_grace);
         return;
     }
     let _ = child.start_kill();
@@ -104,7 +121,7 @@ impl Tool for RunCommandTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Optional timeout in seconds for this command; the process group is killed when it expires. Defaults to 300."
+                        "description": format!("Optional timeout in seconds for this command; the process group is killed when it expires. Defaults to {}.", self.default_timeout_secs)
                     }
                 },
                 "required": ["command"]
@@ -116,8 +133,8 @@ impl Tool for RunCommandTool {
         let timeout_secs = args
             .timeout_secs
             .filter(|secs| *secs > 0)
-            .unwrap_or_else(default_timeout_secs)
-            .min(MAX_TIMEOUT_SECS);
+            .unwrap_or(self.default_timeout_secs)
+            .min(self.max_timeout_secs);
         let timeout = Duration::from_secs(timeout_secs);
 
         let mut command = tokio::process::Command::new("zsh");
@@ -182,14 +199,14 @@ impl Tool for RunCommandTool {
             // the process takes to die, and the kill completes even if this
             // future never gets polled again.
             Outcome::Cancelled => {
-                kill_group_detached(&mut child);
+                kill_group_detached(&mut child, self.term_grace);
                 return Err(ToolError::interrupted(format!(
                     "command interrupted before completing: {}",
                     args.command
                 )));
             }
             Outcome::TimedOut => {
-                kill_group_detached(&mut child);
+                kill_group_detached(&mut child, self.term_grace);
                 return Err(ToolError::io(format!(
                     "command timed out after {timeout_secs}s: {}",
                     args.command
@@ -197,11 +214,10 @@ impl Tool for RunCommandTool {
             }
         };
 
-        Ok(truncate_output(render_output(
-            &stdout,
-            &stderr,
-            Some(status),
-        )))
+        Ok(truncate_output(
+            render_output(&stdout, &stderr, Some(status)),
+            self.max_output_bytes,
+        ))
     }
 }
 

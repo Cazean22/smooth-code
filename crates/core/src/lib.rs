@@ -16,7 +16,7 @@ mod thread_manager;
 pub use agent::{AgentControl, SystemPromptKind};
 pub use error::{CoreError, CoreResult};
 pub use provider::{
-    EnvSessionModelFactory, SessionAssistantContent, SessionCompletionEvent,
+    ConfigSessionModelFactory, SessionAssistantContent, SessionCompletionEvent,
     SessionCompletionStream, SessionModel, SessionModelDriver, SessionModelFactory,
     SessionTurnSummary,
 };

@@ -6,12 +6,21 @@ use ratatui::{
 use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 use unicode_width::UnicodeWidthChar;
 
+use crate::config_state;
 use crate::highlight::{exceeds_highlight_limits, highlight_code_to_styled_spans};
 use crate::wrap;
 
-const ADD_LINE_BG: Color = Color::Indexed(22);
-const DELETE_LINE_BG: Color = Color::Indexed(52);
-const MAX_RENDERED_DIFF_LINES: usize = 1_000;
+fn add_line_bg() -> Color {
+    config_state::to_color(config_state::current().tui.colors.diff_add_bg)
+}
+
+fn delete_line_bg() -> Color {
+    config_state::to_color(config_state::current().tui.colors.diff_delete_bg)
+}
+
+fn max_rendered_diff_lines() -> usize {
+    config_state::current().tui.max_rendered_diff_lines
+}
 
 pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<Line<'static>> {
     let (added, removed) = line_counts(&change.change);
@@ -58,15 +67,16 @@ pub(crate) fn create_diff_summary(change: &FileChangeOutput, width: u16) -> Vec<
     let diff_width = usize::from(width.saturating_sub(4).max(1));
     let rendered_change = render_change(change, diff_width);
     let rendered_len = rendered_change.len();
-    for line in rendered_change.into_iter().take(MAX_RENDERED_DIFF_LINES) {
+    let max_rendered = max_rendered_diff_lines();
+    for line in rendered_change.into_iter().take(max_rendered) {
         let mut spans = vec![Span::raw("    ")];
         spans.extend(line.spans);
         lines.push(Line::from(spans).style(line.style));
     }
-    if rendered_len > MAX_RENDERED_DIFF_LINES {
+    if rendered_len > max_rendered {
         lines.push(Line::from(vec![
             Span::raw("    "),
-            format!("⋮ diff truncated after {MAX_RENDERED_DIFF_LINES} rendered lines").dim(),
+            format!("⋮ diff truncated after {max_rendered} rendered lines").dim(),
         ]));
     }
     lines
@@ -325,8 +335,8 @@ fn render_diff_line(
 
 fn diff_line_style(kind: DiffLineKind) -> Style {
     match kind {
-        DiffLineKind::Insert => Style::default().bg(ADD_LINE_BG),
-        DiffLineKind::Delete => Style::default().bg(DELETE_LINE_BG),
+        DiffLineKind::Insert => Style::default().bg(add_line_bg()),
+        DiffLineKind::Delete => Style::default().bg(delete_line_bg()),
         DiffLineKind::Context => Style::default().dim(),
     }
 }
@@ -445,7 +455,7 @@ mod tests {
             rendered
                 .iter()
                 .any(|line| line_text(line).contains("1 + fn main() {}")
-                    && line.style.bg == Some(ADD_LINE_BG))
+                    && line.style.bg == Some(add_line_bg()))
         );
     }
 
@@ -496,7 +506,7 @@ mod tests {
             rendered
                 .iter()
                 .any(|line| line_text(line).contains("1 + fn main() {}")
-                    && line.style.bg == Some(ADD_LINE_BG))
+                    && line.style.bg == Some(add_line_bg()))
         );
     }
 

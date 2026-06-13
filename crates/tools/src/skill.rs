@@ -26,11 +26,21 @@ pub struct SkillArgs {
 #[derive(Clone)]
 pub struct SkillTool {
     cwd: PathBuf,
+    max_skill_bytes: usize,
 }
 
 impl SkillTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            max_skill_bytes: crate::skills::MAX_SKILL_BYTES,
+        }
+    }
+
+    /// Override the SKILL.md read cap (from the resolved app config).
+    pub fn with_max_skill_bytes(mut self, max_skill_bytes: usize) -> Self {
+        self.max_skill_bytes = max_skill_bytes;
+        self
     }
 }
 
@@ -51,10 +61,10 @@ impl Tool for SkillTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let name = args.skill.trim();
-        match load_skill(&self.cwd, name) {
+        match load_skill(&self.cwd, name, self.max_skill_bytes) {
             Some(skill) => Ok(render_skill_invocation(&skill, args.args.as_deref())),
             None => {
-                let available = list_skills(&self.cwd)
+                let available = list_skills(&self.cwd, self.max_skill_bytes)
                     .into_iter()
                     .map(|meta| meta.name)
                     .collect::<Vec<_>>();

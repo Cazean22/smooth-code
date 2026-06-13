@@ -1,4 +1,5 @@
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -12,29 +13,84 @@ use syntect::{
 };
 use two_face::theme::EmbeddedThemeName;
 
+use crate::config_state;
+
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME: OnceLock<Theme> = OnceLock::new();
+/// Resolved themes cached by name so reinstalling config (and tests installing
+/// a different theme) take effect, rather than freezing the first theme.
+static THEMES: OnceLock<RwLock<HashMap<String, Arc<Theme>>>> = OnceLock::new();
 
 const ANSI_ALPHA_INDEX: u8 = 0x00;
 const ANSI_ALPHA_DEFAULT: u8 = 0x01;
 const OPAQUE_ALPHA: u8 = 0xFF;
-const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
-const MAX_HIGHLIGHT_LINES: usize = 10_000;
+/// Fallback when a configured theme name is unknown (also the built-in default).
+const FALLBACK_THEME: EmbeddedThemeName = EmbeddedThemeName::CatppuccinMocha;
 
 fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
-fn theme() -> &'static Theme {
-    THEME.get_or_init(|| {
-        two_face::theme::extra()
-            .get(EmbeddedThemeName::CatppuccinMocha)
-            .clone()
-    })
+/// Map a config theme name (a two-face `EmbeddedThemeName` identifier) to the
+/// enum variant. Returns `None` for unknown names; the config layer validates
+/// names at startup, and `theme()` falls back to [`FALLBACK_THEME`].
+pub(crate) fn embedded_theme_name(name: &str) -> Option<EmbeddedThemeName> {
+    let variant = match name {
+        "Ansi" => EmbeddedThemeName::Ansi,
+        "Base16" => EmbeddedThemeName::Base16,
+        "Base16EightiesDark" => EmbeddedThemeName::Base16EightiesDark,
+        "Base16MochaDark" => EmbeddedThemeName::Base16MochaDark,
+        "Base16OceanDark" => EmbeddedThemeName::Base16OceanDark,
+        "Base16OceanLight" => EmbeddedThemeName::Base16OceanLight,
+        "Base16_256" => EmbeddedThemeName::Base16_256,
+        "CatppuccinFrappe" => EmbeddedThemeName::CatppuccinFrappe,
+        "CatppuccinLatte" => EmbeddedThemeName::CatppuccinLatte,
+        "CatppuccinMacchiato" => EmbeddedThemeName::CatppuccinMacchiato,
+        "CatppuccinMocha" => EmbeddedThemeName::CatppuccinMocha,
+        "ColdarkCold" => EmbeddedThemeName::ColdarkCold,
+        "ColdarkDark" => EmbeddedThemeName::ColdarkDark,
+        "DarkNeon" => EmbeddedThemeName::DarkNeon,
+        "Dracula" => EmbeddedThemeName::Dracula,
+        "Github" => EmbeddedThemeName::Github,
+        "GruvboxDark" => EmbeddedThemeName::GruvboxDark,
+        "GruvboxLight" => EmbeddedThemeName::GruvboxLight,
+        "InspiredGithub" => EmbeddedThemeName::InspiredGithub,
+        "Leet" => EmbeddedThemeName::Leet,
+        "MonokaiExtended" => EmbeddedThemeName::MonokaiExtended,
+        "MonokaiExtendedBright" => EmbeddedThemeName::MonokaiExtendedBright,
+        "MonokaiExtendedLight" => EmbeddedThemeName::MonokaiExtendedLight,
+        "MonokaiExtendedOrigin" => EmbeddedThemeName::MonokaiExtendedOrigin,
+        "Nord" => EmbeddedThemeName::Nord,
+        "OneHalfDark" => EmbeddedThemeName::OneHalfDark,
+        "OneHalfLight" => EmbeddedThemeName::OneHalfLight,
+        "SolarizedDark" => EmbeddedThemeName::SolarizedDark,
+        "SolarizedLight" => EmbeddedThemeName::SolarizedLight,
+        "SublimeSnazzy" => EmbeddedThemeName::SublimeSnazzy,
+        "TwoDark" => EmbeddedThemeName::TwoDark,
+        "Zenburn" => EmbeddedThemeName::Zenburn,
+        _ => return None,
+    };
+    Some(variant)
+}
+
+fn theme() -> Arc<Theme> {
+    let name = config_state::current().tui.highlight_theme.clone();
+    let cache = THEMES.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(themes) = cache.read()
+        && let Some(theme) = themes.get(&name)
+    {
+        return Arc::clone(theme);
+    }
+    let embedded = embedded_theme_name(&name).unwrap_or(FALLBACK_THEME);
+    let theme = Arc::new(two_face::theme::extra().get(embedded).clone());
+    if let Ok(mut themes) = cache.write() {
+        themes.insert(name, Arc::clone(&theme));
+    }
+    theme
 }
 
 pub(crate) fn exceeds_highlight_limits(total_bytes: usize, total_lines: usize) -> bool {
-    total_bytes > MAX_HIGHLIGHT_BYTES || total_lines > MAX_HIGHLIGHT_LINES
+    let tui = &config_state::current().tui;
+    total_bytes > tui.max_highlight_bytes || total_lines > tui.max_highlight_lines
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -102,7 +158,8 @@ fn highlight_to_line_spans(code: &str, lang: &str) -> Option<Vec<Vec<Span<'stati
     }
 
     let syntax = find_syntax(lang)?;
-    let mut highlighter = HighlightLines::new(syntax, theme());
+    let theme = theme();
+    let mut highlighter = HighlightLines::new(syntax, theme.as_ref());
     let mut lines = Vec::new();
 
     for line in LinesWithEndings::from(code) {

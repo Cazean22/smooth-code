@@ -667,7 +667,7 @@ fn wrap_markdown_lines(
 /// renderer marked the whole line as fenced code. Inline code only colors spans,
 /// so even an inline-code-only paragraph still word-wraps as prose.
 fn is_preformatted_line(line: &Line<'static>) -> bool {
-    !line.spans.is_empty() && line.style.fg == Some(crate::markdown_render::CODE_COLOR)
+    !line.spans.is_empty() && line.style.fg == Some(crate::markdown_render::code_color())
 }
 
 /// User messages are bracketed by a blue left gutter bar on every wrapped row,
@@ -710,16 +710,16 @@ fn user_separator(width: u16) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown_render::CODE_COLOR;
+    use crate::markdown_render::code_color;
     use smooth_protocol::FileChangeOperation;
 
     #[test]
     fn fenced_code_line_marker_is_preformatted() {
         let line = Line::from(vec![Span::styled(
             "    let x = 1;",
-            Style::default().fg(CODE_COLOR),
+            Style::default().fg(code_color()),
         )])
-        .style(Style::default().fg(CODE_COLOR));
+        .style(Style::default().fg(code_color()));
         assert!(is_preformatted_line(&line));
     }
 
@@ -727,7 +727,7 @@ mod tests {
     fn prose_with_inline_code_is_not_preformatted() {
         let line = Line::from(vec![
             Span::raw("use the "),
-            Span::styled("foo", Style::default().fg(CODE_COLOR)),
+            Span::styled("foo", Style::default().fg(code_color())),
             Span::raw(" helper"),
         ]);
         assert!(!is_preformatted_line(&line));
@@ -737,7 +737,7 @@ mod tests {
     fn inline_code_only_line_is_not_preformatted() {
         let line = Line::from(vec![Span::styled(
             "cargo test -p smooth-tui",
-            Style::default().fg(CODE_COLOR),
+            Style::default().fg(code_color()),
         )]);
         assert!(!is_preformatted_line(&line));
     }

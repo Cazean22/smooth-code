@@ -13,7 +13,7 @@ const DESCRIPTION: &str = r#"Read a UTF-8 text file from the local filesystem. A
 
 Usage:
 - `file_path` may be an absolute path, or a path relative to the current working directory.
-- By default, the tool reads up to 2000 lines starting at the beginning of the file. Prefer reading the whole file by omitting `offset` and `limit`; use them only when the file is too large to read in one go.
+- By default, the tool reads up to {default_limit} lines starting at the beginning of the file. Prefer reading the whole file by omitting `offset` and `limit`; use them only when the file is too large to read in one go.
 - `offset` is a zero-based count of lines to skip: omit it or set `offset: 0` to start at the first line; `offset: 1` starts at line 2.
 - Results are returned in `cat -n` format, with line numbers starting at 1.
 - This tool only reads files, not directories. For directories, use shell commands such as `eza` when `run_command` is available.
@@ -22,11 +22,21 @@ Usage:
 #[derive(Clone)]
 pub struct ReadTool {
     cwd: PathBuf,
+    default_limit: usize,
 }
 
 impl ReadTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            default_limit: DEFAULT_LIMIT,
+        }
+    }
+
+    /// Override the default line limit (from the resolved app config).
+    pub fn with_default_limit(mut self, default_limit: usize) -> Self {
+        self.default_limit = default_limit;
+        self
     }
 }
 
@@ -59,7 +69,7 @@ impl Tool for ReadTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: DESCRIPTION.to_string(),
+            description: DESCRIPTION.replace("{default_limit}", &self.default_limit.to_string()),
             parameters: schema_for!(ReadArgs).to_value(),
         }
     }
@@ -75,7 +85,7 @@ impl Tool for ReadTool {
         }
 
         let skip_count = args.offset.unwrap_or(0);
-        let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
+        let limit = args.limit.unwrap_or(self.default_limit);
         let display_start = skip_count.saturating_add(1);
 
         let formatted = content

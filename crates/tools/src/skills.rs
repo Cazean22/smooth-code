@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 /// Maximum bytes of a SKILL.md file that are read; longer bodies are truncated.
-const MAX_SKILL_BYTES: usize = 64 * 1024;
+/// This is the built-in default; callers thread a configured value through.
+pub(crate) const MAX_SKILL_BYTES: usize = 64 * 1024;
 /// Maximum length of a skill name (the skill's directory name).
 const MAX_NAME_LEN: usize = 64;
 
@@ -41,7 +42,7 @@ fn is_valid_skill_name(name: &str) -> bool {
 /// Entries that are not directories, have invalid names, lack a SKILL.md, or
 /// fail frontmatter validation are skipped with a warning rather than
 /// surfacing an error: a single malformed skill must not break discovery.
-pub fn list_skills(cwd: &Path) -> Vec<SkillMeta> {
+pub fn list_skills(cwd: &Path, max_skill_bytes: usize) -> Vec<SkillMeta> {
     let dir = skills_dir(cwd);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -59,7 +60,7 @@ pub fn list_skills(cwd: &Path) -> Vec<SkillMeta> {
             tracing::warn!(skill = %name, "skipping skill with invalid name");
             continue;
         }
-        match load_skill_at(&path.join("SKILL.md"), name) {
+        match load_skill_at(&path.join("SKILL.md"), name, max_skill_bytes) {
             Some(skill) => skills.push(skill.meta),
             None => {
                 tracing::warn!(skill = %name, "skipping skill with missing or invalid SKILL.md");
@@ -72,15 +73,19 @@ pub fn list_skills(cwd: &Path) -> Vec<SkillMeta> {
 
 /// Load a single skill by name. Returns `None` if the name is invalid or the
 /// skill does not exist / fails validation.
-pub fn load_skill(cwd: &Path, name: &str) -> Option<Skill> {
+pub fn load_skill(cwd: &Path, name: &str, max_skill_bytes: usize) -> Option<Skill> {
     if !is_valid_skill_name(name) {
         return None;
     }
-    load_skill_at(&skills_dir(cwd).join(name).join("SKILL.md"), name)
+    load_skill_at(
+        &skills_dir(cwd).join(name).join("SKILL.md"),
+        name,
+        max_skill_bytes,
+    )
 }
 
-fn load_skill_at(path: &Path, dir_name: &str) -> Option<Skill> {
-    let raw = read_bounded_utf8(path, dir_name)?;
+fn load_skill_at(path: &Path, dir_name: &str, max_skill_bytes: usize) -> Option<Skill> {
+    let raw = read_bounded_utf8(path, dir_name, max_skill_bytes)?;
     let (frontmatter_name, description, body) = parse_skill_md(&raw)?;
     if let Some(frontmatter_name) = frontmatter_name
         && frontmatter_name != dir_name
@@ -109,18 +114,18 @@ fn load_skill_at(path: &Path, dir_name: &str) -> Option<Skill> {
 /// Returns `None` on IO errors or invalid UTF-8 — except a multi-byte
 /// character split by the cap itself, which is dropped to keep the valid
 /// prefix.
-fn read_bounded_utf8(path: &Path, dir_name: &str) -> Option<String> {
+fn read_bounded_utf8(path: &Path, dir_name: &str, max_skill_bytes: usize) -> Option<String> {
     use std::io::Read;
 
     let file = std::fs::File::open(path).ok()?;
     let mut raw = Vec::new();
-    file.take(MAX_SKILL_BYTES as u64 + 1)
+    file.take(max_skill_bytes as u64 + 1)
         .read_to_end(&mut raw)
         .ok()?;
-    let truncated = raw.len() > MAX_SKILL_BYTES;
+    let truncated = raw.len() > max_skill_bytes;
     if truncated {
-        tracing::warn!(skill = %dir_name, "SKILL.md exceeds {MAX_SKILL_BYTES} bytes; truncating");
-        raw.truncate(MAX_SKILL_BYTES);
+        tracing::warn!(skill = %dir_name, "SKILL.md exceeds {max_skill_bytes} bytes; truncating");
+        raw.truncate(max_skill_bytes);
     }
     match String::from_utf8(raw) {
         Ok(text) => Some(text),
@@ -277,7 +282,7 @@ mod tests {
         let Some(temp) = temp else {
             panic!("tempdir creation failed");
         };
-        assert!(list_skills(temp.path()).is_empty());
+        assert!(list_skills(temp.path(), MAX_SKILL_BYTES).is_empty());
     }
 
     #[test]
@@ -298,7 +303,7 @@ mod tests {
         // Invalid: name charset.
         write_skill(temp.path(), "bad name", "---\ndescription: nope\n---\nbody")?;
 
-        let skills = list_skills(temp.path());
+        let skills = list_skills(temp.path(), MAX_SKILL_BYTES);
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "zeta"]);
         assert_eq!(skills[0].description, "A skill");
@@ -314,7 +319,7 @@ mod tests {
             "---\nname: deploy\ndescription: Deploy the app\n---\nRun make deploy.\n",
         )?;
 
-        let Some(skill) = load_skill(temp.path(), "deploy") else {
+        let Some(skill) = load_skill(temp.path(), "deploy", MAX_SKILL_BYTES) else {
             panic!("expected skill to load");
         };
         assert_eq!(skill.meta.name, "deploy");
@@ -331,7 +336,7 @@ mod tests {
             "deploy",
             "---\nname: other\ndescription: Mismatch\n---\nbody",
         )?;
-        assert!(load_skill(temp.path(), "deploy").is_none());
+        assert!(load_skill(temp.path(), "deploy", MAX_SKILL_BYTES).is_none());
         Ok(())
     }
 
@@ -341,9 +346,9 @@ mod tests {
         let Some(temp) = temp else {
             panic!("tempdir creation failed");
         };
-        assert!(load_skill(temp.path(), "../escape").is_none());
-        assert!(load_skill(temp.path(), "").is_none());
-        assert!(load_skill(temp.path(), &"x".repeat(65)).is_none());
+        assert!(load_skill(temp.path(), "../escape", MAX_SKILL_BYTES).is_none());
+        assert!(load_skill(temp.path(), "", MAX_SKILL_BYTES).is_none());
+        assert!(load_skill(temp.path(), &"x".repeat(65), MAX_SKILL_BYTES).is_none());
     }
 
     #[test]
@@ -353,7 +358,7 @@ mod tests {
         let body = "x".repeat(MAX_SKILL_BYTES * 2);
         write_skill(temp.path(), "big", &format!("{header}{body}"))?;
 
-        let Some(skill) = load_skill(temp.path(), "big") else {
+        let Some(skill) = load_skill(temp.path(), "big", MAX_SKILL_BYTES) else {
             panic!("expected oversized skill to load truncated");
         };
         assert!(skill.body.len() <= MAX_SKILL_BYTES);
@@ -367,14 +372,14 @@ mod tests {
         // Pick a header length that puts the byte cap mid-character for a
         // two-byte filler char, so the cut must drop the partial char.
         let mut header = "---\ndescription: Big skill\n---\n".to_string();
-        if (MAX_SKILL_BYTES - header.len()) % 2 == 0 {
+        if (MAX_SKILL_BYTES - header.len()).is_multiple_of(2) {
             header.push('\n');
         }
         let fill_chars = (MAX_SKILL_BYTES - header.len()) / 2 + 16;
         let body = "é".repeat(fill_chars);
         write_skill(temp.path(), "split", &format!("{header}{body}"))?;
 
-        let Some(skill) = load_skill(temp.path(), "split") else {
+        let Some(skill) = load_skill(temp.path(), "split", MAX_SKILL_BYTES) else {
             panic!("expected truncated multibyte skill to load");
         };
         assert!(skill.body.len() < MAX_SKILL_BYTES);
@@ -391,8 +396,8 @@ mod tests {
         bytes.extend_from_slice(&[0xff, 0xfe, 0x00]);
         std::fs::write(dir.join("SKILL.md"), bytes)?;
 
-        assert!(load_skill(temp.path(), "binary").is_none());
-        assert!(list_skills(temp.path()).is_empty());
+        assert!(load_skill(temp.path(), "binary", MAX_SKILL_BYTES).is_none());
+        assert!(list_skills(temp.path(), MAX_SKILL_BYTES).is_empty());
         Ok(())
     }
 
@@ -404,7 +409,7 @@ mod tests {
             "deploy",
             "---\ndescription: Deploy the app\n---\nRun make deploy.",
         )?;
-        let Some(skill) = load_skill(temp.path(), "deploy") else {
+        let Some(skill) = load_skill(temp.path(), "deploy", MAX_SKILL_BYTES) else {
             panic!("expected skill to load");
         };
 

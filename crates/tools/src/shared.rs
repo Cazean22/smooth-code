@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::ToolError;
 
+/// Default cap on captured tool output, in bytes. The truncation suffix is
+/// appended *after* clamping to this many bytes, so the returned string can be
+/// slightly longer; the limit bounds the captured payload, not the final text.
 pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
 
 pub(crate) fn resolve_path_for_write(cwd: &Path, path: &str) -> Result<PathBuf, ToolError> {
@@ -49,11 +52,11 @@ pub(crate) fn resolve_path_for_write(cwd: &Path, path: &str) -> Result<PathBuf, 
     Ok(resolved_path)
 }
 
-pub(crate) fn truncate_output(mut output: String) -> String {
-    if output.len() <= MAX_TOOL_OUTPUT_BYTES {
+pub(crate) fn truncate_output(mut output: String, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
         return output;
     }
-    let mut end = MAX_TOOL_OUTPUT_BYTES;
+    let mut end = max_bytes;
     while end > 0 && !output.is_char_boundary(end) {
         end -= 1;
     }
@@ -95,7 +98,7 @@ mod tests {
         output.push('中');
         output.push_str("tail");
 
-        let truncated = truncate_output(output);
+        let truncated = truncate_output(output, MAX_TOOL_OUTPUT_BYTES);
 
         assert!(truncated.is_char_boundary(truncated.len()));
         assert!(truncated.ends_with("\n...[truncated]"));

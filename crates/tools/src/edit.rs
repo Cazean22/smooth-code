@@ -30,11 +30,21 @@ Usage:
 #[derive(Clone)]
 pub struct EditTool {
     cwd: PathBuf,
+    max_file_change_bytes: usize,
 }
 
 impl EditTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            max_file_change_bytes: MAX_FILE_CHANGE_BYTES,
+        }
+    }
+
+    /// Override the file-change byte cap (from the resolved app config).
+    pub fn with_max_file_change_bytes(mut self, max_file_change_bytes: usize) -> Self {
+        self.max_file_change_bytes = max_file_change_bytes;
+        self
     }
 }
 
@@ -84,7 +94,7 @@ impl Tool for EditTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let prepared = prepare_edit(&self.cwd, args)?;
-        let file_changes = vec![prepared.file_change()];
+        let file_changes = vec![prepared.file_change(self.max_file_change_bytes)];
         prepared.apply()?;
 
         let model_output = String::from("applied edits (1 file changed)");
@@ -124,13 +134,14 @@ impl PreparedChange {
         Ok(())
     }
 
-    fn file_change(&self) -> FileChangeOutput {
+    fn file_change(&self, max_file_change_bytes: usize) -> FileChangeOutput {
         FileChangeOutput {
             path: self.path.clone(),
             change: update_file_change(
                 &self.original_content,
                 &self.new_content,
                 self.move_to.clone(),
+                max_file_change_bytes,
             ),
         }
     }
@@ -293,6 +304,7 @@ fn update_file_change(
     original_content: &str,
     new_content: &str,
     move_path: Option<PathBuf>,
+    max_file_change_bytes: usize,
 ) -> FileChange {
     let unified_diff = if original_content == new_content {
         String::new()
@@ -300,12 +312,12 @@ fn update_file_change(
         diffy::create_patch(original_content, new_content).to_string()
     };
     let (added, removed) = diff_line_counts(&unified_diff);
-    if unified_diff.len() > MAX_FILE_CHANGE_BYTES {
+    if unified_diff.len() > max_file_change_bytes {
         FileChange::Omitted {
             operation: FileChangeOperation::Update,
             reason: format!(
                 "diff omitted because it exceeds {} bytes",
-                MAX_FILE_CHANGE_BYTES
+                max_file_change_bytes
             ),
             added,
             removed,

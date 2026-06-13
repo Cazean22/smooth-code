@@ -17,11 +17,21 @@ Usage:
 #[derive(Clone)]
 pub struct DeleteTool {
     cwd: PathBuf,
+    max_file_change_bytes: usize,
 }
 
 impl DeleteTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            max_file_change_bytes: MAX_FILE_CHANGE_BYTES,
+        }
+    }
+
+    /// Override the file-change byte cap (from the resolved app config).
+    pub fn with_max_file_change_bytes(mut self, max_file_change_bytes: usize) -> Self {
+        self.max_file_change_bytes = max_file_change_bytes;
+        self
     }
 }
 
@@ -74,12 +84,12 @@ impl Tool for DeleteTool {
 
         let change = match previous_content {
             PreviousContent::Utf8(content) => {
-                if content.len() > MAX_FILE_CHANGE_BYTES {
+                if content.len() > self.max_file_change_bytes {
                     FileChange::Omitted {
                         operation: FileChangeOperation::Delete,
                         reason: format!(
                             "deleted file content omitted because it exceeds {} bytes",
-                            MAX_FILE_CHANGE_BYTES
+                            self.max_file_change_bytes
                         ),
                         added: 0,
                         removed: content.lines().count(),

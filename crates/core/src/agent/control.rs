@@ -25,8 +25,9 @@ use crate::{
     provider::SessionModelFactory,
 };
 
-pub(crate) const AGENT_MAX_DEPTH: i32 = 8;
+const AGENT_MAX_DEPTH: i32 = 8;
 const AGENT_MAX_THREADS: usize = 16;
+const MAX_SKILL_BYTES: usize = 64 * 1024;
 
 /// Whether `thread_id` sits inside `root_thread_id`'s agent subtree per the
 /// registry's parent edges (a thread is in its own subtree).
@@ -58,6 +59,12 @@ struct AgentControlState {
     statuses: Mutex<HashMap<ThreadId, watch::Sender<AgentStatus>>>,
     inline_waiters: Mutex<HashMap<ThreadId, oneshot::Sender<InlineChildCompletion>>>,
     runtime: Mutex<Option<AgentControlRuntime>>,
+    max_depth: i32,
+    max_threads: usize,
+    // Carried here (the config-threaded handle reaching both root and subagent
+    // creation) so the manual turn loop's skill rendering uses the configured
+    // limit; `SkillTool` gets the same value injected separately.
+    max_skill_bytes: usize,
 }
 
 pub(crate) struct InlineChildCompletion {
@@ -77,14 +84,32 @@ struct AgentControlRuntime {
 
 impl AgentControl {
     pub(crate) fn new() -> Self {
+        Self::with_limits(AGENT_MAX_DEPTH, AGENT_MAX_THREADS, MAX_SKILL_BYTES)
+    }
+
+    /// Construct with explicit limits (from the resolved app config).
+    pub(crate) fn with_limits(max_depth: i32, max_threads: usize, max_skill_bytes: usize) -> Self {
         Self {
             state: Arc::new(AgentControlState {
                 registry: AgentRegistry::new(),
                 statuses: Mutex::new(HashMap::new()),
                 inline_waiters: Mutex::new(HashMap::new()),
                 runtime: Mutex::new(None),
+                max_depth,
+                max_threads,
+                max_skill_bytes,
             }),
         }
+    }
+
+    /// Maximum agent nesting depth permitted for spawns.
+    pub(crate) fn max_depth(&self) -> i32 {
+        self.state.max_depth
+    }
+
+    /// Configured maximum `SKILL.md` bytes read before truncation.
+    pub(crate) fn max_skill_bytes(&self) -> usize {
+        self.state.max_skill_bytes
     }
 
     pub(crate) fn attach_runtime(
@@ -394,7 +419,11 @@ impl AgentControl {
         let reservation = self
             .state
             .registry
-            .reserve_spawn_slot(parent_thread_id, AGENT_MAX_DEPTH, AGENT_MAX_THREADS)
+            .reserve_spawn_slot(
+                parent_thread_id,
+                self.state.max_depth,
+                self.state.max_threads,
+            )
             .map_err(CoreError::registry)?;
 
         let child_thread_id = ThreadId::new();
@@ -1308,23 +1337,20 @@ mod tests {
                 Err(_) => break,
             };
 
-            match event.msg {
-                EventMsg::CollabAgentCompleted(completion) => {
-                    assert_eq!(completion.parent_thread_id, root_id);
-                    assert_eq!(completion.child_thread_id, child_id);
-                    assert_eq!(completion.agent_path, child.agent_path);
-                    assert_eq!(completion.agent_nickname, child.agent_nickname);
-                    assert_eq!(
-                        completion.status,
-                        AgentStatus::Completed(Some("response".to_string()))
-                    );
-                    assert_eq!(
-                        completion.last_assistant_message.as_deref(),
-                        Some("response")
-                    );
-                    saw_completion = true;
-                }
-                _ => {}
+            if let EventMsg::CollabAgentCompleted(completion) = event.msg {
+                assert_eq!(completion.parent_thread_id, root_id);
+                assert_eq!(completion.child_thread_id, child_id);
+                assert_eq!(completion.agent_path, child.agent_path);
+                assert_eq!(completion.agent_nickname, child.agent_nickname);
+                assert_eq!(
+                    completion.status,
+                    AgentStatus::Completed(Some("response".to_string()))
+                );
+                assert_eq!(
+                    completion.last_assistant_message.as_deref(),
+                    Some("response")
+                );
+                saw_completion = true;
             }
 
             if saw_completion {
@@ -1390,12 +1416,9 @@ mod tests {
                 Err(_) => break,
             };
 
-            match event.msg {
-                EventMsg::CollabAgentCompleted(completion) => {
-                    assert_eq!(completion.child_thread_id, child_id);
-                    saw_collab_completion = true;
-                }
-                _ => {}
+            if let EventMsg::CollabAgentCompleted(completion) = event.msg {
+                assert_eq!(completion.child_thread_id, child_id);
+                saw_collab_completion = true;
             }
 
             if saw_collab_completion {

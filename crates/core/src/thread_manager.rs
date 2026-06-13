@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use smooth_config::Config;
 use smooth_protocol::{
     AgentPath, AgentStatus, CollabAgentStatusEntry, CollabResumeBeginEvent, CollabResumeEndEvent,
     ErrorInfo, Event, EventMsg, Op, ProjectInstructions, SessionSource, SubAgentSource, ThreadId,
@@ -16,13 +17,13 @@ use uuid::Uuid;
 use crate::{
     ThreadSummary,
     agent::{
-        AGENT_MAX_DEPTH, AgentControl, SystemPromptKind,
+        AgentControl, SystemPromptKind,
         registry::AgentMetadata,
         status::{agent_status_from_event, last_assistant_message},
     },
     core_thread::CoreThread,
     error::{CoreError, CoreResult},
-    provider::SessionModelFactory,
+    provider::{ConfigSessionModelFactory, SessionModelFactory},
     rollout::{
         RecoveryMode, find_thread_path, list_threads, load_resume_state, load_state, workspace_root,
     },
@@ -60,25 +61,44 @@ pub struct ThreadManagerState {
 }
 
 impl ThreadManagerState {
+    /// Convenience constructor using built-in default configuration. Used by
+    /// tests and any caller that does not thread a resolved [`Config`].
     pub async fn new(
         ask_user_client: Option<AskUserClient>,
         model_factory: Option<Arc<dyn SessionModelFactory>>,
+    ) -> CoreResult<Self> {
+        Self::new_with_config(ask_user_client, model_factory, Arc::new(Config::default())).await
+    }
+
+    pub async fn new_with_config(
+        ask_user_client: Option<AskUserClient>,
+        model_factory: Option<Arc<dyn SessionModelFactory>>,
+        config: Arc<Config>,
     ) -> CoreResult<Self> {
         let threads = Arc::new(RwLock::new(HashMap::new()));
         let workspace_root = workspace_root().map_err(CoreError::rollout)?;
         let state_db =
             StateDbHandle::open(workspace_root.join(".smooth-code").join("state.db")).await?;
-        let agent_control = AgentControl::new();
+        // Resolve the factory exactly once so every thread — including spawned
+        // subagents, which inherit this through `AgentControl` — uses the same
+        // configured factory rather than falling back to a default.
+        let model_factory: Arc<dyn SessionModelFactory> = model_factory
+            .unwrap_or_else(|| Arc::new(ConfigSessionModelFactory::new(Arc::clone(&config))));
+        let agent_control = AgentControl::with_limits(
+            config.agent.max_depth,
+            config.agent.max_threads,
+            config.tools.max_skill_bytes,
+        );
         agent_control.attach_runtime(
             Arc::clone(&threads),
             ask_user_client.clone(),
-            model_factory.clone(),
+            Some(Arc::clone(&model_factory)),
             state_db.clone(),
         )?;
         Ok(Self {
             threads,
             ask_user_client,
-            model_factory,
+            model_factory: Some(model_factory),
             agent_control,
             state_db,
         })
@@ -616,11 +636,9 @@ impl ThreadManagerState {
                 thread_id: parent_thread_id,
             })?;
         let depth = parent_depth + 1;
-        if depth > AGENT_MAX_DEPTH {
-            return Err(CoreError::AgentDepthLimitExceeded {
-                depth,
-                max_depth: AGENT_MAX_DEPTH,
-            });
+        let max_depth = self.agent_control.max_depth();
+        if depth > max_depth {
+            return Err(CoreError::AgentDepthLimitExceeded { depth, max_depth });
         }
         let agent_path = agent_path.ok_or(CoreError::MissingAgentPath {
             thread_id: child_thread_id,

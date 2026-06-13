@@ -7,7 +7,9 @@ use ratatui::{
 /// Foreground color used for both inline code and fenced code blocks. Shared so
 /// the transcript wrapper can recognize code lines (every span code-colored) and
 /// wrap them column-faithfully instead of word-wrapping them like prose.
-pub(crate) const CODE_COLOR: Color = Color::Cyan;
+pub(crate) fn code_color() -> Color {
+    crate::config_state::to_color(crate::config_state::current().tui.colors.code)
+}
 
 #[derive(Default)]
 struct ListState {
@@ -56,7 +58,7 @@ impl Renderer {
                 }
             }
             Event::Code(code) => {
-                let style = Style::default().fg(CODE_COLOR);
+                let style = Style::default().fg(code_color());
                 self.current_line
                     .push(Span::styled(code.into_string(), style));
             }
@@ -161,7 +163,7 @@ impl Renderer {
             }
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
-                let code_style = Style::default().fg(CODE_COLOR);
+                let code_style = Style::default().fg(code_color());
                 // Mark fenced-code lines at the LINE level too. Inline code only
                 // ever sets a span-level color, so the transcript wrapper can use
                 // this line-level marker to tell a fenced block apart from a

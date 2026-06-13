@@ -38,6 +38,7 @@ use rig::{
     },
 };
 use serde::Serialize;
+use smooth_config::{Config, ReasoningEffortConfig, ReasoningSummaryConfig};
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
@@ -69,10 +70,18 @@ pub trait SessionModelFactory: Send + Sync {
     ) -> Result<SessionModel>;
 }
 
-/// Default environment-backed `SessionModelFactory`.
-pub struct EnvSessionModelFactory;
+/// Default `SessionModelFactory` backed by a resolved [`Config`].
+pub struct ConfigSessionModelFactory {
+    config: Arc<Config>,
+}
 
-impl SessionModelFactory for EnvSessionModelFactory {
+impl ConfigSessionModelFactory {
+    pub fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl SessionModelFactory for ConfigSessionModelFactory {
     fn build(
         &self,
         cwd: PathBuf,
@@ -83,7 +92,8 @@ impl SessionModelFactory for EnvSessionModelFactory {
         agent_control: AgentControl,
         plan_mode: bool,
     ) -> Result<SessionModel> {
-        SessionModel::from_env(
+        SessionModel::from_config(
+            &self.config,
             cwd,
             thread_id,
             ask_user_client,
@@ -160,6 +170,7 @@ pub struct OpenAiSessionModel {
     agent: Arc<Agent<openai::responses_api::ResponsesCompletionModel>>,
     client: openai::Client,
     model: String,
+    websocket: smooth_config::WebSocketConfig,
     session_ws: Mutex<Option<OpenAiParkedWebSocket>>,
 }
 
@@ -176,8 +187,40 @@ impl SessionModel {
         matches!(self, Self::OpenAi(_))
     }
 
+    /// OpenAI WebSocket pre-output retry budget. For OpenAI this is the
+    /// configured value; other models (incl. the test stub) use the default,
+    /// because actual retries are gated by the transient-marker check, not the
+    /// budget — preserving the historical global-budget behavior.
+    pub(crate) fn websocket_retry_budget(&self) -> usize {
+        match self {
+            Self::OpenAi(openai) => openai.websocket.retry_budget,
+            _ => smooth_config::WebSocketConfig::default().retry_budget,
+        }
+    }
+
+    /// Backoff delay for the `retry_count`-th OpenAI WebSocket retry, using the
+    /// configured base/max for OpenAI and the defaults for other models.
+    pub(crate) fn websocket_retry_delay(&self, retry_count: usize) -> Duration {
+        let (base_ms, max_ms) = match self {
+            Self::OpenAi(openai) => (
+                openai.websocket.retry_base_ms,
+                openai.websocket.retry_max_ms,
+            ),
+            _ => {
+                let ws = smooth_config::WebSocketConfig::default();
+                (ws.retry_base_ms, ws.retry_max_ms)
+            }
+        };
+        openai_websocket_retry_delay(
+            retry_count,
+            Duration::from_millis(base_ms),
+            Duration::from_millis(max_ms),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn from_env(
+    pub fn from_config(
+        config: &Config,
         cwd: PathBuf,
         thread_id: smooth_protocol::ThreadId,
         ask_user_client: Option<AskUserClient>,
@@ -186,30 +229,30 @@ impl SessionModel {
         agent_control: AgentControl,
         plan_mode: bool,
     ) -> Result<Self> {
-        let provider = env::var("SMOOTH_CODE_LLM_PROVIDER")
-            .unwrap_or_else(|_| "openai".to_string())
-            .to_ascii_lowercase();
-        let model = env::var("SMOOTH_CODE_LLM_MODEL")
-            .ok()
-            .unwrap_or_else(|| "gpt-5.5".to_string());
+        // Normalize identically to config validation (shared helper) so a
+        // value like " openai " that passed validation also matches an arm.
+        let provider = smooth_config::normalize_provider(&config.provider.provider);
+        let model = config.provider.model.clone();
         let environment_context = EnvironmentContext::gather(&cwd);
         let preamble = compose_session_preamble(
             system_prompt_kind,
-            env::var("SMOOTH_CODE_LLM_PREAMBLE").ok(),
+            config.provider.preamble.clone(),
             &environment_context,
             plan_mode,
         );
 
         match provider.as_str() {
             "openai" => {
-                let mut builder = openai::Client::builder().api_key("cazean");
-                builder = builder.base_url("http://localhost:8317/v1");
+                let openai = &config.provider.openai;
+                let builder = openai::Client::builder()
+                    .api_key(&openai.api_key)
+                    .base_url(&openai.base_url);
                 let client = builder.build()?;
                 let additional_params = AdditionalParameters {
                     reasoning: Some(
                         OpenAiReasoning::new()
-                            .with_effort(ReasoningEffort::High)
-                            .with_summary_level(openai::responses_api::ReasoningSummaryLevel::Auto),
+                            .with_effort(reasoning_effort(openai.reasoning_effort))
+                            .with_summary_level(reasoning_summary(openai.reasoning_summary)),
                     ),
                     ..Default::default()
                 };
@@ -225,11 +268,13 @@ impl SessionModel {
                     system_prompt_kind,
                     agent_control.clone(),
                     plan_mode,
+                    config,
                 );
                 Ok(Self::OpenAi(Arc::new(OpenAiSessionModel {
                     agent: Arc::new(agent),
                     client,
                     model,
+                    websocket: config.provider.websocket.clone(),
                     session_ws: Mutex::new(None),
                 })))
             }
@@ -244,6 +289,7 @@ impl SessionModel {
                     system_prompt_kind,
                     agent_control.clone(),
                     plan_mode,
+                    config,
                 ))))
             }
             "anthropic" => {
@@ -257,6 +303,7 @@ impl SessionModel {
                     system_prompt_kind,
                     agent_control.clone(),
                     plan_mode,
+                    config,
                 ))))
             }
             "gemini" => {
@@ -270,9 +317,10 @@ impl SessionModel {
                     system_prompt_kind,
                     agent_control,
                     plan_mode,
+                    config,
                 ))))
             }
-            other => bail!("unsupported SMOOTH_CODE_LLM_PROVIDER `{other}`"),
+            other => bail!("unsupported LLM provider `{other}`"),
         }
     }
 
@@ -320,8 +368,12 @@ pub(crate) fn tool_error_is_interrupted(err: &anyhow::Error) -> bool {
     })
 }
 
+/// Fallback factory for callers that pass no factory. In production the
+/// resolved factory is always threaded down from `ThreadManagerState`, so this
+/// is only hit by direct `CoreThread` callers; it uses built-in defaults
+/// (equivalent to today's behavior).
 pub(crate) fn default_session_model_factory() -> Arc<dyn SessionModelFactory> {
-    Arc::new(EnvSessionModelFactory)
+    Arc::new(ConfigSessionModelFactory::new(Arc::new(Config::default())))
 }
 
 pub(crate) fn stub_session_model_factory(
@@ -384,21 +436,30 @@ fn build_agent<M>(
     system_prompt_kind: SystemPromptKind,
     _agent_control: AgentControl,
     plan_mode: bool,
+    config: &Config,
 ) -> Agent<M>
 where
     M: rig::completion::CompletionModel,
 {
+    let tools = &config.tools;
+    let rc = &tools.run_command;
+    let max_turns = config.provider.max_turns as usize;
     // File reads, shell inspection, and sub-agent spawning are always present.
     let builder = builder
-        .tool(ReadTool::new(cwd.clone()))
-        .tool(RunCommandTool::new(cwd.clone()));
+        .tool(ReadTool::new(cwd.clone()).with_default_limit(tools.read_default_limit))
+        .tool(RunCommandTool::new(cwd.clone()).with_limits(
+            rc.default_timeout_secs,
+            rc.max_timeout_secs,
+            rc.term_grace_ms,
+            tools.max_tool_output_bytes,
+        ));
     if matches!(system_prompt_kind, SystemPromptKind::Explore) {
-        return builder.default_max_turns(99999).build();
+        return builder.default_max_turns(max_turns).build();
     }
     // Progress tracking is available everywhere except read-only Explore agents.
     let builder = builder
-        .tool(TodoWriteTool::new())
-        .tool(SkillTool::new(cwd.clone()));
+        .tool(TodoWriteTool::new().with_max_todos(tools.max_todos))
+        .tool(SkillTool::new(cwd.clone()).with_max_skill_bytes(tools.max_skill_bytes));
     // File-mutating tools are only registered outside plan mode;
     // plan-mode-specific tools (`plan_write`, `exit_plan_mode`) are only
     // registered inside plan mode.
@@ -408,9 +469,14 @@ where
             .tool(ExitPlanModeTool::new())
     } else {
         builder
-            .tool(DeleteTool::new(cwd.clone()))
-            .tool(EditTool::new(cwd.clone()))
-            .tool(WriteTool::new(cwd))
+            .tool(
+                DeleteTool::new(cwd.clone())
+                    .with_max_file_change_bytes(tools.max_file_change_bytes),
+            )
+            .tool(
+                EditTool::new(cwd.clone()).with_max_file_change_bytes(tools.max_file_change_bytes),
+            )
+            .tool(WriteTool::new(cwd).with_max_file_change_bytes(tools.max_file_change_bytes))
     };
     let builder = if let Some(ask_user_client) = ask_user_client {
         builder.tool(AskUserQuestionTool::new(
@@ -422,7 +488,31 @@ where
         builder
     };
     let builder = builder.tool(SpawnAgentTool::new(render_spawn_agent_tool_description()));
-    builder.default_max_turns(99999).build()
+    builder.default_max_turns(max_turns).build()
+}
+
+/// Convert the config reasoning-effort enum to Rig's `ReasoningEffort`.
+fn reasoning_effort(effort: ReasoningEffortConfig) -> ReasoningEffort {
+    match effort {
+        ReasoningEffortConfig::None => ReasoningEffort::None,
+        ReasoningEffortConfig::Minimal => ReasoningEffort::Minimal,
+        ReasoningEffortConfig::Low => ReasoningEffort::Low,
+        ReasoningEffortConfig::Medium => ReasoningEffort::Medium,
+        ReasoningEffortConfig::High => ReasoningEffort::High,
+        ReasoningEffortConfig::Xhigh => ReasoningEffort::Xhigh,
+    }
+}
+
+/// Convert the config reasoning-summary enum to Rig's `ReasoningSummaryLevel`.
+fn reasoning_summary(
+    summary: ReasoningSummaryConfig,
+) -> openai::responses_api::ReasoningSummaryLevel {
+    use openai::responses_api::ReasoningSummaryLevel;
+    match summary {
+        ReasoningSummaryConfig::Auto => ReasoningSummaryLevel::Auto,
+        ReasoningSummaryConfig::Concise => ReasoningSummaryLevel::Concise,
+        ReasoningSummaryConfig::Detailed => ReasoningSummaryLevel::Detailed,
+    }
 }
 
 async fn stream_agent_completion<M>(
@@ -493,19 +583,14 @@ fn session_assistant_content_from_streamed<R>(
 
 type OpenAiWebSocketRawChoice = RawStreamingChoice<OpenAiStreamingCompletionResponse>;
 type OpenAiWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
-// A connection reset before output is how the local proxy (CLIProxyAPI) surfaces an upstream
-// codex account running out of usage: it drops the socket, and on the next attempt the proxy can
-// rotate to a different account. Budget enough attempts to roll through several exhausted accounts
-// before giving up, and cap the exponential backoff so the retry tail stays interactive.
-pub(crate) const OPENAI_WEBSOCKET_RETRY_BUDGET: usize = 8;
-const OPENAI_WEBSOCKET_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
-const OPENAI_WEBSOCKET_RETRY_MAX_DELAY: Duration = Duration::from_secs(3);
-/// After sending `response.cancel`, how long the read loop keeps consuming
-/// frames hoping for a clean protocol terminal (which lets the socket be
-/// parked for the next turn). Past the deadline the socket is dropped, which
-/// is exactly the pre-cancel behavior — a proxy that ignores the cancel frame
-/// costs nothing.
-const OPENAI_WEBSOCKET_CANCEL_DRAIN: Duration = Duration::from_millis(1500);
+// Retry/backoff/cancel-drain tuning is configurable via `[provider.websocket]`
+// and carried on `OpenAiSessionModel.websocket`. Defaults (budget 8, base 250ms,
+// max 3s, drain 1500ms) live in `smooth-config`. A connection reset before
+// output is how the local proxy (CLIProxyAPI) surfaces an upstream codex account
+// running out of usage; the budget rolls through several exhausted accounts and
+// the capped exponential backoff keeps the retry tail interactive. The
+// cancel-drain bounds how long the read loop keeps consuming after sending
+// `response.cancel`, hoping for a clean terminal so the socket can be parked.
 
 struct OpenAiParkedWebSocket {
     socket: OpenAiWebSocket,
@@ -547,7 +632,7 @@ async fn stream_openai_agent_completion(
             let mut stream = match openai_websocket_completion_stream(&openai, completion_request.clone(), cancel.clone()).await {
                 Ok(stream) => stream,
                 Err(error)
-                    if retry_count < OPENAI_WEBSOCKET_RETRY_BUDGET
+                    if retry_count < openai.websocket.retry_budget
                         && should_retry_openai_websocket_error(&error, false) =>
                 {
                     retry_count += 1;
@@ -556,7 +641,7 @@ async fn stream_openai_agent_completion(
                         error = %error,
                         "OpenAI WebSocket transient failure before the turn stream started; retrying"
                     );
-                    tokio::time::sleep(openai_websocket_retry_delay(retry_count)).await;
+                    tokio::time::sleep(openai_websocket_retry_delay(retry_count, Duration::from_millis(openai.websocket.retry_base_ms), Duration::from_millis(openai.websocket.retry_max_ms))).await;
                     continue;
                 }
                 Err(error) => Err(error).context("failed to start OpenAI WebSocket completion stream")?,
@@ -572,7 +657,7 @@ async fn stream_openai_agent_completion(
                         yield SessionCompletionEvent::AssistantItem(assistant_item);
                     }
                     Err(error)
-                        if retry_count < OPENAI_WEBSOCKET_RETRY_BUDGET
+                        if retry_count < openai.websocket.retry_budget
                             && should_retry_openai_websocket_error(&error, yielded_assistant_item) =>
                     {
                         retry_count += 1;
@@ -581,7 +666,7 @@ async fn stream_openai_agent_completion(
                             error = %error,
                             "OpenAI WebSocket transient failure before any assistant item; retrying"
                         );
-                        tokio::time::sleep(openai_websocket_retry_delay(retry_count)).await;
+                        tokio::time::sleep(openai_websocket_retry_delay(retry_count, Duration::from_millis(openai.websocket.retry_base_ms), Duration::from_millis(openai.websocket.retry_max_ms))).await;
                         retry_after_start_error = true;
                         break;
                     }
@@ -701,7 +786,7 @@ fn openai_websocket_stream(
                             .await;
                         cancel_sent = true;
                         drain_deadline =
-                            tokio::time::Instant::now() + OPENAI_WEBSOCKET_CANCEL_DRAIN;
+                            tokio::time::Instant::now() + Duration::from_millis(openai.websocket.cancel_drain_ms);
                         continue;
                     }
                 }
@@ -1300,13 +1385,15 @@ fn should_retry_openai_websocket_error(
     !yielded_assistant_item && is_openai_websocket_transient_start_error(error)
 }
 
-pub(crate) fn openai_websocket_retry_delay(retry_count: usize) -> Duration {
+pub(crate) fn openai_websocket_retry_delay(
+    retry_count: usize,
+    base: Duration,
+    max: Duration,
+) -> Duration {
     let factor = 1_u32
         .checked_shl(retry_count.saturating_sub(1) as u32)
         .unwrap_or(u32::MAX);
-    OPENAI_WEBSOCKET_RETRY_BASE_DELAY
-        .saturating_mul(factor)
-        .min(OPENAI_WEBSOCKET_RETRY_MAX_DELAY)
+    base.saturating_mul(factor).min(max)
 }
 
 struct OpenAiWebSocketAccumulator {
@@ -1783,6 +1870,8 @@ mod tests {
     };
     use tokio_tungstenite::{accept_async, tungstenite::Message as TestWebSocketMessage};
 
+    use smooth_config::Config;
+
     use super::{build_agent, compose_session_preamble};
     use crate::{
         agent::{
@@ -1878,6 +1967,7 @@ mod tests {
             agent: Arc::new(agent),
             client,
             model: "gpt-test".to_string(),
+            websocket: smooth_config::WebSocketConfig::default(),
             session_ws: Mutex::new(None),
         }))
     }
@@ -2260,6 +2350,7 @@ mod tests {
             SystemPromptKind::Root,
             AgentControl::new(),
             false,
+            &Config::default(),
         );
 
         let tool_names = agent
@@ -2296,6 +2387,7 @@ mod tests {
             SystemPromptKind::DefaultSubagent,
             AgentControl::new(),
             false,
+            &Config::default(),
         );
 
         let tool_names = agent
@@ -2330,6 +2422,7 @@ mod tests {
             SystemPromptKind::Root,
             AgentControl::new(),
             true,
+            &Config::default(),
         );
 
         let tool_names = agent
@@ -2361,6 +2454,7 @@ mod tests {
             SystemPromptKind::Explore,
             AgentControl::new(),
             false,
+            &Config::default(),
         );
 
         let tool_names = agent
@@ -2839,26 +2933,18 @@ mod tests {
 
     #[test]
     fn openai_websocket_retry_delay_grows_then_caps() {
+        // Use the built-in WebSocket defaults (base 250ms, max 3s).
+        let ws = smooth_config::WebSocketConfig::default();
+        let base = std::time::Duration::from_millis(ws.retry_base_ms);
+        let max = std::time::Duration::from_millis(ws.retry_max_ms);
         // Early retries back off exponentially from the base delay.
-        assert_eq!(
-            super::openai_websocket_retry_delay(1),
-            super::OPENAI_WEBSOCKET_RETRY_BASE_DELAY
-        );
-        assert_eq!(
-            super::openai_websocket_retry_delay(2),
-            super::OPENAI_WEBSOCKET_RETRY_BASE_DELAY * 2
-        );
+        assert_eq!(super::openai_websocket_retry_delay(1, base, max), base);
+        assert_eq!(super::openai_websocket_retry_delay(2, base, max), base * 2);
 
         // The later attempts in the budget are clamped so the retry tail stays interactive, and a
         // huge retry count saturates to the cap instead of panicking on Duration overflow.
-        assert!(
-            super::openai_websocket_retry_delay(super::OPENAI_WEBSOCKET_RETRY_BUDGET)
-                <= super::OPENAI_WEBSOCKET_RETRY_MAX_DELAY
-        );
-        assert_eq!(
-            super::openai_websocket_retry_delay(64),
-            super::OPENAI_WEBSOCKET_RETRY_MAX_DELAY
-        );
+        assert!(super::openai_websocket_retry_delay(ws.retry_budget, base, max) <= max);
+        assert_eq!(super::openai_websocket_retry_delay(64, base, max), max);
     }
 
     #[test]

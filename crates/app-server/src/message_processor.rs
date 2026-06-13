@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use app_server_protocol::{ClientRequest, JsonRpcError};
 use futures_util::FutureExt;
+use smooth_config::Config;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -17,8 +18,9 @@ impl MessageProcessor {
     pub(crate) async fn new(
         event_tx: mpsc::Sender<InProcessServerEvent>,
         outgoing: Arc<OutgoingMessageSender>,
+        config: Arc<Config>,
     ) -> AppServerResult<Self> {
-        let core_message_processor = CoreMessageProcessor::new(event_tx, outgoing).await?;
+        let core_message_processor = CoreMessageProcessor::new(event_tx, outgoing, config).await?;
         Ok(Self {
             core_message_processor,
         })

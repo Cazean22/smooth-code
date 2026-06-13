@@ -1,0 +1,67 @@
+# smooth-code configuration (example)
+#
+# Copy to one of the following (later layers override earlier ones):
+#   1. ~/.config/smooth-code/config.toml        (user, XDG; honors $XDG_CONFIG_HOME)
+#   2. <workspace>/.smooth-code/config.toml      (project)
+# Legacy SMOOTH_CODE_* environment variables override both (see docs/config.md).
+#
+# Every UNCOMMENTED value below is the built-in default — copying this file
+# verbatim changes nothing. Commented lines show example overrides.
+
+[provider]
+provider = "openai"          # one of: openai, openrouter, anthropic, gemini
+model = "gpt-5.5"
+max_turns = 99999
+# Override the root system prompt. Omit to use the built-in prompt.
+# preamble = "You are a helpful coding agent for ${working_directory}."
+
+[provider.openai]
+# The default api_key/base_url target a local proxy (CLIProxyAPI); they are a
+# non-secret stand-in, not a real key. Real provider keys for the other
+# providers come from OPENROUTER_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY.
+api_key = "cazean"
+base_url = "http://localhost:8317/v1"
+reasoning_effort = "high"    # none | minimal | low | medium | high | xhigh
+reasoning_summary = "auto"   # auto | concise | detailed
+
+[provider.websocket]
+# OpenAI WebSocket retry/cancel tuning (used by the provider stream and the
+# manual turn-retry loop). retry_budget = 0 disables pre-output retries.
+retry_budget = 8
+retry_base_ms = 250
+retry_max_ms = 3000
+cancel_drain_ms = 1500
+
+[agent]
+max_depth = 8                # maximum sub-agent nesting depth
+max_threads = 16             # maximum concurrent agent threads
+
+[tools]
+read_default_limit = 2000        # default lines returned by the read tool
+max_tool_output_bytes = 16384    # captured tool output before a truncation suffix
+max_file_change_bytes = 524288   # diffs/contents larger than this are omitted from the UI
+max_todos = 50
+max_skill_bytes = 65536          # max SKILL.md bytes read before truncation
+
+[tools.run_command]
+default_timeout_secs = 300       # used when a command omits timeout_secs
+max_timeout_secs = 3600          # hard cap; must be >= default_timeout_secs
+term_grace_ms = 2000             # SIGTERM-to-SIGKILL grace period
+
+[tui]
+highlight_theme = "CatppuccinMocha"   # any two-face theme, e.g. Dracula, Nord, GruvboxDark
+max_highlight_bytes = 524288
+max_highlight_lines = 10000
+max_rendered_diff_lines = 1000
+
+[tui.colors]
+# Colors accept: a named color (e.g. "cyan", "dark-gray"), a palette index
+# ("22" or "indexed:22"), or an RGB hex string ("#rrggbb").
+diff_add_bg = "indexed:22"
+diff_delete_bg = "indexed:52"
+code = "cyan"
+
+[telemetry]
+log_filter = "info,smooth_tui=debug,app_server=debug,smooth_core=debug"  # overridable by RUST_LOG
+log_file_name = "smooth-tui.log"   # bare file name under <workspace>/.smooth-code/logs/
+force_stderr = false               # true logs to stderr instead of the file

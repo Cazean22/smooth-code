@@ -387,8 +387,8 @@ impl UiModel {
                 state.pending_args = None;
                 state.pending_g = None;
             }
-            // `g` is a prefix: `gg` jumps to the top, `gd` opens the selected
-            // row's subagent session. `Home` keeps the direct jump.
+            // `g` is a prefix: `gg` jumps to the top. `Enter` opens the
+            // selected row's subagent session. `Home` keeps the direct jump.
             KeyCode::Char('g') => {
                 state.pending_args = None;
                 let chord = state
@@ -405,15 +405,14 @@ impl UiModel {
                 }
             }
             KeyCode::Char('d') => {
-                let chord = state
-                    .pending_g
-                    .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
                 state.pending_g = None;
-                if chord {
-                    return self.goto_selected_subagent(state);
-                }
                 self.transcript_select = Some(state);
                 return Vec::new();
+            }
+            KeyCode::Enter => {
+                state.pending_g = None;
+                state.pending_args = None;
+                return self.goto_selected_subagent(state);
             }
             KeyCode::Home => {
                 state.selected = 0;
@@ -438,7 +437,7 @@ impl UiModel {
         Vec::new()
     }
 
-    /// `gd` in transcript-select mode: open the selected `spawn_agent` row's
+    /// `Enter` in transcript-select mode: open the selected `spawn_agent` row's
     /// subagent session as a live preview. The selection and scroll state are
     /// left untouched, so closing the preview restores this view exactly.
     pub(in crate::app) fn goto_selected_subagent(
@@ -451,7 +450,8 @@ impl UiModel {
             .get(state.selected)
             .and_then(|item| item.tool_group_cell());
         let Some(group) = group else {
-            self.status_line = String::from("Not a subagent row (gd opens spawn_agent sessions)");
+            self.status_line =
+                String::from("Not a subagent row (Enter opens spawn_agent sessions)");
             return Vec::new();
         };
         let thread_id = if group.is_batch() {
@@ -465,7 +465,7 @@ impl UiModel {
             self.status_line = if group.is_spawn_agent() {
                 String::from("Subagent not started yet — no session to open")
             } else {
-                String::from("Not a subagent row (gd opens spawn_agent sessions)")
+                String::from("Not a subagent row (Enter opens spawn_agent sessions)")
             };
             return Vec::new();
         };

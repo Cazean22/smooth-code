@@ -1,4 +1,4 @@
-//! Full-screen, read-only live view of a subagent session, opened with `gd`
+//! Full-screen, read-only live view of a subagent session, opened with `Enter`
 //! from transcript-select mode. Views stack to support nested subagents.
 
 use std::collections::{HashMap, HashSet};
@@ -45,10 +45,10 @@ pub(crate) struct SubagentPreviewView {
     pub(crate) selected: usize,
     pub(crate) selected_tool_entry: Option<usize>,
     /// Whether the view is in the transcript-select sub-mode (entered with
-    /// `Esc Esc`): a highlighted row, `j`/`k` move the selection, `gd` nests,
+    /// `Esc Esc`): a highlighted row, `j`/`k` move the selection, `Enter` nests,
     /// `y` copies. Defaults to the Normal-like scroll sub-mode.
     pub(crate) select_mode: bool,
-    /// Armed by `g` for the `gg`/`gd` chord inside the preview.
+    /// Armed by `g` for the `gg` chord inside the preview.
     pub(crate) pending_g: Option<Instant>,
     /// Armed by `Esc` in scroll mode for the `Esc Esc` chord that enters the
     /// select sub-mode.
@@ -117,7 +117,7 @@ impl SubagentPreviewView {
         format!("subagent {identity} — {}", agent_status_label(&self.status))
     }
 
-    /// The subagent spawned by the currently selected row, for nested `gd`.
+    /// The subagent spawned by the currently selected row, for nested `Enter`.
     pub(crate) fn selected_tool_group(&self) -> Option<&ToolCallGroupCell> {
         self.items
             .get(self.selected)

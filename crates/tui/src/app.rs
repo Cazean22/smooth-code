@@ -54,7 +54,7 @@ pub(crate) enum AppRunControl {
 const DOUBLE_ESC_WINDOW: Duration = Duration::from_millis(500);
 /// Window within which a second `y` press upgrades a tool-result copy to args.
 const COPY_CHORD_WINDOW: Duration = Duration::from_millis(500);
-/// Window within which a `g` prefix completes as `gg` (top) or `gd` (subagent).
+/// Window within which a `g` prefix completes as `gg` (top).
 const GOTO_CHORD_WINDOW: Duration = Duration::from_millis(500);
 /// Cap on the OSC 52 payload; terminals commonly reject larger sequences.
 const MAX_CLIPBOARD_BYTES: usize = 100_000;
@@ -404,8 +404,7 @@ struct TranscriptSelectState {
     selected: usize,
     selected_tool_entry: Option<usize>,
     pending_args: Option<(usize, Option<usize>, Instant)>,
-    /// Armed by `g`: a second `g` within the chord window jumps to the top
-    /// (`gg`), a `d` opens the selected row's subagent session (`gd`).
+    /// Armed by `g`: a second `g` within the chord window jumps to the top (`gg`).
     pending_g: Option<Instant>,
 }
 
@@ -454,8 +453,8 @@ struct UiModel {
     focus: FocusTarget,
     dashboard: DashboardState,
     transcript_select: Option<TranscriptSelectState>,
-    /// Stacked full-screen subagent previews (`gd`); the top view receives
-    /// keys and is rendered, nesting pushes deeper.
+    /// Stacked full-screen subagent previews opened from transcript-select mode;
+    /// the top view receives keys and is rendered, nesting pushes deeper.
     preview_stack: Vec<SubagentPreviewView>,
     /// Subagent previews popped with Ctrl-O, newest last. Ctrl-I reopens these
     /// by issuing fresh preview requests, preserving server watcher refcounts.

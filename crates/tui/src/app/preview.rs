@@ -30,7 +30,7 @@ impl UiModel {
 
     /// Keys while a subagent preview is open. The top view owns the keyboard
     /// and starts in a Normal-like scroll sub-mode; `Esc Esc` switches it into
-    /// a transcript-select sub-mode (mirroring the main view) for `gd`/copy.
+    /// a transcript-select sub-mode (mirroring the main view) for `Enter`/copy.
     pub(in crate::app) fn handle_preview_key(
         &mut self,
         key_event: KeyEvent,
@@ -79,7 +79,7 @@ impl UiModel {
                         view.default_tool_entry_for_selection(view.selected, false);
                     view.ensure_selected_visible(width, viewport);
                     self.status_line = String::from(
-                        "Subagent select — j/k move, gd open, Esc scroll, Ctrl-O back",
+                        "Subagent select — j/k move, Enter open, Esc scroll, Ctrl-O back",
                     );
                 } else {
                     view.pending_esc = Some(now);
@@ -115,16 +115,9 @@ impl UiModel {
                 }
                 Vec::new()
             }
-            KeyCode::Char('d') => {
+            KeyCode::Enter => {
                 view.pending_esc = None;
-                let chord = view
-                    .pending_g
-                    .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
                 view.pending_g = None;
-                if chord {
-                    self.status_line =
-                        String::from("Press Esc Esc to select a row, then gd to open it");
-                }
                 Vec::new()
             }
             KeyCode::Home => {
@@ -166,7 +159,7 @@ impl UiModel {
 
     /// A preview's transcript-select sub-mode (entered with `Esc Esc`): a
     /// highlighted row, `j`/`k` move the selection, `gg`/`G`/Home/End move it,
-    /// `gd` nests a deeper preview, `y`/`yy` copy. `Esc` returns to scroll and
+    /// `Enter` nests a deeper preview, `y`/`yy` copy. `Esc` returns to scroll and
     /// `Ctrl-O` returns to the parent preview/session.
     pub(in crate::app) fn handle_preview_select_key(
         &mut self,
@@ -221,14 +214,9 @@ impl UiModel {
                 }
                 Vec::new()
             }
-            KeyCode::Char('d') => {
-                let chord = view
-                    .pending_g
-                    .is_some_and(|t| now.duration_since(t) <= GOTO_CHORD_WINDOW);
+            KeyCode::Enter => {
                 view.pending_g = None;
-                if !chord {
-                    return Vec::new();
-                }
+                view.pending_args = None;
                 let target = view.selected_tool_group().map(|group| {
                     let thread_id = if group.is_batch() {
                         view.selected_tool_entry
@@ -254,7 +242,7 @@ impl UiModel {
                     }
                     _ => {
                         self.status_line =
-                            String::from("Not a subagent row (gd opens spawn_agent sessions)");
+                            String::from("Not a subagent row (Enter opens spawn_agent sessions)");
                         Vec::new()
                     }
                 }
@@ -585,7 +573,7 @@ impl UiModel {
         // feedback ("Subagent not started yet", failed nested opens) would
         // otherwise be invisible until the user exits.
         let hint = if select_mode {
-            "j/k move  gd nested  y copy selected tool  yy args  Esc scroll  Ctrl-O back"
+            "j/k move  Enter nested  y copy selected tool  yy args  Esc scroll  Ctrl-O back"
         } else {
             "j/k scroll  gg/G top/bottom  Esc Esc select  Ctrl-O back  Ctrl-I forward"
         };
@@ -712,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn gd_on_subagent_row_emits_one_preview_effect_and_preserves_selection() {
+    fn enter_on_subagent_row_emits_one_preview_effect_and_preserves_selection() {
         let mut app = App::new();
         let child_thread_id = ThreadId::new();
 
@@ -760,10 +748,18 @@ mod tests {
 
         let t = t0 + Duration::from_millis(300);
         let effects = app.model.handle_key_event_at(key(KeyCode::Char('g')), t);
-        assert!(effects.is_empty(), "g alone arms the chord");
+        assert!(effects.is_empty(), "g alone arms only the gg chord");
         let effects = app
             .model
             .handle_key_event_at(key(KeyCode::Char('d')), t + Duration::from_millis(100));
+        assert!(
+            preview_targets(&effects).is_empty(),
+            "gd no longer opens a subagent preview"
+        );
+
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Enter), t + Duration::from_millis(200));
 
         let preview_targets: Vec<ThreadId> = effects
             .iter()
@@ -778,31 +774,29 @@ mod tests {
         assert_eq!(
             app.model.transcript_select.map(|state| state.selected),
             Some(tool_row),
-            "gd leaves the parent selection untouched"
+            "Enter leaves the parent selection untouched"
         );
     }
 
     #[test]
-    fn gd_on_plain_row_is_noop_with_status() {
+    fn enter_on_plain_row_is_noop_with_status() {
         let mut model = select_model_with_items(3);
         let t0 = Instant::now();
         enter_select(&mut model, t0);
 
         let t = t0 + Duration::from_millis(300);
-        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t);
-        let effects =
-            model.handle_key_event_at(key(KeyCode::Char('d')), t + Duration::from_millis(100));
+        let effects = model.handle_key_event_at(key(KeyCode::Enter), t);
 
         assert!(effects.is_empty());
         assert_eq!(
             model.status_line,
-            "Not a subagent row (gd opens spawn_agent sessions)"
+            "Not a subagent row (Enter opens spawn_agent sessions)"
         );
         assert_eq!(model.mode, UiMode::TranscriptSelect);
     }
 
     #[test]
-    fn gd_on_spawn_row_without_child_id_reports_pending() {
+    fn enter_on_spawn_row_without_child_id_reports_pending() {
         let mut app = App::new();
         start_turn(&mut app);
         start_tool_call(
@@ -826,10 +820,7 @@ mod tests {
         }
 
         let t = t0 + Duration::from_millis(300);
-        let _ = app.model.handle_key_event_at(key(KeyCode::Char('g')), t);
-        let effects = app
-            .model
-            .handle_key_event_at(key(KeyCode::Char('d')), t + Duration::from_millis(100));
+        let effects = app.model.handle_key_event_at(key(KeyCode::Enter), t);
 
         assert!(effects.is_empty());
         assert_eq!(
@@ -839,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn gd_on_spawn_row_after_spawn_end_opens_before_tool_result() {
+    fn enter_on_spawn_row_after_spawn_end_opens_before_tool_result() {
         let mut app = App::new();
         let child_thread_id = ThreadId::new();
 
@@ -882,10 +873,7 @@ mod tests {
         }
 
         let t = t0 + Duration::from_millis(300);
-        let _ = app.model.handle_key_event_at(key(KeyCode::Char('g')), t);
-        let effects = app
-            .model
-            .handle_key_event_at(key(KeyCode::Char('d')), t + Duration::from_millis(100));
+        let effects = app.model.handle_key_event_at(key(KeyCode::Enter), t);
 
         let preview_targets: Vec<ThreadId> = effects
             .iter()
@@ -935,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_renders_status_line_for_in_preview_gd_failures()
+    fn preview_renders_status_line_for_in_preview_enter_failures()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut model = workspace_normal_model();
         let child = ThreadId::new();
@@ -947,15 +935,14 @@ mod tests {
             }],
         );
 
-        // `gd` on a non-subagent row inside the preview: the feedback must be
-        // visible without leaving the preview. `gd` lives in the select
+        // `Enter` on a non-subagent row inside the preview: the feedback must be
+        // visible without leaving the preview. `Enter` opens only in the select
         // sub-mode, reached with `Esc Esc`.
         let t0 = Instant::now();
         let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
         let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(50));
-        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0 + Duration::from_millis(100));
         let effects =
-            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(150));
+            model.handle_key_event_at(key(KeyCode::Enter), t0 + Duration::from_millis(100));
         assert!(effects.is_empty());
 
         let mut terminal = Terminal::new(TestBackend::new(80, 12))?;
@@ -1114,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_gd_pushes_second_view_and_duplicates_are_dropped() {
+    fn nested_enter_pushes_second_view_and_duplicates_are_dropped() {
         let mut model = workspace_normal_model();
         let child = ThreadId::new();
         let grandchild = ThreadId::new();
@@ -1163,16 +1150,15 @@ mod tests {
             "duplicate started/completed events must not add rows"
         );
 
-        // `gd` on the spawn row nests a second preview. `gd` lives in the
-        // select sub-mode, reached with `Esc Esc`. A fresh `gd` branch clears
+        // `Enter` on the spawn row nests a second preview. `Enter` lives in the
+        // select sub-mode, reached with `Esc Esc`. A fresh `Enter` branch clears
         // any Ctrl-I forward history left by prior back navigation.
         model.preview_forward_stack.push(ThreadId::new());
         let t0 = Instant::now();
         let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
         let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(50));
-        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0 + Duration::from_millis(100));
         let effects =
-            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(150));
+            model.handle_key_event_at(key(KeyCode::Enter), t0 + Duration::from_millis(100));
         let targets = preview_targets(&effects);
         assert_eq!(targets, vec![grandchild]);
         assert!(model.preview_forward_stack.is_empty());
@@ -1252,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_gd_in_scroll_mode_does_not_open_nested() {
+    fn preview_enter_in_scroll_mode_does_not_open_nested() {
         let mut model = workspace_normal_model();
         let child = ThreadId::new();
         let grandchild = ThreadId::new();
@@ -1278,17 +1264,15 @@ mod tests {
         });
         open_preview(&mut model, child, vec![started, completed]);
 
-        // In scroll mode `gd` must not open the nested subagent (it lives in
+        // In scroll mode `Enter` must not open the nested subagent (it lives in
         // the select sub-mode); the preview stack is unchanged.
         let t0 = Instant::now();
-        let _ = model.handle_key_event_at(key(KeyCode::Char('g')), t0);
-        let effects =
-            model.handle_key_event_at(key(KeyCode::Char('d')), t0 + Duration::from_millis(50));
+        let effects = model.handle_key_event_at(key(KeyCode::Enter), t0);
         assert!(
             effects
                 .iter()
                 .all(|effect| !matches!(effect.kind, UiEffectKind::ThreadPreview { .. })),
-            "gd in scroll mode must not emit a ThreadPreview effect"
+            "Enter in scroll mode must not emit a ThreadPreview effect"
         );
         assert_eq!(model.preview_stack.len(), 1);
     }

@@ -585,7 +585,7 @@ impl UiModel {
         if self.mode == UiMode::TranscriptSelect {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
-                "j/k move  y copy selected tool  yy copy selected args  gg top  G bottom  gd subagent  Esc exit",
+                "j/k move  y copy selected tool  yy copy selected args  gg top  G bottom  Enter subagent  Esc exit",
                 Style::default().fg(Color::DarkGray),
             ));
         }

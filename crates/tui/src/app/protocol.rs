@@ -140,7 +140,7 @@ impl UiModel {
                 self.finalize_assistant_stream(None);
                 // Record the spawned child on the tool row (both the live
                 // StatusUpdate and the fast-finish Final paths carry it), so
-                // `gd` can resolve the row to a subagent session later.
+                // Enter can resolve the row to a subagent session later.
                 if let Some(thread_id) = tool.related_thread_id
                     && let Some((cell_idx, entry_idx)) =
                         self.tool_call_rows.get(&tool.call_id).copied()

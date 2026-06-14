@@ -330,7 +330,7 @@ pub(crate) struct ToolCallEntry {
     error: Option<String>,
     output: Option<String>,
     /// The child thread spawned by this call (`spawn_agent` only), recorded
-    /// from `ToolCallCompletedEvent::related_thread_id`. The `gd` target.
+    /// from `ToolCallCompletedEvent::related_thread_id`. The `Enter` target.
     related_thread_id: Option<smooth_protocol::ThreadId>,
 }
 
@@ -392,7 +392,7 @@ impl ToolCallGroupCell {
         }
     }
 
-    /// The subagent session this cell opens with `gd`: the first entry that
+    /// The subagent session this cell opens with `Enter`: the first entry that
     /// recorded a child thread id (grouped consecutive `spawn_agent` calls
     /// share one cell).
     pub(crate) fn subagent_thread_id(&self) -> Option<smooth_protocol::ThreadId> {
@@ -676,7 +676,7 @@ fn tool_call_glyph(state: ToolCallState) -> Span<'static> {
 }
 
 /// Marker appended to a tool row whose entry spawned a subagent: the row can
-/// be entered with `gd` in transcript-select mode.
+/// be entered with `Enter` in transcript-select mode.
 fn subagent_suffix() -> Span<'static> {
     Span::styled(" ↳ subagent", Style::default().dim())
 }

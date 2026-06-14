@@ -106,10 +106,12 @@ impl UiModel {
 
         let item_count = self.transcript_items.len();
         let has_active_below = self.has_active_stream_lines();
-        let selected_idx = if self.mode == UiMode::TranscriptSelect {
-            self.transcript_select.map(|state| state.selected)
+        let (selected_idx, selected_tool_entry) = if self.mode == UiMode::TranscriptSelect {
+            self.transcript_select
+                .map(|state| (Some(state.selected), state.selected_tool_entry))
+                .unwrap_or((None, None))
         } else {
-            None
+            (None, None)
         };
         self.render_cache.evict_stale_widths(width);
         for (idx, item) in self.transcript_items.iter().enumerate() {
@@ -127,13 +129,24 @@ impl UiModel {
                 continue;
             }
 
-            let mut item_lines = self.render_cache.item_lines(item, width);
+            let mut item_lines = if selected_idx == Some(idx)
+                && let Some(entry_idx) = selected_tool_entry
+                && let Some(group) = item.tool_group_cell()
+                && group.is_batch()
+            {
+                group.display_lines_with_selected_entry(
+                    usize::from(width.max(1)),
+                    Some(entry_idx.min(group.entry_count().saturating_sub(1))),
+                )
+            } else {
+                self.render_cache.item_lines(item, width)
+            };
             if omit_bottom {
                 item_lines.pop();
             }
             // Highlight the selected row by patching the per-frame clone of
             // the cached lines; the cache itself stays untouched.
-            if selected_idx == Some(idx) {
+            if selected_idx == Some(idx) && selected_tool_entry.is_none() {
                 for line in &mut item_lines {
                     line.style = line.style.patch(Style::default().bg(Color::DarkGray));
                 }
@@ -572,7 +585,7 @@ impl UiModel {
         if self.mode == UiMode::TranscriptSelect {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
-                "j/k move  y copy  yy copy args  gg top  G bottom  gd subagent  Esc exit",
+                "j/k move  y copy selected tool  yy copy selected args  gg top  G bottom  gd subagent  Esc exit",
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -867,7 +880,7 @@ mod tests {
         complete_tool_call(&mut app, "5", "c2", true, None);
 
         let joined = transcript_strings(&app).join("\n");
-        assert!(joined.contains("✓ read\n      ✓ foo.rs\n      ✓ bar.rs"));
+        assert!(joined.contains("✓ read\n   1. ✓ foo.rs\n   2. ✓ bar.rs"));
         assert!(!joined.contains("✓ read foo.rs"));
     }
 
@@ -927,8 +940,8 @@ mod tests {
             transcript_strings(&app),
             vec![
                 String::from("✗ read"),
-                String::from("      ✓ foo.rs"),
-                String::from("      ✗ bar.rs"),
+                String::from("   1. ✓ foo.rs"),
+                String::from("   2. ✗ bar.rs"),
                 String::from("        ! permission denied"),
             ]
         );

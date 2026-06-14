@@ -153,14 +153,39 @@ impl UiModel {
         (rows, 0)
     }
 
+    pub(in crate::app) fn transcript_selected_row_extent(
+        &mut self,
+        state: TranscriptSelectState,
+        width: u16,
+    ) -> (usize, usize) {
+        let (item_start, item_height) = self.transcript_item_row_extent(state.selected, width);
+        let Some(entry_idx) = state.selected_tool_entry else {
+            return (item_start, item_height);
+        };
+        let Some(group) = self
+            .transcript_items
+            .get(state.selected)
+            .and_then(|item| item.tool_group_cell())
+        else {
+            return (item_start, item_height);
+        };
+        let Some((entry_start, entry_height)) =
+            group.entry_row_extent(usize::from(width.max(1)), entry_idx)
+        else {
+            return (item_start, item_height);
+        };
+        (item_start.saturating_add(entry_start), entry_height)
+    }
+
     /// Scroll just enough that the selected transcript row is on screen;
-    /// items taller than the viewport pin to their top.
+    /// selected entries inside batched tool rows scroll independently. Items or
+    /// entries taller than the viewport pin to their top.
     pub(in crate::app) fn transcript_select_ensure_visible(&mut self, viewport_height: u16) {
         let Some(state) = self.transcript_select else {
             return;
         };
         let (start, height) =
-            self.transcript_item_row_extent(state.selected, self.transcript_inner_width);
+            self.transcript_selected_row_extent(state, self.transcript_inner_width);
         let vp = usize::from(viewport_height.max(1));
         let scroll = usize::from(self.scroll);
         let mut new_scroll = if start < scroll {

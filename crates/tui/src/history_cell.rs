@@ -378,6 +378,10 @@ impl ToolCallGroupCell {
         self.entries.len()
     }
 
+    pub(crate) fn is_batch(&self) -> bool {
+        self.entries.len() > 1
+    }
+
     pub(crate) fn set_entry_related_thread(
         &mut self,
         entry_idx: usize,
@@ -415,6 +419,33 @@ impl ToolCallGroupCell {
         }
     }
 
+    /// The real tool result for one entry: stored output wins over error, and
+    /// running entries return `None`.
+    pub(crate) fn copy_entry_result(&self, entry_idx: usize) -> Option<String> {
+        let entry = self.entries.get(entry_idx)?;
+        match (&entry.output, &entry.error) {
+            (Some(output), _) => Some(output.clone()),
+            (None, Some(error)) => Some(format!("error: {error}")),
+            (None, None) => None,
+        }
+    }
+
+    /// The real tool parameters for one entry.
+    pub(crate) fn copy_entry_args(&self, entry_idx: usize) -> Option<String> {
+        self.entries
+            .get(entry_idx)
+            .map(|entry| entry.args_preview.clone())
+    }
+
+    pub(crate) fn entry_subagent_thread_id(
+        &self,
+        entry_idx: usize,
+    ) -> Option<smooth_protocol::ThreadId> {
+        self.entries
+            .get(entry_idx)
+            .and_then(|entry| entry.related_thread_id)
+    }
+
     /// The real tool results for copying: each finished entry contributes its
     /// stored output (or its error), running entries are skipped. `None` when
     /// no entry has anything to report yet.
@@ -444,8 +475,62 @@ impl ToolCallGroupCell {
             .join("\n\n")
     }
 
+    pub(crate) fn entry_row_extent(
+        &self,
+        width: usize,
+        entry_idx: usize,
+    ) -> Option<(usize, usize)> {
+        if entry_idx >= self.entries.len() {
+            return None;
+        }
+        if self.entries.len() == 1 {
+            return Some((0, self.display_lines(width).len()));
+        }
+
+        let (header, indent) = tool_call_line("", self.header_state(), Some(self.tool_name()), "");
+        let mut row = wrap::wrap_line_char_hanging(header, width, indent).len();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let mut height = self.entry_display_lines(width, idx, entry, false).len();
+            if height == 0 {
+                height = 1;
+            }
+            if idx == entry_idx {
+                return Some((row, height));
+            }
+            row = row.saturating_add(height);
+        }
+        None
+    }
+
     pub(crate) fn display_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let header_state = if self
+        self.display_lines_with_selected_entry(width, None)
+    }
+
+    pub(crate) fn display_lines_with_selected_entry(
+        &self,
+        width: usize,
+        selected_entry: Option<usize>,
+    ) -> Vec<Line<'static>> {
+        let header_state = self.header_state();
+
+        let mut lines = Vec::new();
+        if self.entries.len() == 1 {
+            let entry = &self.entries[0];
+            let entry_lines = self.entry_display_lines(width, 0, entry, selected_entry == Some(0));
+            lines.extend(entry_lines);
+            return lines;
+        }
+
+        let (header, indent) = tool_call_line("", header_state, Some(self.tool_name()), "");
+        lines.extend(wrap::wrap_line_char_hanging(header, width, indent));
+        for (idx, entry) in self.entries.iter().enumerate() {
+            lines.extend(self.entry_display_lines(width, idx, entry, selected_entry == Some(idx)));
+        }
+        lines
+    }
+
+    fn header_state(&self) -> ToolCallState {
+        if self
             .entries
             .iter()
             .any(|entry| matches!(entry.state, ToolCallState::Failure))
@@ -459,43 +544,47 @@ impl ToolCallGroupCell {
             ToolCallState::Running
         } else {
             ToolCallState::Success
+        }
+    }
+
+    fn entry_display_lines(
+        &self,
+        width: usize,
+        idx: usize,
+        entry: &ToolCallEntry,
+        selected: bool,
+    ) -> Vec<Line<'static>> {
+        let (mut line, indent) = if self.entries.len() == 1 {
+            tool_call_line("", entry.state, Some(self.tool_name()), &entry.args_preview)
+        } else {
+            let entry_prefix = format!("  {:>2}. ", idx.saturating_add(1));
+            tool_call_line(&entry_prefix, entry.state, None, &entry.args_preview)
         };
-
-        let mut lines = Vec::new();
-        if self.entries.len() == 1 {
-            let entry = &self.entries[0];
-            let (mut line, indent) =
-                tool_call_line("", entry.state, Some(self.tool_name()), &entry.args_preview);
-            if entry.related_thread_id.is_some() {
-                line.spans.push(subagent_suffix());
-            }
-            lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
-            if matches!(entry.state, ToolCallState::Failure)
-                && let Some(error) = entry.error.as_deref()
-            {
-                let (line, indent) = tool_error_line("      ", error);
-                lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
-            }
-            return lines;
+        if entry.related_thread_id.is_some() {
+            line.spans.push(subagent_suffix());
         }
-
-        let (header, indent) = tool_call_line("", header_state, Some(self.tool_name()), "");
-        lines.extend(wrap::wrap_line_char_hanging(header, width, indent));
-        for entry in &self.entries {
-            let (mut line, indent) =
-                tool_call_line("      ", entry.state, None, &entry.args_preview);
-            if entry.related_thread_id.is_some() {
-                line.spans.push(subagent_suffix());
-            }
-            lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
-            if matches!(entry.state, ToolCallState::Failure)
-                && let Some(error) = entry.error.as_deref()
-            {
-                let (line, indent) = tool_error_line("        ", error);
-                lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
-            }
+        let mut entry_lines = wrap::wrap_line_char_hanging(line, width, indent);
+        if matches!(entry.state, ToolCallState::Failure)
+            && let Some(error) = entry.error.as_deref()
+        {
+            let error_prefix = if self.entries.len() == 1 {
+                "      "
+            } else {
+                "        "
+            };
+            let (line, indent) = tool_error_line(error_prefix, error);
+            entry_lines.extend(wrap::wrap_line_char_hanging(line, width, indent));
         }
-        lines
+        if selected {
+            highlight_lines(&mut entry_lines);
+        }
+        entry_lines
+    }
+}
+
+fn highlight_lines(lines: &mut [Line<'static>]) {
+    for line in lines {
+        line.style = line.style.patch(Style::default().bg(Color::DarkGray));
     }
 }
 
@@ -546,7 +635,7 @@ fn render_todo_list(todos: &[TodoItem], width: usize) -> Vec<Line<'static>> {
 /// so wrapped continuation rows can hang-indent under the args rather than the
 /// glyph or tool name.
 fn tool_call_line(
-    indent: &'static str,
+    indent: &str,
     state: ToolCallState,
     label: Option<&str>,
     args_preview: &str,
@@ -554,7 +643,7 @@ fn tool_call_line(
     let mut spans = Vec::new();
     let mut content_col = 0usize;
     if !indent.is_empty() {
-        spans.push(Span::raw(indent));
+        spans.push(Span::raw(indent.to_owned()));
         content_col += wrap::display_width(indent);
     }
     let glyph = tool_call_glyph(state);
@@ -594,10 +683,10 @@ fn subagent_suffix() -> Span<'static> {
 
 /// Build a tool failure row and report the column after the `! ` marker so
 /// wrapped continuation rows hang-indent under the error text.
-fn tool_error_line(indent: &'static str, error: &str) -> (Line<'static>, usize) {
+fn tool_error_line(indent: &str, error: &str) -> (Line<'static>, usize) {
     let content_col = wrap::display_width(indent) + 2;
     let line = Line::from(vec![
-        Span::raw(indent),
+        Span::raw(indent.to_owned()),
         Span::styled("! ", Style::default().fg(Color::Red).bold()),
         Span::styled(error.to_owned(), Style::default().fg(Color::Red).dim()),
     ]);
@@ -792,7 +881,11 @@ mod tests {
         let lines = cell.display_lines(24);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
 
-        // entry indent "      " (6) + glyph (2) = 8.
+        assert!(
+            texts.iter().any(|t| t.contains("1. ")) && texts.iter().any(|t| t.contains("2. ")),
+            "batch entries should be visibly numbered: {texts:?}"
+        );
+        // entry prefix "   1. " (6) + glyph (2) = 8.
         let indent = " ".repeat(8);
         assert!(
             texts.iter().skip(1).any(|t| t.starts_with(&indent)),
@@ -1010,6 +1103,37 @@ mod tests {
             item.copy_text().as_deref(),
             Some("Update big.bin: omitted (too large, +10/-2, 4096 bytes)")
         );
+    }
+
+    #[test]
+    fn tool_copy_entry_result_targets_one_output_or_error() {
+        let mut cell = ToolCallGroupCell::new("run".to_string(), "{\"a\":1}".to_string());
+        cell.set_entry_output(0, "first output".to_string());
+        cell.set_entry_outcome(0, ToolCallState::Success, None);
+        let second = cell.push_entry("{\"b\":2}".to_string());
+        cell.set_entry_outcome(second, ToolCallState::Failure, Some("boom".to_string()));
+
+        assert_eq!(cell.copy_entry_result(0).as_deref(), Some("first output"));
+        assert_eq!(cell.copy_entry_result(1).as_deref(), Some("error: boom"));
+        assert_eq!(cell.copy_entry_args(1).as_deref(), Some("{\"b\":2}"));
+        assert_eq!(cell.copy_entry_result(2), None);
+        assert_eq!(cell.copy_entry_args(2), None);
+    }
+
+    #[test]
+    fn selected_batch_entry_highlights_only_that_entry() {
+        let mut cell = ToolCallGroupCell::new("run".to_string(), "first".to_string());
+        cell.push_entry("second".to_string());
+        let lines = cell.display_lines_with_selected_entry(80, Some(1));
+        let highlighted: Vec<String> = lines
+            .iter()
+            .filter(|line| line.style.bg == Some(Color::DarkGray))
+            .map(line_text)
+            .collect();
+
+        assert_eq!(highlighted.len(), 1);
+        assert!(highlighted[0].contains("2. "));
+        assert!(highlighted[0].contains("second"));
     }
 
     #[test]

@@ -396,12 +396,14 @@ struct RunningToolInfo {
     args_preview: String,
 }
 
-/// State for transcript-select mode: which row is selected and, after a `y` on
-/// a tool row, the pending chance to upgrade the copy to the tool args.
+/// State for transcript-select mode: which row/optional batch entry is selected
+/// and, after a `y` on a tool row, the pending chance to upgrade the copy to the
+/// selected tool args.
 #[derive(Debug, Clone, Copy)]
 struct TranscriptSelectState {
     selected: usize,
-    pending_args: Option<(usize, Instant)>,
+    selected_tool_entry: Option<usize>,
+    pending_args: Option<(usize, Option<usize>, Instant)>,
     /// Armed by `g`: a second `g` within the chord window jumps to the top
     /// (`gg`), a `d` opens the selected row's subagent session (`gd`).
     pending_g: Option<Instant>,

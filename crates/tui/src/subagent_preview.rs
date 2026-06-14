@@ -43,6 +43,7 @@ pub(crate) struct SubagentPreviewView {
     active_version: u64,
     active_wrap: Option<ActiveWrap>,
     pub(crate) selected: usize,
+    pub(crate) selected_tool_entry: Option<usize>,
     /// Whether the view is in the transcript-select sub-mode (entered with
     /// `Esc Esc`): a highlighted row, `j`/`k` move the selection, `gd` nests,
     /// `y` copies. Defaults to the Normal-like scroll sub-mode.
@@ -54,7 +55,7 @@ pub(crate) struct SubagentPreviewView {
     pub(crate) pending_esc: Option<Instant>,
     /// Armed by `y` on a tool row in select mode: a second `y` within the
     /// chord window upgrades the copy from the result to the arguments.
-    pub(crate) pending_args: Option<(usize, Instant)>,
+    pub(crate) pending_args: Option<(usize, Option<usize>, Instant)>,
     pub(crate) scroll: u16,
     pub(crate) auto_scroll: bool,
     render_cache: RenderedTranscriptCache,
@@ -86,6 +87,7 @@ impl SubagentPreviewView {
             active_version: 0,
             active_wrap: None,
             selected: 0,
+            selected_tool_entry: None,
             select_mode: false,
             pending_g: None,
             pending_esc: None,
@@ -101,6 +103,7 @@ impl SubagentPreviewView {
         // terminal event at all), so the response status wins.
         view.status = response.status;
         view.selected = view.items.len().saturating_sub(1);
+        view.selected_tool_entry = view.default_tool_entry_for_selection(view.selected, true);
         view
     }
 
@@ -119,6 +122,51 @@ impl SubagentPreviewView {
         self.items
             .get(self.selected)
             .and_then(|i| i.tool_group_cell())
+    }
+
+    pub(crate) fn default_tool_entry_for_selection(
+        &self,
+        selected: usize,
+        prefer_last: bool,
+    ) -> Option<usize> {
+        let group = self.items.get(selected).and_then(|i| i.tool_group_cell())?;
+        if !group.is_batch() {
+            return None;
+        }
+        Some(if prefer_last {
+            group.entry_count().saturating_sub(1)
+        } else {
+            0
+        })
+    }
+
+    pub(crate) fn move_selection_up(&mut self) {
+        if let Some(entry_idx) = self.selected_tool_entry
+            && entry_idx > 0
+        {
+            self.selected_tool_entry = Some(entry_idx - 1);
+            return;
+        }
+        self.selected = self.selected.saturating_sub(1);
+        self.selected_tool_entry = self.default_tool_entry_for_selection(self.selected, true);
+    }
+
+    pub(crate) fn move_selection_down(&mut self) {
+        if let Some(entry_idx) = self.selected_tool_entry
+            && let Some(group) = self
+                .items
+                .get(self.selected)
+                .and_then(|i| i.tool_group_cell())
+            && entry_idx + 1 < group.entry_count()
+        {
+            self.selected_tool_entry = Some(entry_idx + 1);
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add(1)
+            .min(self.item_count().saturating_sub(1));
+        self.selected_tool_entry = self.default_tool_entry_for_selection(self.selected, false);
     }
 
     /// The transcript item under the selection cursor — the copy target in
@@ -536,8 +584,28 @@ impl SubagentPreviewView {
         self.items.len().saturating_sub(1)
     }
 
+    fn selected_row_extent(&mut self, width: u16) -> (usize, usize) {
+        let (item_start, item_height) = self.item_row_extent(self.selected, width);
+        let Some(entry_idx) = self.selected_tool_entry else {
+            return (item_start, item_height);
+        };
+        let Some(group) = self
+            .items
+            .get(self.selected)
+            .and_then(|item| item.tool_group_cell())
+        else {
+            return (item_start, item_height);
+        };
+        let Some((entry_start, entry_height)) =
+            group.entry_row_extent(usize::from(width.max(1)), entry_idx)
+        else {
+            return (item_start, item_height);
+        };
+        (item_start.saturating_add(entry_start), entry_height)
+    }
+
     pub(crate) fn ensure_selected_visible(&mut self, width: u16, viewport_height: u16) {
-        let (start, height) = self.item_row_extent(self.selected, width);
+        let (start, height) = self.selected_row_extent(width);
         let vp = usize::from(viewport_height.max(1));
         let scroll = usize::from(self.scroll);
         let mut new_scroll = if start < scroll {
@@ -571,8 +639,20 @@ impl SubagentPreviewView {
                 all_rows = all_rows.saturating_add(item_height);
                 continue;
             }
-            let mut item_lines = self.render_cache.item_lines(item, width);
-            if show_selection && selected_idx == idx {
+            let mut item_lines = if show_selection
+                && selected_idx == idx
+                && let Some(entry_idx) = self.selected_tool_entry
+                && let Some(group) = item.tool_group_cell()
+                && group.is_batch()
+            {
+                group.display_lines_with_selected_entry(
+                    usize::from(width.max(1)),
+                    Some(entry_idx.min(group.entry_count().saturating_sub(1))),
+                )
+            } else {
+                self.render_cache.item_lines(item, width)
+            };
+            if show_selection && selected_idx == idx && self.selected_tool_entry.is_none() {
                 for line in &mut item_lines {
                     line.style = line.style.patch(Style::default().bg(Color::DarkGray));
                 }

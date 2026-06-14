@@ -292,13 +292,61 @@ impl UiModel {
         self.mode = UiMode::TranscriptSelect;
         self.focus = FocusTarget::Transcript;
         self.auto_scroll = false;
+        let selected = self.transcript_items.len().saturating_sub(1);
         self.transcript_select = Some(TranscriptSelectState {
-            selected: self.transcript_items.len().saturating_sub(1),
+            selected,
+            selected_tool_entry: self.default_tool_entry_for_selection(selected, true),
             pending_args: None,
             pending_g: None,
         });
         self.transcript_select_ensure_visible(self.viewport_height);
         self.status_line = String::from("Transcript select");
+    }
+
+    fn default_tool_entry_for_selection(
+        &self,
+        selected: usize,
+        prefer_last: bool,
+    ) -> Option<usize> {
+        let group = self
+            .transcript_items
+            .get(selected)
+            .and_then(|item| item.tool_group_cell())?;
+        if !group.is_batch() {
+            return None;
+        }
+        Some(if prefer_last {
+            group.entry_count().saturating_sub(1)
+        } else {
+            0
+        })
+    }
+
+    fn move_transcript_selection_up(&self, state: &mut TranscriptSelectState) {
+        if let Some(entry_idx) = state.selected_tool_entry
+            && entry_idx > 0
+        {
+            state.selected_tool_entry = Some(entry_idx - 1);
+            return;
+        }
+        state.selected = state.selected.saturating_sub(1);
+        state.selected_tool_entry = self.default_tool_entry_for_selection(state.selected, true);
+    }
+
+    fn move_transcript_selection_down(&self, state: &mut TranscriptSelectState) {
+        if let Some(entry_idx) = state.selected_tool_entry
+            && let Some(group) = self
+                .transcript_items
+                .get(state.selected)
+                .and_then(|item| item.tool_group_cell())
+            && entry_idx + 1 < group.entry_count()
+        {
+            state.selected_tool_entry = Some(entry_idx + 1);
+            return;
+        }
+        let last = self.transcript_items.len().saturating_sub(1);
+        state.selected = state.selected.saturating_add(1).min(last);
+        state.selected_tool_entry = self.default_tool_entry_for_selection(state.selected, false);
     }
 
     /// Leave transcript-select mode. Safe to call when not in it (no-op apart
@@ -330,12 +378,12 @@ impl UiModel {
                 return Vec::new();
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                state.selected = state.selected.saturating_sub(1);
+                self.move_transcript_selection_up(&mut state);
                 state.pending_args = None;
                 state.pending_g = None;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                state.selected = state.selected.saturating_add(1).min(last);
+                self.move_transcript_selection_down(&mut state);
                 state.pending_args = None;
                 state.pending_g = None;
             }
@@ -349,6 +397,7 @@ impl UiModel {
                 if chord {
                     state.pending_g = None;
                     state.selected = 0;
+                    state.selected_tool_entry = self.default_tool_entry_for_selection(0, false);
                 } else {
                     state.pending_g = Some(now);
                     self.transcript_select = Some(state);
@@ -368,11 +417,13 @@ impl UiModel {
             }
             KeyCode::Home => {
                 state.selected = 0;
+                state.selected_tool_entry = self.default_tool_entry_for_selection(0, false);
                 state.pending_args = None;
                 state.pending_g = None;
             }
             KeyCode::End | KeyCode::Char('G') => {
                 state.selected = last;
+                state.selected_tool_entry = self.default_tool_entry_for_selection(last, true);
                 state.pending_args = None;
                 state.pending_g = None;
             }
@@ -403,7 +454,14 @@ impl UiModel {
             self.status_line = String::from("Not a subagent row (gd opens spawn_agent sessions)");
             return Vec::new();
         };
-        let Some(thread_id) = group.subagent_thread_id() else {
+        let thread_id = if group.is_batch() {
+            state
+                .selected_tool_entry
+                .and_then(|entry_idx| group.entry_subagent_thread_id(entry_idx))
+        } else {
+            group.subagent_thread_id()
+        };
+        let Some(thread_id) = thread_id else {
             self.status_line = if group.is_spawn_agent() {
                 String::from("Subagent not started yet — no session to open")
             } else {
@@ -1393,6 +1451,28 @@ mod tests {
         }
     }
 
+    fn complete_tool_call_with_output(app: &mut App, event_id: &str, call_id: &str, output: &str) {
+        app.handle_session_event(
+            event(
+                event_id,
+                EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+                    thread_id: String::from("thread"),
+                    turn_id: String::from("turn-1"),
+                    call_id: call_id.to_owned(),
+                    success: true,
+                    output_preview: Some(output.to_owned()),
+                    error: None,
+                    result_kind: ToolCallResultKind::Final,
+                    related_thread_id: None,
+                    file_change: None,
+                    file_changes: Vec::new(),
+                    todos: Vec::new(),
+                }),
+            ),
+            20,
+        );
+    }
+
     #[test]
     fn y_copies_tool_result_then_second_y_copies_args() {
         let mut app = App::new();
@@ -1439,6 +1519,109 @@ mod tests {
             .model
             .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(200));
         assert_eq!(clipboard_content(&effects), Some("{\"cmd\":\"sleep\"}"));
+    }
+
+    #[test]
+    fn batch_tool_selection_moves_between_entries_and_y_copies_one_entry() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        start_tool_call(&mut app, "1", "call-1", "run_command", "{\"cmd\":\"one\"}");
+        start_tool_call(&mut app, "2", "call-2", "run_command", "{\"cmd\":\"two\"}");
+        complete_tool_call_with_output(&mut app, "3", "call-1", "output one");
+        complete_tool_call_with_output(&mut app, "4", "call-2", "output two");
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        assert_eq!(
+            app.model
+                .transcript_select
+                .and_then(|state| state.selected_tool_entry),
+            Some(1),
+            "selecting a final batch row starts on its last entry"
+        );
+
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(100));
+        assert_eq!(clipboard_content(&effects), Some("output two"));
+
+        let _ = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('k')), t0 + Duration::from_millis(200));
+        assert_eq!(
+            app.model
+                .transcript_select
+                .and_then(|state| state.selected_tool_entry),
+            Some(0)
+        );
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(300));
+        assert_eq!(clipboard_content(&effects), Some("output one"));
+    }
+
+    #[test]
+    fn yy_on_batch_tool_entry_copies_only_that_entry_args() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        start_tool_call(&mut app, "1", "call-1", "run_command", "{\"cmd\":\"one\"}");
+        start_tool_call(&mut app, "2", "call-2", "run_command", "{\"cmd\":\"two\"}");
+        complete_tool_call_with_output(&mut app, "3", "call-1", "output one");
+        complete_tool_call_with_output(&mut app, "4", "call-2", "output two");
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        let _ = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(100));
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(200));
+        assert_eq!(clipboard_content(&effects), Some("{\"cmd\":\"two\"}"));
+    }
+
+    #[test]
+    fn y_on_running_batch_tool_entry_falls_back_to_that_entry_args() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        start_tool_call(&mut app, "1", "call-1", "run_command", "{\"cmd\":\"one\"}");
+        start_tool_call(&mut app, "2", "call-2", "run_command", "{\"cmd\":\"two\"}");
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        let effects = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(100));
+        assert_eq!(clipboard_content(&effects), Some("{\"cmd\":\"two\"}"));
+    }
+
+    #[test]
+    fn batch_tool_selection_leaves_row_after_last_entry() {
+        let mut app = App::new();
+        start_turn(&mut app);
+        start_tool_call(&mut app, "1", "call-1", "run_command", "{\"cmd\":\"one\"}");
+        start_tool_call(&mut app, "2", "call-2", "run_command", "{\"cmd\":\"two\"}");
+        complete_agent_message(&mut app, "3", "assistant-1", "done");
+
+        let t0 = Instant::now();
+        enter_select(&mut app.model, t0);
+        let _ = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('k')), t0 + Duration::from_millis(100));
+        assert_eq!(
+            app.model
+                .transcript_select
+                .and_then(|state| state.selected_tool_entry),
+            Some(1)
+        );
+        let _ = app
+            .model
+            .handle_key_event_at(key(KeyCode::Char('j')), t0 + Duration::from_millis(200));
+        assert_eq!(
+            app.model.transcript_select.map(|state| state.selected),
+            Some(1),
+            "j from the last batch entry moves to the next transcript item"
+        );
     }
 
     #[test]

@@ -75,6 +75,8 @@ impl UiModel {
                     view.pending_g = None;
                     view.select_mode = true;
                     view.selected = view.first_visible_item(width);
+                    view.selected_tool_entry =
+                        view.default_tool_entry_for_selection(view.selected, false);
                     view.ensure_selected_visible(width, viewport);
                     self.status_line = String::from(
                         "Subagent select — j/k move, gd open, Esc scroll, Ctrl-O back",
@@ -193,14 +195,14 @@ impl UiModel {
             KeyCode::Up | KeyCode::Char('k') => {
                 view.pending_g = None;
                 view.pending_args = None;
-                view.selected = view.selected.saturating_sub(1);
+                view.move_selection_up();
                 view.ensure_selected_visible(width, viewport);
                 Vec::new()
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 view.pending_g = None;
                 view.pending_args = None;
-                view.selected = view.selected.saturating_add(1).min(last);
+                view.move_selection_down();
                 view.ensure_selected_visible(width, viewport);
                 Vec::new()
             }
@@ -212,6 +214,7 @@ impl UiModel {
                 if chord {
                     view.pending_g = None;
                     view.selected = 0;
+                    view.selected_tool_entry = view.default_tool_entry_for_selection(0, false);
                     view.ensure_selected_visible(width, viewport);
                 } else {
                     view.pending_g = Some(now);
@@ -226,9 +229,15 @@ impl UiModel {
                 if !chord {
                     return Vec::new();
                 }
-                let target = view
-                    .selected_tool_group()
-                    .map(|group| (group.is_spawn_agent(), group.subagent_thread_id()));
+                let target = view.selected_tool_group().map(|group| {
+                    let thread_id = if group.is_batch() {
+                        view.selected_tool_entry
+                            .and_then(|entry_idx| group.entry_subagent_thread_id(entry_idx))
+                    } else {
+                        group.subagent_thread_id()
+                    };
+                    (group.is_spawn_agent(), thread_id)
+                });
                 match target {
                     Some((_, Some(thread_id))) => {
                         self.preview_forward_stack.clear();
@@ -255,6 +264,7 @@ impl UiModel {
                 view.pending_g = None;
                 view.pending_args = None;
                 view.selected = 0;
+                view.selected_tool_entry = view.default_tool_entry_for_selection(0, false);
                 view.ensure_selected_visible(width, viewport);
                 Vec::new()
             }
@@ -262,6 +272,7 @@ impl UiModel {
                 view.pending_g = None;
                 view.pending_args = None;
                 view.selected = last;
+                view.selected_tool_entry = view.default_tool_entry_for_selection(last, true);
                 view.ensure_selected_visible(width, viewport);
                 view.auto_scroll = true;
                 Vec::new()
@@ -295,7 +306,11 @@ impl UiModel {
     pub(in crate::app) fn copy_preview_selected_row(&mut self, now: Instant) -> Vec<UiEffect> {
         // (payload, status message, next `pending_args`) resolved from the
         // selected item before the immutable borrow is released.
-        type Resolved = (String, &'static str, Option<(usize, Instant)>);
+        type Resolved = (
+            String,
+            &'static str,
+            Option<(usize, Option<usize>, Instant)>,
+        );
         let Some(view) = self.preview_stack.last_mut() else {
             return Vec::new();
         };
@@ -310,23 +325,53 @@ impl UiModel {
                 return Vec::new();
             };
             if let Some(group) = item.tool_group_cell() {
-                let chord = prev_pending
-                    .is_some_and(|(p, t)| p == idx && now.duration_since(t) <= COPY_CHORD_WINDOW);
-                Some(if chord {
-                    (group.copy_args(), "Copied tool arguments", None)
-                } else if let Some(result) = group.copy_result() {
-                    (
-                        result,
-                        "Copied tool result — y again for arguments",
-                        Some((idx, now)),
+                let selected_entry = if group.is_batch() {
+                    Some(
+                        view.selected_tool_entry
+                            .unwrap_or(0)
+                            .min(group.entry_count().saturating_sub(1)),
                     )
                 } else {
-                    (
-                        group.copy_args(),
-                        "No result yet — copied tool arguments",
-                        None,
-                    )
-                })
+                    None
+                };
+                let chord = prev_pending.is_some_and(|(p, e, t)| {
+                    p == idx && e == selected_entry && now.duration_since(t) <= COPY_CHORD_WINDOW
+                });
+                if let Some(entry_idx) = selected_entry {
+                    Some(if chord {
+                        match group.copy_entry_args(entry_idx) {
+                            Some(args) => (args, "Copied tool arguments", None),
+                            None => return Vec::new(),
+                        }
+                    } else if let Some(result) = group.copy_entry_result(entry_idx) {
+                        (
+                            result,
+                            "Copied tool result — y again for arguments",
+                            Some((idx, selected_entry, now)),
+                        )
+                    } else {
+                        match group.copy_entry_args(entry_idx) {
+                            Some(args) => (args, "No result yet — copied tool arguments", None),
+                            None => return Vec::new(),
+                        }
+                    })
+                } else {
+                    Some(if chord {
+                        (group.copy_args(), "Copied tool arguments", None)
+                    } else if let Some(result) = group.copy_result() {
+                        (
+                            result,
+                            "Copied tool result — y again for arguments",
+                            Some((idx, None, now)),
+                        )
+                    } else {
+                        (
+                            group.copy_args(),
+                            "No result yet — copied tool arguments",
+                            None,
+                        )
+                    })
+                }
             } else {
                 item.copy_text().map(|text| (text, "Copied", None))
             }
@@ -363,14 +408,49 @@ impl UiModel {
             return Vec::new();
         };
         let (payload, status) = if let Some(group) = item.tool_group_cell() {
-            let chord = state
-                .pending_args
-                .is_some_and(|(p, t)| p == idx && now.duration_since(t) <= COPY_CHORD_WINDOW);
-            if chord {
+            let selected_entry = if group.is_batch() {
+                Some(
+                    state
+                        .selected_tool_entry
+                        .unwrap_or(0)
+                        .min(group.entry_count().saturating_sub(1)),
+                )
+            } else {
+                None
+            };
+            let chord = state.pending_args.is_some_and(|(p, e, t)| {
+                p == idx && e == selected_entry && now.duration_since(t) <= COPY_CHORD_WINDOW
+            });
+            if let Some(entry_idx) = selected_entry {
+                if chord {
+                    state.pending_args = None;
+                    match group.copy_entry_args(entry_idx) {
+                        Some(args) => (args, "Copied tool arguments"),
+                        None => {
+                            self.transcript_select = Some(state);
+                            self.status_line = String::from("Nothing to copy");
+                            return Vec::new();
+                        }
+                    }
+                } else if let Some(result) = group.copy_entry_result(entry_idx) {
+                    state.pending_args = Some((idx, selected_entry, now));
+                    (result, "Copied tool result — y again for arguments")
+                } else {
+                    state.pending_args = None;
+                    match group.copy_entry_args(entry_idx) {
+                        Some(args) => (args, "No result yet — copied tool arguments"),
+                        None => {
+                            self.transcript_select = Some(state);
+                            self.status_line = String::from("Nothing to copy");
+                            return Vec::new();
+                        }
+                    }
+                }
+            } else if chord {
                 state.pending_args = None;
                 (group.copy_args(), "Copied tool arguments")
             } else if let Some(result) = group.copy_result() {
-                state.pending_args = Some((idx, now));
+                state.pending_args = Some((idx, None, now));
                 (result, "Copied tool result — y again for arguments")
             } else {
                 state.pending_args = None;
@@ -505,7 +585,7 @@ impl UiModel {
         // feedback ("Subagent not started yet", failed nested opens) would
         // otherwise be invisible until the user exits.
         let hint = if select_mode {
-            "j/k move  gg/G top/bottom  gd nested  y copy  Esc scroll  Ctrl-O back"
+            "j/k move  gd nested  y copy selected tool  yy args  Esc scroll  Ctrl-O back"
         } else {
             "j/k scroll  gg/G top/bottom  Esc Esc select  Ctrl-O back  Ctrl-I forward"
         };
@@ -524,6 +604,66 @@ impl UiModel {
 mod tests {
     use super::*;
     use crate::app::test_support::*;
+
+    fn tool_started(thread_id: ThreadId, call_id: &str, args: &str) -> EventMsg {
+        EventMsg::ToolCallStarted(ToolCallStartedEvent {
+            thread_id: thread_id.to_string(),
+            turn_id: String::from("turn-1"),
+            call_id: call_id.to_owned(),
+            tool_name: String::from("run_command"),
+            args_preview: args.to_owned(),
+        })
+    }
+
+    fn tool_completed(thread_id: ThreadId, call_id: &str, output: &str) -> EventMsg {
+        EventMsg::ToolCallCompleted(ToolCallCompletedEvent {
+            thread_id: thread_id.to_string(),
+            turn_id: String::from("turn-1"),
+            call_id: call_id.to_owned(),
+            success: true,
+            output_preview: Some(output.to_owned()),
+            error: None,
+            result_kind: ToolCallResultKind::Final,
+            related_thread_id: None,
+            file_change: None,
+            file_changes: Vec::new(),
+            todos: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn preview_batch_selection_y_copies_one_entry() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(
+            &mut model,
+            child,
+            vec![
+                tool_started(child, "call-1", "{\"cmd\":\"one\"}"),
+                tool_started(child, "call-2", "{\"cmd\":\"two\"}"),
+                tool_completed(child, "call-1", "output one"),
+                tool_completed(child, "call-2", "output two"),
+            ],
+        );
+
+        let t0 = Instant::now();
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
+        let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(50));
+        let view = model
+            .preview_stack
+            .last()
+            .unwrap_or_else(|| panic!("preview view"));
+        assert!(view.select_mode);
+        assert_eq!(view.selected_tool_entry, Some(0));
+
+        let effects =
+            model.handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(100));
+        assert_eq!(clipboard_content(&effects), Some("output one"));
+        let _ = model.handle_key_event_at(key(KeyCode::Char('j')), t0 + Duration::from_millis(150));
+        let effects =
+            model.handle_key_event_at(key(KeyCode::Char('y')), t0 + Duration::from_millis(200));
+        assert_eq!(clipboard_content(&effects), Some("output two"));
+    }
 
     #[test]
     fn final_spawn_completion_records_related_thread_on_entry() {

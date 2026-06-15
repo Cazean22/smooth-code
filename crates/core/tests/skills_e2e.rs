@@ -26,6 +26,7 @@ fn final_text_stream(text: &str) -> SessionCompletionStream {
         Ok(SessionCompletionEvent::AssistantItem(
             SessionAssistantContent::Text(Text {
                 text: text.to_string(),
+                additional_params: None,
             }),
         )),
         Ok(SessionCompletionEvent::Completed(SessionTurnSummary {

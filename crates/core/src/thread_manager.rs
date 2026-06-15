@@ -776,6 +776,7 @@ mod tests {
                 Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(Text {
                         text: self.text.clone(),
+                        additional_params: None,
                     }),
                 )),
                 Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -826,6 +827,7 @@ mod tests {
                 Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(Text {
                         text: "captured response".to_string(),
+                        additional_params: None,
                     }),
                 )),
                 Ok(SessionCompletionEvent::Completed(SessionTurnSummary {

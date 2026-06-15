@@ -803,6 +803,7 @@ mod tests {
                 Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(Text {
                         text: self.text.clone(),
+                        additional_params: None,
                     }),
                 )),
                 Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -865,6 +866,7 @@ mod tests {
                 Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(Text {
                         text: self.text.clone(),
+                        additional_params: None,
                     }),
                 )),
                 Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -943,7 +945,10 @@ mod tests {
                         .await
                         .map_err(|err| anyhow!("release permit: {err}"))?;
                     Ok(SessionCompletionEvent::AssistantItem(
-                        crate::SessionAssistantContent::Text(Text { text }),
+                        crate::SessionAssistantContent::Text(Text {
+                            text,
+                            additional_params: None,
+                        }),
                     ))
                 })
                 .chain(stream::iter(vec![Ok(SessionCompletionEvent::Completed(

@@ -61,6 +61,7 @@ impl SessionModelDriver for StubDriver {
             Ok(SessionCompletionEvent::AssistantItem(
                 SessionAssistantContent::Text(Text {
                     text: self.text.clone(),
+                    additional_params: None,
                 }),
             )),
             Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -151,6 +152,7 @@ impl SessionModelDriver for ExploreRoutingParentDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "parent saw explore".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -185,7 +187,10 @@ impl SessionModelDriver for ExploreRoutingChildDriver {
         let text = "explore findings".to_string();
         Ok(Box::pin(stream::iter(vec![
             Ok(SessionCompletionEvent::AssistantItem(
-                SessionAssistantContent::Text(Text { text: text.clone() }),
+                SessionAssistantContent::Text(Text {
+                    text: text.clone(),
+                    additional_params: None,
+                }),
             )),
             Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
                 assistant_message_id: Some("assistant-explore-child".to_string()),
@@ -479,6 +484,7 @@ impl SessionModelDriver for ConcurrentSpawnDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "parent finished".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -511,7 +517,10 @@ impl SessionModelDriver for DeferredChildDriver {
             stream::once(async move {
                 release.acquire().await?.forget();
                 Ok(SessionCompletionEvent::AssistantItem(
-                    SessionAssistantContent::Text(Text { text }),
+                    SessionAssistantContent::Text(Text {
+                        text,
+                        additional_params: None,
+                    }),
                 ))
             })
             .chain(stream::iter(vec![Ok(SessionCompletionEvent::Completed(
@@ -623,6 +632,7 @@ impl SessionModelDriver for MixedBatchDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "parent finished".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -763,6 +773,7 @@ impl SessionModelDriver for TwoRetainedDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "parent finished".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1394,6 +1405,7 @@ impl SessionModelDriver for ReasoningStreamDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "final-response".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1432,6 +1444,7 @@ impl SessionModelDriver for ReasoningStreamDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "ack".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1511,6 +1524,7 @@ impl SessionModelDriver for ReasoningToolLoopDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "tool-loop-done".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1539,6 +1553,7 @@ impl SessionModelDriver for ReasoningToolLoopDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "verified".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1658,6 +1673,7 @@ impl SessionModelDriver for PersistedToolLoopDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "tool-loop-final".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1709,6 +1725,7 @@ impl SessionModelDriver for VerifyPersistedToolLoopDriver {
             Ok(SessionCompletionEvent::AssistantItem(
                 SessionAssistantContent::Text(Text {
                     text: "verified resume".to_string(),
+                    additional_params: None,
                 }),
             )),
             Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1801,6 +1818,7 @@ impl SessionModelDriver for IdlessReasoningCompletionDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "final".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1836,6 +1854,7 @@ impl SessionModelDriver for IdlessReasoningCompletionDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "ack".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1916,6 +1935,7 @@ impl SessionModelDriver for EncryptedReasoningDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "answer".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -1948,6 +1968,7 @@ impl SessionModelDriver for EncryptedReasoningDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "ack".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -2202,6 +2223,7 @@ impl SessionModelDriver for SequentialSpawnParentDriver {
                 Ok(SessionCompletionEvent::AssistantItem(
                     SessionAssistantContent::Text(Text {
                         text: "parent done".to_string(),
+                        additional_params: None,
                     }),
                 )),
                 Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -2332,6 +2354,7 @@ impl SessionModelDriver for ConsumeThenBlockParentDriver {
                     Ok(SessionCompletionEvent::AssistantItem(
                         SessionAssistantContent::Text(Text {
                             text: "unreached".to_string(),
+                            additional_params: None,
                         }),
                     ))
                 })

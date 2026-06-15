@@ -232,7 +232,10 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
             }
             PersistedItem::HistoryMessage(HistoryMessage::UserText { text }) => {
                 history.push(Message::User {
-                    content: OneOrMany::one(UserContent::Text(Text { text })),
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text,
+                        additional_params: None,
+                    })),
                 });
             }
             PersistedItem::HistoryMessage(HistoryMessage::AssistantText { text }) => {
@@ -514,6 +517,7 @@ mod tests {
                 message: Message::User {
                     content: OneOrMany::one(UserContent::Text(Text {
                         text: "human prompt".to_string(),
+                        additional_params: None,
                     })),
                 },
             }))
@@ -532,6 +536,7 @@ mod tests {
                     content: OneOrMany::one(UserContent::Text(Text {
                         text: r#"{"event":"agent_completed","last_assistant_message":"internal"}"#
                             .to_string(),
+                        additional_params: None,
                     })),
                 },
             }))
@@ -686,7 +691,7 @@ mod tests {
         let reconstructed_texts = content
             .iter()
             .filter_map(|item| match item {
-                UserContent::Text(Text { text }) => Some(text.clone()),
+                UserContent::Text(Text { text, .. }) => Some(text.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -831,7 +836,13 @@ mod tests {
             .await?;
 
         let state = load_resume_state(recorder.path()).await?;
-        assert_eq!(state.history, vec![message]);
+        // rig 0.38's `Text::additional_params` is `#[serde(flatten)]`, so an empty
+        // one round-trips through JSON as `Some({})` rather than `None`. That is
+        // wire-identical, so compare serialized forms instead of Rust `PartialEq`.
+        assert_eq!(
+            serde_json::to_value(&state.history)?,
+            serde_json::to_value(vec![message])?,
+        );
 
         let _ = fs::remove_dir_all(&root).await;
         Ok(())
@@ -861,7 +872,13 @@ mod tests {
             .await?;
 
         let state = load_resume_state(recorder.path()).await?;
-        assert_eq!(state.history, vec![message]);
+        // rig 0.38's `Text::additional_params` is `#[serde(flatten)]`, so an empty
+        // one round-trips through JSON as `Some({})` rather than `None`. That is
+        // wire-identical, so compare serialized forms instead of Rust `PartialEq`.
+        assert_eq!(
+            serde_json::to_value(&state.history)?,
+            serde_json::to_value(vec![message])?,
+        );
 
         let _ = fs::remove_dir_all(&root).await;
         Ok(())

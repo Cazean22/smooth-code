@@ -314,7 +314,10 @@ impl SessionTask for RegularTask {
             .await;
 
         let prompt = Message::User {
-            content: OneOrMany::one(UserContent::Text(Text { text: model_text })),
+            content: OneOrMany::one(UserContent::Text(Text {
+                text: model_text,
+                additional_params: None,
+            })),
         };
         let skills = if skills_enabled {
             tools::list_skills(&session.cwd, session.agent_control.max_skill_bytes())
@@ -2218,7 +2221,10 @@ fn skills_context_message(skills: &[SkillMeta]) -> Option<Message> {
         "# Available skills\n\nThe following user-defined skills exist in this project. When a request matches a skill's purpose, invoke the `skill` tool with its name and follow the returned instructions.\n\n{listing}"
     );
     Some(Message::User {
-        content: OneOrMany::one(UserContent::Text(Text { text })),
+        content: OneOrMany::one(UserContent::Text(Text {
+            text,
+            additional_params: None,
+        })),
     })
 }
 
@@ -2259,7 +2265,10 @@ fn project_instructions_message(
         .collect::<Vec<_>>()
         .join("\n\n");
     (!text.is_empty()).then_some(Message::User {
-        content: OneOrMany::one(UserContent::Text(Text { text })),
+        content: OneOrMany::one(UserContent::Text(Text {
+            text,
+            additional_params: None,
+        })),
     })
 }
 

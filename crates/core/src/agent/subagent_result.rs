@@ -108,6 +108,7 @@ pub(crate) fn completion_entries_to_user_message(entries: &[CompletionEntry]) ->
         .map(|entry| {
             UserContent::Text(Text {
                 text: entry.to_model_json(),
+                additional_params: None,
             })
         })
         .collect::<Vec<_>>();

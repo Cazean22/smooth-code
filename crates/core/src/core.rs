@@ -626,7 +626,10 @@ impl Session {
 
     pub(crate) async fn record_user_message(&self, text: String) {
         let message = Message::User {
-            content: OneOrMany::one(UserContent::Text(Text { text })),
+            content: OneOrMany::one(UserContent::Text(Text {
+                text,
+                additional_params: None,
+            })),
         };
         let mut state = self.state.lock().await;
         state.history.push(message.clone());
@@ -824,6 +827,7 @@ mod tests {
                 Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(rig::message::Text {
                         text: "done".to_string(),
+                        additional_params: None,
                     }),
                 )),
                 Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -858,6 +862,7 @@ mod tests {
                     Ok(SessionCompletionEvent::AssistantItem(
                         crate::SessionAssistantContent::Text(Text {
                             text: "partial ".to_string(),
+                            additional_params: None,
                         }),
                     )),
                     Err(anyhow::Error::new(CompletionError::ProviderError(
@@ -871,6 +876,7 @@ mod tests {
                 Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(Text {
                         text: "continued".to_string(),
+                        additional_params: None,
                     }),
                 )),
                 Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
@@ -926,6 +932,7 @@ mod tests {
                 Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(Text {
                         text: "after tool".to_string(),
+                        additional_params: None,
                     }),
                 )),
                 Ok(SessionCompletionEvent::Completed(SessionTurnSummary {

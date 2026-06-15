@@ -21,9 +21,8 @@ use rig::{
             self,
             responses_api::{
                 AdditionalParameters, CompletionRequest as OpenAiResponsesCompletionRequest,
-                InputItem as OpenAiResponsesInputItem, Output, OutputTokensDetails,
-                Reasoning as OpenAiReasoning, ReasoningEffort, ReasoningSummary, ResponseStatus,
-                ResponsesUsage,
+                InputItem as OpenAiResponsesInputItem, Output, Reasoning as OpenAiReasoning,
+                ReasoningEffort, ReasoningSummary, ResponseStatus, ResponsesUsage,
                 streaming::{
                     ContentPartChunkPart, ItemChunk, ItemChunkKind, ResponseChunkKind,
                     StreamingCompletionResponse as OpenAiStreamingCompletionResponse,
@@ -712,7 +711,7 @@ async fn openai_websocket_completion_stream(
         // A parked socket may have gone stale since the previous turn, so keep the payload
         // around to resend after reconnecting if the first send fails. A fresh connection
         // can't be stale, so the `else` branch sends by move and pays no clone.
-        if let Err(error) = socket.send(TungsteniteMessage::Text(payload.clone())).await {
+        if let Err(error) = socket.send(TungsteniteMessage::text(payload.clone())).await {
             let error = openai_websocket_provider_error(error);
             tracing::debug!(
                 error = %error,
@@ -721,13 +720,13 @@ async fn openai_websocket_completion_stream(
             socket = openai_websocket_connect(&openai.client).await?;
             trailing_done_response_id = None;
             socket
-                .send(TungsteniteMessage::Text(payload))
+                .send(TungsteniteMessage::text(payload))
                 .await
                 .map_err(openai_websocket_provider_error)?;
         }
     } else {
         socket
-            .send(TungsteniteMessage::Text(payload))
+            .send(TungsteniteMessage::text(payload))
             .await
             .map_err(openai_websocket_provider_error)?;
     }
@@ -780,8 +779,8 @@ fn openai_websocket_stream(
                         // Responses-over-WebSocket dialect; a proxy that does
                         // not understand it just runs into the drain deadline.
                         let _ = socket
-                            .send(TungsteniteMessage::Text(
-                                r#"{"type":"response.cancel"}"#.to_string(),
+                            .send(TungsteniteMessage::text(
+                                r#"{"type":"response.cancel"}"#,
                             ))
                             .await;
                         cancel_sent = true;
@@ -1068,8 +1067,8 @@ fn openai_websocket_message_to_text(
     message: TungsteniteMessage,
 ) -> std::result::Result<Option<String>, CompletionError> {
     match message {
-        TungsteniteMessage::Text(text) => Ok(Some(text)),
-        TungsteniteMessage::Binary(bytes) => String::from_utf8(bytes)
+        TungsteniteMessage::Text(text) => Ok(Some(text.to_string())),
+        TungsteniteMessage::Binary(bytes) => String::from_utf8(bytes.to_vec())
             .map(Some)
             .map_err(|error| CompletionError::ResponseError(error.to_string())),
         TungsteniteMessage::Ping(_)
@@ -1471,12 +1470,14 @@ impl OpenAiWebSocketAccumulator {
                 self.mark_completed_message_item(item_id);
             }
             ItemChunkKind::FunctionCallArgsDelta(delta) => {
-                let internal_call_id = self.internal_call_id_for(&delta.item_id);
-                choices.push(RawStreamingChoice::ToolCallDelta {
-                    id: delta.item_id,
-                    internal_call_id,
-                    content: ToolCallDeltaContent::Delta(delta.delta),
-                });
+                if let Some(item_id) = item_id.as_deref() {
+                    let internal_call_id = self.internal_call_id_for(item_id);
+                    choices.push(RawStreamingChoice::ToolCallDelta {
+                        id: item_id.to_string(),
+                        internal_call_id,
+                        content: ToolCallDeltaContent::Delta(delta.delta),
+                    });
+                }
             }
             ItemChunkKind::FunctionCallArgsDone(done) => {
                 if let Some(item_id) = item_id.as_deref() {
@@ -1794,9 +1795,7 @@ fn empty_openai_usage() -> ResponsesUsage {
         input_tokens: 0,
         input_tokens_details: None,
         output_tokens: 0,
-        output_tokens_details: OutputTokensDetails {
-            reasoning_tokens: 0,
-        },
+        output_tokens_details: None,
         total_tokens: 0,
     }
 }
@@ -2106,7 +2105,7 @@ mod tests {
                             total_tokens,
                         );
                         if socket
-                            .send(TestWebSocketMessage::Text(frame))
+                            .send(TestWebSocketMessage::text(frame))
                             .await
                             .is_err()
                         {
@@ -2128,7 +2127,7 @@ mod tests {
                                     r#"{"type":"codex.rate_limits","rate_limits":{"allowed":true}}"#
                                         .to_string();
                                 if socket
-                                    .send(TestWebSocketMessage::Text(telemetry_frame))
+                                    .send(TestWebSocketMessage::text(telemetry_frame))
                                     .await
                                     .is_err()
                                 {
@@ -2140,7 +2139,7 @@ mod tests {
                                 total_tokens + 1,
                             );
                             if socket
-                                .send(TestWebSocketMessage::Text(done_frame))
+                                .send(TestWebSocketMessage::text(done_frame))
                                 .await
                                 .is_err()
                             {
@@ -2199,7 +2198,7 @@ mod tests {
                     continue;
                 }
                 if socket
-                    .send(TestWebSocketMessage::Text(frame.clone()))
+                    .send(TestWebSocketMessage::text(frame.clone()))
                     .await
                     .is_err()
                 {
@@ -2557,8 +2556,7 @@ mod tests {
             item_id: Some("fc_1".to_string()),
             output_index: 0,
             data: ItemChunkKind::FunctionCallArgsDelta(DeltaTextChunkWithItemId {
-                item_id: "fc_1".to_string(),
-                content_index: 0,
+                content_index: Some(0),
                 sequence_number: 2,
                 delta: "{\"path\":\"src/lib.rs\"}".to_string(),
             }),
@@ -2850,7 +2848,7 @@ mod tests {
                     item_id: Some("fc_1".to_string()),
                     output_index: 0,
                     data: ItemChunkKind::FunctionCallArgsDone(ArgsTextChunk {
-                        content_index: 0,
+                        content_index: Some(0),
                         sequence_number: 2,
                         arguments: serde_json::json!({"path": "Cargo.toml"}),
                     }),
@@ -3061,7 +3059,7 @@ mod tests {
                 if !saw_create {
                     saw_create = true;
                     if socket
-                        .send(TestWebSocketMessage::Text(
+                        .send(TestWebSocketMessage::text(
                             openai_websocket_text_delta_frame(),
                         ))
                         .await
@@ -3074,7 +3072,7 @@ mod tests {
                 if text.contains("response.cancel") {
                     server_cancel_received.store(true, Ordering::SeqCst);
                     let _ = socket
-                        .send(TestWebSocketMessage::Text(
+                        .send(TestWebSocketMessage::text(
                             openai_websocket_completed_frame("resp_cancelled"),
                         ))
                         .await;

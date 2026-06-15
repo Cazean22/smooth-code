@@ -966,14 +966,13 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: Some(cazean_protocol::FileChangeOutput {
+                    file_changes: vec![cazean_protocol::FileChangeOutput {
                         path: "src/lib.rs".into(),
                         change: cazean_protocol::FileChange::Update {
                             unified_diff: diffy::create_patch("old\n", "new\n").to_string(),
                             move_path: None,
                         },
-                    }),
-                    file_changes: Vec::new(),
+                    }],
                     todos: Vec::new(),
                 }),
             ),
@@ -1017,7 +1016,6 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: None,
                     file_changes: Vec::new(),
                     todos: vec![
                         TodoItem {
@@ -1058,14 +1056,13 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: Some(cazean_protocol::FileChangeOutput {
+                    file_changes: vec![cazean_protocol::FileChangeOutput {
                         path: "src/old.rs".into(),
                         change: cazean_protocol::FileChange::Update {
                             unified_diff: String::new(),
                             move_path: Some("src/new.rs".into()),
                         },
-                    }),
-                    file_changes: Vec::new(),
+                    }],
                     todos: Vec::new(),
                 }),
             ),
@@ -1109,7 +1106,6 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: None,
                     file_changes: vec![
                         cazean_protocol::FileChangeOutput {
                             path: "one.txt".into(),
@@ -1157,7 +1153,7 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: Some(cazean_protocol::FileChangeOutput {
+                    file_changes: vec![cazean_protocol::FileChangeOutput {
                         path: "large.txt".into(),
                         change: cazean_protocol::FileChange::Add {
                             content: (0..40)
@@ -1165,8 +1161,7 @@ mod tests {
                                 .collect::<Vec<_>>()
                                 .join("\n"),
                         },
-                    }),
-                    file_changes: Vec::new(),
+                    }],
                     todos: Vec::new(),
                 }),
             ),
@@ -1207,7 +1202,7 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: Some(cazean_protocol::FileChangeOutput {
+                    file_changes: vec![cazean_protocol::FileChangeOutput {
                         path: "src/lib.rs".into(),
                         change: cazean_protocol::FileChange::Update {
                             unified_diff: diffy::create_patch(
@@ -1217,8 +1212,7 @@ mod tests {
                             .to_string(),
                             move_path: None,
                         },
-                    }),
-                    file_changes: Vec::new(),
+                    }],
                     todos: Vec::new(),
                 }),
             ),

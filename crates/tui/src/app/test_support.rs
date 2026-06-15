@@ -144,7 +144,6 @@ pub(in crate::app) fn complete_tool_call(
                 error: error.map(str::to_owned),
                 result_kind: ToolCallResultKind::Final,
                 related_thread_id: None,
-                file_change: None,
                 file_changes: Vec::new(),
                 todos: Vec::new(),
             }),

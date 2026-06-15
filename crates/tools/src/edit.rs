@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(decoded.model_output, "applied edits (1 file changed)");
         assert_eq!(decoded.file_changes.len(), 1);
         assert_eq!(
-            decoded.file_change.as_ref().map(|change| &change.path),
+            decoded.file_changes.first().map(|change| &change.path),
             Some(&resolved_path)
         );
         match &decoded.file_changes[0].change {

@@ -171,12 +171,7 @@ impl UiModel {
                 let output_preview = tool.output_preview;
                 let handled_structured = if tool.success {
                     if tool.todos.is_empty() {
-                        let file_changes = if tool.file_changes.is_empty() {
-                            tool.file_change.into_iter().collect()
-                        } else {
-                            tool.file_changes
-                        };
-                        self.replace_tool_call_with_file_changes(&tool.call_id, file_changes)
+                        self.replace_tool_call_with_file_changes(&tool.call_id, tool.file_changes)
                     } else {
                         self.replace_tool_call_with_todo_list(&tool.call_id, tool.todos)
                     }
@@ -647,7 +642,6 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::StatusUpdate,
                     related_thread_id: Some(child_thread_id),
-                    file_change: None,
                     file_changes: Vec::new(),
                     todos: Vec::new(),
                 }),

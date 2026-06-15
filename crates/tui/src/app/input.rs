@@ -1464,7 +1464,6 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: None,
                     file_changes: Vec::new(),
                     todos: Vec::new(),
                 }),

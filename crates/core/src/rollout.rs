@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use cazean_protocol::{EventMsg, ProjectInstructions, ThreadId, TurnInterruptedEvent};
 use rig::{
     OneOrMany,
-    message::{AssistantContent, Message, Text, UserContent},
+    message::{AssistantContent, Message},
 };
 use serde::{Deserialize, Serialize};
 use time::{
@@ -52,12 +52,6 @@ pub struct ResumeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub(crate) enum HistoryMessage {
-    UserText {
-        text: String,
-    },
-    AssistantText {
-        text: String,
-    },
     Full {
         message: Message,
     },
@@ -230,20 +224,6 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
                     meta = Some(session_meta);
                 }
             }
-            PersistedItem::HistoryMessage(HistoryMessage::UserText { text }) => {
-                history.push(Message::User {
-                    content: OneOrMany::one(UserContent::Text(Text {
-                        text,
-                        additional_params: None,
-                    })),
-                });
-            }
-            PersistedItem::HistoryMessage(HistoryMessage::AssistantText { text }) => {
-                history.push(Message::Assistant {
-                    id: None,
-                    content: OneOrMany::one(AssistantContent::text(text)),
-                });
-            }
             PersistedItem::HistoryMessage(HistoryMessage::Full { message }) => {
                 history.push(message);
             }
@@ -295,13 +275,9 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
 
 pub(crate) async fn list_threads(workspace_root: &Path) -> Result<Vec<ThreadSummary>> {
     let mut rollout_paths = Vec::new();
-    for sessions_root in [
-        legacy_sessions_root(workspace_root),
-        sessions_root(workspace_root),
-    ] {
-        if fs::try_exists(&sessions_root).await.unwrap_or(false) {
-            collect_rollout_paths(&sessions_root, &mut rollout_paths).await?;
-        }
+    let sessions_root = sessions_root(workspace_root);
+    if fs::try_exists(&sessions_root).await.unwrap_or(false) {
+        collect_rollout_paths(&sessions_root, &mut rollout_paths).await?;
     }
 
     let mut threads = Vec::new();
@@ -396,12 +372,6 @@ async fn summarize_rollout(path: &Path) -> Result<ThreadSummary> {
                     meta = Some(session_meta);
                 }
             }
-            PersistedItem::HistoryMessage(HistoryMessage::UserText { text }) => {
-                last_user_message = Some(text);
-            }
-            PersistedItem::HistoryMessage(HistoryMessage::AssistantText { text }) => {
-                last_assistant_message = Some(text);
-            }
             PersistedItem::HistoryMessage(HistoryMessage::Full { message }) => {
                 update_assistant_summary_message(&message, &mut last_assistant_message);
             }
@@ -459,10 +429,6 @@ fn sessions_root(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".cazean").join("sessions")
 }
 
-fn legacy_sessions_root(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".smooth-code").join("sessions")
-}
-
 fn now_rfc3339() -> Result<String> {
     Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
 }
@@ -482,6 +448,7 @@ mod tests {
         AgentPath, AgentStatus, ProjectInstructionEntry, ProjectInstructions,
         SessionConfiguredEvent, TurnStartedEvent,
     };
+    use rig::message::{Text, UserContent};
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cazean-rollout-{name}-{}", ThreadId::new()))
@@ -496,9 +463,9 @@ mod tests {
         let thread_id = ThreadId::new();
         let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
         recorder
-            .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
+            .append(PersistedItem::UserMessage {
                 text: "hello".to_string(),
-            }))
+            })
             .await?;
 
         let threads = list_threads(&root).await?;
@@ -612,16 +579,22 @@ mod tests {
             )))
             .await?;
         recorder
-            .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
-                text: "hello".to_string(),
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: "hello".to_string(),
+                        additional_params: None,
+                    })),
+                },
             }))
             .await?;
         recorder
-            .append(PersistedItem::HistoryMessage(
-                HistoryMessage::AssistantText {
-                    text: "world".to_string(),
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("world".to_string())),
                 },
-            ))
+            }))
             .await?;
         recorder
             .append(PersistedItem::Event(EventMsg::TurnStarted(
@@ -656,8 +629,13 @@ mod tests {
         let thread_id = ThreadId::new();
         let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
         recorder
-            .append(PersistedItem::HistoryMessage(HistoryMessage::UserText {
-                text: "spawn two agents".to_string(),
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: "spawn two agents".to_string(),
+                        additional_params: None,
+                    })),
+                },
             }))
             .await?;
         // A grouped deferred completion: two entries sharing one user message,

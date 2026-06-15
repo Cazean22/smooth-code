@@ -3,8 +3,7 @@
 # Copy to one of the following (later layers override earlier ones):
 #   1. ~/.config/cazean/config.toml        (user, XDG; honors $XDG_CONFIG_HOME)
 #   2. <workspace>/.cazean/config.toml      (project)
-# CAZEAN_* environment variables override file config; legacy SMOOTH_CODE_* env vars
-# are also read at lower precedence during the rename (see docs/config.md).
+# CAZEAN_* environment variables override file config (see docs/config.md).
 #
 # Every UNCOMMENTED value below is the built-in default — copying this file
 # verbatim changes nothing. Commented lines show example overrides.

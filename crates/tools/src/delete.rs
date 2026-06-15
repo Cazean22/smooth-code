@@ -158,7 +158,9 @@ mod tests {
             format!("deleted {} (12 bytes)", resolved_path.display())
         );
         let file_change = decoded
-            .file_change
+            .file_changes
+            .first()
+            .cloned()
             .ok_or_else(|| std::io::Error::other("file change metadata"))?;
         assert_eq!(file_change.path, resolved_path);
         assert_eq!(
@@ -222,7 +224,9 @@ mod tests {
         assert!(!path.exists());
         let decoded = decode_tool_output_for_tool("delete", output, true);
         let file_change = decoded
-            .file_change
+            .file_changes
+            .first()
+            .cloned()
             .ok_or_else(|| std::io::Error::other("file change metadata"))?;
         match file_change.change {
             FileChange::Omitted {

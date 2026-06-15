@@ -2,12 +2,9 @@
 
 //! Layered configuration for cazean.
 //!
-//! Precedence (low → high): built-in defaults → legacy user config
-//! (`~/.config/smooth-code/config.toml`) → user config
-//! (`~/.config/cazean/config.toml`) → legacy project config
-//! (`<workspace>/.smooth-code/config.toml`) → project config
-//! (`<workspace>/.cazean/config.toml`) → legacy `SMOOTH_CODE_*` env vars
-//! → `CAZEAN_*` env vars.
+//! Precedence (low → high): built-in defaults → user config
+//! (`~/.config/cazean/config.toml`) → project config
+//! (`<workspace>/.cazean/config.toml`) → `CAZEAN_*` env vars.
 //!
 //! Each layer parses into a [`PartialConfig`] (all-optional fields); the layers
 //! are merged highest-wins and then [`PartialConfig::resolve`] fills built-in
@@ -31,44 +28,33 @@ pub use schema::{
 
 /// Relative path of the config file within a config root (XDG or project).
 const CONFIG_RELATIVE_PATH: &str = "cazean/config.toml";
-/// Legacy user config path, still read at lower precedence during the rename.
-const LEGACY_CONFIG_RELATIVE_PATH: &str = "smooth-code/config.toml";
 /// Project config lives under `<workspace>/.cazean/config.toml`.
 const PROJECT_CONFIG_RELATIVE_PATH: &str = ".cazean/config.toml";
-/// Legacy project config path, still read at lower precedence during the rename.
-const LEGACY_PROJECT_CONFIG_RELATIVE_PATH: &str = ".smooth-code/config.toml";
 
 /// Load and resolve configuration for the given workspace root.
 ///
-/// Layers, in increasing precedence: built-in defaults, legacy/current user
-/// config files, legacy/current project config files, and legacy/current
-/// environment variables. Missing files are skipped. If the user config
-/// directory cannot be discovered, the user layer is silently skipped
-/// (non-fatal).
+/// Layers, in increasing precedence: built-in defaults, user config file,
+/// project config file, and environment variables. Missing files are skipped.
+/// If the user config directory cannot be discovered, the user layer is
+/// silently skipped (non-fatal).
 pub fn load(workspace_root: &Path) -> Result<Config, ConfigError> {
     let env_vars = std::env::vars().collect::<Vec<_>>();
-    load_from(workspace_root, user_config_paths(), env_vars)
+    load_from(workspace_root, user_config_path(), env_vars)
 }
 
-/// Discover user-level config paths using the XDG base strategy explicitly
-/// (`~/.config/cazean/config.toml`, honoring `$XDG_CONFIG_HOME`). Returns an
-/// empty list if the config directory cannot be determined. Paths are ordered
-/// from lower to higher precedence.
-fn user_config_paths() -> Vec<PathBuf> {
-    let Some(config_dir) = Xdg::new().ok().map(|strategy| strategy.config_dir()) else {
-        return Vec::new();
-    };
-    vec![
-        config_dir.join(LEGACY_CONFIG_RELATIVE_PATH),
-        config_dir.join(CONFIG_RELATIVE_PATH),
-    ]
+/// Discover the user-level config path using the XDG base strategy explicitly
+/// (`~/.config/cazean/config.toml`, honoring `$XDG_CONFIG_HOME`). Returns
+/// `None` if the config directory cannot be determined.
+fn user_config_path() -> Option<PathBuf> {
+    let strategy = Xdg::new().ok()?;
+    Some(strategy.config_dir().join(CONFIG_RELATIVE_PATH))
 }
 
 /// Core of [`load`], parameterized over the user path and env vars so tests can
 /// drive it deterministically without touching the process environment.
 fn load_from<I>(
     workspace_root: &Path,
-    user_paths: Vec<PathBuf>,
+    user_path: Option<PathBuf>,
     env_vars: I,
 ) -> Result<Config, ConfigError>
 where
@@ -76,19 +62,15 @@ where
 {
     let mut merged = PartialConfig::default();
 
-    for user_path in user_paths {
-        if let Some(user) = read_partial(&user_path)? {
-            merged = merged.merge(user);
-        }
+    if let Some(user_path) = user_path
+        && let Some(user) = read_partial(&user_path)?
+    {
+        merged = merged.merge(user);
     }
 
-    for project_path in [
-        workspace_root.join(LEGACY_PROJECT_CONFIG_RELATIVE_PATH),
-        workspace_root.join(PROJECT_CONFIG_RELATIVE_PATH),
-    ] {
-        if let Some(project) = read_partial(&project_path)? {
-            merged = merged.merge(project);
-        }
+    let project_path = workspace_root.join(PROJECT_CONFIG_RELATIVE_PATH);
+    if let Some(project) = read_partial(&project_path)? {
+        merged = merged.merge(project);
     }
 
     merged = merged.merge(env_overlay(env_vars));
@@ -117,32 +99,12 @@ fn read_partial(path: &Path) -> Result<Option<PartialConfig>, ConfigError> {
 
 /// Build the env-var overlay from an iterator of `(name, value)` pairs.
 ///
-/// `CAZEAN_*` variables are the canonical names. Legacy `SMOOTH_CODE_*`
-/// variables are still honored at lower precedence to keep existing shell
-/// setups working during the rename. Parsing is permissive to match historical
-/// behavior: invalid/zero numeric values fall through to the lower layer
-/// (`None`) rather than erroring.
+/// `CAZEAN_*` variables are the supported names. Parsing is permissive to
+/// match historical behavior: invalid/zero numeric values fall through to the
+/// lower layer (`None`) rather than erroring.
 pub fn env_overlay<I>(vars: I) -> PartialConfig
 where
     I: IntoIterator<Item = (String, String)>,
-{
-    let vars = vars.into_iter().collect::<Vec<_>>();
-    let legacy = env_overlay_for_prefix(
-        vars.iter()
-            .map(|(name, value)| (name.as_str(), value.as_str())),
-        "SMOOTH_CODE",
-    );
-    let current = env_overlay_for_prefix(
-        vars.iter()
-            .map(|(name, value)| (name.as_str(), value.as_str())),
-        "CAZEAN",
-    );
-    legacy.merge(current)
-}
-
-fn env_overlay_for_prefix<'a, I>(vars: I, prefix: &str) -> PartialConfig
-where
-    I: IntoIterator<Item = (&'a str, &'a str)>,
 {
     use schema::{PartialProvider, PartialRunCommand, PartialTelemetry, PartialTools};
 
@@ -154,33 +116,30 @@ where
     let mut saw_telemetry = false;
 
     for (name, value) in vars {
-        let key = name
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_prefix('_'));
-        match key {
-            Some("LLM_PROVIDER") => {
-                provider.provider = Some(value.to_string());
+        match name.as_str() {
+            "CAZEAN_LLM_PROVIDER" => {
+                provider.provider = Some(value);
                 saw_provider = true;
             }
-            Some("LLM_MODEL") => {
-                provider.model = Some(value.to_string());
+            "CAZEAN_LLM_MODEL" => {
+                provider.model = Some(value);
                 saw_provider = true;
             }
-            Some("LLM_PREAMBLE") => {
+            "CAZEAN_LLM_PREAMBLE" => {
                 // Empty string is a real override to an empty preamble, matching
                 // today's `env::var(...).ok()` behavior — do not filter it.
-                provider.preamble = Some(value.to_string());
+                provider.preamble = Some(value);
                 saw_provider = true;
             }
-            Some("RUN_COMMAND_TIMEOUT_SECS") => {
+            "CAZEAN_RUN_COMMAND_TIMEOUT_SECS" => {
                 // Permissive: only a parseable, non-zero value overrides.
                 if let Some(secs) = value.parse::<u64>().ok().filter(|secs| *secs > 0) {
                     run_command.default_timeout_secs = Some(secs);
                     saw_run_command = true;
                 }
             }
-            _ if name == "SMOOTH_TRACE_STDERR" => {
-                if let Some(flag) = parse_bool_like(value) {
+            "CAZEAN_TRACE_STDERR" => {
+                if let Some(flag) = parse_bool_like(&value) {
                     telemetry.force_stderr = Some(flag);
                     saw_telemetry = true;
                 }
@@ -275,60 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn cazean_project_config_overrides_legacy_project_config() -> TestResult {
-        let root = temp_root("project-config")?;
-        std::fs::create_dir_all(root.join(".smooth-code"))?;
-        std::fs::create_dir_all(root.join(".cazean"))?;
-        std::fs::write(
-            root.join(".smooth-code").join("config.toml"),
-            "[provider]\nmodel = \"legacy-project\"\n",
-        )?;
-        std::fs::write(
-            root.join(".cazean").join("config.toml"),
-            "[provider]\nmodel = \"cazean-project\"\n",
-        )?;
-
-        let config = load_from(&root, Vec::new(), no_env())?;
-        assert_eq!(config.provider.model, "cazean-project");
-
-        std::fs::remove_file(root.join(".cazean").join("config.toml"))?;
-        let config = load_from(&root, Vec::new(), no_env())?;
-        assert_eq!(config.provider.model, "legacy-project");
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn cazean_env_overrides_legacy_smooth_code_env() -> TestResult {
-        let legacy_only = PartialConfig::default()
-            .merge(env_overlay(env(&[("SMOOTH_CODE_LLM_MODEL", "legacy-env")])))
-            .resolve()?;
-        assert_eq!(legacy_only.provider.model, "legacy-env");
-
-        let current_wins = PartialConfig::default()
-            .merge(env_overlay(env(&[
-                ("CAZEAN_LLM_MODEL", "cazean-env"),
-                ("SMOOTH_CODE_LLM_MODEL", "legacy-env"),
-            ])))
-            .resolve()?;
-        assert_eq!(current_wins.provider.model, "cazean-env");
-        Ok(())
-    }
-
-    fn temp_root(name: &str) -> TestResult<PathBuf> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "cazean-config-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root)?;
-        Ok(root)
-    }
-
-    #[test]
     fn nested_merge_preserves_sibling_fields() -> TestResult {
         // User sets the openai base_url; project sets only the model. The
         // project layer must NOT discard the user's [provider.openai] block.
@@ -384,14 +289,14 @@ mod tests {
         let file = parse("[telemetry]\nforce_stderr = true\n")?;
         let config = PartialConfig::default()
             .merge(file.clone())
-            .merge(env_overlay(env(&[("SMOOTH_TRACE_STDERR", "false")])))
+            .merge(env_overlay(env(&[("CAZEAN_TRACE_STDERR", "false")])))
             .resolve()?;
         assert!(!config.telemetry.force_stderr);
 
         // A non-bool-like value is ignored, leaving the file value intact.
         let config = PartialConfig::default()
             .merge(file)
-            .merge(env_overlay(env(&[("SMOOTH_TRACE_STDERR", "banana")])))
+            .merge(env_overlay(env(&[("CAZEAN_TRACE_STDERR", "banana")])))
             .resolve()?;
         assert!(config.telemetry.force_stderr);
         Ok(())

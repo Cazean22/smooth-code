@@ -304,7 +304,7 @@ mod tests {
                 .unwrap_or(false)
         }
 
-        let marker = format!("smooth-grandchild-{}", std::process::id());
+        let marker = format!("cazean-grandchild-{}", std::process::id());
         // Outer shell dies on SIGTERM; the inner zsh traps (ignores) it.
         let command = format!(r#"zsh -c 'trap "" TERM; sleep 30; : {marker}' & sleep 30"#);
 
@@ -370,7 +370,7 @@ mod tests {
                 .unwrap_or(false)
         }
 
-        let marker = format!("smooth-exit-sweep-{}", std::process::id());
+        let marker = format!("cazean-exit-sweep-{}", std::process::id());
         let command = format!(r#"zsh -c 'trap "" TERM; sleep 30; : {marker}' & sleep 30"#);
 
         let token = CancellationToken::new();

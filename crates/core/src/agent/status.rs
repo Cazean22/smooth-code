@@ -1,4 +1,4 @@
-use smooth_protocol::{AgentStatus, EventMsg};
+use cazean_protocol::{AgentStatus, EventMsg};
 
 pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
     match msg {
@@ -32,7 +32,7 @@ pub(crate) fn last_assistant_message(status: &AgentStatus) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use smooth_protocol::{
+    use cazean_protocol::{
         ErrorEvent, ErrorInfo, EventMsg, TurnCompletedEvent, TurnInterruptedEvent,
     };
 
@@ -51,7 +51,7 @@ mod tests {
         };
         assert_eq!(
             completed,
-            smooth_protocol::AgentStatus::Completed(Some("done".to_string()))
+            cazean_protocol::AgentStatus::Completed(Some("done".to_string()))
         );
 
         let Some(interrupted) =
@@ -63,7 +63,7 @@ mod tests {
         else {
             panic!("interrupted status");
         };
-        assert_eq!(interrupted, smooth_protocol::AgentStatus::Interrupted);
+        assert_eq!(interrupted, cazean_protocol::AgentStatus::Interrupted);
 
         let error = ErrorInfo::new("turn_failed", "boom");
         let errored = agent_status_from_event(&EventMsg::Error(ErrorEvent {
@@ -72,30 +72,30 @@ mod tests {
         let Some(errored) = errored else {
             panic!("errored status");
         };
-        assert_eq!(errored, smooth_protocol::AgentStatus::Errored(error));
+        assert_eq!(errored, cazean_protocol::AgentStatus::Errored(error));
     }
 
     #[test]
     fn final_statuses_match_contract() {
-        assert!(is_final(&smooth_protocol::AgentStatus::Interrupted));
-        assert!(is_final(&smooth_protocol::AgentStatus::Completed(None)));
-        assert!(is_final(&smooth_protocol::AgentStatus::Errored(
+        assert!(is_final(&cazean_protocol::AgentStatus::Interrupted));
+        assert!(is_final(&cazean_protocol::AgentStatus::Completed(None)));
+        assert!(is_final(&cazean_protocol::AgentStatus::Errored(
             ErrorInfo::new("turn_failed", "x")
         )));
-        assert!(is_final(&smooth_protocol::AgentStatus::Shutdown));
-        assert!(!is_final(&smooth_protocol::AgentStatus::Running));
+        assert!(is_final(&cazean_protocol::AgentStatus::Shutdown));
+        assert!(!is_final(&cazean_protocol::AgentStatus::Running));
     }
 
     #[test]
     fn completed_status_exposes_last_assistant_message() {
         assert_eq!(
-            last_assistant_message(&smooth_protocol::AgentStatus::Completed(Some(
+            last_assistant_message(&cazean_protocol::AgentStatus::Completed(Some(
                 "done".to_string()
             ))),
             Some("done".to_string())
         );
         assert_eq!(
-            last_assistant_message(&smooth_protocol::AgentStatus::Errored(ErrorInfo::new(
+            last_assistant_message(&cazean_protocol::AgentStatus::Errored(ErrorInfo::new(
                 "turn_failed",
                 "boom"
             ))),

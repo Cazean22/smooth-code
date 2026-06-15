@@ -1,6 +1,6 @@
-use smooth_protocol::{FileChangeOutput, TodoItem};
+use cazean_protocol::{FileChangeOutput, TodoItem};
 
-const STRUCTURED_TOOL_OUTPUT_PREFIX: &str = "__smooth_tool_output_v1__\n";
+const STRUCTURED_TOOL_OUTPUT_PREFIX: &str = "__cazean_tool_output_v1__\n";
 pub const MAX_FILE_CHANGE_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
@@ -116,7 +116,7 @@ fn decode_tool_output(raw_output: String) -> DecodedToolOutput {
 
 #[cfg(test)]
 mod tests {
-    use smooth_protocol::{FileChange, FileChangeOutput, TodoItem, TodoStatus};
+    use cazean_protocol::{FileChange, FileChangeOutput, TodoItem, TodoStatus};
 
     use super::*;
 

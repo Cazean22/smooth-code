@@ -1,5 +1,5 @@
 use app_server_protocol::JsonRpcError;
-use smooth_protocol::ErrorInfo;
+use cazean_protocol::ErrorInfo;
 
 use crate::error_code::{INTERNAL_ERROR_CODE, INVALID_PARAMS_ERROR_CODE, SERVER_ERROR_CODE};
 
@@ -18,7 +18,7 @@ pub enum AppServerError {
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("core error: {0}")]
-    Core(#[from] smooth_core::CoreError),
+    Core(#[from] cazean_core::CoreError),
     #[error("{0}")]
     Internal(String),
 }
@@ -74,8 +74,8 @@ impl From<AppServerError> for JsonRpcError {
 
 #[cfg(test)]
 mod tests {
-    use smooth_core::CoreError;
-    use smooth_protocol::ThreadId;
+    use cazean_core::CoreError;
+    use cazean_protocol::ThreadId;
 
     use super::AppServerError;
     use crate::error_code::SERVER_ERROR_CODE;
@@ -91,7 +91,7 @@ mod tests {
         assert_eq!(json_rpc.code, SERVER_ERROR_CODE);
         let info = json_rpc.data.as_ref().ok_or("missing error data")?;
         assert_eq!(info.kind, "unknown_thread");
-        assert_eq!(info.source.as_deref(), Some("smooth-core"));
+        assert_eq!(info.source.as_deref(), Some("cazean-core"));
         assert_eq!(json_rpc.message, info.message);
         assert!(info.message.contains(&thread_id.to_string()));
         Ok(())

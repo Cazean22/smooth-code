@@ -35,12 +35,12 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "app-server-protocol",
+ "cazean-config",
+ "cazean-core",
+ "cazean-protocol",
  "futures-util",
  "serde",
  "serde_json",
- "smooth-config",
- "smooth-core",
- "smooth-protocol",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -51,10 +51,10 @@ dependencies = [
 name = "app-server-protocol"
 version = "0.0.1"
 dependencies = [
+ "cazean-protocol",
  "schemars",
  "serde",
  "serde_json",
- "smooth-protocol",
  "tokio",
 ]
 
@@ -307,6 +307,98 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "cazean-config"
+version = "0.0.1"
+dependencies = [
+ "etcetera",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "cazean-core"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "app-server-protocol",
+ "async-channel",
+ "async-stream",
+ "cazean-config",
+ "cazean-protocol",
+ "cazean-state-db",
+ "futures-util",
+ "indexmap",
+ "rig-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tools",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "cazean-protocol"
+version = "0.0.1"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "cazean-state-db"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "cazean-tui"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "app-server",
+ "app-server-protocol",
+ "base64 0.22.1",
+ "cazean-config",
+ "cazean-core",
+ "cazean-protocol",
+ "console-subscriber",
+ "crossterm",
+ "diffy",
+ "futures-util",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "syntect",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tools",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "two-face",
+ "unicode-width",
+ "uuid",
 ]
 
 [[package]]
@@ -3108,98 +3200,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "smooth-config"
-version = "0.0.1"
-dependencies = [
- "etcetera",
- "serde",
- "thiserror 2.0.18",
- "toml",
-]
-
-[[package]]
-name = "smooth-core"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "app-server-protocol",
- "async-channel",
- "async-stream",
- "futures-util",
- "indexmap",
- "rig-core",
- "serde",
- "serde_json",
- "smooth-config",
- "smooth-protocol",
- "smooth-state-db",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tools",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "smooth-protocol"
-version = "0.0.1"
-dependencies = [
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "smooth-state-db"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "smooth-tui"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "app-server",
- "app-server-protocol",
- "base64 0.22.1",
- "console-subscriber",
- "crossterm",
- "diffy",
- "futures-util",
- "pulldown-cmark",
- "ratatui",
- "serde",
- "serde_json",
- "smooth-config",
- "smooth-core",
- "smooth-protocol",
- "syntect",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tools",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "two-face",
- "unicode-width",
- "uuid",
-]
-
-[[package]]
 name = "socket2"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3955,6 +3955,7 @@ name = "tools"
 version = "0.0.1"
 dependencies = [
  "app-server-protocol",
+ "cazean-protocol",
  "diffy",
  "futures-util",
  "libc",
@@ -3962,7 +3963,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "smooth-protocol",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

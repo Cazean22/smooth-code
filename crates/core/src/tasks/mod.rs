@@ -12,7 +12,7 @@ use crate::{
 
 pub(crate) use regular::RegularTask;
 
-/// Async task that drives one smooth-code session turn.
+/// Async task that drives one cazean session turn.
 ///
 /// This intentionally mirrors Codex's split between a small object-safe
 /// runtime trait (`AnySessionTask`) and ergonomically implemented concrete

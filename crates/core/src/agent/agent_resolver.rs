@@ -1,4 +1,4 @@
-use smooth_protocol::{AgentPath, SessionSource, ThreadId};
+use cazean_protocol::{AgentPath, SessionSource, ThreadId};
 
 use crate::agent::registry::{AgentMetadata, AgentRegistry};
 
@@ -63,7 +63,7 @@ pub(crate) fn list_agents(
 
 #[cfg(test)]
 mod tests {
-    use smooth_protocol::{AgentPath, SessionSource, SubAgentSource, ThreadId};
+    use cazean_protocol::{AgentPath, SessionSource, SubAgentSource, ThreadId};
 
     use crate::agent::registry::{AgentMetadata, AgentRegistry};
 

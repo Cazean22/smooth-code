@@ -7,14 +7,14 @@ use std::{
 };
 
 use anyhow::Result;
-use futures_util::stream;
-use rig::message::{Message, Text, ToolCall, ToolFunction, UserContent};
-use smooth_core::{
+use cazean_core::{
     AgentControl, SessionAssistantContent, SessionCompletionEvent, SessionCompletionStream,
     SessionModel, SessionModelDriver, SessionModelFactory, SessionTurnSummary, SystemPromptKind,
     ThreadManagerState,
 };
-use smooth_protocol::ThreadId;
+use cazean_protocol::ThreadId;
+use futures_util::stream;
+use rig::message::{Message, Text, ToolCall, ToolFunction, UserContent};
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 use tools::AskUserClient;
@@ -189,7 +189,7 @@ async fn skill_tool_call_returns_skill_instructions_to_the_model() -> Result<()>
     let last_assistant_message = loop {
         let event =
             tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await??;
-        if let smooth_protocol::EventMsg::TurnCompleted(turn) = event.msg {
+        if let cazean_protocol::EventMsg::TurnCompleted(turn) = event.msg {
             break turn.last_assistant_message;
         }
     };
@@ -351,7 +351,7 @@ async fn explore_children_get_no_skills_advertising_or_slash_expansion() -> Resu
     loop {
         let event =
             tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await??;
-        if matches!(event.msg, smooth_protocol::EventMsg::TurnCompleted(_)) {
+        if matches!(event.msg, cazean_protocol::EventMsg::TurnCompleted(_)) {
             break;
         }
     }

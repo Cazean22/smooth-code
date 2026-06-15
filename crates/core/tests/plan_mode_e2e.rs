@@ -8,14 +8,14 @@ use anyhow::Result;
 use app_server_protocol::{
     AskUserQuestionResponse, PlanApprovalDecision, RequestPlanApprovalResponse,
 };
-use futures_util::stream;
-use rig::message::{Message, Text, ToolCall, ToolFunction, UserContent};
-use smooth_core::{
+use cazean_core::{
     AgentControl, SessionAssistantContent, SessionCompletionEvent, SessionCompletionStream,
     SessionModel, SessionModelDriver, SessionModelFactory, SessionTurnSummary, SystemPromptKind,
     ThreadManagerState,
 };
-use smooth_protocol::{EventMsg, ThreadId};
+use cazean_protocol::{EventMsg, ThreadId};
+use futures_util::stream;
+use rig::message::{Message, Text, ToolCall, ToolFunction, UserContent};
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 use tools::AskUserClient;

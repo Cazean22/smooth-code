@@ -1,9 +1,9 @@
 use app_server_protocol::AskUserQuestionAnswer;
+use cazean_protocol::{FileChange, FileChangeOutput, TodoItem, TodoStatus};
 use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
 };
-use smooth_protocol::{FileChange, FileChangeOutput, TodoItem, TodoStatus};
 
 use crate::{diff_render::create_diff_summary, wrap};
 
@@ -331,7 +331,7 @@ pub(crate) struct ToolCallEntry {
     output: Option<String>,
     /// The child thread spawned by this call (`spawn_agent` only), recorded
     /// from `ToolCallCompletedEvent::related_thread_id`. The `Enter` target.
-    related_thread_id: Option<smooth_protocol::ThreadId>,
+    related_thread_id: Option<cazean_protocol::ThreadId>,
 }
 
 #[derive(Debug, Clone)]
@@ -385,7 +385,7 @@ impl ToolCallGroupCell {
     pub(crate) fn set_entry_related_thread(
         &mut self,
         entry_idx: usize,
-        thread_id: smooth_protocol::ThreadId,
+        thread_id: cazean_protocol::ThreadId,
     ) {
         if let Some(entry) = self.entries.get_mut(entry_idx) {
             entry.related_thread_id = Some(thread_id);
@@ -395,7 +395,7 @@ impl ToolCallGroupCell {
     /// The subagent session this cell opens with `Enter`: the first entry that
     /// recorded a child thread id (grouped consecutive `spawn_agent` calls
     /// share one cell).
-    pub(crate) fn subagent_thread_id(&self) -> Option<smooth_protocol::ThreadId> {
+    pub(crate) fn subagent_thread_id(&self) -> Option<cazean_protocol::ThreadId> {
         self.entries
             .iter()
             .find_map(|entry| entry.related_thread_id)
@@ -440,7 +440,7 @@ impl ToolCallGroupCell {
     pub(crate) fn entry_subagent_thread_id(
         &self,
         entry_idx: usize,
-    ) -> Option<smooth_protocol::ThreadId> {
+    ) -> Option<cazean_protocol::ThreadId> {
         self.entries
             .get(entry_idx)
             .and_then(|entry| entry.related_thread_id)
@@ -800,7 +800,7 @@ fn user_separator(width: u16) -> Line<'static> {
 mod tests {
     use super::*;
     use crate::markdown_render::code_color;
-    use smooth_protocol::FileChangeOperation;
+    use cazean_protocol::FileChangeOperation;
 
     #[test]
     fn fenced_code_line_marker_is_preformatted() {
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn inline_code_only_line_is_not_preformatted() {
         let line = Line::from(vec![Span::styled(
-            "cargo test -p smooth-tui",
+            "cargo test -p cazean-tui",
             Style::default().fg(code_color()),
         )]);
         assert!(!is_preformatted_line(&line));

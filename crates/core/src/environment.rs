@@ -81,7 +81,7 @@ mod tests {
 
     fn context() -> EnvironmentContext {
         EnvironmentContext {
-            working_directory: "/workspace/smooth-code".to_string(),
+            working_directory: "/workspace/cazean".to_string(),
             is_git_repo: "yes".to_string(),
             platform: "macos".to_string(),
             os_version: "25.0.0".to_string(),
@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(
             context().apply(prompt),
             concat!(
-                "Working directory: /workspace/smooth-code\n",
+                "Working directory: /workspace/cazean\n",
                 "Git repository: yes\n",
                 "Platform: macos\n",
                 "OS version: 25.0.0\n",

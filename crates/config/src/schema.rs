@@ -235,8 +235,8 @@ impl Default for TuiColors {
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
-            log_filter: "info,smooth_tui=debug,app_server=debug,smooth_core=debug".to_string(),
-            log_file_name: "smooth-tui.log".to_string(),
+            log_filter: "info,cazean_tui=debug,app_server=debug,cazean_core=debug".to_string(),
+            log_file_name: "cazean-tui.log".to_string(),
             force_stderr: false,
         }
     }
@@ -625,7 +625,7 @@ impl Config {
             )));
         }
         // `provider.model` is intentionally NOT checked for emptiness: today an
-        // empty `SMOOTH_CODE_LLM_MODEL` is accepted as-is and passed to the
+        // empty `CAZEAN_LLM_MODEL` is accepted as-is and passed to the
         // provider, so the resolved config preserves that.
         if self.provider.max_turns == 0 {
             return Err(ConfigError::validate("provider.max_turns must be >= 1"));
@@ -689,7 +689,7 @@ fn check_nonzero(key: &str, value: usize) -> Result<(), ConfigError> {
     }
 }
 
-/// `log_file_name` is joined under `.smooth-code/logs/`; it must be a bare
+/// `log_file_name` is joined under `.cazean/logs/`; it must be a bare
 /// file name so a config file can't redirect logs outside that directory.
 fn validate_log_file_name(name: &str) -> Result<(), ConfigError> {
     if name.is_empty() {

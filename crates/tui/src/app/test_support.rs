@@ -4,14 +4,14 @@ pub(in crate::app) use app_server_protocol::{
     AskUserQuestion, AskUserQuestionOption, AskUserQuestionParams, PlanApprovalDecision,
     RequestPlanApprovalParams,
 };
-pub(in crate::app) use ratatui::{Terminal, backend::TestBackend};
-pub(in crate::app) use smooth_protocol::{
+pub(in crate::app) use cazean_protocol::{
     AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
     AgentReasoningDeltaEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
     CollabResumeBeginEvent, CollabResumeEndEvent, EventMsg, StreamErrorEvent,
     ToolCallCompletedEvent, ToolCallStartedEvent, TurnCompletedEvent, TurnInterruptedEvent,
     TurnStartedEvent,
 };
+pub(in crate::app) use ratatui::{Terminal, backend::TestBackend};
 
 pub(in crate::app) fn event(id: &str, msg: EventMsg) -> Event {
     Event {

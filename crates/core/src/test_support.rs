@@ -15,7 +15,7 @@ pub struct StubSessionModelFactory {
 }
 
 impl StubSessionModelFactory {
-    pub fn new(models: HashMap<smooth_protocol::ThreadId, SessionModel>) -> Self {
+    pub fn new(models: HashMap<cazean_protocol::ThreadId, SessionModel>) -> Self {
         Self {
             inner: stub_session_model_factory(models),
         }
@@ -26,7 +26,7 @@ impl SessionModelFactory for StubSessionModelFactory {
     fn build(
         &self,
         cwd: PathBuf,
-        thread_id: smooth_protocol::ThreadId,
+        thread_id: cazean_protocol::ThreadId,
         ask_user_client: Option<AskUserClient>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         system_prompt_kind: SystemPromptKind,

@@ -6,7 +6,7 @@ use app_server_protocol::{
     ThreadStartResponse, ThreadUnwatchParams, ThreadUnwatchResponse, TurnCancelParams,
     TurnCancelResponse, TurnStartParams, TurnStartResponse,
 };
-use smooth_protocol::ThreadId;
+use cazean_protocol::ThreadId;
 
 use crate::app_server_client::AppServerClient;
 use crate::error::TuiResult;

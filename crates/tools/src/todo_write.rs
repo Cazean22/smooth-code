@@ -1,7 +1,7 @@
+use cazean_protocol::{TodoItem, TodoStatus};
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
-use smooth_protocol::{TodoItem, TodoStatus};
 
 use crate::{ToolError, output::encode_tool_output_with_todos};
 

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use app_server_protocol::{ClientCommand, JsonRpcError};
-use smooth_config::Config;
-use smooth_protocol::{ErrorInfo, Event, ThreadId};
+use cazean_config::Config;
+use cazean_protocol::{ErrorInfo, Event, ThreadId};
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
@@ -132,8 +132,8 @@ async fn start_internal(
 #[cfg(test)]
 mod tests {
     use app_server_protocol::{AskUserQuestionParams, ServerRequestPayload};
+    use cazean_protocol::ThreadId;
     use serde_json::json;
-    use smooth_protocol::ThreadId;
     use tokio::time::{Duration, timeout};
 
     use super::*;

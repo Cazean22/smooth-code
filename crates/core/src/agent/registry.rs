@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
-use smooth_protocol::{AgentPath, ThreadId};
+use cazean_protocol::{AgentPath, ThreadId};
 
 use crate::agent::prompt::SystemPromptKind;
 
@@ -268,7 +268,7 @@ fn next_agent_name(state: &mut RegistryState) -> String {
 
 #[cfg(test)]
 mod tests {
-    use smooth_protocol::{AgentPath, ThreadId};
+    use cazean_protocol::{AgentPath, ThreadId};
 
     use super::{AgentMetadata, AgentRegistry};
 

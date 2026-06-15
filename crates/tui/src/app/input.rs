@@ -780,7 +780,7 @@ impl UiModel {
                             error: JsonRpcError::new(
                                 -32001,
                                 ErrorInfo::new("user_declined", "user declined to answer")
-                                    .with_source("smooth-tui"),
+                                    .with_source("cazean-tui"),
                             ),
                         },
                     ),

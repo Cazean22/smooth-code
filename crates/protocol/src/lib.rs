@@ -883,7 +883,7 @@ mod tests {
     #[test]
     fn structured_error_event_round_trip() -> TestResult {
         let event = ErrorEvent {
-            error: ErrorInfo::new("provider", "model stream failed").with_source("smooth-core"),
+            error: ErrorInfo::new("provider", "model stream failed").with_source("cazean-core"),
         };
         let value = serde_json::to_value(&event)?;
         assert_eq!(value["error"]["kind"], "provider");

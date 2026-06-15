@@ -1,5 +1,5 @@
 [package]
-name = "smooth-core"
+name = "cazean-core"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -15,9 +15,9 @@ indexmap.workspace = true
 rig.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-smooth-config = { path = "../config" }
-smooth-protocol = { path = "../protocol" }
-smooth-state-db = { path = "../state-db" }
+cazean-config = { path = "../config" }
+cazean-protocol = { path = "../protocol" }
+cazean-state-db = { path = "../state-db" }
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }

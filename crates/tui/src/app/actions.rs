@@ -172,7 +172,7 @@ impl UiModel {
                 request_id,
                 error: JsonRpcError::new(
                     -32000,
-                    ErrorInfo::new("server_request_failed", message).with_source("smooth-tui"),
+                    ErrorInfo::new("server_request_failed", message).with_source("cazean-tui"),
                 ),
             },
         )]
@@ -435,7 +435,7 @@ mod tests {
 
         assert!(!rendered.contains("Pick a path?"), "{rendered}");
         assert!(!rendered.contains("Use option A"), "{rendered}");
-        assert!(rendered.contains("smooth-code"), "{rendered}");
+        assert!(rendered.contains("cazean"), "{rendered}");
         Ok(())
     }
 

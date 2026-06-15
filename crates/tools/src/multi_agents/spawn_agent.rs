@@ -46,7 +46,7 @@ impl Tool for SpawnAgentTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let _ = args;
         Err(ToolError::unsupported(
-            "spawn_agent is executed by the smooth-core manual tool loop",
+            "spawn_agent is executed by the cazean-core manual tool loop",
         ))
     }
 }

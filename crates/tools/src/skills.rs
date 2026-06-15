@@ -24,9 +24,9 @@ pub struct Skill {
     pub body: String,
 }
 
-/// Directory that holds project skills: `<cwd>/.smooth-code/skills`.
+/// Directory that holds project skills: `<cwd>/.cazean/skills`.
 pub fn skills_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".smooth-code").join("skills")
+    cwd.join(".cazean").join("skills")
 }
 
 fn is_valid_skill_name(name: &str) -> bool {
@@ -37,7 +37,7 @@ fn is_valid_skill_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// List all valid skills under `<cwd>/.smooth-code/skills`, sorted by name.
+/// List all valid skills under `<cwd>/.cazean/skills`, sorted by name.
 ///
 /// Entries that are not directories, have invalid names, lack a SKILL.md, or
 /// fail frontmatter validation are skipped with a warning rather than

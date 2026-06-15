@@ -4,8 +4,8 @@ use app_server_protocol::{
     AskUserQuestionParams, AskUserQuestionResponse, JsonRpcError, RequestPlanApprovalParams,
     RequestPlanApprovalResponse,
 };
+use cazean_protocol::ThreadId;
 use futures_util::future::BoxFuture;
-use smooth_protocol::ThreadId;
 
 type AskUserFuture = BoxFuture<'static, Result<AskUserQuestionResponse, JsonRpcError>>;
 type AbortPendingFuture = BoxFuture<'static, ()>;

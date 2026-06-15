@@ -1014,10 +1014,10 @@ mod tests {
             source_thread_id: Some(view_a),
             event: Box::new(child_event(
                 "done",
-                EventMsg::CollabAgentCompleted(smooth_protocol::CollabAgentCompletedEvent {
+                EventMsg::CollabAgentCompleted(cazean_protocol::CollabAgentCompletedEvent {
                     parent_thread_id: view_a,
                     child_thread_id: view_b,
-                    agent_path: smooth_protocol::AgentPath::try_from("/root/a/b")
+                    agent_path: cazean_protocol::AgentPath::try_from("/root/a/b")
                         .unwrap_or_else(|_| panic!("agent path")),
                     agent_nickname: Some(String::from("b")),
                     status: AgentStatus::Completed(Some(String::from("done"))),

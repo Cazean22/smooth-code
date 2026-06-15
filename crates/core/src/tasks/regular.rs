@@ -1,6 +1,11 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use app_server_protocol::{PlanApprovalDecision, RequestPlanApprovalParams};
+use cazean_protocol::{
+    AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
+    AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, ErrorInfo, EventMsg, ProjectInstructions,
+    StreamErrorEvent, ThreadId, ToolCallCompletedEvent, ToolCallResultKind, ToolCallStartedEvent,
+};
 use futures_util::{FutureExt, StreamExt, future::select_all, stream::FuturesUnordered};
 use indexmap::IndexMap;
 use rig::{
@@ -10,11 +15,6 @@ use rig::{
         AssistantContent, Message, Reasoning as MessageReasoning, ReasoningContent, Text,
         ToolResult, ToolResultContent, UserContent,
     },
-};
-use smooth_protocol::{
-    AgentMessageCompletedEvent, AgentMessageDeltaEvent, AgentReasoningCompletedEvent,
-    AgentReasoningDeltaEvent, AgentStatus, ErrorEvent, ErrorInfo, EventMsg, ProjectInstructions,
-    StreamErrorEvent, ThreadId, ToolCallCompletedEvent, ToolCallResultKind, ToolCallStartedEvent,
 };
 use tokio_util::sync::CancellationToken;
 use tools::{DecodedToolOutput, SkillMeta, SubagentArgs, decode_tool_output_for_tool};
@@ -66,7 +66,7 @@ async fn fail_turn(
 ) {
     let message = err.to_string();
     let error_info =
-        ErrorInfo::new("turn_failed", message.clone()).with_source(format!("smooth-core::{site}"));
+        ErrorInfo::new("turn_failed", message.clone()).with_source(format!("cazean-core::{site}"));
     tracing::error!(
         thread_id = %session.id,
         turn_id = %ctx.sub_id,
@@ -139,7 +139,7 @@ impl PendingCallDescriptor {
 /// override, clamped below the deadline so no configuration can push the
 /// batch past the hard abort.
 fn tool_cancel_grace(reason: CancelReason) -> Duration {
-    let override_ms = std::env::var("SMOOTH_CODE_TOOL_CANCEL_GRACE_MS")
+    let override_ms = std::env::var("CAZEAN_TOOL_CANCEL_GRACE_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok());
     tool_cancel_grace_with_override(reason, override_ms)
@@ -2229,7 +2229,7 @@ fn skills_context_message(skills: &[SkillMeta]) -> Option<Message> {
 }
 
 /// If the prompt starts with `/name` where `name` is a skill in
-/// `<cwd>/.smooth-code/skills`, return the expanded model-facing text (skill
+/// `<cwd>/.cazean/skills`, return the expanded model-facing text (skill
 /// instructions + remaining text as arguments). Any other text — including
 /// unknown `/foo` commands — passes through unchanged.
 fn expand_skill_invocation(
@@ -2352,8 +2352,8 @@ fn tool_result(id: String, call_id: Option<String>, tool_result: String) -> Tool
 
 #[cfg(test)]
 mod tests {
+    use cazean_protocol::{FileChange, FileChangeOutput, ToolCallResultKind};
     use rig::message::Reasoning as MessageReasoning;
-    use smooth_protocol::{FileChange, FileChangeOutput, ToolCallResultKind};
     use tools::{SubagentArgs, encode_tool_output};
 
     use crate::agent::SystemPromptKind;

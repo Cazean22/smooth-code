@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use cazean_protocol::ThreadId;
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
-use smooth_protocol::ThreadId;
 
 use crate::ToolError;
 
@@ -11,7 +11,7 @@ const DESCRIPTION: &str = r#"Write or overwrite this thread's plan file.
 
 Usage:
 - Call this tool while in plan mode to record the agreed-upon plan as markdown.
-- The file is always written to `<workspace>/.smooth-code/plans/<thread_id>.md`; you do not choose the path.
+- The file is always written to `<workspace>/.cazean/plans/<thread_id>.md`; you do not choose the path.
 - The previous contents (if any) are replaced. Call this tool again to refine the plan.
 - After the plan is ready, call `exit_plan_mode` to submit it for user approval."#;
 
@@ -20,7 +20,7 @@ Usage:
 /// `exit_plan_mode` approval flow.
 pub fn plan_file_path(workspace_root: &Path, thread_id: ThreadId) -> PathBuf {
     workspace_root
-        .join(".smooth-code")
+        .join(".cazean")
         .join("plans")
         .join(format!("{thread_id}.md"))
 }
@@ -87,7 +87,7 @@ impl Tool for PlanWriteTool {
 mod tests {
     use std::fs;
 
-    use smooth_protocol::ThreadId;
+    use cazean_protocol::ThreadId;
     use tempfile::TempDir;
 
     use super::*;
@@ -95,7 +95,7 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[tokio::test]
-    async fn writes_plan_file_under_smooth_code_plans() -> TestResult {
+    async fn writes_plan_file_under_cazean_plans() -> TestResult {
         let tmp = TempDir::new()?;
         let thread_id = ThreadId::new();
         let tool = PlanWriteTool::new(tmp.path().to_path_buf(), thread_id);
@@ -108,7 +108,7 @@ mod tests {
 
         let path = tmp
             .path()
-            .join(".smooth-code")
+            .join(".cazean")
             .join("plans")
             .join(format!("{thread_id}.md"));
         assert!(output.contains(&path.display().to_string()));
@@ -134,7 +134,7 @@ mod tests {
 
         let path = tmp
             .path()
-            .join(".smooth-code")
+            .join(".cazean")
             .join("plans")
             .join(format!("{thread_id}.md"));
         let written = fs::read_to_string(&path)?;

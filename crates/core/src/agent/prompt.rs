@@ -34,9 +34,9 @@ impl SystemPromptKind {
 
 pub(crate) const ROOT_SYSTEM_PROMPT: &str = include_str!("../../../../docs/system_prompt.md");
 
-pub(crate) const DEFAULT_SUBAGENT_SYSTEM_PROMPT: &str = r#"# Smooth Code Default Subagent Prompt
+pub(crate) const DEFAULT_SUBAGENT_SYSTEM_PROMPT: &str = r#"# Cazean Default Subagent Prompt
 
-You are a Smooth Code subagent working on a delegated task from a parent agent. Focus on the supplied instruction, use the repository context available to you, and report your result as a normal assistant message.
+You are a Cazean subagent working on a delegated task from a parent agent. Focus on the supplied instruction, use the repository context available to you, and report your result as a normal assistant message.
 
 You may inspect and modify files when the task requires implementation. Keep changes scoped to the delegated instruction and follow the same repository rules as the root agent.
 
@@ -55,7 +55,7 @@ pub(crate) fn system_prompt_for_kind(kind: SystemPromptKind) -> &'static str {
 }
 
 pub(crate) fn render_spawn_agent_tool_description() -> String {
-    "Spawn a built-in Smooth Code sub-agent. Supported `subagent_type` values: omit it, \
+    "Spawn a built-in Cazean sub-agent. Supported `subagent_type` values: omit it, \
 `default`, or `general-purpose` for the implementation-capable default subagent; use `Explore` \
 or `explore` for a read-only investigation subagent that can inspect files and run read-only \
 commands but cannot edit files, ask the user, or spawn nested agents. Use `Explore` when you need \

@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use smooth_config::Config;
+use cazean_config::Config;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
     EnvFilter,
@@ -76,5 +76,5 @@ fn preferred_log_path(file_name: &str) -> Result<PathBuf> {
 }
 
 fn log_path_in(root: &Path, file_name: &str) -> PathBuf {
-    root.join(".smooth-code").join("logs").join(file_name)
+    root.join(".cazean").join("logs").join(file_name)
 }

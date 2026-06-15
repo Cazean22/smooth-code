@@ -1,12 +1,12 @@
 [package]
-name = "smooth-config"
+name = "cazean-config"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "smooth_config"
+name = "cazean_config"
 
 [dependencies]
 etcetera.workspace = true

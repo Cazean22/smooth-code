@@ -3,11 +3,11 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use smooth_protocol::{
+use cazean_protocol::{
     AgentStatus, CollabAgentCompletedEvent, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
     ErrorInfo, EventMsg, Op, SessionSource, SubAgentSource, ThreadId,
 };
-use smooth_state_db::StateDbHandle;
+use cazean_state_db::StateDbHandle;
 use tokio::sync::{RwLock, oneshot, watch};
 use tools::AskUserClient;
 
@@ -169,7 +169,7 @@ impl AgentControl {
         let Ok(statuses) = self.state.statuses.lock() else {
             return AgentStatus::Errored(
                 ErrorInfo::new("mutex_poisoned", "agent control status mutex was poisoned")
-                    .with_source("smooth-core"),
+                    .with_source("cazean-core"),
             );
         };
         statuses
@@ -749,9 +749,9 @@ mod tests {
     };
 
     use anyhow::{Context, Result, anyhow};
+    use cazean_state_db::StateDbHandle;
     use futures_util::{StreamExt, stream};
     use rig::message::{Message, Text};
-    use smooth_state_db::StateDbHandle;
     use tempfile::TempDir;
     use tokio::sync::{RwLock, Semaphore};
 
@@ -761,7 +761,7 @@ mod tests {
         SessionModelFactory, SessionTurnSummary, agent::SystemPromptKind,
         thread_manager::ThreadManagerState,
     };
-    use smooth_protocol::{AgentStatus, EventMsg, ThreadId};
+    use cazean_protocol::{AgentStatus, EventMsg, ThreadId};
     use tools::AskUserClient;
 
     fn lock_test_mutex<'a, T>(
@@ -987,7 +987,7 @@ mod tests {
 
         assert!(child.agent_path.as_str().starts_with("/root/"));
         assert_eq!(control.registry().live_agents().len(), 2);
-        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db")).await?;
+        let state_db = StateDbHandle::open(workspace.path().join(".cazean/state.db")).await?;
         let root_row = state_db
             .get_thread(&root_id.to_string())
             .await?
@@ -1145,7 +1145,7 @@ mod tests {
             .await?;
         assert_eq!(status, AgentStatus::Shutdown);
         assert_eq!(control.registry().live_agents().len(), 1);
-        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db")).await?;
+        let state_db = StateDbHandle::open(workspace.path().join(".cazean/state.db")).await?;
         assert!(
             state_db
                 .list_open_children(&root_id.to_string())
@@ -1197,7 +1197,7 @@ mod tests {
         .await
         .map_err(|_| anyhow!("timed out waiting for child to finish"))?;
 
-        let state_db = StateDbHandle::open(workspace.path().join(".smooth-code/state.db")).await?;
+        let state_db = StateDbHandle::open(workspace.path().join(".cazean/state.db")).await?;
         assert_eq!(control.registry().live_agents().len(), 2);
         assert_eq!(
             state_db

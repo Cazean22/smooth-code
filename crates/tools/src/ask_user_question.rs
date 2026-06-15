@@ -61,14 +61,14 @@ pub struct AskUserQuestionOptionInput {
 
 #[derive(Clone)]
 pub struct AskUserQuestionTool {
-    thread_id: smooth_protocol::ThreadId,
+    thread_id: cazean_protocol::ThreadId,
     client: AskUserClient,
     current_turn_id: Arc<RwLock<Option<String>>>,
 }
 
 impl AskUserQuestionTool {
     pub fn new(
-        thread_id: smooth_protocol::ThreadId,
+        thread_id: cazean_protocol::ThreadId,
         client: AskUserClient,
         current_turn_id: Arc<RwLock<Option<String>>>,
     ) -> Self {
@@ -187,7 +187,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use app_server_protocol::{AskUserQuestionAnswer, JsonRpcError};
-    use smooth_protocol::ErrorInfo;
+    use cazean_protocol::ErrorInfo;
 
     use super::*;
 
@@ -257,7 +257,7 @@ mod tests {
             }],
         });
         let tool = AskUserQuestionTool::new(
-            smooth_protocol::ThreadId::new(),
+            cazean_protocol::ThreadId::new(),
             client,
             Arc::new(RwLock::new(Some("turn-1".to_string()))),
         );
@@ -287,7 +287,7 @@ mod tests {
             }],
         });
         let tool = AskUserQuestionTool::new(
-            smooth_protocol::ThreadId::new(),
+            cazean_protocol::ThreadId::new(),
             client,
             Arc::new(RwLock::new(Some("turn-2".to_string()))),
         );
@@ -317,7 +317,7 @@ mod tests {
             ],
         });
         let tool = AskUserQuestionTool::new(
-            smooth_protocol::ThreadId::new(),
+            cazean_protocol::ThreadId::new(),
             client,
             Arc::new(RwLock::new(Some("turn-4".to_string()))),
         );
@@ -333,7 +333,7 @@ mod tests {
     async fn fails_without_active_turn() -> TestResult {
         let (client, _) = ok_client(AskUserQuestionResponse { answers: vec![] });
         let tool = AskUserQuestionTool::new(
-            smooth_protocol::ThreadId::new(),
+            cazean_protocol::ThreadId::new(),
             client,
             Arc::new(RwLock::new(None)),
         );
@@ -349,7 +349,7 @@ mod tests {
     async fn surfaces_client_error_as_tool_failure() -> TestResult {
         let client = err_client("user declined to answer");
         let tool = AskUserQuestionTool::new(
-            smooth_protocol::ThreadId::new(),
+            cazean_protocol::ThreadId::new(),
             client,
             Arc::new(RwLock::new(Some("turn-3".to_string()))),
         );

@@ -41,7 +41,7 @@ pub use error::{TuiError, TuiResult};
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 #[tracing::instrument(name = "tui.run", skip_all)]
-pub async fn run(config: std::sync::Arc<smooth_config::Config>) -> TuiResult<()> {
+pub async fn run(config: std::sync::Arc<cazean_config::Config>) -> TuiResult<()> {
     // Make appearance settings available to the render layer, and reject an
     // unknown highlight theme before entering raw mode / the alternate screen.
     config_state::install(std::sync::Arc::clone(&config));
@@ -118,7 +118,7 @@ pub async fn run(config: std::sync::Arc<smooth_config::Config>) -> TuiResult<()>
 /// Reject configuration the render layer can't honor before terminal setup.
 /// The highlight theme is validated here (not in the leaf config crate, which
 /// is two-face-free); `highlight::theme` still falls back defensively.
-fn validate_tui_config(config: &smooth_config::Config) -> TuiResult<()> {
+fn validate_tui_config(config: &cazean_config::Config) -> TuiResult<()> {
     let theme = &config.tui.highlight_theme;
     if highlight::embedded_theme_name(theme).is_none() {
         return Err(TuiError::Config(format!(
@@ -135,7 +135,7 @@ async fn shutdown_app_server(app_server: &mut AppServerSession) {
     // here for the timeout path — if the core hung and we are exiting anyway,
     // outstanding subprocess groups must still be SIGKILLed before the
     // process (and the detached sweep tasks with it) goes away.
-    smooth_core::sweep_pending_process_kills();
+    cazean_core::sweep_pending_process_kills();
 }
 
 /// SIGINT/SIGTERM listener (no-op stream on non-unix platforms).

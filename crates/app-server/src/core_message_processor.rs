@@ -7,9 +7,9 @@ use app_server_protocol::{
     ThreadPreviewResponse, ThreadResumeResponse, ThreadStartResponse, ThreadUnwatchResponse,
     TurnCancelResponse, TurnStartResponse,
 };
-use smooth_config::Config;
-use smooth_core::{AskUserClient, CoreError, ThreadManagerState, ThreadSummary};
-use smooth_protocol::ThreadId;
+use cazean_config::Config;
+use cazean_core::{AskUserClient, CoreError, ThreadManagerState, ThreadSummary};
+use cazean_protocol::ThreadId;
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
@@ -680,7 +680,7 @@ mod tests {
         serde_json::from_value(value).map_err(|err| {
             app_server_protocol::JsonRpcError::new(
                 -32000,
-                smooth_protocol::ErrorInfo::new("test_decode", err.to_string()),
+                cazean_protocol::ErrorInfo::new("test_decode", err.to_string()),
             )
         })
     }
@@ -715,7 +715,7 @@ mod tests {
             .await?;
         let started: app_server_protocol::ThreadStartResponse =
             serde_json::from_value(started_value)?;
-        let thread_id = started.thread_id.parse::<smooth_protocol::ThreadId>()?;
+        let thread_id = started.thread_id.parse::<cazean_protocol::ThreadId>()?;
 
         let response = preview(&processor, &started.thread_id).await?;
         assert_eq!(response.thread_id, started.thread_id);
@@ -841,7 +841,7 @@ mod tests {
         let _cwd_restore = CwdRestore(original_cwd);
 
         let (processor, _event_rx) = test_processor().await?;
-        let unknown = smooth_protocol::ThreadId::new();
+        let unknown = cazean_protocol::ThreadId::new();
         assert!(preview(&processor, &unknown.to_string()).await.is_err());
         let subscribed = processor.subscribed_threads.lock().await;
         assert!(subscribed.is_empty());

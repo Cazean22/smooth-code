@@ -1,5 +1,5 @@
 [package]
-name = "smooth-protocol"
+name = "cazean-protocol"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

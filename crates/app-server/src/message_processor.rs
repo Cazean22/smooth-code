@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use app_server_protocol::{ClientRequest, JsonRpcError};
+use cazean_config::Config;
 use futures_util::FutureExt;
-use smooth_config::Config;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{

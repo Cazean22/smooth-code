@@ -1,4 +1,4 @@
-use smooth_protocol::{ErrorInfo, ThreadId};
+use cazean_protocol::{ErrorInfo, ThreadId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -18,7 +18,7 @@ pub enum CoreError {
     InvalidAgentPath {
         thread_id: ThreadId,
         path: String,
-        source: smooth_protocol::AgentPathError,
+        source: cazean_protocol::AgentPathError,
     },
     #[error("agent control runtime is not attached")]
     RuntimeNotAttached,
@@ -33,7 +33,7 @@ pub enum CoreError {
         source: std::io::Error,
     },
     #[error("state database error: {0}")]
-    StateDb(#[from] smooth_state_db::StateDbError),
+    StateDb(#[from] cazean_state_db::StateDbError),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("I/O error: {0}")]
@@ -100,7 +100,7 @@ impl CoreError {
             Self::AgentControl(_) => "agent_control",
             Self::Other(_) => "core_error",
         };
-        ErrorInfo::new(kind, self.to_string()).with_source("smooth-core")
+        ErrorInfo::new(kind, self.to_string()).with_source("cazean-core")
     }
 }
 

@@ -1,6 +1,6 @@
+use cazean_protocol::ProjectInstructions;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use smooth_protocol::ProjectInstructions;
 
 use crate::RequestId;
 
@@ -29,7 +29,7 @@ pub struct ThreadResumeParams {
 pub struct ThreadResumeResponse {
     pub thread_id: String,
     pub rollout_path: String,
-    pub initial_messages: Vec<smooth_protocol::EventMsg>,
+    pub initial_messages: Vec<cazean_protocol::EventMsg>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
@@ -48,9 +48,9 @@ pub struct ThreadPreviewResponse {
     pub agent_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_nickname: Option<String>,
-    pub status: smooth_protocol::AgentStatus,
+    pub status: cazean_protocol::AgentStatus,
     pub is_live: bool,
-    pub initial_messages: Vec<smooth_protocol::EventMsg>,
+    pub initial_messages: Vec<cazean_protocol::EventMsg>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
@@ -309,8 +309,8 @@ impl ServerRequest {
 
 #[cfg(test)]
 mod tests {
+    use cazean_protocol::{ProjectInstructionEntry, ProjectInstructions};
     use serde_json::json;
-    use smooth_protocol::{ProjectInstructionEntry, ProjectInstructions};
 
     use super::*;
 
@@ -321,7 +321,7 @@ mod tests {
         let response = ThreadResumeResponse {
             thread_id: "018f6f32-7a31-7c22-8c95-3c3dfb63dce1".to_string(),
             rollout_path: "session.jsonl".to_string(),
-            initial_messages: vec![smooth_protocol::EventMsg::UserMessage {
+            initial_messages: vec![cazean_protocol::EventMsg::UserMessage {
                 text: "hello".to_string(),
             }],
         };
@@ -466,9 +466,9 @@ mod tests {
             thread_id: "018f6f32-7a31-7c22-8c95-3c3dfb63dce1".to_string(),
             agent_path: Some("/root/worker".to_string()),
             agent_nickname: Some("worker".to_string()),
-            status: smooth_protocol::AgentStatus::Running,
+            status: cazean_protocol::AgentStatus::Running,
             is_live: true,
-            initial_messages: vec![smooth_protocol::EventMsg::UserMessage {
+            initial_messages: vec![cazean_protocol::EventMsg::UserMessage {
                 text: "inspect".to_string(),
             }],
         };

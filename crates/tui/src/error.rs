@@ -1,6 +1,6 @@
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
-    #[error("smooth-tui requires a TTY")]
+    #[error("cazean-tui requires a TTY")]
     TtyRequired,
     #[error("app-server error: {0}")]
     AppServer(#[from] app_server::AppServerError),

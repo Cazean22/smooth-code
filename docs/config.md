@@ -1,16 +1,22 @@
 # Configuration
 
-smooth-code reads layered TOML configuration. Each layer overrides the one
+cazean reads layered TOML configuration. Each layer overrides the one
 before it (lowest precedence first):
 
 1. **Built-in defaults** — reproduce the historical hardcoded behavior. See
    `config.example.toml` at the repo root for the full set with comments.
-2. **User config** — `~/.config/smooth-code/config.toml` (XDG; honors
+2. **Legacy user config** — `~/.config/smooth-code/config.toml` (read for
+   migration at lower precedence).
+3. **User config** — `~/.config/cazean/config.toml` (XDG; honors
    `$XDG_CONFIG_HOME`, so the path is `~/.config` on macOS too).
-3. **Project config** — `<workspace>/.smooth-code/config.toml`, where
+4. **Legacy project config** — `<workspace>/.smooth-code/config.toml` (read for
+   migration at lower precedence).
+5. **Project config** — `<workspace>/.cazean/config.toml`, where
    `<workspace>` is the current working directory.
-4. **Legacy environment variables** — the five `SMOOTH_CODE_*` / `SMOOTH_TRACE_STDERR`
-   variables below.
+6. **Legacy environment variables** — supported `SMOOTH_CODE_*` values are read
+   at lower precedence.
+7. **Environment variables** — the `CAZEAN_*` / `SMOOTH_TRACE_STDERR` variables
+   below.
 
 Missing files are skipped. Configuration is loaded once at startup (before
 logging is initialized), so a malformed file prints a clear error to stderr and
@@ -32,17 +38,21 @@ the process exits.
 
 ## Environment variables (v1)
 
-Only these legacy variables are supported — there is **no** generic
-`SMOOTH_CODE_<SECTION>_<KEY>` mapping for every TOML key yet. New keys are
+Only these variables are supported — there is **no** generic
+`CAZEAN_<SECTION>_<KEY>` mapping for every TOML key yet. New keys are
 file-only.
 
 | Variable | Maps to | Notes |
 |---|---|---|
-| `SMOOTH_CODE_LLM_PROVIDER` | `provider.provider` | |
-| `SMOOTH_CODE_LLM_MODEL` | `provider.model` | empty string accepted as-is |
-| `SMOOTH_CODE_LLM_PREAMBLE` | `provider.preamble` | empty string is a real override to an empty preamble |
-| `SMOOTH_CODE_RUN_COMMAND_TIMEOUT_SECS` | `tools.run_command.default_timeout_secs` | invalid/zero values are ignored (fall through) |
+| `CAZEAN_LLM_PROVIDER` | `provider.provider` | |
+| `CAZEAN_LLM_MODEL` | `provider.model` | empty string accepted as-is |
+| `CAZEAN_LLM_PREAMBLE` | `provider.preamble` | empty string is a real override to an empty preamble |
+| `CAZEAN_RUN_COMMAND_TIMEOUT_SECS` | `tools.run_command.default_timeout_secs` | invalid/zero values are ignored (fall through) |
 | `SMOOTH_TRACE_STDERR` | `telemetry.force_stderr` | truthy (`1/true/yes/on`) → true, falsey (`0/false/no/off`) → false, anything else ignored |
+
+The matching legacy `SMOOTH_CODE_LLM_PROVIDER`, `SMOOTH_CODE_LLM_MODEL`,
+`SMOOTH_CODE_LLM_PREAMBLE`, and `SMOOTH_CODE_RUN_COMMAND_TIMEOUT_SECS` names are
+also accepted at lower precedence than `CAZEAN_*`.
 
 These env vars are permissive (an invalid value falls through to the lower
 layer); values in TOML files are strict (an invalid value is an error).
@@ -65,4 +75,4 @@ local-proxy stand-in.
   provider stream and the manual turn-retry loop. `retry_budget = 0` disables
   pre-output retries. These values only affect the OpenAI provider.
 - `telemetry.log_file_name` must be a bare file name (no path separators, `.`,
-  or `..`); it is written under `<workspace>/.smooth-code/logs/`.
+  or `..`); it is written under `<workspace>/.cazean/logs/`.

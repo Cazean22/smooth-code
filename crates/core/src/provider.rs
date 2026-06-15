@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use cazean_config::{Config, ReasoningEffortConfig, ReasoningSummaryConfig};
 use futures_util::{SinkExt, StreamExt};
 use rig::{
     OneOrMany,
@@ -37,7 +38,6 @@ use rig::{
     },
 };
 use serde::Serialize;
-use smooth_config::{Config, ReasoningEffortConfig, ReasoningSummaryConfig};
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
@@ -60,7 +60,7 @@ pub trait SessionModelFactory: Send + Sync {
     fn build(
         &self,
         cwd: PathBuf,
-        thread_id: smooth_protocol::ThreadId,
+        thread_id: cazean_protocol::ThreadId,
         ask_user_client: Option<AskUserClient>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         system_prompt_kind: SystemPromptKind,
@@ -84,7 +84,7 @@ impl SessionModelFactory for ConfigSessionModelFactory {
     fn build(
         &self,
         cwd: PathBuf,
-        thread_id: smooth_protocol::ThreadId,
+        thread_id: cazean_protocol::ThreadId,
         ask_user_client: Option<AskUserClient>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         system_prompt_kind: SystemPromptKind,
@@ -169,7 +169,7 @@ pub struct OpenAiSessionModel {
     agent: Arc<Agent<openai::responses_api::ResponsesCompletionModel>>,
     client: openai::Client,
     model: String,
-    websocket: smooth_config::WebSocketConfig,
+    websocket: cazean_config::WebSocketConfig,
     session_ws: Mutex<Option<OpenAiParkedWebSocket>>,
 }
 
@@ -193,7 +193,7 @@ impl SessionModel {
     pub(crate) fn websocket_retry_budget(&self) -> usize {
         match self {
             Self::OpenAi(openai) => openai.websocket.retry_budget,
-            _ => smooth_config::WebSocketConfig::default().retry_budget,
+            _ => cazean_config::WebSocketConfig::default().retry_budget,
         }
     }
 
@@ -206,7 +206,7 @@ impl SessionModel {
                 openai.websocket.retry_max_ms,
             ),
             _ => {
-                let ws = smooth_config::WebSocketConfig::default();
+                let ws = cazean_config::WebSocketConfig::default();
                 (ws.retry_base_ms, ws.retry_max_ms)
             }
         };
@@ -221,7 +221,7 @@ impl SessionModel {
     pub fn from_config(
         config: &Config,
         cwd: PathBuf,
-        thread_id: smooth_protocol::ThreadId,
+        thread_id: cazean_protocol::ThreadId,
         ask_user_client: Option<AskUserClient>,
         current_turn_id: Arc<RwLock<Option<String>>>,
         system_prompt_kind: SystemPromptKind,
@@ -230,7 +230,7 @@ impl SessionModel {
     ) -> Result<Self> {
         // Normalize identically to config validation (shared helper) so a
         // value like " openai " that passed validation also matches an arm.
-        let provider = smooth_config::normalize_provider(&config.provider.provider);
+        let provider = cazean_config::normalize_provider(&config.provider.provider);
         let model = config.provider.model.clone();
         let environment_context = EnvironmentContext::gather(&cwd);
         let preamble = compose_session_preamble(
@@ -376,7 +376,7 @@ pub(crate) fn default_session_model_factory() -> Arc<dyn SessionModelFactory> {
 }
 
 pub(crate) fn stub_session_model_factory(
-    models: HashMap<smooth_protocol::ThreadId, SessionModel>,
+    models: HashMap<cazean_protocol::ThreadId, SessionModel>,
 ) -> Arc<dyn SessionModelFactory> {
     Arc::new(StubSessionModelFactory {
         models: std::sync::Mutex::new(models),
@@ -384,14 +384,14 @@ pub(crate) fn stub_session_model_factory(
 }
 
 struct StubSessionModelFactory {
-    models: std::sync::Mutex<HashMap<smooth_protocol::ThreadId, SessionModel>>,
+    models: std::sync::Mutex<HashMap<cazean_protocol::ThreadId, SessionModel>>,
 }
 
 impl SessionModelFactory for StubSessionModelFactory {
     fn build(
         &self,
         _cwd: PathBuf,
-        thread_id: smooth_protocol::ThreadId,
+        thread_id: cazean_protocol::ThreadId,
         _ask_user_client: Option<AskUserClient>,
         _current_turn_id: Arc<RwLock<Option<String>>>,
         _system_prompt_kind: SystemPromptKind,
@@ -429,7 +429,7 @@ fn compose_session_preamble(
 fn build_agent<M>(
     builder: rig::agent::AgentBuilder<M, (), rig::agent::NoToolConfig>,
     cwd: PathBuf,
-    thread_id: smooth_protocol::ThreadId,
+    thread_id: cazean_protocol::ThreadId,
     ask_user_client: Option<AskUserClient>,
     current_turn_id: Arc<RwLock<Option<String>>>,
     system_prompt_kind: SystemPromptKind,
@@ -584,7 +584,7 @@ type OpenAiWebSocketRawChoice = RawStreamingChoice<OpenAiStreamingCompletionResp
 type OpenAiWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 // Retry/backoff/cancel-drain tuning is configurable via `[provider.websocket]`
 // and carried on `OpenAiSessionModel.websocket`. Defaults (budget 8, base 250ms,
-// max 3s, drain 1500ms) live in `smooth-config`. A connection reset before
+// max 3s, drain 1500ms) live in `cazean-config`. A connection reset before
 // output is how the local proxy (CLIProxyAPI) surfaces an upstream codex account
 // running out of usage; the budget rolls through several exhausted accounts and
 // the capped exponential backoff keeps the retry tail interactive. The
@@ -1869,7 +1869,7 @@ mod tests {
     };
     use tokio_tungstenite::{accept_async, tungstenite::Message as TestWebSocketMessage};
 
-    use smooth_config::Config;
+    use cazean_config::Config;
 
     use super::{build_agent, compose_session_preamble};
     use crate::{
@@ -1925,7 +1925,7 @@ mod tests {
 
     fn environment_context() -> EnvironmentContext {
         EnvironmentContext {
-            working_directory: "/workspace/smooth-code".to_string(),
+            working_directory: "/workspace/cazean".to_string(),
             is_git_repo: "yes".to_string(),
             platform: "macos".to_string(),
             os_version: "25.0.0".to_string(),
@@ -1966,7 +1966,7 @@ mod tests {
             agent: Arc::new(agent),
             client,
             model: "gpt-test".to_string(),
-            websocket: smooth_config::WebSocketConfig::default(),
+            websocket: cazean_config::WebSocketConfig::default(),
             session_ws: Mutex::new(None),
         }))
     }
@@ -2270,9 +2270,9 @@ mod tests {
         let preamble =
             compose_session_preamble(SystemPromptKind::Root, None, &environment_context(), false);
 
-        assert!(preamble.starts_with("# Smooth Code System Prompt"));
-        assert!(preamble.contains("You are Smooth Code"));
-        assert!(preamble.contains("Working directory: /workspace/smooth-code"));
+        assert!(preamble.starts_with("# Cazean System Prompt"));
+        assert!(preamble.contains("You are Cazean"));
+        assert!(preamble.contains("Working directory: /workspace/cazean"));
         assert!(preamble.contains("Shell: /bin/zsh"));
         assert!(preamble.contains("rg available: yes"));
         assert!(preamble.contains("fd available: yes"));
@@ -2302,7 +2302,7 @@ mod tests {
             false,
         );
 
-        assert!(preamble.starts_with("# Smooth Code Default Subagent Prompt"));
+        assert!(preamble.starts_with("# Cazean Default Subagent Prompt"));
         assert!(preamble.contains("delegated task from a parent agent"));
         assert!(!preamble.contains("Root override."));
     }
@@ -2316,7 +2316,7 @@ mod tests {
             false,
         );
 
-        assert!(preamble.starts_with("# Smooth Code Explorer Subagent Prompt"));
+        assert!(preamble.starts_with("# Cazean Explorer Subagent Prompt"));
         assert!(preamble.contains("Do not create, edit, delete"));
         assert!(preamble.contains("run_command"));
         assert!(!preamble.contains("Root override."));
@@ -2343,7 +2343,7 @@ mod tests {
         let agent = build_agent(
             AgentBuilder::new(DummyModel),
             workspace.path().to_path_buf(),
-            smooth_protocol::ThreadId::new(),
+            cazean_protocol::ThreadId::new(),
             None,
             Arc::new(RwLock::new(None)),
             SystemPromptKind::Root,
@@ -2380,7 +2380,7 @@ mod tests {
         let agent = build_agent(
             AgentBuilder::new(DummyModel),
             workspace.path().to_path_buf(),
-            smooth_protocol::ThreadId::new(),
+            cazean_protocol::ThreadId::new(),
             None,
             Arc::new(RwLock::new(None)),
             SystemPromptKind::DefaultSubagent,
@@ -2415,7 +2415,7 @@ mod tests {
         let agent = build_agent(
             AgentBuilder::new(DummyModel),
             workspace.path().to_path_buf(),
-            smooth_protocol::ThreadId::new(),
+            cazean_protocol::ThreadId::new(),
             Some(stub_ask_user_client()),
             Arc::new(RwLock::new(None)),
             SystemPromptKind::Root,
@@ -2447,7 +2447,7 @@ mod tests {
         let agent = build_agent(
             AgentBuilder::new(DummyModel),
             workspace.path().to_path_buf(),
-            smooth_protocol::ThreadId::new(),
+            cazean_protocol::ThreadId::new(),
             Some(stub_ask_user_client()),
             Arc::new(RwLock::new(None)),
             SystemPromptKind::Explore,
@@ -2932,7 +2932,7 @@ mod tests {
     #[test]
     fn openai_websocket_retry_delay_grows_then_caps() {
         // Use the built-in WebSocket defaults (base 250ms, max 3s).
-        let ws = smooth_config::WebSocketConfig::default();
+        let ws = cazean_config::WebSocketConfig::default();
         let base = std::time::Duration::from_millis(ws.retry_base_ms);
         let max = std::time::Duration::from_millis(ws.retry_max_ms);
         // Early retries back off exponentially from the base delay.

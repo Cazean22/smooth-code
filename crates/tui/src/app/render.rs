@@ -269,7 +269,7 @@ impl UiModel {
     pub(in crate::app) fn render_dashboard_body(&self, frame: &mut Frame<'_>, area: Rect) {
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled("smooth-code", Style::default().bold().fg(Color::Cyan)),
+            Span::styled("cazean", Style::default().bold().fg(Color::Cyan)),
             Span::raw("  "),
             Span::styled("sessions", Style::default().dim()),
         ]));
@@ -966,9 +966,9 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: Some(smooth_protocol::FileChangeOutput {
+                    file_change: Some(cazean_protocol::FileChangeOutput {
                         path: "src/lib.rs".into(),
-                        change: smooth_protocol::FileChange::Update {
+                        change: cazean_protocol::FileChange::Update {
                             unified_diff: diffy::create_patch("old\n", "new\n").to_string(),
                             move_path: None,
                         },
@@ -1022,11 +1022,11 @@ mod tests {
                     todos: vec![
                         TodoItem {
                             content: String::from("add module"),
-                            status: smooth_protocol::TodoStatus::Completed,
+                            status: cazean_protocol::TodoStatus::Completed,
                         },
                         TodoItem {
                             content: String::from("register tool"),
-                            status: smooth_protocol::TodoStatus::InProgress,
+                            status: cazean_protocol::TodoStatus::InProgress,
                         },
                     ],
                 }),
@@ -1058,9 +1058,9 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: Some(smooth_protocol::FileChangeOutput {
+                    file_change: Some(cazean_protocol::FileChangeOutput {
                         path: "src/old.rs".into(),
-                        change: smooth_protocol::FileChange::Update {
+                        change: cazean_protocol::FileChange::Update {
                             unified_diff: String::new(),
                             move_path: Some("src/new.rs".into()),
                         },
@@ -1111,16 +1111,16 @@ mod tests {
                     related_thread_id: None,
                     file_change: None,
                     file_changes: vec![
-                        smooth_protocol::FileChangeOutput {
+                        cazean_protocol::FileChangeOutput {
                             path: "one.txt".into(),
-                            change: smooth_protocol::FileChange::Update {
+                            change: cazean_protocol::FileChange::Update {
                                 unified_diff: diffy::create_patch("one\n", "uno\n").to_string(),
                                 move_path: None,
                             },
                         },
-                        smooth_protocol::FileChangeOutput {
+                        cazean_protocol::FileChangeOutput {
                             path: "two.txt".into(),
-                            change: smooth_protocol::FileChange::Add {
+                            change: cazean_protocol::FileChange::Add {
                                 content: "dos\n".to_string(),
                             },
                         },
@@ -1157,9 +1157,9 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: Some(smooth_protocol::FileChangeOutput {
+                    file_change: Some(cazean_protocol::FileChangeOutput {
                         path: "large.txt".into(),
-                        change: smooth_protocol::FileChange::Add {
+                        change: cazean_protocol::FileChange::Add {
                             content: (0..40)
                                 .map(|idx| format!("line {idx}"))
                                 .collect::<Vec<_>>()
@@ -1207,9 +1207,9 @@ mod tests {
                     error: None,
                     result_kind: ToolCallResultKind::Final,
                     related_thread_id: None,
-                    file_change: Some(smooth_protocol::FileChangeOutput {
+                    file_change: Some(cazean_protocol::FileChangeOutput {
                         path: "src/lib.rs".into(),
-                        change: smooth_protocol::FileChange::Update {
+                        change: cazean_protocol::FileChange::Update {
                             unified_diff: diffy::create_patch(
                                 &format!("{old}\n"),
                                 &format!("{new}\n"),

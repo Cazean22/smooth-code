@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use smooth_protocol::{ProjectInstructionEntry, ProjectInstructions};
+use cazean_protocol::{ProjectInstructionEntry, ProjectInstructions};
 
 use crate::error::TuiResult;
 

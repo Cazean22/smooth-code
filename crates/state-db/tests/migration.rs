@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use smooth_state_db::StateDbHandle;
+use cazean_state_db::StateDbHandle;
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;

@@ -6,21 +6,21 @@ use std::{
 };
 
 use anyhow::Result;
+use cazean_core::{
+    AgentControl, SessionAssistantContent, SessionCompletionEvent, SessionCompletionStream,
+    SessionModel, SessionModelDriver, SessionModelFactory, SessionTurnSummary, SystemPromptKind,
+    ThreadManagerState,
+};
+use cazean_protocol::{
+    AgentStatus, CollabAgentStatusEntry, EventMsg, ThreadId, ToolCallResultKind,
+    TurnCompletedEvent, TurnStartedEvent,
+};
 use futures_util::{StreamExt, stream};
 use rig::message::{
     AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction,
     UserContent,
 };
 use serde::Deserialize;
-use smooth_core::{
-    AgentControl, SessionAssistantContent, SessionCompletionEvent, SessionCompletionStream,
-    SessionModel, SessionModelDriver, SessionModelFactory, SessionTurnSummary, SystemPromptKind,
-    ThreadManagerState,
-};
-use smooth_protocol::{
-    AgentStatus, CollabAgentStatusEntry, EventMsg, ThreadId, ToolCallResultKind,
-    TurnCompletedEvent, TurnStartedEvent,
-};
 use tempfile::TempDir;
 use tokio::sync::{RwLock, Semaphore};
 use tools::AskUserClient;
@@ -2002,7 +2002,7 @@ impl SessionModelFactory for EncryptedReasoningFactory {
 }
 
 async fn wait_for_turn_completion(
-    events: &mut tokio::sync::broadcast::Receiver<smooth_protocol::Event>,
+    events: &mut tokio::sync::broadcast::Receiver<cazean_protocol::Event>,
     turn_id: &str,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);

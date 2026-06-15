@@ -1,9 +1,9 @@
 use std::{fs, io::ErrorKind, path::PathBuf};
 
+use cazean_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 use rig::{completion::ToolDefinition, tool::Tool};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
-use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 
 use crate::{
     MAX_FILE_CHANGE_BYTES, ToolError, encode_tool_output_with_file_changes,

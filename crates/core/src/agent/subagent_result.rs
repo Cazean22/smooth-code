@@ -8,12 +8,12 @@
 //! encoder keeps the reconstructed JSON byte-identical to what the live turn
 //! produced.
 
+use cazean_protocol::{AgentPath, AgentStatus, ErrorInfo, ThreadId};
 use rig::{
     OneOrMany,
     message::{Message, Text, UserContent},
 };
 use serde::{Deserialize, Serialize};
-use smooth_protocol::{AgentPath, AgentStatus, ErrorInfo, ThreadId};
 
 use crate::agent::{
     control::InlineChildCompletion, registry::AgentMetadata, status::last_assistant_message,
@@ -70,7 +70,7 @@ impl CompletionEntry {
             Err(message) => (
                 AgentStatus::Errored(
                     ErrorInfo::new("spawn_agent_inline_wait_failed", message)
-                        .with_source("smooth-core"),
+                        .with_source("cazean-core"),
                 ),
                 None,
             ),

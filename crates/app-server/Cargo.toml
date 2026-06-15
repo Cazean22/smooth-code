@@ -9,11 +9,11 @@ license.workspace = true
 anyhow.workspace = true
 app-server-protocol = { path = "../app-server-protocol" }
 futures-util.workspace = true
-smooth-config = { path = "../config" }
-smooth-core = { path = "../core" }
+cazean-config = { path = "../config" }
+cazean-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
-smooth-protocol = { path = "../protocol" }
+cazean-protocol = { path = "../protocol" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true

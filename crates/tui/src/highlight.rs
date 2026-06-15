@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn unknown_language_returns_plain_fallback_lines() {
-        let lines = highlight_code_to_styled_spans("plain text", "unknown-smooth-language");
+        let lines = highlight_code_to_styled_spans("plain text", "unknown-cazean-language");
 
         assert!(lines.is_none());
     }

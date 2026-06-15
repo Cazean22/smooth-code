@@ -2,10 +2,10 @@
 
 mod common;
 
+use cazean_protocol::ErrorInfo;
 pub use common::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use smooth_protocol::ErrorInfo;
 use std::fmt;
 use tokio::sync::oneshot;
 

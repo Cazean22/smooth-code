@@ -5,11 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use app_server_protocol::ThreadPreviewResponse;
+use cazean_protocol::{AgentStatus, EventMsg, ThreadId, ToolCallResultKind};
 use ratatui::{
     style::{Color, Style},
     text::Line,
 };
-use smooth_protocol::{AgentStatus, EventMsg, ThreadId, ToolCallResultKind};
 
 use crate::app::{ActiveWrap, RenderedTranscriptCache, agent_status_label, append_visible_line};
 use crate::history_cell::{ToolCallGroupCell, ToolCallState, TranscriptItem, TranscriptItemId};
@@ -702,7 +702,7 @@ fn render_markdown(message: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn format_args_completed(event: &smooth_protocol::CollabAgentCompletedEvent) -> String {
+fn format_args_completed(event: &cazean_protocol::CollabAgentCompletedEvent) -> String {
     let nickname = event
         .agent_nickname
         .as_deref()

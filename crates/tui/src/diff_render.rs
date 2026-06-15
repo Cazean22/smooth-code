@@ -1,9 +1,9 @@
+use cazean_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 use diffy::{Hunk, Patch};
 use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
 };
-use smooth_protocol::{FileChange, FileChangeOperation, FileChangeOutput};
 use unicode_width::UnicodeWidthChar;
 
 use crate::config_state;

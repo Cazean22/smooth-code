@@ -1,35 +1,35 @@
-# smooth-code agent notes
+# cazean agent notes
 
 ## Repo Scope
 
 - This is a Rust 2024 workspace. No nested `AGENTS.md`/`AGENT.md` files or Cursor/Claude/Windsurf/Cline/Goose/Copilot rule files were found in this repo.
 - When a real implementation, debugging, or fix task yields durable repo knowledge, record it in `PROGRESS.md` before the final response. Organize entries by subsystem/topic, not by chat timeline, and keep them focused on reusable decisions, caveats, and verification notes. Do not update `PROGRESS.md` for inspection-only/listing/exploration tasks unless the user explicitly asks to persist findings.
 - `.cargo/config.toml` enables `tokio_unstable`; do not remove or bypass it casually.
-- Default workspace member is `crates/tui`, so bare `cargo build`, `cargo test`, and `cargo run` target `smooth-tui` unless `--workspace` or `-p` is used.
-- Workspace members are `app-server`, `app-server-protocol`, `smooth-core`, `smooth-protocol`, `smooth-state-db`, `tools`, and `smooth-tui`.
+- Default workspace member is `crates/tui`, so bare `cargo build`, `cargo test`, and `cargo run` target `cazean-tui` unless `--workspace` or `-p` is used.
+- Workspace members are `app-server`, `app-server-protocol`, `cazean-core`, `cazean-protocol`, `cazean-state-db`, `tools`, and `cazean-tui`.
 
 ## Main Commands
 
-- Build/check: `cargo check --workspace`, `cargo build --workspace`, `cargo run -p smooth-tui`.
+- Build/check: `cargo check --workspace`, `cargo build --workspace`, `cargo run -p cazean-tui`.
 - Format/lint: `cargo fmt`, `cargo fmt -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`.
-- Tests: `cargo test --workspace`; package tests use `cargo test -p smooth-tui` or `cargo test -p smooth-core`.
+- Tests: `cargo test --workspace`; package tests use `cargo test -p cazean-tui` or `cargo test -p cazean-core`.
 - Single test pattern: `cargo test -p <package> <module_path::test_name> -- --exact --nocapture`.
-- Multi-agent integration tests live in `crates/core/tests/multi_agent_e2e.rs`; run them with `cargo test -p smooth-core --test multi_agent_e2e -- --nocapture`. `cargo test -p smooth-core multi_agent_e2e -- --nocapture` is only a name filter and may match zero tests.
+- Multi-agent integration tests live in `crates/core/tests/multi_agent_e2e.rs`; run them with `cargo test -p cazean-core --test multi_agent_e2e -- --nocapture`. `cargo test -p cazean-core multi_agent_e2e -- --nocapture` is only a name filter and may match zero tests.
 
 ## Architecture
 
 - Runtime flow is TUI -> `AppServerSession` -> `app_server::in_process` -> `MessageProcessor`/`CoreMessageProcessor` -> `ThreadManagerState` -> `CoreThread`/`Core` -> Rig model/tool loop -> protocol events back to the TUI.
-- `smooth-tui` is the terminal UI entrypoint. It uses ratatui/crossterm, keeps state in a reducer-style `UiModel::update(UiEvent) -> Vec<UiEffect>`, and lets `App` run async effects and render.
+- `cazean-tui` is the terminal UI entrypoint. It uses ratatui/crossterm, keeps state in a reducer-style `UiModel::update(UiEvent) -> Vec<UiEffect>`, and lets `App` run async effects and render.
 - `app-server` is an in-process request/event bridge. It owns `CoreMessageProcessor`, thread subscriptions, and client-directed server requests such as `ask_user_question` and `request_plan_approval`.
 - `app-server-protocol` owns typed client/server request envelopes: `ClientRequest`, `ServerRequest`, `ThreadStart`, `ThreadResume`, `ThreadList`, `TurnStart`, `SetPlanMode`, and ask-user/plan-approval request/response types.
-- `smooth-core` owns session/thread runtime, rollout persistence, model/provider setup, manual tool-loop execution, plan-mode state and approval, and multi-agent orchestration.
-- `smooth-protocol` owns shared event/status/thread/file-change wire types, `ThreadId`, `AgentPath`, and structured `ErrorInfo`.
-- `smooth-state-db` owns SQLite state at `.smooth-code/state.db`, currently thread metadata plus parent/child thread spawn edges.
+- `cazean-core` owns session/thread runtime, rollout persistence, model/provider setup, manual tool-loop execution, plan-mode state and approval, and multi-agent orchestration.
+- `cazean-protocol` owns shared event/status/thread/file-change wire types, `ThreadId`, `AgentPath`, and structured `ErrorInfo`.
+- `cazean-state-db` owns SQLite state at `.cazean/state.db`, currently thread metadata plus parent/child thread spawn edges.
 - `tools` owns Rig tool definitions and implementations: `read`, `run_command`, `ask_user_question`, `spawn_agent`, `delete`, `edit`, `write`, `plan_write`, and `exit_plan_mode`.
 
 ## Persistence and Events
 
-- Rollout sessions are newline-delimited JSON under `.smooth-code/sessions/YYYY/MM/DD/*.jsonl`; telemetry logs go to `.smooth-code/logs/smooth-tui.log`; multi-agent thread metadata lives in `.smooth-code/state.db`.
+- Rollout sessions are newline-delimited JSON under `.cazean/sessions/YYYY/MM/DD/*.jsonl`; telemetry logs go to `.cazean/logs/cazean-tui.log`; multi-agent thread metadata lives in `.cazean/state.db`.
 - `ThreadManagerState::start_thread` creates a root thread, registers `/root` in `AgentControl`, persists root metadata, and emits `SessionConfigured` after app-server subscribes.
 - `ThreadManagerState::resume_thread` reloads rollout history/events and rehydrates open child subtrees from SQLite, emitting `CollabResumeBegin`/`CollabResumeEnd` initial messages for resumed children.
 - Only selected protocol events are persisted to rollout. Check `rollout::persist_event` before assuming a new event will replay on resume.
@@ -37,10 +37,10 @@
 
 ## LLM Providers and Prompting
 
-- LLM config comes from env vars: `SMOOTH_CODE_LLM_PROVIDER`, `SMOOTH_CODE_LLM_MODEL`, and `SMOOTH_CODE_LLM_PREAMBLE`.
+- LLM config comes from env vars: `CAZEAN_LLM_PROVIDER`, `CAZEAN_LLM_MODEL`, and `CAZEAN_LLM_PREAMBLE`.
 - Supported providers are `openai`, `openrouter`, `anthropic`, and `gemini`. The current defaults are `openai` and `gpt-5.5`.
 - The `openai` path is wired to a local OpenAI-compatible base URL at `http://localhost:8317/v1` with a placeholder API key; `openrouter`, `anthropic`, and `gemini` require their respective API keys.
-- `docs/system_prompt.md` is the default base prompt included by `crates/core/src/provider.rs`. `SMOOTH_CODE_LLM_PREAMBLE` replaces that base prompt; role-specific preambles and plan-mode instructions layer on top.
+- `docs/system_prompt.md` is the default base prompt included by `crates/core/src/provider.rs`. `CAZEAN_LLM_PREAMBLE` replaces that base prompt; role-specific preambles and plan-mode instructions layer on top.
 - Environment placeholders are filled by `crates/core/src/environment.rs`: working directory, git repo yes/no, platform, OS version, shell, and command availability for `rg`, `fd`, and `eza`.
 - OpenAI uses Rig's Responses model plus a local WebSocket streaming path for the manual tool loop. Keep OpenAI manual turns on `stream_completion_turn`; do not route them through the generic SSE-style `CompletionModel::stream()` path.
 - The local OpenAI-compatible proxy may emit provider telemetry, omit `output` on lifecycle events, and reset/close WebSockets early. Keep the tolerant local parser and retry only before any assistant item has been yielded.
@@ -85,11 +85,11 @@
 ## Error Handling
 
 - Workspace crates deny `clippy::unwrap_used` and `clippy::expect_used` across all targets, including tests. Use `Result`-returning tests, `?`, explicit `let Some/Ok ... else { panic!(...) }` assertions, or typed error conversion instead of `unwrap`/`expect`.
-- Crate boundaries use typed errors: `smooth_protocol::AgentPathError`, `smooth_core::CoreError`, `app_server::AppServerError`, `tools::ToolError`, `smooth_state_db::StateDbError`, and `smooth_tui::TuiError`.
+- Crate boundaries use typed errors: `cazean_protocol::AgentPathError`, `cazean_core::CoreError`, `app_server::AppServerError`, `tools::ToolError`, `cazean_state_db::StateDbError`, and `cazean_tui::TuiError`.
 - Keep `anyhow` at app entrypoints/tests or provider-facing glue when useful, but prefer crate result aliases and typed variants for internal public APIs.
-- Wire-level errors are structured: `app-server-protocol::JsonRpcError` keeps JSON-RPC `code`/`message` and carries `smooth_protocol::ErrorInfo { kind, message, source, details }` in `data`.
+- Wire-level errors are structured: `app-server-protocol::JsonRpcError` keeps JSON-RPC `code`/`message` and carries `cazean_protocol::ErrorInfo { kind, message, source, details }` in `data`.
 - Protocol `ErrorEvent` and `AgentStatus::Errored` carry `ErrorInfo` directly. Do not reintroduce string-only error payloads.
-- App-server JSON-RPC conversion is centralized through `AppServerError::to_json_rpc_error`; core errors preserve their `smooth-core` source and typed kind when surfaced to clients.
+- App-server JSON-RPC conversion is centralized through `AppServerError::to_json_rpc_error`; core errors preserve their `cazean-core` source and typed kind when surfaced to clients.
 - Tool errors expose stable `kind()` values while preserving readable `Display` text for model/UI output.
 - Replace poisoned `std::sync::Mutex` assumptions with helpers that map lock errors into typed domain errors. In tests, map poisoned locks into test errors rather than using `expect`.
 

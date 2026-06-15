@@ -4,12 +4,12 @@ use std::{
     sync::Arc,
 };
 
-use smooth_config::Config;
-use smooth_protocol::{
+use cazean_config::Config;
+use cazean_protocol::{
     AgentPath, AgentStatus, CollabAgentStatusEntry, CollabResumeBeginEvent, CollabResumeEndEvent,
     ErrorInfo, Event, EventMsg, Op, ProjectInstructions, SessionSource, SubAgentSource, ThreadId,
 };
-use smooth_state_db::StateDbHandle;
+use cazean_state_db::StateDbHandle;
 use tokio::sync::{RwLock, broadcast};
 use tools::AskUserClient;
 use uuid::Uuid;
@@ -37,7 +37,7 @@ pub struct StartedThread {
 pub struct ResumedThread {
     pub thread_id: ThreadId,
     pub rollout_path: PathBuf,
-    pub initial_messages: Vec<smooth_protocol::EventMsg>,
+    pub initial_messages: Vec<cazean_protocol::EventMsg>,
 }
 
 /// Read-only snapshot of a thread's transcript, taken without registering,
@@ -45,7 +45,7 @@ pub struct ResumedThread {
 pub struct PreviewedThread {
     pub thread_id: ThreadId,
     pub rollout_path: PathBuf,
-    pub initial_messages: Vec<smooth_protocol::EventMsg>,
+    pub initial_messages: Vec<cazean_protocol::EventMsg>,
     pub agent_path: Option<String>,
     pub agent_nickname: Option<String>,
     pub status: AgentStatus,
@@ -77,8 +77,7 @@ impl ThreadManagerState {
     ) -> CoreResult<Self> {
         let threads = Arc::new(RwLock::new(HashMap::new()));
         let workspace_root = workspace_root().map_err(CoreError::rollout)?;
-        let state_db =
-            StateDbHandle::open(workspace_root.join(".smooth-code").join("state.db")).await?;
+        let state_db = StateDbHandle::open(workspace_root.join(".cazean").join("state.db")).await?;
         // Resolve the factory exactly once so every thread — including spawned
         // subagents, which inherit this through `AgentControl` — uses the same
         // configured factory rather than falling back to a default.
@@ -475,7 +474,7 @@ impl ThreadManagerState {
                                     "missing_thread_metadata",
                                     "missing thread metadata",
                                 )
-                                .with_source("smooth-core"),
+                                .with_source("cazean-core"),
                             ),
                         }));
                         continue;
@@ -747,7 +746,7 @@ mod tests {
         rollout::{find_thread_path, load_resume_state},
         test_support::cwd_test_lock,
     };
-    use smooth_protocol::{
+    use cazean_protocol::{
         AgentStatus, EventMsg, ProjectInstructionEntry, ProjectInstructions, ThreadId,
     };
 
@@ -1354,7 +1353,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("grandchild id"))?;
 
         let result = manager
-            .submit(root_id, smooth_protocol::Op::Shutdown)
+            .submit(root_id, cazean_protocol::Op::Shutdown)
             .await?;
         assert_eq!(result, "shutdown");
         assert_eq!(control.get_status(child_id), AgentStatus::Shutdown);
@@ -1838,7 +1837,7 @@ mod tests {
 
     #[test]
     fn folded_live_status_is_order_sensitive() {
-        use smooth_protocol::{
+        use cazean_protocol::{
             ErrorEvent, ErrorInfo, TurnCompletedEvent, TurnInterruptedEvent, TurnStartedEvent,
         };
 

@@ -4,7 +4,7 @@ use std::{
 };
 
 use app_server_protocol::{JsonRpcError, RequestId, ServerRequestPayload};
-use smooth_protocol::{ErrorInfo, ThreadId};
+use cazean_protocol::{ErrorInfo, ThreadId};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 
@@ -207,8 +207,8 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use app_server_protocol::AskUserQuestionParams;
-    use smooth_protocol::ErrorInfo;
-    use smooth_protocol::ThreadId;
+    use cazean_protocol::ErrorInfo;
+    use cazean_protocol::ThreadId;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
 

@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use cazean_protocol::{EventMsg, ProjectInstructions, ThreadId, TurnInterruptedEvent};
 use rig::{
     OneOrMany,
     message::{AssistantContent, Message, Text, UserContent},
 };
 use serde::{Deserialize, Serialize};
-use smooth_protocol::{EventMsg, ProjectInstructions, ThreadId, TurnInterruptedEvent};
 use time::{
     OffsetDateTime, format_description::FormatItem, format_description::well_known::Rfc3339,
     macros::format_description,
@@ -294,13 +294,15 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
 }
 
 pub(crate) async fn list_threads(workspace_root: &Path) -> Result<Vec<ThreadSummary>> {
-    let sessions_root = sessions_root(workspace_root);
-    if !fs::try_exists(&sessions_root).await.unwrap_or(false) {
-        return Ok(Vec::new());
-    }
-
     let mut rollout_paths = Vec::new();
-    collect_rollout_paths(&sessions_root, &mut rollout_paths).await?;
+    for sessions_root in [
+        legacy_sessions_root(workspace_root),
+        sessions_root(workspace_root),
+    ] {
+        if fs::try_exists(&sessions_root).await.unwrap_or(false) {
+            collect_rollout_paths(&sessions_root, &mut rollout_paths).await?;
+        }
+    }
 
     let mut threads = Vec::new();
     for path in rollout_paths {
@@ -454,6 +456,10 @@ fn create_rollout_path(workspace_root: &Path, thread_id: ThreadId) -> Result<Pat
 }
 
 fn sessions_root(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".cazean").join("sessions")
+}
+
+fn legacy_sessions_root(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".smooth-code").join("sessions")
 }
 
@@ -472,13 +478,13 @@ pub(crate) fn workspace_root() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smooth_protocol::{
+    use cazean_protocol::{
         AgentPath, AgentStatus, ProjectInstructionEntry, ProjectInstructions,
         SessionConfiguredEvent, TurnStartedEvent,
     };
 
     fn test_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("smooth-code-rollout-{name}-{}", ThreadId::new()))
+        std::env::temp_dir().join(format!("cazean-rollout-{name}-{}", ThreadId::new()))
     }
 
     #[tokio::test]
@@ -565,7 +571,7 @@ mod tests {
         let state = load_resume_state(recorder.path()).await?;
         assert!(!state.plan_mode, "fresh rollout should not be in plan mode");
 
-        let enabled = EventMsg::PlanModeChanged(smooth_protocol::PlanModeChangedEvent {
+        let enabled = EventMsg::PlanModeChanged(cazean_protocol::PlanModeChangedEvent {
             thread_id: thread_id.to_string(),
             enabled: true,
         });
@@ -575,7 +581,7 @@ mod tests {
         let state = load_resume_state(recorder.path()).await?;
         assert!(state.plan_mode, "last PlanModeChanged(true) should win");
 
-        let disabled = EventMsg::PlanModeChanged(smooth_protocol::PlanModeChangedEvent {
+        let disabled = EventMsg::PlanModeChanged(cazean_protocol::PlanModeChangedEvent {
             thread_id: thread_id.to_string(),
             enabled: false,
         });

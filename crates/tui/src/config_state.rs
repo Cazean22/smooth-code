@@ -9,8 +9,8 @@
 
 use std::sync::{Arc, OnceLock, RwLock};
 
+use cazean_config::{ColorSpec, Config, NamedColor};
 use ratatui::style::Color;
-use smooth_config::{ColorSpec, Config, NamedColor};
 
 static RUNTIME_CONFIG: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
 

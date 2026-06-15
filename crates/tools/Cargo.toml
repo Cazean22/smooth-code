@@ -13,7 +13,7 @@ rig.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-smooth-protocol = { path = "../protocol" }
+cazean-protocol = { path = "../protocol" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "process", "time", "io-util"] }
 tokio-util.workspace = true

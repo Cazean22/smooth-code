@@ -1,4 +1,4 @@
-**In smooth-code today: no.** The HashMap is populated at exactly one site — `crates/app-server/src/in_process.rs:64-67`:
+**In cazean today: no.** The HashMap is populated at exactly one site — `crates/app-server/src/in_process.rs:64-67`:
 
 ```rust
 outbound_connections.insert(
@@ -19,4 +19,4 @@ That insert runs once at runtime startup; nothing else produces `OutboundConnect
 
 So a typical codex session running in app-server mode could have, say, 1 stdio + 2 attached websocket clients + 1 remote-control peer = 4 entries in the same HashMap. `OutgoingEnvelope::Broadcast` then fans the same `OutgoingMessage` out to all four; `OutgoingEnvelope::ToConnection { connection_id, ... }` picks one (e.g., the websocket peer that originally issued the request whose response we're sending).
 
-**For smooth-code to grow past 1:** you'd need to add a non-in-process transport — e.g., stdout/stdin JSONL for embedding via subprocess, or a websocket server for a separate UI process. The current `route_outgoing_envelope` / `OutboundConnectionState` machinery would handle multi-entry as-is; only the runtime startup needs to register additional `IN_PROCESS_CONNECTION_ID + N` entries (or use `next_connection_id()` like codex does).
+**For cazean to grow past 1:** you'd need to add a non-in-process transport — e.g., stdout/stdin JSONL for embedding via subprocess, or a websocket server for a separate UI process. The current `route_outgoing_envelope` / `OutboundConnectionState` machinery would handle multi-entry as-is; only the runtime startup needs to register additional `IN_PROCESS_CONNECTION_ID + N` entries (or use `next_connection_id()` like codex does).

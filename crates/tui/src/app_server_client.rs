@@ -4,8 +4,8 @@ use app_server::in_process::{
     self, InProcessClientHandle, InProcessServerEvent, InProcessStartArgs,
 };
 use app_server_protocol::{ClientCommand, ClientRequest, JsonRpcError};
-use smooth_config::Config;
-use smooth_protocol::ErrorInfo;
+use cazean_config::Config;
+use cazean_protocol::ErrorInfo;
 use tokio::sync::oneshot;
 
 use crate::error::TuiResult;
@@ -51,14 +51,14 @@ impl AppServerClient {
         self.handle.client_tx.send(command).await.map_err(|err| {
             JsonRpcError::new(
                 -32000,
-                ErrorInfo::new("request_channel_closed", err.to_string()).with_source("smooth-tui"),
+                ErrorInfo::new("request_channel_closed", err.to_string()).with_source("cazean-tui"),
             )
         })?;
         response_rx.await.map_err(|err| {
             JsonRpcError::new(
                 -32000,
                 ErrorInfo::new("response_channel_closed", err.to_string())
-                    .with_source("smooth-tui"),
+                    .with_source("cazean-tui"),
             )
         })?
     }
@@ -80,7 +80,7 @@ impl AppServerClient {
                 JsonRpcError::new(
                     -32000,
                     ErrorInfo::new("request_channel_closed", err.to_string())
-                        .with_source("smooth-tui"),
+                        .with_source("cazean-tui"),
                 )
             })?;
         Ok(())
@@ -99,7 +99,7 @@ impl AppServerClient {
                 JsonRpcError::new(
                     -32000,
                     ErrorInfo::new("request_channel_closed", err.to_string())
-                        .with_source("smooth-tui"),
+                        .with_source("cazean-tui"),
                 )
             })?;
         Ok(())

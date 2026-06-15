@@ -6,6 +6,10 @@ use app_server_protocol::{
     SetPlanModeResponse, ThreadListItem, ThreadListResponse, ThreadPreviewResponse,
     ThreadResumeResponse, ThreadStartResponse, TurnCancelResponse, TurnStartResponse,
 };
+use cazean_protocol::{
+    AgentStatus, ErrorInfo, Event, EventMsg, FileChangeOutput, ThreadId, TodoItem,
+    ToolCallResultKind,
+};
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
@@ -13,10 +17,6 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::Paragraph,
-};
-use smooth_protocol::{
-    AgentStatus, ErrorInfo, Event, EventMsg, FileChangeOutput, ThreadId, TodoItem,
-    ToolCallResultKind,
 };
 
 use crate::{

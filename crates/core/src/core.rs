@@ -5,15 +5,15 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+use cazean_protocol::{
+    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, PlanModeChangedEvent,
+    ProjectInstructions, SessionSource, ThreadId, TurnCompletedEvent, TurnInterruptedEvent,
+    TurnStartedEvent,
+};
 use futures_util::future::BoxFuture;
 use rig::{
     OneOrMany,
     message::{Message, Text, UserContent},
-};
-use smooth_protocol::{
-    AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, PlanModeChangedEvent,
-    ProjectInstructions, SessionSource, ThreadId, TurnCompletedEvent, TurnInterruptedEvent,
-    TurnStartedEvent,
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tools::AskUserClient;
@@ -504,7 +504,7 @@ impl Session {
                         .await;
                     self.emit_event(
                         &turn_context,
-                        EventMsg::Error(smooth_protocol::ErrorEvent { error: info }),
+                        EventMsg::Error(cazean_protocol::ErrorEvent { error: info }),
                     )
                     .await;
                     return Err(error);
@@ -812,7 +812,7 @@ mod tests {
     };
 
     use super::{CancelReason, Core, Session, SessionModels, TurnContext};
-    use smooth_protocol::{AgentStatus, AgentStatusChangedEvent, EventMsg, SessionSource};
+    use cazean_protocol::{AgentStatus, AgentStatusChangedEvent, EventMsg, SessionSource};
     use tokio_util::sync::CancellationToken;
 
     struct EmptyDriver;
@@ -1079,12 +1079,12 @@ mod tests {
         driver: Arc<dyn SessionModelDriver>,
     ) -> Result<(
         Core,
-        tokio::sync::broadcast::Receiver<smooth_protocol::Event>,
+        tokio::sync::broadcast::Receiver<cazean_protocol::Event>,
         TempDir,
     )> {
         let workspace = TempDir::new()?;
         let cwd = PathBuf::from(workspace.path());
-        let thread_id = smooth_protocol::ThreadId::new();
+        let thread_id = cazean_protocol::ThreadId::new();
         let current_turn_id = Arc::new(RwLock::new(None));
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let model = SessionModel::Stub(driver);
@@ -1109,11 +1109,11 @@ mod tests {
 
     async fn test_core() -> Result<(
         Core,
-        tokio::sync::broadcast::Receiver<smooth_protocol::Event>,
+        tokio::sync::broadcast::Receiver<cazean_protocol::Event>,
     )> {
         let workspace = TempDir::new()?;
         let cwd = PathBuf::from(workspace.path());
-        let thread_id = smooth_protocol::ThreadId::new();
+        let thread_id = cazean_protocol::ThreadId::new();
         let current_turn_id = Arc::new(RwLock::new(None));
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let model = SessionModel::Stub(Arc::new(EmptyDriver));
@@ -1194,7 +1194,7 @@ mod tests {
     async fn submit_interrupt_without_active_turn_is_noop() -> Result<()> {
         let (core, mut rx) = test_core().await?;
 
-        let result = core.submit(smooth_protocol::Op::Interrupt).await?;
+        let result = core.submit(cazean_protocol::Op::Interrupt).await?;
         assert_eq!(result, "idle");
         assert!(matches!(
             rx.try_recv(),
@@ -1217,7 +1217,7 @@ mod tests {
             )
             .await?;
 
-        let result = core.submit(smooth_protocol::Op::Interrupt).await?;
+        let result = core.submit(cazean_protocol::Op::Interrupt).await?;
         assert_eq!(result, "interrupted");
         for _ in 0..8 {
             tokio::task::yield_now().await;
@@ -1285,7 +1285,7 @@ mod tests {
             }
         }
 
-        let result = core.submit(smooth_protocol::Op::Interrupt).await?;
+        let result = core.submit(cazean_protocol::Op::Interrupt).await?;
         assert_eq!(result, "interrupted");
 
         // The cooperative tool resolves with an interrupted error once the
@@ -1304,7 +1304,7 @@ mod tests {
                     assert!(!completed.success);
                     assert_eq!(
                         completed.result_kind,
-                        smooth_protocol::ToolCallResultKind::Interrupted
+                        cazean_protocol::ToolCallResultKind::Interrupted
                     );
                     saw_interrupted_completion = true;
                 }
@@ -1336,7 +1336,7 @@ mod tests {
         // Shrink the tool-batch grace so the synthesized-placeholder path runs
         // quickly. Process-global, but the only other consumers resolve their
         // tools cooperatively and never reach the deadline.
-        unsafe { std::env::set_var("SMOOTH_CODE_TOOL_CANCEL_GRACE_MS", "100") };
+        unsafe { std::env::set_var("CAZEAN_TOOL_CANCEL_GRACE_MS", "100") };
         let (core, mut rx, _workspace) =
             test_core_with_driver(Arc::new(InterruptibleToolDriver::new(true))).await?;
         let turn_id = core.start_user_input("hello".to_string()).await?;
@@ -1352,7 +1352,7 @@ mod tests {
             }
         }
 
-        let result = core.submit(smooth_protocol::Op::Interrupt).await?;
+        let result = core.submit(cazean_protocol::Op::Interrupt).await?;
         assert_eq!(result, "interrupted");
 
         // The tool never resolves; after the (shrunk) grace the batch
@@ -1371,7 +1371,7 @@ mod tests {
                 assert!(!completed.success);
                 assert_eq!(
                     completed.result_kind,
-                    smooth_protocol::ToolCallResultKind::Interrupted
+                    cazean_protocol::ToolCallResultKind::Interrupted
                 );
                 assert!(
                     completed
@@ -1514,7 +1514,7 @@ mod tests {
             }
         }
 
-        let result = core.submit(smooth_protocol::Op::Shutdown).await?;
+        let result = core.submit(cazean_protocol::Op::Shutdown).await?;
         assert_eq!(result, "shutdown");
 
         // The inline drain returned, so the cancelled task already finished
@@ -1527,7 +1527,7 @@ mod tests {
             {
                 assert_eq!(
                     completed.result_kind,
-                    smooth_protocol::ToolCallResultKind::Interrupted
+                    cazean_protocol::ToolCallResultKind::Interrupted
                 );
                 saw_placeholder = true;
             }
@@ -1589,7 +1589,7 @@ mod tests {
     async fn retryable_mid_reply_reset_commits_partial_and_continues() -> Result<()> {
         let workspace = TempDir::new()?;
         let cwd = PathBuf::from(workspace.path());
-        let thread_id = smooth_protocol::ThreadId::new();
+        let thread_id = cazean_protocol::ThreadId::new();
         let current_turn_id = Arc::new(RwLock::new(None));
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let driver = Arc::new(ResetOnceDriver::new());
@@ -1667,7 +1667,7 @@ mod tests {
     async fn retryable_reset_after_tool_call_executes_tool_once_before_continuing() -> Result<()> {
         let workspace = TempDir::new()?;
         let cwd = PathBuf::from(workspace.path());
-        let thread_id = smooth_protocol::ThreadId::new();
+        let thread_id = cazean_protocol::ThreadId::new();
         let current_turn_id = Arc::new(RwLock::new(None));
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let driver = Arc::new(ResetAfterToolDriver::new());
@@ -1740,7 +1740,7 @@ mod tests {
     async fn submit_shutdown_emits_shutdown_status() -> Result<()> {
         let (core, mut rx) = test_core().await?;
 
-        let result = core.submit(smooth_protocol::Op::Shutdown).await?;
+        let result = core.submit(cazean_protocol::Op::Shutdown).await?;
         assert_eq!(result, "shutdown");
 
         let event = rx.recv().await?;
@@ -1749,7 +1749,7 @@ mod tests {
             EventMsg::AgentStatusChanged(AgentStatusChangedEvent {
                 thread_id: core.session.id.to_string(),
                 turn_id: None,
-                status: smooth_protocol::AgentStatus::Shutdown,
+                status: cazean_protocol::AgentStatus::Shutdown,
             })
         );
         Ok(())
@@ -1759,7 +1759,7 @@ mod tests {
     async fn toggle_plan_mode_selects_prebuilt_model_and_emits_event() -> Result<()> {
         let workspace = TempDir::new()?;
         let cwd = PathBuf::from(workspace.path());
-        let thread_id = smooth_protocol::ThreadId::new();
+        let thread_id = cazean_protocol::ThreadId::new();
         let current_turn_id = Arc::new(RwLock::new(None));
         let rollout = RolloutRecorder::create(workspace.path(), thread_id, &cwd).await?;
         let normal_driver: Arc<dyn SessionModelDriver> = Arc::new(EmptyDriver);

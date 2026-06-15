@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rig::message::Message;
-use smooth_protocol::{
+use cazean_protocol::{
     Event, EventMsg, ProjectInstructions, SessionConfiguredEvent, SessionSource,
 };
+use rig::message::Message;
 use tokio::sync::{RwLock, broadcast};
 use tools::AskUserClient;
 
@@ -15,7 +15,7 @@ use crate::{
     provider::{SessionModelFactory, default_session_model_factory},
     rollout::{ResumeState, RolloutRecorder, workspace_root},
 };
-use smooth_protocol::{Op, ThreadId};
+use cazean_protocol::{Op, ThreadId};
 
 pub struct CoreThread {
     pub(crate) core: Core,

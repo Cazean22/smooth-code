@@ -657,10 +657,10 @@ mod tests {
         app.handle_session_event(
             event(
                 "4",
-                EventMsg::CollabAgentCompleted(smooth_protocol::CollabAgentCompletedEvent {
+                EventMsg::CollabAgentCompleted(cazean_protocol::CollabAgentCompletedEvent {
                     parent_thread_id: ThreadId::new(),
                     child_thread_id,
-                    agent_path: smooth_protocol::AgentPath::try_from("/root/child")?,
+                    agent_path: cazean_protocol::AgentPath::try_from("/root/child")?,
                     agent_nickname: Some("child".to_string()),
                     status: AgentStatus::Completed(Some("Done".to_string())),
                     last_assistant_message: Some("Done".to_string()),

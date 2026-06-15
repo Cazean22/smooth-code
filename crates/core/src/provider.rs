@@ -1350,7 +1350,10 @@ fn is_openai_websocket_connection_reset(error: &CompletionError) -> bool {
 /// mark a transient condition worth retrying. `openai_websocket_error_event_message` folds
 /// these into the rendered error string, so matching them here is effectively a match on the
 /// structured code rather than on free-form prose — robust to the proxy's message wording.
-const OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES: &[&str] = &["websocket_connection_limit_reached"];
+/// `internal_server_error` is the upstream 5xx the proxy reports when the codex backend returns
+/// a server error (often alongside a `": EOF` transport tail; see the markers below).
+const OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES: &[&str] =
+    &["websocket_connection_limit_reached", "internal_server_error"];
 
 /// Free-text transport/stream phrases that indicate the connection dropped before the turn
 /// finished. Unlike the codes above, these conditions are only ever surfaced as human-readable
@@ -1362,6 +1365,10 @@ const OPENAI_WEBSOCKET_RETRYABLE_TRANSIENT_MARKERS: &[&str] = &[
     "An error occurred while processing the request.",
     "stream closed before response.completed",
     "disconnected before completion",
+    // CLIProxyAPI surfaces an upstream POST that closed without a response as a Go `net/http`
+    // error ending in `": EOF` (e.g. `Post "…/codex/responses": EOF`). The quote+colon+space
+    // prefix keeps this from matching unrelated phrases such as `unexpected EOF`.
+    "\": EOF",
 ];
 
 pub(crate) fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
@@ -2903,6 +2910,10 @@ mod tests {
             "stream closed before response.completed",
             "disconnected before completion",
             "stream disconnected before completion",
+            // Upstream-drop 5xx the proxy reports when its POST to the codex backend
+            // closes without a response (structured code plus the Go `": EOF` tail).
+            "internal_server_error: server_error: Post \"https://chatgpt.com/backend-api/codex/responses\": EOF",
+            "internal_server_error: upstream unavailable",
         ];
 
         for message in retryable {
@@ -2913,11 +2924,21 @@ mod tests {
             );
         }
 
-        let invalid_request =
-            CompletionError::ProviderError("invalid_request_error: Bad input".to_string());
-        assert!(!super::is_openai_websocket_transient_start_error(
-            &invalid_request
-        ));
+        // Boundary: a non-transient request error and the clean terminal failures must stay
+        // fatal. In particular a bare `server_error` is deliberately not matched, so a genuine
+        // `response.failed: server_error` keeps surfacing instead of being retried.
+        let non_retryable = [
+            "invalid_request_error: Bad input",
+            "server_error: test failure",
+            "OpenAI WebSocket response was incomplete: max_output_tokens",
+        ];
+        for message in non_retryable {
+            let error = CompletionError::ProviderError(message.to_string());
+            assert!(
+                !super::is_openai_websocket_transient_start_error(&error),
+                "{message} should not be retryable"
+            );
+        }
     }
 
     #[test]
@@ -3001,6 +3022,33 @@ mod tests {
         assert!(
             super::is_openai_websocket_transient_start_error(&error),
             "disconnect error events must be retryable before output"
+        );
+    }
+
+    #[test]
+    fn openai_websocket_error_event_upstream_eof_is_retryable() {
+        let mut accumulator = super::OpenAiWebSocketAccumulator::new();
+        // CLIProxyAPI relays an upstream POST that closed without a response: a structured 5xx
+        // code/type folded into the message plus the Go `net/http` `": EOF` transport tail.
+        let payload = serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "internal_server_error",
+                "type": "server_error",
+                "message": "Post \"https://chatgpt.com/backend-api/codex/responses\": EOF"
+            }
+        })
+        .to_string();
+        let Err(error) = super::parse_openai_websocket_payload(&payload, &mut accumulator) else {
+            panic!("proxy error event should surface as a CompletionError");
+        };
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("internal_server_error"), "{rendered}");
+        assert!(rendered.contains("EOF"), "{rendered}");
+        assert!(
+            super::is_openai_websocket_transient_start_error(&error),
+            "upstream-drop EOF error events must be retryable before output"
         );
     }
 

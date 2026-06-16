@@ -41,6 +41,7 @@ Use this file to capture concise, durable insights when a task produces knowledg
 ## OpenAI Provider
 
 - The OpenAI provider uses Rig's Responses WebSocket session for the manual tool loop; keep OpenAI turn streaming on `stream_completion_turn` and do not route OpenAI through the generic `CompletionModel::stream()` SSE path.
+- Set `CAZEAN_OPENAI_TURN_REQUEST_JSON=/path/to/request.json` to dump the exact OpenAI Responses request body as pretty JSON before the WebSocket `response.create` event is sent. The dump is best-effort, creates parent directories, overwrites the file each turn, and may contain full prompts/history/tool schemas, so keep it out of git.
 - OpenAI WebSocket mode reuses one per-thread socket across sequential stateless `response.create` requests and reconnects after poisoned sockets or retryable early failures. This is safe only while cazean sends full-history stateless requests with no `previous_response_id`, `conversation_id`, `store`, or connection-scoped routing state; revisit reuse if that changes.
 - Defensively handle a reused OpenAI WebSocket receiving a trailing `response.done` after an earlier primary terminal frame (`response.completed`/`failed`/`incomplete`). Park the prior terminal response ID with the socket and skip only a matching late `response.done` on the next request, or it can terminate the next turn with stale metadata.
 - Connection-limit and early-close OpenAI WebSocket failures are retryable only before any visible assistant output has been yielded, so retries cannot duplicate streamed text or tool calls.

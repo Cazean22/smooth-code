@@ -962,11 +962,57 @@ fn openai_websocket_create_payload(
     normalize_openai_websocket_response_request(&mut request)?;
     request.stream = None;
     request.additional_parameters.background = None;
+
+    dump_openai_turn_request_body(&request);
+
     serde_json::to_string(&OpenAiWebSocketCreateEvent {
         kind: "response.create",
         request,
     })
     .map_err(CompletionError::from)
+}
+
+fn dump_openai_turn_request_body(request: &OpenAiResponsesCompletionRequest) {
+    let Ok(path) = env::var("CAZEAN_OPENAI_TURN_REQUEST_JSON") else {
+        return;
+    };
+    if path.trim().is_empty() {
+        tracing::warn!("CAZEAN_OPENAI_TURN_REQUEST_JSON is empty; skipping turn request dump");
+        return;
+    }
+
+    let path = PathBuf::from(path);
+    let payload = match serde_json::to_vec_pretty(request) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to serialize OpenAI turn request body for debug dump"
+            );
+            return;
+        }
+    };
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            path = %parent.display(),
+            error = %error,
+            "failed to create OpenAI turn request dump directory"
+        );
+        return;
+    }
+
+    if let Err(error) = std::fs::write(&path, payload) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to write OpenAI turn request body debug dump"
+        );
+    }
 }
 
 fn normalize_openai_websocket_response_request(

@@ -14,10 +14,7 @@ use cazean_protocol::{
     TurnStartedEvent,
 };
 use futures_util::future::BoxFuture;
-use rig::{
-    OneOrMany,
-    message::{Message, Text, UserContent},
-};
+use rig::message::Message;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tools::AskUserClient;
 use tracing::Instrument;
@@ -275,6 +272,7 @@ pub(crate) struct Session {
     event_tx: broadcast::Sender<Event>,
     state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    interrupt_cleanup: Mutex<Option<Arc<tokio::sync::Notify>>>,
     turn_closed: tokio::sync::Notify,
     #[allow(dead_code)]
     pub(crate) session_source: SessionSource,
@@ -325,6 +323,7 @@ impl Core {
             event_tx,
             state: Mutex::new(SessionState::new(context_manager)),
             active_turn: Mutex::new(None),
+            interrupt_cleanup: Mutex::new(None),
             turn_closed: tokio::sync::Notify::new(),
             session_source,
             agent_control,
@@ -404,10 +403,15 @@ impl Core {
         interrupted.extend(descendants);
         tasks.extend(descendant_tasks);
         if !tasks.is_empty() {
-            tokio::spawn(drain_aborted_tasks(
-                tasks,
-                CancelReason::UserInterrupt.drain_grace(),
-            ));
+            let session = Arc::clone(&self.session);
+            let cleanup_done = Arc::new(tokio::sync::Notify::new());
+            self.session
+                .set_interrupt_cleanup(Arc::clone(&cleanup_done))
+                .await;
+            tokio::spawn(async move {
+                drain_aborted_tasks(tasks, CancelReason::UserInterrupt.drain_grace()).await;
+                session.complete_interrupt_cleanup(cleanup_done).await;
+            });
         }
         interrupted
     }
@@ -455,6 +459,7 @@ impl Session {
         task_kind: crate::state::TaskKind,
     ) -> BoxFuture<'_, CoreResult<()>> {
         Box::pin(async move {
+            self.wait_for_interrupt_cleanup().await;
             self.wait_for_finishing_turn().await;
             // Replacement awaits the drain inline: the old task may still be
             // writing history/rollout during its cooperative cleanup, and the
@@ -473,6 +478,7 @@ impl Session {
                 aborted.extend(descendant_tasks);
             }
             drain_aborted_tasks(aborted, CancelReason::Replaced.drain_grace()).await;
+            self.complete_current_interrupt_cleanup().await;
             self.wait_for_finishing_turn().await;
             let cancellation = TurnCancel::new();
             let done = Arc::new(tokio::sync::Notify::new());
@@ -702,7 +708,42 @@ impl Session {
         let tasks = self.abort_all_tasks(reason).await;
         let interrupted = !tasks.is_empty();
         drain_aborted_tasks(tasks, reason.drain_grace()).await;
+        self.complete_current_interrupt_cleanup().await;
         interrupted
+    }
+
+    async fn wait_for_interrupt_cleanup(&self) {
+        loop {
+            let cleanup_done = { self.interrupt_cleanup.lock().await.clone() };
+            let Some(cleanup_done) = cleanup_done else {
+                return;
+            };
+            cleanup_done.notified().await;
+        }
+    }
+
+    async fn set_interrupt_cleanup(&self, cleanup_done: Arc<tokio::sync::Notify>) {
+        *self.interrupt_cleanup.lock().await = Some(cleanup_done);
+    }
+
+    async fn complete_interrupt_cleanup(&self, cleanup_done: Arc<tokio::sync::Notify>) {
+        {
+            let mut current = self.interrupt_cleanup.lock().await;
+            if current
+                .as_ref()
+                .is_some_and(|stored| Arc::ptr_eq(stored, &cleanup_done))
+            {
+                *current = None;
+            }
+        }
+        cleanup_done.notify_waiters();
+    }
+
+    async fn complete_current_interrupt_cleanup(&self) {
+        let cleanup_done = { self.interrupt_cleanup.lock().await.take() };
+        if let Some(cleanup_done) = cleanup_done {
+            cleanup_done.notify_waiters();
+        }
     }
 
     async fn wait_for_finishing_turn(&self) {
@@ -728,26 +769,7 @@ impl Session {
         state.history.replace(history);
     }
 
-    pub(crate) async fn record_user_message(&self, text: String) {
-        let message = Message::User {
-            content: OneOrMany::one(UserContent::Text(Text {
-                text,
-                additional_params: None,
-            })),
-        };
-        let mut state = self.state.lock().await;
-        state.history.push(message.clone());
-        drop(state);
-        let _ = self
-            .rollout
-            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
-                message,
-            }))
-            .await;
-    }
-
-    /// Persist the turn's model-facing tail (everything after the
-    /// already-recorded prompt at index 0) to the rollout. Tail indices present
+    /// Persist the turn's model-facing messages to the rollout. Indices present
     /// in `completions_by_index` are written as typed `SubagentCompletion`
     /// records — the durable source of truth — instead of the rendered
     /// `Message::User`; every other tail message is written as `Full`. Returns
@@ -759,7 +781,7 @@ impl Session {
         completions_by_index: &BTreeMap<usize, Vec<CompletionEntry>>,
     ) -> bool {
         let mut persisted = true;
-        for (index, message) in new_messages.iter().enumerate().skip(1) {
+        for (index, message) in new_messages.iter().enumerate() {
             let item = match completions_by_index.get(&index) {
                 Some(completions) => {
                     PersistedItem::HistoryMessage(HistoryMessage::SubagentCompletion {
@@ -901,13 +923,13 @@ mod tests {
         },
     };
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use rig::{
         completion::CompletionError,
         message::{AssistantContent, Message, Text, ToolCall, ToolFunction, UserContent},
     };
     use tempfile::TempDir;
-    use tokio::sync::RwLock;
+    use tokio::sync::{Notify, RwLock};
 
     use crate::{
         SessionCompletionEvent, SessionCompletionStream, SessionModel, SessionModelDriver,
@@ -932,6 +954,48 @@ mod tests {
             Ok(Box::pin(futures_util::stream::iter(vec![
                 Ok(SessionCompletionEvent::AssistantItem(
                     crate::SessionAssistantContent::Text(rig::message::Text {
+                        text: "done".to_string(),
+                        additional_params: None,
+                    }),
+                )),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-done".to_string()),
+                    response: "done".to_string(),
+                })),
+            ])))
+        }
+    }
+
+    struct FailsBeforeOutputOnceDriver {
+        calls: AtomicUsize,
+    }
+
+    impl FailsBeforeOutputOnceDriver {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SessionModelDriver for FailsBeforeOutputOnceDriver {
+        fn stream_completion_turn(
+            &self,
+            _prompt: Message,
+            _history: Vec<Message>,
+        ) -> Result<SessionCompletionStream> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                let events: Vec<Result<SessionCompletionEvent>> =
+                    vec![Err(anyhow::Error::new(CompletionError::ProviderError(
+                        "OpenAI WebSocket connection reset before response.completed".to_string(),
+                    )))];
+                return Ok(Box::pin(futures_util::stream::iter(events)));
+            }
+
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(SessionCompletionEvent::AssistantItem(
+                    crate::SessionAssistantContent::Text(Text {
                         text: "done".to_string(),
                         additional_params: None,
                     }),
@@ -1087,6 +1151,34 @@ mod tests {
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
+        }
+    }
+
+    struct DelayedCancelCleanupTask {
+        cleanup_started: Arc<Notify>,
+        cleanup_release: Arc<Notify>,
+    }
+
+    impl SessionTask for DelayedCancelCleanupTask {
+        fn kind(&self) -> TaskKind {
+            TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "test.delayed_cancel_cleanup_task"
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _session: Arc<Session>,
+            _ctx: Arc<TurnContext>,
+            _input: Vec<String>,
+            cancel: TurnCancel,
+        ) -> Option<String> {
+            cancel.cancelled().await;
+            self.cleanup_started.notify_one();
+            self.cleanup_release.notified().await;
+            None
         }
     }
 
@@ -1381,6 +1473,97 @@ mod tests {
         }
 
         assert_eq!(interrupted, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_output_provider_failure_does_not_persist_prompt_to_model_history() -> Result<()> {
+        let (core, mut rx, _workspace) =
+            test_core_with_driver(Arc::new(FailsBeforeOutputOnceDriver::new())).await?;
+        let failed_turn_id = core.start_user_input("continue".to_string()).await?;
+
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await??;
+            if matches!(event.msg, EventMsg::Error(_)) {
+                break;
+            }
+        }
+        assert!(
+            core.session.history().await.is_empty(),
+            "failed pre-output prompt should not enter model history"
+        );
+
+        let retry_turn_id = core.start_user_input("retry".to_string()).await?;
+        assert_ne!(failed_turn_id, retry_turn_id);
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await??;
+            if matches!(event.msg, EventMsg::TurnCompleted(turn) if turn.turn_id == retry_turn_id) {
+                break;
+            }
+        }
+        let history = core.session.history().await;
+        assert_eq!(history.len(), 2);
+        assert_eq!(user_message_text(&history[0]).as_deref(), Some("retry"));
+        assert_eq!(assistant_message_text(&history[1]).as_deref(), Some("done"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continue_after_interrupt_waits_for_cancel_cleanup() -> Result<()> {
+        let (core, _rx) = test_core().await?;
+        let cleanup_started = Arc::new(Notify::new());
+        let cleanup_release = Arc::new(Notify::new());
+        let turn_context = Arc::new(core.session.fresh_turn_context());
+        core.session
+            .start_task(
+                turn_context,
+                vec!["hello".to_string()],
+                Arc::new(DelayedCancelCleanupTask {
+                    cleanup_started: Arc::clone(&cleanup_started),
+                    cleanup_release: Arc::clone(&cleanup_release),
+                }),
+                TaskKind::Regular,
+            )
+            .await?;
+
+        let result = core.submit(cazean_protocol::Op::Interrupt).await?;
+        assert_eq!(result, "interrupted");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cleanup_started.notified(),
+        )
+        .await
+        .context("cancelled task did not enter cleanup")?;
+
+        let core_for_continue = Core {
+            session: Arc::clone(&core.session),
+        };
+        let continue_handle = tokio::spawn(async move {
+            core_for_continue
+                .start_user_input("continue".to_string())
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !continue_handle.is_finished(),
+            "continue turn should wait for interrupted-turn cleanup"
+        );
+        assert!(
+            core.session.history().await.is_empty(),
+            "continue prompt should not be recorded before cleanup finishes"
+        );
+
+        cleanup_release.notify_waiters();
+        let continue_turn_id =
+            tokio::time::timeout(std::time::Duration::from_secs(2), continue_handle)
+                .await
+                .context("continue turn did not start after cleanup finished")???;
+        let history = wait_for_history_len(&core, 2).await;
+        assert_eq!(user_message_text(&history[0]).as_deref(), Some("continue"));
+        assert_eq!(assistant_message_text(&history[1]).as_deref(), Some("done"));
+        assert_eq!(continue_turn_id, "1");
         Ok(())
     }
 

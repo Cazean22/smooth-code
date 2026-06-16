@@ -279,7 +279,6 @@ impl SessionTask for RegularTask {
             })
             .flatten()
             .unwrap_or_else(|| prompt_text.clone());
-        session.record_user_message(model_text.clone()).await;
         session
             .emit_event(
                 &ctx,

@@ -14,8 +14,4 @@ impl ContextManager {
     pub(crate) fn replace(&mut self, items: Vec<Message>) {
         self.items = items;
     }
-
-    pub(crate) fn push(&mut self, item: Message) {
-        self.items.push(item);
-    }
 }

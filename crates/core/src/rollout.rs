@@ -208,6 +208,8 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
     let mut max_turn_index = None::<u64>;
     let mut has_open_turn = false;
     let mut has_terminal_turn = false;
+    let mut open_turn_history_start = None::<usize>;
+    let mut unstable_history_start = None::<usize>;
     let mut plan_mode = false;
 
     for line in contents.lines() {
@@ -240,6 +242,22 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
                 initial_messages.push(EventMsg::UserMessage { text });
             }
             PersistedItem::Event(event) => {
+                match &event {
+                    EventMsg::TurnStarted(_) => {
+                        open_turn_history_start = Some(history.len());
+                    }
+                    EventMsg::TurnCompleted(_) => {
+                        open_turn_history_start = None;
+                        unstable_history_start = None;
+                    }
+                    EventMsg::TurnInterrupted(_) | EventMsg::Error(_) => {
+                        let start = open_turn_history_start.take().unwrap_or(history.len());
+                        if unstable_history_start.is_none() {
+                            unstable_history_start = Some(start);
+                        }
+                    }
+                    _ => {}
+                }
                 update_turn_tracking(
                     &event,
                     &mut max_turn_index,
@@ -255,6 +273,16 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
     }
 
     let meta = meta.with_context(|| format!("missing session metadata in {}", path.display()))?;
+    if recovery == RecoveryMode::Resume {
+        let truncate_to = if has_open_turn && !has_terminal_turn {
+            unstable_history_start.or(open_turn_history_start)
+        } else {
+            unstable_history_start
+        };
+        if let Some(start) = truncate_to {
+            history.truncate(start);
+        }
+    }
     if recovery == RecoveryMode::Resume && has_open_turn && !has_terminal_turn {
         initial_messages.push(EventMsg::TurnInterrupted(TurnInterruptedEvent {
             thread_id: meta.thread_id.to_string(),
@@ -317,7 +345,7 @@ fn update_turn_tracking(
             *has_open_turn = true;
             *has_terminal_turn = false;
         }
-        EventMsg::TurnCompleted(_) | EventMsg::TurnInterrupted(_) => {
+        EventMsg::TurnCompleted(_) | EventMsg::TurnInterrupted(_) | EventMsg::Error(_) => {
             *has_open_turn = false;
             *has_terminal_turn = true;
         }
@@ -445,13 +473,27 @@ pub(crate) fn workspace_root() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use cazean_protocol::{
-        AgentPath, AgentStatus, ProjectInstructionEntry, ProjectInstructions,
-        SessionConfiguredEvent, TurnStartedEvent,
+        AgentPath, AgentStatus, ErrorEvent, ErrorInfo, ProjectInstructionEntry,
+        ProjectInstructions, SessionConfiguredEvent, TurnStartedEvent,
     };
     use rig::message::{Text, UserContent};
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cazean-rollout-{name}-{}", ThreadId::new()))
+    }
+
+    fn user_message_text(message: &Message) -> Option<String> {
+        let Message::User { content } = message else {
+            return None;
+        };
+        let text = content
+            .iter()
+            .filter_map(|content| match content {
+                UserContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        (!text.is_empty()).then_some(text)
     }
 
     #[tokio::test]
@@ -615,6 +657,166 @@ mod tests {
             state.initial_messages.last(),
             Some(EventMsg::TurnInterrupted(turn)) if turn.reason == "resume_recovery"
         ));
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_state_prunes_model_history_from_interrupted_turn() -> Result<()> {
+        let root = test_root("resume-interrupted-turn");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: "stable prompt".to_string(),
+                        additional_params: None,
+                    })),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("stable answer".to_string())),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "3".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: "make a plan".to_string(),
+                        additional_params: None,
+                    })),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("partial plan".to_string())),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnInterrupted(
+                TurnInterruptedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "3".to_string(),
+                    reason: "interrupted".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text(
+                        "late partial after interruption event".to_string(),
+                    )),
+                },
+            }))
+            .await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        assert_eq!(state.next_turn_index, 4);
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(
+            user_message_text(&state.history[0]).as_deref(),
+            Some("stable prompt")
+        );
+        assert!(matches!(state.history[1], Message::Assistant { .. }));
+        assert!(state.initial_messages.iter().any(|event| {
+            matches!(event, EventMsg::TurnInterrupted(turn) if turn.reason == "interrupted")
+        }));
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_state_prunes_model_history_from_errored_open_turn() -> Result<()> {
+        let root = test_root("resume-errored-turn");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: "stable prompt".to_string(),
+                        additional_params: None,
+                    })),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("stable answer".to_string())),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "7".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: "continue".to_string(),
+                        additional_params: None,
+                    })),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::Error(ErrorEvent {
+                error: ErrorInfo::new("turn_failed", "provider reset"),
+            })))
+            .await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        assert_eq!(state.next_turn_index, 8);
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(
+            user_message_text(&state.history[0]).as_deref(),
+            Some("stable prompt")
+        );
+        assert!(matches!(state.history[1], Message::Assistant { .. }));
+        assert!(
+            state
+                .initial_messages
+                .iter()
+                .any(|event| matches!(event, EventMsg::Error(_)))
+        );
+        assert!(!state.initial_messages.iter().any(|event| {
+            matches!(event, EventMsg::TurnInterrupted(turn) if turn.reason == "resume_recovery")
+        }));
 
         let _ = fs::remove_dir_all(&root).await;
         Ok(())

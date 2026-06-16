@@ -617,6 +617,14 @@ struct OpenAiWebSocketCreateEvent {
     request: OpenAiResponsesCompletionRequest,
 }
 
+#[derive(Debug, Serialize)]
+struct OpenAiWebSocketCancelEvent<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_id: Option<&'a str>,
+}
+
 #[derive(Default)]
 struct OpenAiWebSocketPayloadOutcome {
     choices: Vec<OpenAiWebSocketRawChoice>,
@@ -791,10 +799,11 @@ fn openai_websocket_stream(
                         // silently dropping the connection. Frame per the
                         // Responses-over-WebSocket dialect; a proxy that does
                         // not understand it just runs into the drain deadline.
+                        let cancel_payload = openai_websocket_cancel_payload(
+                            accumulator.active_response_id.as_deref(),
+                        );
                         let _ = socket
-                            .send(TungsteniteMessage::text(
-                                r#"{"type":"response.cancel"}"#,
-                            ))
+                            .send(TungsteniteMessage::text(cancel_payload))
                             .await;
                         cancel_sent = true;
                         drain_deadline =
@@ -970,6 +979,20 @@ fn openai_websocket_create_payload(
         request,
     })
     .map_err(CompletionError::from)
+}
+
+fn openai_websocket_cancel_payload(response_id: Option<&str>) -> String {
+    serde_json::to_string(&OpenAiWebSocketCancelEvent {
+        kind: "response.cancel",
+        response_id,
+    })
+    .unwrap_or_else(|error| {
+        tracing::warn!(
+            error = %error,
+            "failed to serialize OpenAI WebSocket cancel payload; falling back to bare cancel"
+        );
+        r#"{"type":"response.cancel"}"#.to_string()
+    })
 }
 
 fn dump_openai_turn_request_body(request: &OpenAiResponsesCompletionRequest) {
@@ -1473,6 +1496,7 @@ struct OpenAiWebSocketAccumulator {
     pending_tool_calls: HashMap<String, PendingOpenAiToolCall>,
     pending_tool_call_order: Vec<String>,
     completed_tool_call_ids: HashSet<String>,
+    active_response_id: Option<String>,
     complete_output_seen: bool,
     completed_response_seen: bool,
 }
@@ -1502,6 +1526,7 @@ impl OpenAiWebSocketAccumulator {
             pending_tool_calls: HashMap::new(),
             pending_tool_call_order: Vec::new(),
             completed_tool_call_ids: HashSet::new(),
+            active_response_id: None,
             complete_output_seen: false,
             completed_response_seen: false,
         }
@@ -1576,6 +1601,9 @@ impl OpenAiWebSocketAccumulator {
         kind: ResponseChunkKind,
         response: &serde_json::Value,
     ) -> std::result::Result<Option<CompletionError>, CompletionError> {
+        if let Some(response_id) = openai_websocket_response_id(response) {
+            self.active_response_id = Some(response_id);
+        }
         match kind {
             ResponseChunkKind::ResponseCompleted => {
                 self.record_completed_response_value(response);
@@ -1598,6 +1626,9 @@ impl OpenAiWebSocketAccumulator {
         &mut self,
         response: &serde_json::Value,
     ) -> std::result::Result<Option<CompletionError>, CompletionError> {
+        if let Some(response_id) = openai_websocket_response_id(response) {
+            self.active_response_id = Some(response_id);
+        }
         // The local proxy sometimes emits `response.done` without a `status`
         // field. Treat a missing status as a completed turn rather than failing
         // the whole response — genuine failures surface earlier via
@@ -2056,6 +2087,17 @@ mod tests {
 
     fn openai_websocket_completed_frame(response_id: &str) -> String {
         openai_websocket_completed_frame_with_total_tokens(response_id, 2)
+    }
+
+    fn openai_websocket_created_frame(response_id: &str) -> String {
+        serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "status": "in_progress"
+            }
+        })
+        .to_string()
     }
 
     fn openai_websocket_completed_frame_with_total_tokens(
@@ -3143,12 +3185,15 @@ mod tests {
     async fn start_openai_websocket_cancel_server() -> Result<(
         String,
         Arc<std::sync::atomic::AtomicBool>,
+        Arc<Mutex<Option<String>>>,
         tokio::task::JoinHandle<()>,
     )> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let cancel_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_payload = Arc::new(Mutex::new(None));
         let server_cancel_received = Arc::clone(&cancel_received);
+        let server_cancel_payload = Arc::clone(&cancel_payload);
         let handle = tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
@@ -3168,6 +3213,15 @@ mod tests {
                 if !saw_create {
                     saw_create = true;
                     if socket
+                        .send(TestWebSocketMessage::text(openai_websocket_created_frame(
+                            "resp_cancel_target",
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if socket
                         .send(TestWebSocketMessage::text(
                             openai_websocket_text_delta_frame(),
                         ))
@@ -3180,9 +3234,10 @@ mod tests {
                 }
                 if text.contains("response.cancel") {
                     server_cancel_received.store(true, Ordering::SeqCst);
+                    *server_cancel_payload.lock().await = Some(text.to_string());
                     let _ = socket
                         .send(TestWebSocketMessage::text(
-                            openai_websocket_completed_frame("resp_cancelled"),
+                            openai_websocket_completed_frame("resp_cancel_target"),
                         ))
                         .await;
                     // Keep the connection open so the client can park it.
@@ -3190,12 +3245,18 @@ mod tests {
                 }
             }
         });
-        Ok((format!("http://{address}/v1"), cancel_received, handle))
+        Ok((
+            format!("http://{address}/v1"),
+            cancel_received,
+            cancel_payload,
+            handle,
+        ))
     }
 
     #[tokio::test]
     async fn openai_websocket_cancel_sends_cancel_frame_and_parks_socket() -> Result<()> {
-        let (base_url, cancel_received, server) = start_openai_websocket_cancel_server().await?;
+        let (base_url, cancel_received, cancel_payload, server) =
+            start_openai_websocket_cancel_server().await?;
         let model = openai_websocket_test_model(&base_url).await?;
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut stream = super::openai_websocket_completion_stream(
@@ -3225,11 +3286,51 @@ mod tests {
             cancel_received.load(Ordering::SeqCst),
             "server should have received a response.cancel frame"
         );
+        let cancel_payload = cancel_payload.lock().await.clone();
+        let Some(cancel_payload) = cancel_payload else {
+            panic!("server should have captured the response.cancel payload");
+        };
+        let cancel_json: serde_json::Value = serde_json::from_str(&cancel_payload)?;
+        assert_eq!(
+            cancel_json.get("type").and_then(serde_json::Value::as_str),
+            Some("response.cancel")
+        );
+        assert_eq!(
+            cancel_json
+                .get("response_id")
+                .and_then(serde_json::Value::as_str),
+            Some("resp_cancel_target")
+        );
         assert!(
             model.session_ws.lock().await.is_some(),
             "socket should be parked after a clean post-cancel terminal"
         );
         server.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn openai_websocket_cancel_payload_uses_optional_response_id() -> Result<()> {
+        let targeted: serde_json::Value =
+            serde_json::from_str(&super::openai_websocket_cancel_payload(Some("resp_123")))?;
+        assert_eq!(
+            targeted.get("type").and_then(serde_json::Value::as_str),
+            Some("response.cancel")
+        );
+        assert_eq!(
+            targeted
+                .get("response_id")
+                .and_then(serde_json::Value::as_str),
+            Some("resp_123")
+        );
+
+        let bare: serde_json::Value =
+            serde_json::from_str(&super::openai_websocket_cancel_payload(None))?;
+        assert_eq!(
+            bare.get("type").and_then(serde_json::Value::as_str),
+            Some("response.cancel")
+        );
+        assert!(bare.get("response_id").is_none());
         Ok(())
     }
 

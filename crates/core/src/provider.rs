@@ -1182,9 +1182,13 @@ fn parse_openai_websocket_payload(
     };
 
     match kind.as_str() {
-        "error" => Err(CompletionError::ProviderError(
-            openai_websocket_error_event_message(&value),
-        )),
+        "error" => {
+            let message = openai_websocket_error_event_message(&value);
+            Err(provider_error_with_optional_tag(
+                message,
+                openai_websocket_error_value_is_transient(&value),
+            ))
+        }
         "response.done" => {
             let response_value = value.get("response").ok_or_else(|| {
                 CompletionError::ProviderError(
@@ -1405,20 +1409,94 @@ fn openai_websocket_error_event_message(value: &serde_json::Value) -> String {
     }
 }
 
+/// Owned marker prepended to a surfaced WebSocket error message once it has been
+/// classified as a transient, pre-output disconnect worth retrying. Classification
+/// happens once, at the structured/typed source (the proxy `error` event, the
+/// tungstenite variant, or the chokepoint prose fallback); the retry decision
+/// points then key off this owned tag instead of re-matching foreign upstream
+/// prose, which a proxy reword could otherwise silently flip.
+const WS_TRANSIENT_TAG: &str = "[cazean:transient-ws]";
+
+/// Build a `ProviderError`, prepending [`WS_TRANSIENT_TAG`] when `transient` so
+/// the verdict travels with the error to the retry decision points.
+fn provider_error_with_optional_tag(message: String, transient: bool) -> CompletionError {
+    if transient {
+        CompletionError::ProviderError(format!("{WS_TRANSIENT_TAG} {message}"))
+    } else {
+        CompletionError::ProviderError(message)
+    }
+}
+
+fn openai_error_message_is_tagged_transient(error: &CompletionError) -> bool {
+    error.to_string().contains(WS_TRANSIENT_TAG)
+}
+
+/// The raw human message of a `CompletionError`, without the variant's `Display`
+/// prefix. Used when re-tagging an error so a `ProviderError`'s message is not
+/// nested inside another `ProviderError` (which would render as
+/// `ProviderError: ProviderError: …`).
+fn raw_completion_message(error: &CompletionError) -> String {
+    match error {
+        CompletionError::ProviderError(message) | CompletionError::ResponseError(message) => {
+            message.clone()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Remove the internal [`WS_TRANSIENT_TAG`] from a rendered error message before
+/// it is shown to a person (e.g. once retries are exhausted and the error
+/// surfaces). The tag is an internal retry-classification marker, not user copy.
+pub(crate) fn strip_ws_transient_tag(message: &str) -> String {
+    message.replace(&format!("{WS_TRANSIENT_TAG} "), "")
+}
+
 fn openai_websocket_provider_error(
     error: tokio_tungstenite::tungstenite::Error,
 ) -> CompletionError {
-    CompletionError::ProviderError(error.to_string())
+    // Classify from the typed tungstenite variant (robust to Display wording),
+    // falling back to the shared prose markers, and tag once here: the
+    // connect-retry path classifies this error directly without passing through
+    // the stream chokepoint, so the tag has to be set at this source.
+    let candidate = CompletionError::ProviderError(error.to_string());
+    let transient = tungstenite_error_is_transient(&error) || legacy_prose_is_transient(&candidate);
+    provider_error_with_optional_tag(error.to_string(), transient)
+}
+
+/// Typed transient classification for a tungstenite transport error: a reset
+/// without a closing handshake, or an `ECONNRESET` I/O error. These are the
+/// variants whose `Display` the legacy prose list matched, expressed structurally.
+fn tungstenite_error_is_transient(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    match error {
+        Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        Error::Io(io) => io.kind() == std::io::ErrorKind::ConnectionReset,
+        _ => false,
+    }
 }
 
 fn openai_websocket_stream_error(error: CompletionError) -> CompletionError {
+    // Canonicalize a bare connection reset (the parked-socket reuse path and the
+    // user-facing message both expect this phrasing) and tag it transient.
     if is_openai_websocket_connection_reset(&error) {
-        CompletionError::ProviderError(
+        return provider_error_with_optional_tag(
             "OpenAI WebSocket connection reset before response.completed".to_string(),
-        )
-    } else {
-        error
+            true,
+        );
     }
+    // Already classified at a structured/typed source — keep the verdict and the
+    // message (idempotent if the chokepoint runs twice on the same error).
+    if openai_error_message_is_tagged_transient(&error) {
+        return error;
+    }
+    // Fallback for errors that reach the chokepoint untagged (e.g. our own
+    // synthesized "closed before the turn finished" strings). Re-tag the raw
+    // message so a `ProviderError` is not nested inside another `ProviderError`.
+    if legacy_prose_is_transient(&error) {
+        return provider_error_with_optional_tag(raw_completion_message(&error), true);
+    }
+    error
 }
 
 fn is_openai_websocket_connection_reset(error: &CompletionError) -> bool {
@@ -1429,11 +1507,11 @@ fn is_openai_websocket_connection_reset(error: &CompletionError) -> bool {
 }
 
 /// Structured proxy error codes/types (`error.code` / `error.type` / top-level `code`) that
-/// mark a transient condition worth retrying. `openai_websocket_error_event_message` folds
-/// these into the rendered error string, so matching them here is effectively a match on the
-/// structured code rather than on free-form prose — robust to the proxy's message wording.
-/// `internal_server_error` is the upstream 5xx the proxy reports when the codex backend returns
-/// a server error (often alongside a `": EOF` transport tail; see the markers below).
+/// mark a transient condition worth retrying. [`openai_websocket_error_value_is_transient`]
+/// matches these against the structured fields of a proxy `error` event, so the verdict
+/// keys on the code rather than on free-form prose. `internal_server_error` is the upstream
+/// 5xx the proxy reports when the codex backend returns a server error (often alongside a
+/// `": EOF` transport tail; see the markers below).
 const OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES: &[&str] = &[
     "websocket_connection_limit_reached",
     "internal_server_error",
@@ -1455,17 +1533,55 @@ const OPENAI_WEBSOCKET_RETRYABLE_TRANSIENT_MARKERS: &[&str] = &[
     "\": EOF",
 ];
 
-pub(crate) fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
-    // Classification is text-based because `CompletionError` carries only a rendered message at
-    // this boundary; the marker lists are the single source of truth for what counts as
-    // transient. The provider uses this before output, and the manual turn loop reuses it after
-    // partial output so both retry paths agree on what a transient WebSocket disconnect means.
+/// Whether a proxy `error` event is a transient, retryable disconnect, judged from its
+/// *structured* fields (`error.code` / `error.type` / top-level `code`) with a fallback to
+/// the shared message markers for proxy drops that are only ever expressed as prose (e.g. the
+/// Go `": EOF` tail).
+fn openai_websocket_error_value_is_transient(value: &serde_json::Value) -> bool {
+    let error = value.get("error");
+    let codes = [
+        error
+            .and_then(|error| error.get("code"))
+            .and_then(serde_json::Value::as_str),
+        error
+            .and_then(|error| error.get("type"))
+            .and_then(serde_json::Value::as_str),
+        value.get("code").and_then(serde_json::Value::as_str),
+    ];
+    if codes
+        .into_iter()
+        .flatten()
+        .any(|code| OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES.contains(&code))
+    {
+        return true;
+    }
+    let message = openai_websocket_error_event_message(value);
+    OPENAI_WEBSOCKET_RETRYABLE_TRANSIENT_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Legacy prose-based transient classification, retained as the fallback applied at the stream
+/// chokepoint ([`openai_websocket_stream_error`]) for errors that arrive without a structured
+/// tag, and by [`openai_websocket_provider_error`] alongside the typed variant check. The
+/// retry *decision* points no longer call this — they read the owned tag.
+fn legacy_prose_is_transient(error: &CompletionError) -> bool {
     let message = error.to_string();
     is_openai_websocket_connection_reset(error)
         || OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES
             .iter()
             .chain(OPENAI_WEBSOCKET_RETRYABLE_TRANSIENT_MARKERS)
             .any(|marker| message.contains(marker))
+}
+
+pub(crate) fn is_openai_websocket_transient_start_error(error: &CompletionError) -> bool {
+    // Prefer the owned tag baked in at the error's structured/typed source (the
+    // proxy `error` arm classifies from `error.code`; `openai_websocket_provider_error`
+    // from the tungstenite variant), so a proxy rewording its prose cannot flip the
+    // verdict. Fall back to the shared prose classifier for errors that reach a
+    // decision point untagged — non-OpenAI providers, test doubles, or any path that
+    // did not pass through the tagging sites — so classification never regresses.
+    openai_error_message_is_tagged_transient(error) || legacy_prose_is_transient(error)
 }
 
 fn should_retry_openai_websocket_error(
@@ -2994,8 +3110,14 @@ mod tests {
 
             assert!(super::is_openai_websocket_connection_reset(&error));
             assert!(super::is_openai_websocket_transient_start_error(&error));
+
+            // The chokepoint canonicalizes the message and tags it transient, so the
+            // retry verdict is stable regardless of the original prose; the tag is an
+            // internal marker, stripped before the message is shown to a user.
+            let rewritten = super::openai_websocket_stream_error(error);
+            assert!(super::is_openai_websocket_transient_start_error(&rewritten));
             assert_eq!(
-                super::openai_websocket_stream_error(error).to_string(),
+                super::strip_ws_transient_tag(&rewritten.to_string()),
                 "ProviderError: OpenAI WebSocket connection reset before response.completed"
             );
         }
@@ -3051,6 +3173,98 @@ mod tests {
 
         assert!(super::should_retry_openai_websocket_error(&error, false));
         assert!(!super::should_retry_openai_websocket_error(&error, true));
+    }
+
+    #[test]
+    fn proxy_error_event_is_classified_from_structured_code_not_prose() {
+        // A retryable proxy code stays retryable even when the human-readable
+        // message is reworded to something the prose markers would never match.
+        let reworded = serde_json::json!({
+            "type": "error",
+            "error": { "code": "internal_server_error", "message": "totally new wording" },
+        });
+        assert!(super::openai_websocket_error_value_is_transient(&reworded));
+
+        // The `websocket_connection_limit_reached` code likewise classifies on the
+        // structured field.
+        let limit = serde_json::json!({
+            "type": "error",
+            "error": { "type": "websocket_connection_limit_reached", "message": "busy" },
+        });
+        assert!(super::openai_websocket_error_value_is_transient(&limit));
+
+        // A genuine request error has no transient code and a non-marker message,
+        // so it stays fatal.
+        let fatal = serde_json::json!({
+            "type": "error",
+            "error": { "code": "invalid_request_error", "message": "bad input" },
+        });
+        assert!(!super::openai_websocket_error_value_is_transient(&fatal));
+
+        // A proxy drop expressed only as the Go `": EOF` message tail (no code) is
+        // still caught by the marker fallback.
+        let eof = serde_json::json!({
+            "type": "error",
+            "error": { "message": "Post \"https://chatgpt.com/backend-api/codex/responses\": EOF" },
+        });
+        assert!(super::openai_websocket_error_value_is_transient(&eof));
+    }
+
+    #[test]
+    fn tungstenite_reset_variants_are_tagged_transient_by_type() {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+        // A reset without a closing handshake is classified by the typed variant.
+        let reset = super::openai_websocket_provider_error(Error::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake,
+        ));
+        assert!(super::is_openai_websocket_transient_start_error(&reset));
+
+        // An `ECONNRESET` I/O error is matched by `io.kind()` even though its
+        // `Display` ("connection reset") is not one of the prose markers — the
+        // typed check adds coverage the string match would miss.
+        let io_reset = super::openai_websocket_provider_error(Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )));
+        assert!(super::is_openai_websocket_transient_start_error(&io_reset));
+
+        // An unrelated I/O error stays fatal.
+        let denied = super::openai_websocket_provider_error(Error::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert!(!super::is_openai_websocket_transient_start_error(&denied));
+    }
+
+    #[test]
+    fn transient_tag_round_trips_and_is_stripped_for_display() {
+        let tagged = super::provider_error_with_optional_tag("upstream blip".to_string(), true);
+        assert!(super::is_openai_websocket_transient_start_error(&tagged));
+        // The internal marker is never shown to a user.
+        assert_eq!(
+            super::strip_ws_transient_tag(&tagged.to_string()),
+            "ProviderError: upstream blip"
+        );
+
+        let untagged = super::provider_error_with_optional_tag("upstream blip".to_string(), false);
+        // No tag, and "upstream blip" matches no prose marker, so it stays fatal.
+        assert!(!super::is_openai_websocket_transient_start_error(&untagged));
+    }
+
+    #[test]
+    fn openai_websocket_stream_error_does_not_nest_provider_error_prefix() {
+        // A non-reset transient error reaches the prose fallback; re-tagging must
+        // re-use the raw message, not the `ProviderError:`-prefixed `Display`, so
+        // the user never sees `ProviderError: ProviderError: …`.
+        let error = CompletionError::ProviderError(
+            "The OpenAI WebSocket connection closed before the turn finished".to_string(),
+        );
+        let rewritten = super::openai_websocket_stream_error(error);
+        assert!(super::is_openai_websocket_transient_start_error(&rewritten));
+        assert_eq!(
+            super::strip_ws_transient_tag(&rewritten.to_string()),
+            "ProviderError: The OpenAI WebSocket connection closed before the turn finished"
+        );
     }
 
     #[test]

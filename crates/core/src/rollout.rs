@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use cazean_protocol::{EventMsg, ProjectInstructions, ThreadId, TurnInterruptedEvent};
 use rig::{
     OneOrMany,
-    message::{AssistantContent, Message},
+    message::{AssistantContent, Message, Reasoning as MessageReasoning, Text, UserContent},
 };
 use serde::{Deserialize, Serialize};
 use time::{
@@ -200,6 +200,38 @@ pub(crate) async fn load_resume_state(path: &Path) -> Result<ResumeState> {
     load_state(path, RecoveryMode::Resume).await
 }
 
+fn user_history_message(text: String) -> Message {
+    Message::User {
+        content: OneOrMany::one(UserContent::Text(Text {
+            text,
+            additional_params: None,
+        })),
+    }
+}
+
+fn assistant_reasoning_history_message(reasoning: Vec<(String, String)>) -> Option<Message> {
+    let content = reasoning
+        .into_iter()
+        .filter(|(_, text)| !text.is_empty())
+        .map(|(id, text)| {
+            AssistantContent::Reasoning(MessageReasoning::summaries(vec![text]).with_id(id))
+        })
+        .collect::<Vec<_>>();
+    Some(Message::Assistant {
+        id: None,
+        content: OneOrMany::many(content).ok()?,
+    })
+}
+
+fn remove_synthetic_interrupted_prompt(
+    history: &mut Vec<Message>,
+    interrupted_synthetic_start: &mut Option<usize>,
+) {
+    if let Some(start) = interrupted_synthetic_start.take() {
+        history.truncate(start);
+    }
+}
+
 pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<ResumeState> {
     let contents = fs::read_to_string(path).await?;
     let mut meta: Option<SessionMeta> = None;
@@ -209,6 +241,9 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
     let mut has_open_turn = false;
     let mut has_terminal_turn = false;
     let mut open_turn_history_start = None::<usize>;
+    let mut open_turn_user_message = None::<String>;
+    let mut open_turn_reasoning = Vec::<(String, String)>::new();
+    let mut interrupted_synthetic_start = None::<usize>;
     let mut unstable_history_start = None::<usize>;
     let mut plan_mode = false;
 
@@ -227,6 +262,7 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
                 }
             }
             PersistedItem::HistoryMessage(HistoryMessage::Full { message }) => {
+                remove_synthetic_interrupted_prompt(&mut history, &mut interrupted_synthetic_start);
                 history.push(message);
             }
             PersistedItem::HistoryMessage(HistoryMessage::SubagentCompletion { completions }) => {
@@ -235,26 +271,64 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
                 // transcript row (deferred completions are transcript-silent), so
                 // it does not push to `initial_messages`.
                 if let Some(message) = completion_entries_to_user_message(&completions) {
+                    remove_synthetic_interrupted_prompt(
+                        &mut history,
+                        &mut interrupted_synthetic_start,
+                    );
                     history.push(message);
                 }
             }
             PersistedItem::UserMessage { text } => {
+                if open_turn_history_start.is_some() && open_turn_user_message.is_none() {
+                    open_turn_user_message = Some(text.clone());
+                }
                 initial_messages.push(EventMsg::UserMessage { text });
             }
             PersistedItem::Event(event) => {
                 match &event {
                     EventMsg::TurnStarted(_) => {
                         open_turn_history_start = Some(history.len());
+                        open_turn_user_message = None;
+                        open_turn_reasoning.clear();
+                        interrupted_synthetic_start = None;
                     }
                     EventMsg::TurnCompleted(_) => {
                         open_turn_history_start = None;
+                        open_turn_user_message = None;
+                        open_turn_reasoning.clear();
+                        interrupted_synthetic_start = None;
                         unstable_history_start = None;
                     }
-                    EventMsg::TurnInterrupted(_) | EventMsg::Error(_) => {
+                    EventMsg::TurnInterrupted(_) => {
+                        if let Some(start) = open_turn_history_start.take()
+                            && history.len() == start
+                        {
+                            interrupted_synthetic_start = Some(history.len());
+                            if let Some(text) = open_turn_user_message.take() {
+                                history.push(user_history_message(text));
+                            }
+                            if let Some(message) = assistant_reasoning_history_message(
+                                std::mem::take(&mut open_turn_reasoning),
+                            ) {
+                                history.push(message);
+                            }
+                        }
+                        open_turn_user_message = None;
+                        open_turn_reasoning.clear();
+                    }
+                    EventMsg::Error(_) => {
                         let start = open_turn_history_start.take().unwrap_or(history.len());
+                        open_turn_user_message = None;
+                        open_turn_reasoning.clear();
                         if unstable_history_start.is_none() {
                             unstable_history_start = Some(start);
                         }
+                    }
+                    EventMsg::AgentReasoningCompleted(reasoning)
+                        if open_turn_history_start.is_some() =>
+                    {
+                        open_turn_reasoning
+                            .push((reasoning.item_id.clone(), reasoning.text.clone()));
                     }
                     _ => {}
                 }
@@ -473,10 +547,10 @@ pub(crate) fn workspace_root() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use cazean_protocol::{
-        AgentPath, AgentStatus, ErrorEvent, ErrorInfo, ProjectInstructionEntry,
-        ProjectInstructions, SessionConfiguredEvent, TurnStartedEvent,
+        AgentPath, AgentReasoningCompletedEvent, AgentStatus, ErrorEvent, ErrorInfo,
+        ProjectInstructionEntry, ProjectInstructions, SessionConfiguredEvent, TurnStartedEvent,
     };
-    use rig::message::{Text, UserContent};
+    use rig::message::{ReasoningContent, Text, UserContent};
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cazean-rollout-{name}-{}", ThreadId::new()))
@@ -494,6 +568,43 @@ mod tests {
             })
             .collect::<String>();
         (!text.is_empty()).then_some(text)
+    }
+
+    fn assistant_message_text(message: &Message) -> Option<String> {
+        let Message::Assistant { content, .. } = message else {
+            return None;
+        };
+        let text = content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn assistant_reasoning_summaries(message: &Message) -> Vec<(Option<String>, String)> {
+        let Message::Assistant { content, .. } = message else {
+            return Vec::new();
+        };
+        content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Reasoning(reasoning) => Some((
+                    reasoning.id.clone(),
+                    reasoning
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            ReasoningContent::Summary(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -663,7 +774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_state_prunes_model_history_from_interrupted_turn() -> Result<()> {
+    async fn resume_state_preserves_model_history_from_interrupted_turn() -> Result<()> {
         let root = test_root("resume-interrupted-turn");
         let cwd = root.join("workspace");
         fs::create_dir_all(&cwd).await?;
@@ -736,15 +847,146 @@ mod tests {
 
         let state = load_resume_state(recorder.path()).await?;
         assert_eq!(state.next_turn_index, 4);
-        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history.len(), 5);
         assert_eq!(
             user_message_text(&state.history[0]).as_deref(),
             Some("stable prompt")
         );
-        assert!(matches!(state.history[1], Message::Assistant { .. }));
+        assert_eq!(
+            assistant_message_text(&state.history[1]).as_deref(),
+            Some("stable answer")
+        );
+        assert_eq!(
+            user_message_text(&state.history[2]).as_deref(),
+            Some("make a plan")
+        );
+        assert_eq!(
+            assistant_message_text(&state.history[3]).as_deref(),
+            Some("partial plan")
+        );
+        assert_eq!(
+            assistant_message_text(&state.history[4]).as_deref(),
+            Some("late partial after interruption event")
+        );
         assert!(state.initial_messages.iter().any(|event| {
             matches!(event, EventMsg::TurnInterrupted(turn) if turn.reason == "interrupted")
         }));
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_state_synthesizes_interrupted_prompt_when_cleanup_did_not_persist_tail()
+    -> Result<()> {
+        let root = test_root("resume-interrupted-synthetic-prompt");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "0".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(
+                persisted_event_item(&EventMsg::UserMessage {
+                    text: "make a plan to refactor plan mode".to_string(),
+                })
+                .with_context(|| "user message should persist")?,
+            )
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::AgentReasoningCompleted(
+                AgentReasoningCompletedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "0".to_string(),
+                    item_id: "rs_planning".to_string(),
+                    text: "**Planning for Refactoring**\n\nNeed to inspect plan-mode code."
+                        .to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnInterrupted(
+                TurnInterruptedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "0".to_string(),
+                    reason: "interrupted".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "1".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(
+                persisted_event_item(&EventMsg::UserMessage {
+                    text: "continue".to_string(),
+                })
+                .with_context(|| "user message should persist")?,
+            )
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::User {
+                    content: OneOrMany::one(UserContent::Text(Text {
+                        text: "continue".to_string(),
+                        additional_params: None,
+                    })),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("continued plan".to_string())),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnCompleted(
+                cazean_protocol::TurnCompletedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "1".to_string(),
+                    last_assistant_message: Some("continued plan".to_string()),
+                },
+            )))
+            .await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        assert_eq!(state.next_turn_index, 2);
+        assert_eq!(state.history.len(), 4);
+        assert_eq!(
+            user_message_text(&state.history[0]).as_deref(),
+            Some("make a plan to refactor plan mode")
+        );
+        assert_eq!(
+            assistant_reasoning_summaries(&state.history[1]),
+            vec![(
+                Some("rs_planning".to_string()),
+                "**Planning for Refactoring**\n\nNeed to inspect plan-mode code.".to_string(),
+            ),]
+        );
+        assert_eq!(
+            user_message_text(&state.history[2]).as_deref(),
+            Some("continue")
+        );
+        assert_eq!(
+            assistant_message_text(&state.history[3]).as_deref(),
+            Some("continued plan")
+        );
 
         let _ = fs::remove_dir_all(&root).await;
         Ok(())

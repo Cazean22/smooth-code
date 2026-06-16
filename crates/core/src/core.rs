@@ -24,7 +24,10 @@ use crate::{
     context_manager::ContextManager,
     error::{CoreError, CoreResult},
     provider::SessionModel,
-    rollout::{HistoryMessage, PersistedItem, RolloutRecorder, persisted_event_item},
+    rollout::{
+        HistoryMessage, PersistedItem, RolloutRecorder, is_terminal_lifecycle_event,
+        persisted_event_item,
+    },
     state::{ActiveTurn, RunningTask, SessionState},
     tasks::{AnySessionTask, RegularTask},
 };
@@ -781,6 +784,7 @@ impl Session {
         completions_by_index: &BTreeMap<usize, Vec<CompletionEntry>>,
     ) -> bool {
         let mut persisted = true;
+        let last_index = new_messages.len().saturating_sub(1);
         for (index, message) in new_messages.iter().enumerate() {
             let item = match completions_by_index.get(&index) {
                 Some(completions) => {
@@ -792,7 +796,15 @@ impl Session {
                     message: message.clone(),
                 }),
             };
-            if let Err(err) = self.rollout.append(item).await {
+            // `fsync` the final tail item so the whole turn result is durable
+            // against an OS crash (one sync flushes the preceding appends on the
+            // same file too); a sync failure folds into `persisted = false`.
+            let append_result = if index == last_index {
+                self.rollout.append_synced(item).await
+            } else {
+                self.rollout.append(item).await
+            };
+            if let Err(err) = append_result {
                 tracing::warn!(
                     thread_id = %self.id,
                     error = %err,
@@ -806,7 +818,11 @@ impl Session {
 
     pub(crate) async fn emit_event(&self, ctx: &TurnContext, msg: EventMsg) {
         if let Some(item) = persisted_event_item(&msg) {
-            let _ = self.rollout.append(item).await;
+            let _ = if is_terminal_lifecycle_event(&msg) {
+                self.rollout.append_synced(item).await
+            } else {
+                self.rollout.append(item).await
+            };
         }
         let _ = self.event_tx.send(Event {
             id: ctx.sub_id.clone(),
@@ -816,7 +832,11 @@ impl Session {
 
     pub(crate) async fn emit_session_event(&self, msg: EventMsg) {
         if let Some(item) = persisted_event_item(&msg) {
-            let _ = self.rollout.append(item).await;
+            let _ = if is_terminal_lifecycle_event(&msg) {
+                self.rollout.append_synced(item).await
+            } else {
+                self.rollout.append(item).await
+            };
         }
         let _ = self.event_tx.send(Event {
             id: "session".to_string(),

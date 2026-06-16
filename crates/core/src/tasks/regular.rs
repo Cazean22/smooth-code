@@ -31,7 +31,8 @@ use crate::{
     core::{CancelBudget, Session, TurnCancel, TurnContext},
     provider::{
         SessionAssistantContent, SessionCompletionEvent, SessionTurnSummary,
-        is_openai_websocket_transient_start_error, tool_error_is_interrupted,
+        is_openai_websocket_transient_start_error, strip_ws_transient_tag,
+        tool_error_is_interrupted,
     },
     state::TaskKind,
 };
@@ -63,7 +64,7 @@ async fn fail_turn(
     site: &'static str,
     err: anyhow::Error,
 ) {
-    let message = err.to_string();
+    let message = strip_ws_transient_tag(&err.to_string());
     let error_info =
         ErrorInfo::new("turn_failed", message.clone()).with_source(format!("cazean-core::{site}"));
     tracing::error!(
@@ -513,6 +514,7 @@ async fn run_manual_turn(
         if cancel.is_cancelled() {
             finalize_interrupted_turn(
                 &session,
+                &ctx,
                 history_before_turn,
                 new_messages,
                 &completions_by_index,
@@ -618,6 +620,7 @@ async fn run_manual_turn(
                         if batch_cancelled {
                             finalize_interrupted_turn(
                                 &session,
+                                &ctx,
                                 history_before_turn,
                                 new_messages,
                                 &completions_by_index,
@@ -643,6 +646,7 @@ async fn run_manual_turn(
                             _ = cancel.cancelled() => {
                                 finalize_interrupted_turn(
                                     &session,
+                                    &ctx,
                                     history_before_turn,
                                     new_messages,
                                     &completions_by_index,
@@ -685,6 +689,7 @@ async fn run_manual_turn(
             if batch_cancelled {
                 finalize_interrupted_turn(
                     &session,
+                    &ctx,
                     history_before_turn,
                     new_messages,
                     &completions_by_index,
@@ -762,16 +767,26 @@ async fn run_manual_turn(
         // guarantees we never close an edge before the result that supersedes it
         // is durable: an interrupted, crashed, or unpersisted turn leaves the
         // edge open, and resume reaps the finished child instead.
-        if persisted {
-            close_consumed_child_edges(&session, &consumed_children).await;
-        } else if !consumed_children.is_empty() {
-            tracing::warn!(
-                thread_id = %session.id,
-                turn_id = %ctx.sub_id,
-                consumed_children = consumed_children.len(),
-                "history persistence failed; leaving consumed-child edges open for resume"
-            );
+        if !persisted {
+            // The completed turn's tail could not be durably written. Surface it as
+            // a failed turn and, crucially, return `None` so the runner does NOT
+            // emit `TurnCompleted`: a `TurnCompleted` would clear the unstable
+            // marker on resume and replay the partial, possibly-malformed tail.
+            // With an errored terminal instead, resume prunes that tail. In-memory
+            // history keeps the turn so the live session stays coherent, and
+            // consumed-child edges stay open so resume reaps those children.
+            fail_turn(
+                &session,
+                &ctx,
+                "manual.persist_turn_tail",
+                anyhow::anyhow!(
+                    "turn result could not be saved to the session rollout; it will not survive a resume"
+                ),
+            )
+            .await;
+            return None;
         }
+        close_consumed_child_edges(&session, &consumed_children).await;
         if !last_assistant_message.is_empty() {
             session
                 .emit_event(
@@ -877,6 +892,7 @@ async fn finalize_interrupted_attempt_and_turn(
     }
     finalize_interrupted_turn(
         session,
+        ctx,
         history_before_turn,
         new_messages,
         completions_by_index,
@@ -893,16 +909,28 @@ async fn finalize_interrupted_attempt_and_turn(
 /// own partial output and the interrupted tool results on the next turn.
 async fn finalize_interrupted_turn(
     session: &Arc<Session>,
+    ctx: &TurnContext,
     history_before_turn: Vec<Message>,
     new_messages: Vec<Message>,
     completions_by_index: &BTreeMap<usize, Vec<CompletionEntry>>,
 ) {
-    let _ = session
+    let persisted = session
         .persist_turn_tail(&new_messages, completions_by_index)
         .await;
     let mut final_history = history_before_turn;
     final_history.extend(new_messages);
     session.replace_history(final_history).await;
+    if !persisted {
+        // Best-effort: the interrupted turn's partial tail did not fully persist.
+        // Only log it — the turn's `TurnInterrupted` is emitted before this cleanup
+        // runs, so an `Error` here would land after the partial tail (not pruning
+        // it on resume) and would mislabel an interrupted turn as errored.
+        tracing::warn!(
+            thread_id = %session.id,
+            turn_id = %ctx.sub_id,
+            "interrupted turn-tail persistence failed; partial model history may be incomplete on resume"
+        );
+    }
 }
 
 /// Commit one stream attempt's output into the turn's `new_messages` (and the

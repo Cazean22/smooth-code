@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use time::{
 };
 use tokio::{
     fs::{self, File},
-    io::AsyncWriteExt,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Mutex,
 };
 
@@ -147,6 +148,18 @@ impl RolloutRecorder {
     }
 
     pub(crate) async fn append(&self, item: PersistedItem) -> Result<()> {
+        self.append_inner(item, false).await
+    }
+
+    /// Like [`append`](Self::append), but `fsync`s the file after writing so the
+    /// record survives an OS crash / power loss, not just a process exit.
+    /// Reserved for durable turn results and terminal lifecycle events, where a
+    /// lost tail would make a completed turn resume as interrupted.
+    pub(crate) async fn append_synced(&self, item: PersistedItem) -> Result<()> {
+        self.append_inner(item, true).await
+    }
+
+    async fn append_inner(&self, item: PersistedItem, sync: bool) -> Result<()> {
         let envelope = RolloutEnvelope {
             timestamp: now_rfc3339()?,
             item,
@@ -156,6 +169,9 @@ impl RolloutRecorder {
         let mut file = self.file.lock().await;
         file.write_all(&line).await?;
         file.flush().await?;
+        if sync {
+            file.sync_data().await?;
+        }
         Ok(())
     }
 }
@@ -182,6 +198,16 @@ pub(crate) fn persisted_event_item(event: &EventMsg) -> Option<PersistedItem> {
         event if persist_event(event) => Some(PersistedItem::Event(event.clone())),
         _ => None,
     }
+}
+
+/// Whether an event terminates a turn (completion, interruption, or error). Such
+/// records are `fsync`ed when persisted: a terminal record lost to an OS crash
+/// would make a finished turn resume as still-open / interrupted.
+pub(crate) fn is_terminal_lifecycle_event(event: &EventMsg) -> bool {
+    matches!(
+        event,
+        EventMsg::TurnCompleted(_) | EventMsg::TurnInterrupted(_) | EventMsg::Error(_)
+    )
 }
 
 /// How `load_state` should treat a rollout whose last turn is still open.
@@ -233,7 +259,8 @@ fn remove_synthetic_interrupted_prompt(
 }
 
 pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<ResumeState> {
-    let contents = fs::read_to_string(path).await?;
+    let file = File::open(path).await?;
+    let mut lines = BufReader::new(file).lines();
     let mut meta: Option<SessionMeta> = None;
     let mut history = Vec::new();
     let mut initial_messages = Vec::new();
@@ -244,14 +271,13 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
     let mut open_turn_user_message = None::<String>;
     let mut open_turn_reasoning = Vec::<(String, String)>::new();
     let mut interrupted_synthetic_start = None::<usize>;
-    let mut unstable_history_start = None::<usize>;
     let mut plan_mode = false;
 
-    for line in contents.lines() {
+    while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        let envelope = match serde_json::from_str::<RolloutEnvelope>(line) {
+        let envelope = match serde_json::from_str::<RolloutEnvelope>(&line) {
             Ok(envelope) => envelope,
             Err(_) => continue,
         };
@@ -297,7 +323,6 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
                         open_turn_user_message = None;
                         open_turn_reasoning.clear();
                         interrupted_synthetic_start = None;
-                        unstable_history_start = None;
                     }
                     EventMsg::TurnInterrupted(_) => {
                         if let Some(start) = open_turn_history_start.take()
@@ -320,8 +345,15 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
                         let start = open_turn_history_start.take().unwrap_or(history.len());
                         open_turn_user_message = None;
                         open_turn_reasoning.clear();
-                        if unstable_history_start.is_none() {
-                            unstable_history_start = Some(start);
+                        // Truncate the errored turn's partial tail immediately, not
+                        // via a deferred marker: a failed-persistence tail (e.g. an
+                        // assistant tool call whose matching result never wrote) is
+                        // permanently malformed, so a *later* completed turn must not
+                        // be able to resurrect it. Doing it inline means subsequent
+                        // turns append onto the already-truncated history.
+                        if recovery == RecoveryMode::Resume {
+                            history.truncate(start);
+                            interrupted_synthetic_start = None;
                         }
                     }
                     EventMsg::AgentReasoningCompleted(reasoning)
@@ -347,17 +379,13 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
     }
 
     let meta = meta.with_context(|| format!("missing session metadata in {}", path.display()))?;
-    if recovery == RecoveryMode::Resume {
-        let truncate_to = if has_open_turn && !has_terminal_turn {
-            unstable_history_start.or(open_turn_history_start)
-        } else {
-            unstable_history_start
-        };
-        if let Some(start) = truncate_to {
+    if recovery == RecoveryMode::Resume && has_open_turn && !has_terminal_turn {
+        // A turn that started but never reached a terminal event (process crashed
+        // mid-turn): drop its partial tail and surface it as interrupted. (Errored
+        // turns are already truncated inline above.)
+        if let Some(start) = open_turn_history_start {
             history.truncate(start);
         }
-    }
-    if recovery == RecoveryMode::Resume && has_open_turn && !has_terminal_turn {
         initial_messages.push(EventMsg::TurnInterrupted(TurnInterruptedEvent {
             thread_id: meta.thread_id.to_string(),
             turn_id: max_turn_index.unwrap_or(0).to_string(),
@@ -376,12 +404,7 @@ pub(crate) async fn load_state(path: &Path, recovery: RecoveryMode) -> Result<Re
 }
 
 pub(crate) async fn list_threads(workspace_root: &Path) -> Result<Vec<ThreadSummary>> {
-    let mut rollout_paths = Vec::new();
-    let sessions_root = sessions_root(workspace_root);
-    if fs::try_exists(&sessions_root).await.unwrap_or(false) {
-        collect_rollout_paths(&sessions_root, &mut rollout_paths).await?;
-    }
-
+    let rollout_paths = collect_workspace_rollout_paths(workspace_root).await?;
     let mut threads = Vec::new();
     for path in rollout_paths {
         if let Ok(summary) = summarize_rollout(&path).await {
@@ -396,12 +419,50 @@ pub(crate) async fn find_thread_path(
     workspace_root: &Path,
     thread_id: ThreadId,
 ) -> Result<PathBuf> {
-    let threads = list_threads(workspace_root).await?;
-    threads
+    let rollout_paths = collect_workspace_rollout_paths(workspace_root).await?;
+    rollout_paths
         .into_iter()
-        .find(|thread| thread.thread_id == thread_id)
-        .map(|thread| thread.rollout_path)
+        .find(|path| rollout_thread_id(path) == Some(thread_id))
         .with_context(|| format!("unknown thread id: {thread_id}"))
+}
+
+/// Build the `thread_id`→rollout-path map for an entire workspace in a single
+/// directory walk, reading no file contents. Resume uses this to resolve a whole
+/// child subtree without re-walking the sessions tree per child.
+pub(crate) async fn collect_rollout_path_map(
+    workspace_root: &Path,
+) -> Result<HashMap<ThreadId, PathBuf>> {
+    let rollout_paths = collect_workspace_rollout_paths(workspace_root).await?;
+    let mut map = HashMap::with_capacity(rollout_paths.len());
+    for path in rollout_paths {
+        if let Some(thread_id) = rollout_thread_id(&path) {
+            map.insert(thread_id, path);
+        }
+    }
+    Ok(map)
+}
+
+async fn collect_workspace_rollout_paths(workspace_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut rollout_paths = Vec::new();
+    let sessions_root = sessions_root(workspace_root);
+    if fs::try_exists(&sessions_root).await.unwrap_or(false) {
+        collect_rollout_paths(&sessions_root, &mut rollout_paths).await?;
+    }
+    Ok(rollout_paths)
+}
+
+/// Extract the thread id a rollout filename encodes. [`create_rollout_path`]
+/// writes `rollout-<timestamp>-<thread_id>.jsonl`, and `ThreadId` is a fixed
+/// 36-char UUID, so the id is the trailing 36 chars of the `rollout-`-prefixed
+/// stem. Returns `None` for names that don't match the template or don't parse
+/// as a thread id (e.g. unrelated `.jsonl` files).
+fn rollout_thread_id(path: &Path) -> Option<ThreadId> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("rollout-")?;
+    // ASCII throughout (timestamp + hyphens + hex UUID), so byte-slicing the
+    // trailing 36 chars lands on a char boundary.
+    let candidate = rest.get(rest.len().checked_sub(36)?..)?;
+    candidate.parse::<ThreadId>().ok()
 }
 
 fn update_turn_tracking(
@@ -453,17 +514,18 @@ fn assistant_text(content: &OneOrMany<AssistantContent>) -> Option<String> {
 }
 
 async fn summarize_rollout(path: &Path) -> Result<ThreadSummary> {
-    let contents = fs::read_to_string(path).await?;
+    let file = File::open(path).await?;
+    let mut lines = BufReader::new(file).lines();
     let mut meta: Option<SessionMeta> = None;
     let mut updated_at = None::<String>;
     let mut last_user_message = None;
     let mut last_assistant_message = None;
 
-    for line in contents.lines() {
+    while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        let envelope = match serde_json::from_str::<RolloutEnvelope>(line) {
+        let envelope = match serde_json::from_str::<RolloutEnvelope>(&line) {
             Ok(envelope) => envelope,
             Err(_) => continue,
         };
@@ -1307,6 +1369,323 @@ mod tests {
             serde_json::to_value(&state.history)?,
             serde_json::to_value(vec![message])?,
         );
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_thread_path_resolves_by_filename_without_reading_contents() -> Result<()> {
+        let root = test_root("find-by-filename");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        // A real rollout (with content).
+        let real_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, real_id, &cwd).await?;
+
+        // A content-less rollout whose id lives only in the filename: resolution
+        // must succeed without parsing the (empty) body.
+        let empty_id = ThreadId::new();
+        let sessions = sessions_root(&root);
+        fs::create_dir_all(&sessions).await?;
+        let empty_path = sessions.join(format!("rollout-2026-01-01T00-00-00-{empty_id}.jsonl"));
+        fs::write(&empty_path, b"").await?;
+
+        assert_eq!(
+            find_thread_path(&root, real_id).await?.as_path(),
+            recorder.path()
+        );
+        assert_eq!(find_thread_path(&root, empty_id).await?, empty_path);
+        assert!(find_thread_path(&root, ThreadId::new()).await.is_err());
+
+        let map = collect_rollout_path_map(&root).await?;
+        assert_eq!(
+            map.get(&real_id).map(PathBuf::as_path),
+            Some(recorder.path())
+        );
+        assert_eq!(map.get(&empty_id), Some(&empty_path));
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_truncates_partial_tail_of_crashed_open_turn_without_terminal_event()
+    -> Result<()> {
+        let root = test_root("resume-crashed-open-turn");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        // A completed stable turn's model history.
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: user_history_message("stable prompt".to_string()),
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("stable answer".to_string())),
+                },
+            }))
+            .await?;
+        // A turn that started, persisted a partial tail, then crashed — no
+        // `TurnCompleted` / `TurnInterrupted` / `Error` ever followed.
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "5".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: user_history_message("crashed prompt".to_string()),
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("partial answer".to_string())),
+                },
+            }))
+            .await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        // The crashed turn's partial tail is dropped back to the open-turn start.
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(
+            user_message_text(&state.history[0]).as_deref(),
+            Some("stable prompt")
+        );
+        assert_eq!(
+            assistant_message_text(&state.history[1]).as_deref(),
+            Some("stable answer")
+        );
+        assert_eq!(state.next_turn_index, 6);
+        // A crashed open turn surfaces as interrupted on resume.
+        assert!(matches!(
+            state.initial_messages.last(),
+            Some(EventMsg::TurnInterrupted(turn)) if turn.reason == "resume_recovery"
+        ));
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_history_when_an_errored_turn_is_followed_by_a_completed_turn()
+    -> Result<()> {
+        let root = test_root("resume-error-then-complete");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: user_history_message("stable prompt".to_string()),
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("stable answer".to_string())),
+                },
+            }))
+            .await?;
+        // A turn that errored before any assistant output (no persisted tail, as
+        // the live path no longer eagerly writes the failed prompt).
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "7".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::Error(ErrorEvent {
+                error: ErrorInfo::new("turn_failed", "provider reset"),
+            })))
+            .await?;
+        // A later turn that completed cleanly: history through it must survive,
+        // and the earlier error's `unstable_history_start` must be cleared.
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "8".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: user_history_message("recovered prompt".to_string()),
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("recovered answer".to_string())),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnCompleted(
+                cazean_protocol::TurnCompletedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "8".to_string(),
+                    last_assistant_message: Some("recovered answer".to_string()),
+                },
+            )))
+            .await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        assert_eq!(state.history.len(), 4);
+        assert_eq!(
+            user_message_text(&state.history[0]).as_deref(),
+            Some("stable prompt")
+        );
+        assert_eq!(
+            user_message_text(&state.history[2]).as_deref(),
+            Some("recovered prompt")
+        );
+        assert_eq!(
+            assistant_message_text(&state.history[3]).as_deref(),
+            Some("recovered answer")
+        );
+        assert_eq!(state.next_turn_index, 9);
+        // The completed turn means no crash-recovery interrupt is synthesized, and
+        // the earlier error is still visible in the replayed transcript.
+        assert!(!state.initial_messages.iter().any(|event| {
+            matches!(event, EventMsg::TurnInterrupted(turn) if turn.reason == "resume_recovery")
+        }));
+        assert!(
+            state
+                .initial_messages
+                .iter()
+                .any(|event| matches!(event, EventMsg::Error(_)))
+        );
+
+        let _ = fs::remove_dir_all(&root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_prunes_failed_persist_tail_even_when_a_later_turn_completes() -> Result<()> {
+        // Models a turn whose persist partially succeeded (its prompt was written
+        // but the assistant/tool-result tail was not) and then failed with `Error`
+        // and no `TurnCompleted`, after which the user continued in the same live
+        // session and a later turn completed. The earlier malformed tail must NOT
+        // be resurrected by the later completion (the bug: a deferred unstable
+        // marker cleared by any later `TurnCompleted`).
+        let root = test_root("resume-failed-persist-then-complete");
+        let cwd = root.join("workspace");
+        fs::create_dir_all(&cwd).await?;
+
+        let thread_id = ThreadId::new();
+        let recorder = RolloutRecorder::create(&root, thread_id, &cwd).await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: user_history_message("stable prompt".to_string()),
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("stable answer".to_string())),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "7".to_string(),
+                },
+            )))
+            .await?;
+        // The failed turn persisted a partial tail (just its prompt) before the
+        // append/sync failure surfaced as `Error`.
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: user_history_message("failed prompt".to_string()),
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::Error(ErrorEvent {
+                error: ErrorInfo::new("turn_failed", "rollout write failed"),
+            })))
+            .await?;
+        // The user continued; a later turn completed cleanly.
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnStarted(
+                TurnStartedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "8".to_string(),
+                },
+            )))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: user_history_message("recovered prompt".to_string()),
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::HistoryMessage(HistoryMessage::Full {
+                message: Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text("recovered answer".to_string())),
+                },
+            }))
+            .await?;
+        recorder
+            .append(PersistedItem::Event(EventMsg::TurnCompleted(
+                cazean_protocol::TurnCompletedEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "8".to_string(),
+                    last_assistant_message: Some("recovered answer".to_string()),
+                },
+            )))
+            .await?;
+
+        let state = load_resume_state(recorder.path()).await?;
+        // "failed prompt" is gone; the later completion did not resurrect it.
+        assert_eq!(state.history.len(), 4);
+        assert_eq!(
+            user_message_text(&state.history[0]).as_deref(),
+            Some("stable prompt")
+        );
+        assert_eq!(
+            assistant_message_text(&state.history[1]).as_deref(),
+            Some("stable answer")
+        );
+        assert_eq!(
+            user_message_text(&state.history[2]).as_deref(),
+            Some("recovered prompt")
+        );
+        assert_eq!(
+            assistant_message_text(&state.history[3]).as_deref(),
+            Some("recovered answer")
+        );
+        assert!(
+            !state
+                .history
+                .iter()
+                .any(|message| user_message_text(message).as_deref() == Some("failed prompt")),
+            "the failed turn's partial tail must not survive into model history"
+        );
+        assert_eq!(state.next_turn_index, 9);
 
         let _ = fs::remove_dir_all(&root).await;
         Ok(())

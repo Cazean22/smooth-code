@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use cazean_config::Config;
@@ -10,7 +11,7 @@ use cazean_protocol::{
     ErrorInfo, Event, EventMsg, Op, ProjectInstructions, SessionSource, SubAgentSource, ThreadId,
 };
 use cazean_state_db::StateDbHandle;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tools::AskUserClient;
 use uuid::Uuid;
 
@@ -25,7 +26,8 @@ use crate::{
     error::{CoreError, CoreResult},
     provider::{ConfigSessionModelFactory, SessionModelFactory},
     rollout::{
-        RecoveryMode, find_thread_path, list_threads, load_resume_state, load_state, workspace_root,
+        RecoveryMode, ResumeState, collect_rollout_path_map, find_thread_path, list_threads,
+        load_resume_state, load_state, workspace_root,
     },
 };
 
@@ -52,12 +54,23 @@ pub struct PreviewedThread {
     pub is_live: bool,
 }
 
+/// A memoized `load_state` result for a non-live thread's rollout, validated by
+/// the file's `len`/`mtime` so an appended-to (e.g. later resumed) rollout is
+/// re-read. Previews are re-requested on every picker selection move, so this
+/// keeps arrowing through a large old session from re-parsing it each time.
+struct CachedPreview {
+    len: u64,
+    mtime: Option<SystemTime>,
+    state: Arc<ResumeState>,
+}
+
 pub struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CoreThread>>>>,
     ask_user_client: Option<AskUserClient>,
     model_factory: Option<Arc<dyn SessionModelFactory>>,
     agent_control: AgentControl,
     state_db: StateDbHandle,
+    preview_cache: Arc<Mutex<HashMap<PathBuf, CachedPreview>>>,
 }
 
 impl ThreadManagerState {
@@ -100,6 +113,7 @@ impl ThreadManagerState {
             model_factory: Some(model_factory),
             agent_control,
             state_db,
+            preview_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -159,9 +173,15 @@ impl ThreadManagerState {
         }
 
         let workspace_root = workspace_root().map_err(CoreError::rollout)?;
-        let rollout_path = find_thread_path(&workspace_root, thread_id)
+        // One directory walk resolves both this thread and its whole child
+        // subtree below, instead of re-scanning the sessions tree per thread.
+        let rollout_paths = collect_rollout_path_map(&workspace_root)
             .await
             .map_err(CoreError::rollout)?;
+        let rollout_path = rollout_paths
+            .get(&thread_id)
+            .cloned()
+            .ok_or(CoreError::UnknownThread { thread_id })?;
         let resume_state = load_resume_state(&rollout_path)
             .await
             .map_err(CoreError::rollout)?;
@@ -191,7 +211,7 @@ impl ThreadManagerState {
                 Some(SystemPromptKind::Root.storage_key()),
             )
             .await?;
-        initial_messages.extend(self.resume_child_subtree(thread_id).await?);
+        initial_messages.extend(self.resume_child_subtree(thread_id, &rollout_paths).await?);
         Ok(ResumedThread {
             thread_id,
             rollout_path,
@@ -216,14 +236,19 @@ impl ThreadManagerState {
                     .map_err(CoreError::rollout)?
             }
         };
-        let recovery = if is_live {
-            RecoveryMode::PreviewLive
+        // A live thread's rollout is still being appended to, so it is read
+        // fresh (and as `PreviewLive`); a finished thread's rollout is immutable
+        // for this session, so its parsed state is memoized — the picker
+        // re-requests a preview on every selection move.
+        let state: Arc<ResumeState> = if is_live {
+            Arc::new(
+                load_state(&rollout_path, RecoveryMode::PreviewLive)
+                    .await
+                    .map_err(CoreError::rollout)?,
+            )
         } else {
-            RecoveryMode::Resume
+            self.load_preview_state_cached(&rollout_path).await?
         };
-        let state = load_state(&rollout_path, recovery)
-            .await
-            .map_err(CoreError::rollout)?;
 
         let derived_status = || {
             state
@@ -257,12 +282,47 @@ impl ThreadManagerState {
         Ok(PreviewedThread {
             thread_id,
             rollout_path,
-            initial_messages: state.initial_messages,
+            initial_messages: state.initial_messages.clone(),
             agent_path,
             agent_nickname,
             status,
             is_live,
         })
+    }
+
+    /// Load a non-live thread's `ResumeState` for preview, served from
+    /// [`Self::preview_cache`] when the rollout's `len`/`mtime` are unchanged.
+    /// A finished rollout is immutable for the session, so this turns repeated
+    /// previews (picker navigation) into one parse instead of one per view.
+    async fn load_preview_state_cached(&self, rollout_path: &Path) -> CoreResult<Arc<ResumeState>> {
+        let (len, mtime) = match tokio::fs::metadata(rollout_path).await {
+            Ok(meta) => (meta.len(), meta.modified().ok()),
+            Err(_) => (0, None),
+        };
+        {
+            let cache = self.preview_cache.lock().await;
+            if let Some(entry) = cache.get(rollout_path)
+                && entry.len == len
+                && entry.mtime == mtime
+            {
+                return Ok(Arc::clone(&entry.state));
+            }
+        }
+        let state = Arc::new(
+            load_state(rollout_path, RecoveryMode::Resume)
+                .await
+                .map_err(CoreError::rollout)?,
+        );
+        let mut cache = self.preview_cache.lock().await;
+        cache.insert(
+            rollout_path.to_path_buf(),
+            CachedPreview {
+                len,
+                mtime,
+                state: Arc::clone(&state),
+            },
+        );
+        Ok(state)
     }
 
     #[tracing::instrument(name = "core.thread_manager.list_threads", skip(self))]
@@ -429,7 +489,11 @@ impl ThreadManagerState {
             .ok_or(CoreError::UnknownThread { thread_id })
     }
 
-    async fn resume_child_subtree(&self, root_thread_id: ThreadId) -> CoreResult<Vec<EventMsg>> {
+    async fn resume_child_subtree(
+        &self,
+        root_thread_id: ThreadId,
+        rollout_paths: &HashMap<ThreadId, PathBuf>,
+    ) -> CoreResult<Vec<EventMsg>> {
         // BFS over the persisted open-edge subtree. Each entry carries whether
         // the subtree is being reaped. A child that *completed* is reaped — its
         // edge is closed and it is not rehydrated, since its result already
@@ -445,7 +509,6 @@ impl ThreadManagerState {
         // `Interrupted` — so the reap/rehydrate split keys on `Completed`
         // specifically, not on `is_final`.)
         let mut queue: VecDeque<(ThreadId, bool)> = VecDeque::from([(root_thread_id, false)]);
-        let workspace_root = workspace_root().map_err(CoreError::rollout)?;
         let mut events = Vec::new();
 
         while let Some((parent_thread_id, reap_subtree)) = queue.pop_front() {
@@ -499,15 +562,12 @@ impl ThreadManagerState {
                 // leaves the edge open, exactly as before.
                 let reap_status = if reap_subtree {
                     Some(
-                        self.peek_child_status(&workspace_root, child_thread_id)
+                        self.peek_child_status(rollout_paths, child_thread_id)
                             .await
                             .unwrap_or(AgentStatus::Shutdown),
                     )
                 } else {
-                    match self
-                        .peek_child_status(&workspace_root, child_thread_id)
-                        .await
-                    {
+                    match self.peek_child_status(rollout_paths, child_thread_id).await {
                         Ok(status @ AgentStatus::Completed(_)) => Some(status),
                         _ => None,
                     }
@@ -547,7 +607,7 @@ impl ThreadManagerState {
 
                 let result = self
                     .resume_child_thread(
-                        &workspace_root,
+                        rollout_paths,
                         parent_thread_id,
                         child_thread_id,
                         thread_row.agent_path.as_deref(),
@@ -594,16 +654,18 @@ impl ThreadManagerState {
     /// from its rollout (or `PendingInit` if none was recorded).
     async fn peek_child_status(
         &self,
-        workspace_root: &std::path::Path,
+        rollout_paths: &HashMap<ThreadId, PathBuf>,
         child_thread_id: ThreadId,
     ) -> CoreResult<AgentStatus> {
         if self.threads.read().await.contains_key(&child_thread_id) {
             return Ok(self.agent_control.get_status(child_thread_id));
         }
-        let rollout_path = find_thread_path(workspace_root, child_thread_id)
-            .await
-            .map_err(CoreError::rollout)?;
-        let resume_state = load_resume_state(&rollout_path)
+        let rollout_path = rollout_paths
+            .get(&child_thread_id)
+            .ok_or(CoreError::UnknownThread {
+                thread_id: child_thread_id,
+            })?;
+        let resume_state = load_resume_state(rollout_path)
             .await
             .map_err(CoreError::rollout)?;
         Ok(resume_state
@@ -616,7 +678,7 @@ impl ThreadManagerState {
 
     async fn resume_child_thread(
         &self,
-        workspace_root: &std::path::Path,
+        rollout_paths: &HashMap<ThreadId, PathBuf>,
         parent_thread_id: ThreadId,
         child_thread_id: ThreadId,
         agent_path: Option<&str>,
@@ -648,9 +710,13 @@ impl ThreadManagerState {
                 path: agent_path.to_string(),
                 source,
             })?;
-        let rollout_path = find_thread_path(workspace_root, child_thread_id)
-            .await
-            .map_err(CoreError::rollout)?;
+        let rollout_path =
+            rollout_paths
+                .get(&child_thread_id)
+                .cloned()
+                .ok_or(CoreError::UnknownThread {
+                    thread_id: child_thread_id,
+                })?;
         let resume_state = load_resume_state(&rollout_path)
             .await
             .map_err(CoreError::rollout)?;

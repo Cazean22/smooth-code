@@ -3,10 +3,9 @@ mod regular;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
-use tokio_util::sync::CancellationToken;
 
 use crate::{
-    core::{Session, TurnContext},
+    core::{Session, TurnCancel, TurnContext},
     state::TaskKind,
 };
 
@@ -30,7 +29,7 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
         session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<String>,
-        cancellation_token: CancellationToken,
+        cancel: TurnCancel,
     ) -> impl std::future::Future<Output = Option<String>> + Send;
 
     fn abort(
@@ -54,7 +53,7 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
         session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<String>,
-        cancellation_token: CancellationToken,
+        cancel: TurnCancel,
     ) -> BoxFuture<'static, Option<String>>;
 
     fn abort<'a>(&'a self, session: Arc<Session>, ctx: Arc<TurnContext>) -> BoxFuture<'a, ()>;
@@ -77,15 +76,9 @@ where
         session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<String>,
-        cancellation_token: CancellationToken,
+        cancel: TurnCancel,
     ) -> BoxFuture<'static, Option<String>> {
-        Box::pin(SessionTask::run(
-            self,
-            session,
-            ctx,
-            input,
-            cancellation_token,
-        ))
+        Box::pin(SessionTask::run(self, session, ctx, input, cancel))
     }
 
     fn abort<'a>(&'a self, session: Arc<Session>, ctx: Arc<TurnContext>) -> BoxFuture<'a, ()> {

@@ -16,7 +16,6 @@ use rig::{
         ToolResult, ToolResultContent, UserContent,
     },
 };
-use tokio_util::sync::CancellationToken;
 use tools::{DecodedToolOutput, SkillMeta, SubagentArgs, decode_tool_output_for_tool};
 
 use crate::{
@@ -29,7 +28,7 @@ use crate::{
             CompletionEntry, completion_entries_to_user_message, encode_spawn_agent_result,
         },
     },
-    core::{CancelReason, Session, TurnContext},
+    core::{CancelBudget, Session, TurnCancel, TurnContext},
     provider::{
         SessionAssistantContent, SessionCompletionEvent, SessionTurnSummary,
         is_openai_websocket_transient_start_error, tool_error_is_interrupted,
@@ -129,29 +128,6 @@ impl PendingCallDescriptor {
             tool_name: pending.tool_call.function.name.clone(),
         }
     }
-}
-
-/// How long a cancelled tool batch keeps draining before outstanding calls
-/// are completed with placeholder interrupted results. Reason-aware so the
-/// batch (and the partial-turn persistence after it) always finishes inside
-/// the cancelled task's `drain_grace()` hard-abort deadline — shutdown gives
-/// tools far less time than a user interrupt. The env var is a test/ops
-/// override, clamped below the deadline so no configuration can push the
-/// batch past the hard abort.
-fn tool_cancel_grace(reason: CancelReason) -> Duration {
-    let override_ms = std::env::var("CAZEAN_TOOL_CANCEL_GRACE_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok());
-    tool_cancel_grace_with_override(reason, override_ms)
-}
-
-fn tool_cancel_grace_with_override(reason: CancelReason, override_ms: Option<u64>) -> Duration {
-    // Keep at least a second of headroom under the hard-abort deadline for
-    // placeholder synthesis and partial-turn persistence.
-    let ceiling = reason.drain_grace().saturating_sub(Duration::from_secs(1));
-    override_ms
-        .map(|ms| Duration::from_millis(ms).min(ceiling))
-        .unwrap_or_else(|| reason.tool_drain_grace())
 }
 
 /// Complete a tool call that will never produce real output because the turn
@@ -265,7 +241,7 @@ impl SessionTask for RegularTask {
         session: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<String>,
-        cancellation_token: CancellationToken,
+        cancel: TurnCancel,
     ) -> Option<String> {
         tracing::debug!(
             thread_id = %session.id,
@@ -274,7 +250,7 @@ impl SessionTask for RegularTask {
             "running regular task"
         );
         let _ = self;
-        if cancellation_token.is_cancelled() {
+        if cancel.is_cancelled() {
             return None;
         }
 
@@ -330,7 +306,7 @@ impl SessionTask for RegularTask {
             prompt,
             history_before_turn,
             skills,
-            cancellation_token.clone(),
+            cancel.clone(),
         )
         .await;
         tracing::debug!(
@@ -511,7 +487,7 @@ async fn run_manual_turn(
     initial_prompt: Message,
     history_before_turn: Vec<Message>,
     skills: Vec<SkillMeta>,
-    cancellation_token: CancellationToken,
+    cancel: TurnCancel,
 ) -> Option<String> {
     let mut new_messages = vec![initial_prompt];
     // Maps an index in `new_messages` to the typed completion group that index
@@ -535,7 +511,7 @@ async fn run_manual_turn(
     let mut stream_phase_completions: Vec<CompletionEntry> = Vec::new();
 
     'turn_loop: loop {
-        if cancellation_token.is_cancelled() {
+        if cancel.is_cancelled() {
             finalize_interrupted_turn(
                 &session,
                 history_before_turn,
@@ -555,7 +531,7 @@ async fn run_manual_turn(
         )?;
         let model_for_stream = session.model();
         let mut stream = match model_for_stream
-            .stream_completion_turn(pending_prompt, &request_history, cancellation_token.clone())
+            .stream_completion_turn(pending_prompt, &request_history, cancel.token())
             .await
         {
             Ok(stream) => stream,
@@ -567,8 +543,8 @@ async fn run_manual_turn(
         let mut attempt = AttemptState::new();
 
         loop {
-            if cancellation_token.is_cancelled() {
-                drain_cancelled_stream(&session, &mut stream).await;
+            if cancel.is_cancelled() {
+                drain_cancelled_stream(&session, &mut stream, &cancel).await;
                 finalize_interrupted_attempt_and_turn(
                     &session,
                     &ctx,
@@ -582,8 +558,8 @@ async fn run_manual_turn(
             }
 
             let item = tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    drain_cancelled_stream(&session, &mut stream).await;
+                _ = cancel.cancelled() => {
+                    drain_cancelled_stream(&session, &mut stream, &cancel).await;
                     finalize_interrupted_attempt_and_turn(
                         &session,
                         &ctx,
@@ -624,7 +600,7 @@ async fn run_manual_turn(
                             &mut retained_subagents,
                             &mut consumed_children,
                             &mut stream_phase_completions,
-                            &cancellation_token,
+                            &cancel,
                         )
                         .await;
                         if !attempt.accumulated_text.is_empty() {
@@ -665,7 +641,7 @@ async fn run_manual_turn(
                             .await;
                         stream_retries = next_retry;
                         tokio::select! {
-                            _ = cancellation_token.cancelled() => {
+                            _ = cancel.cancelled() => {
                                 finalize_interrupted_turn(
                                     &session,
                                     history_before_turn,
@@ -704,7 +680,7 @@ async fn run_manual_turn(
                 &mut retained_subagents,
                 &mut consumed_children,
                 &mut stream_phase_completions,
-                &cancellation_token,
+                &cancel,
             )
             .await;
             if batch_cancelled {
@@ -735,7 +711,7 @@ async fn run_manual_turn(
 
         if !retained_subagents.is_empty() {
             let completion_entries = tokio::select! {
-                _ = cancellation_token.cancelled() => {
+                _ = cancel.cancelled() => {
                     // The attempt streamed no tool calls (handled above), so
                     // its partial text has not been committed yet — fold it in
                     // before finalizing the interrupted turn.
@@ -831,16 +807,19 @@ async fn run_manual_turn(
 /// Keep polling the cancelled stream briefly so the provider-side cancel can
 /// make progress — the OpenAI WebSocket stream sends `response.cancel` and
 /// tries to park its socket from *inside* the stream, which only runs while
-/// someone polls it. No-op for providers that cancel by drop. Bounded well
-/// under the turn's drain grace.
+/// someone polls it. No-op for providers that cancel by drop. The poll budget
+/// ([`CancelBudget::stream`]) covers the provider's own `cancel_drain_ms`
+/// deadline and is bounded under the turn's hard-abort grace.
 async fn drain_cancelled_stream(
     session: &Arc<Session>,
     stream: &mut crate::provider::SessionCompletionStream,
+    cancel: &TurnCancel,
 ) {
     if !session.model().requires_stream_cancel_drain() {
         return;
     }
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+    let budget = CancelBudget::for_reason(cancel.reason(), session.model().stream_cancel_drain());
+    let _ = tokio::time::timeout(budget.stream, async {
         while stream.next().await.is_some() {}
     })
     .await;
@@ -952,7 +931,7 @@ async fn commit_attempt_messages(
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
     consumed_children: &mut Vec<ThreadId>,
     stream_phase_completions: &mut Vec<CompletionEntry>,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> bool {
     let requires_provider_reasoning_ids = session.model().requires_provider_reasoning_ids();
     let assistant_message = if attempt.saw_tool_call_this_attempt {
@@ -979,7 +958,7 @@ async fn commit_attempt_messages(
             retained_subagents,
             consumed_children,
             stream_phase_completions,
-            cancellation_token,
+            cancel,
         )
         .await
     } else {
@@ -1007,7 +986,7 @@ async fn execute_normal_tool_call(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     pending: PendingToolCall,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> ExecutedToolCall {
     let PendingToolCall {
         index,
@@ -1020,7 +999,7 @@ async fn execute_normal_tool_call(
     // A child token scopes this one call: cancelling the turn cancels the
     // call, but the token handed to the tool can never outlive the turn it
     // belongs to.
-    let call_token = cancellation_token.child_token();
+    let call_token = cancel.child_token();
     let call_result = tools::with_tool_cancel_scope(
         call_token,
         model_for_call.call_tool(
@@ -1147,37 +1126,32 @@ fn decode_completed_tool_output(
 /// Run the batch's immediate tools concurrently. On cancellation the in-flight
 /// futures are not dropped on the spot: their per-call child tokens are already
 /// cancelled, so cooperative tools (e.g. run_command killing its process group)
-/// resolve within [`tool_cancel_grace`]; anything still outstanding at the
+/// resolve within [`CancelBudget::tool`]; anything still outstanding at the
 /// deadline is completed with a placeholder interrupted result so every call
 /// in the batch ends with a `ToolCallCompleted` event and a tool result.
 async fn execute_normal_tools_concurrently(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     normal_calls: Vec<PendingToolCall>,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> ToolBatchOutcome {
     let mut outstanding = normal_calls
         .iter()
         .map(PendingCallDescriptor::of)
         .collect::<Vec<_>>();
     let mut resolved = Vec::new();
-    let mut cancelled = cancellation_token.is_cancelled();
+    let mut cancelled = cancel.is_cancelled();
 
     if !cancelled {
         let mut pending_futures = normal_calls
             .into_iter()
             .map(|pending| {
-                execute_normal_tool_call(
-                    Arc::clone(&session),
-                    Arc::clone(&ctx),
-                    pending,
-                    cancellation_token,
-                )
+                execute_normal_tool_call(Arc::clone(&session), Arc::clone(&ctx), pending, cancel)
             })
             .collect::<FuturesUnordered<_>>();
         while !pending_futures.is_empty() {
             let next = tokio::select! {
-                _ = cancellation_token.cancelled() => {
+                _ = cancel.cancelled() => {
                     cancelled = true;
                     break;
                 }
@@ -1190,7 +1164,9 @@ async fn execute_normal_tools_concurrently(
             resolved.push(executed);
         }
         if cancelled {
-            let deadline = tokio::time::sleep(tool_cancel_grace(session.last_cancel_reason()));
+            let budget =
+                CancelBudget::for_reason(cancel.reason(), session.model().stream_cancel_drain());
+            let deadline = tokio::time::sleep(budget.tool);
             tokio::pin!(deadline);
             while !pending_futures.is_empty() {
                 let next = tokio::select! {
@@ -1233,7 +1209,7 @@ async fn execute_pending_tool_calls_for_turn(
     retained_subagents: &mut Vec<RetainedSpawnCompletion>,
     consumed_children: &mut Vec<ThreadId>,
     stream_phase_completions: &mut Vec<CompletionEntry>,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> (Vec<ExecutedToolCall>, bool) {
     let DispatchedTools {
         immediate,
@@ -1244,13 +1220,12 @@ async fn execute_pending_tool_calls_for_turn(
         Arc::clone(&session),
         Arc::clone(&ctx),
         pending_tool_calls,
-        cancellation_token,
+        cancel,
     )
     .await;
 
     let surfacing = Surfacing::for_batch(has_immediate_results);
-    let (deferred, wait_cancelled) =
-        wait_for_deferred(deferred, &surfacing, cancellation_token).await;
+    let (deferred, wait_cancelled) = wait_for_deferred(deferred, &surfacing, cancel).await;
     let deferred_results = collect_spawn_results(
         Arc::clone(&session),
         Arc::clone(&ctx),
@@ -1270,7 +1245,7 @@ async fn execute_pending_tool_calls_for_turn(
     // A cancelled batch skips the drain — the turn is ending.
     if matches!(surfacing, Surfacing::BlockInline) && !cancelled {
         tokio::select! {
-            _ = cancellation_token.cancelled() => cancelled = true,
+            _ = cancel.cancelled() => cancelled = true,
             completions = drain_retained_subagent_completions(retained_subagents, &session.agent_control, consumed_children) => {
                 stream_phase_completions.extend(completions);
             }
@@ -1303,7 +1278,7 @@ async fn dispatch_tool_calls(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     pending_tool_calls: Vec<PendingToolCall>,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> DispatchedTools {
     let (normal_calls, spawn_calls, exit_plan_calls) =
         partition_pending_tool_calls(pending_tool_calls);
@@ -1321,7 +1296,7 @@ async fn dispatch_tool_calls(
     // deadline, so blocking on a stubborn child here would eat the parent's
     // whole grace and cost it the spawn results and partial-turn persistence
     // the grace exists to protect.
-    if cancellation_token.is_cancelled() {
+    if cancel.is_cancelled() {
         let started_child_ids = started_spawns
             .iter()
             .filter_map(|spawn| match spawn {
@@ -1329,7 +1304,7 @@ async fn dispatch_tool_calls(
                 SpawnToolStart::Completed(_) => None,
             })
             .collect::<Vec<_>>();
-        let reason = session.last_cancel_reason();
+        let reason = cancel.reason();
         let (_interrupted, child_tasks) = session
             .agent_control
             .abort_threads(&started_child_ids, reason)
@@ -1344,7 +1319,7 @@ async fn dispatch_tool_calls(
         Arc::clone(&session),
         Arc::clone(&ctx),
         normal_calls,
-        cancellation_token,
+        cancel,
     )
     .await;
 
@@ -1352,7 +1327,7 @@ async fn dispatch_tool_calls(
         Arc::clone(&session),
         Arc::clone(&ctx),
         exit_plan_calls,
-        cancellation_token,
+        cancel,
     )
     .await;
 
@@ -1423,7 +1398,7 @@ async fn execute_exit_plan_mode_call(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     pending: PendingToolCall,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> Option<ExecutedToolCall> {
     let PendingToolCall {
         index,
@@ -1433,8 +1408,7 @@ async fn execute_exit_plan_mode_call(
     } = pending;
 
     let (tool_output, success, error) =
-        exit_plan_mode_outcome(&session, &ctx, internal_call_id.clone(), cancellation_token)
-            .await?;
+        exit_plan_mode_outcome(&session, &ctx, internal_call_id.clone(), cancel).await?;
 
     Some(
         complete_tool_call(
@@ -1459,7 +1433,7 @@ async fn exit_plan_mode_outcome(
     session: &Arc<Session>,
     ctx: &Arc<TurnContext>,
     internal_call_id: String,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> Option<(String, bool, Option<String>)> {
     let failure = |message: String| Some((message.clone(), false, Some(message)));
 
@@ -1492,7 +1466,7 @@ async fn exit_plan_mode_outcome(
         plan,
     };
     let decision = tokio::select! {
-        _ = cancellation_token.cancelled() => return None,
+        _ = cancel.cancelled() => return None,
         decision = ask_user_client.request_plan_approval(params) => decision,
     };
 
@@ -1541,12 +1515,12 @@ async fn execute_exit_plan_mode_calls(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     exit_plan_calls: Vec<PendingToolCall>,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> ToolBatchOutcome {
     let mut resolved = Vec::with_capacity(exit_plan_calls.len());
     let mut cancelled = false;
     for pending in exit_plan_calls {
-        if cancelled || cancellation_token.is_cancelled() {
+        if cancelled || cancel.is_cancelled() {
             cancelled = true;
             resolved.push(
                 complete_interrupted_tool_call(
@@ -1559,13 +1533,8 @@ async fn execute_exit_plan_mode_calls(
             continue;
         }
         let descriptor = PendingCallDescriptor::of(&pending);
-        match execute_exit_plan_mode_call(
-            Arc::clone(&session),
-            Arc::clone(&ctx),
-            pending,
-            cancellation_token,
-        )
-        .await
+        match execute_exit_plan_mode_call(Arc::clone(&session), Arc::clone(&ctx), pending, cancel)
+            .await
         {
             Some(executed) => resolved.push(executed),
             None => {
@@ -1633,12 +1602,12 @@ fn split_started_and_immediate(
 async fn wait_for_deferred(
     mut deferred: Vec<StartedSpawnToolCall>,
     surfacing: &Surfacing,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> (Vec<StartedSpawnToolCall>, bool) {
     if deferred.is_empty() {
         return (deferred, false);
     }
-    let cancelled = await_deferred_completions(&mut deferred, surfacing, cancellation_token).await;
+    let cancelled = await_deferred_completions(&mut deferred, surfacing, cancel).await;
     (deferred, cancelled)
 }
 
@@ -1893,13 +1862,13 @@ impl Surfacing {
 async fn await_deferred_completions(
     spawn_tool_calls: &mut [StartedSpawnToolCall],
     surfacing: &Surfacing,
-    cancellation_token: &CancellationToken,
+    cancel: &TurnCancel,
 ) -> bool {
     match surfacing {
         Surfacing::BlockInline => {
             while spawn_tool_calls.iter().any(|call| call.waiter.is_some()) {
                 let completion = tokio::select! {
-                    _ = cancellation_token.cancelled() => return true,
+                    _ = cancel.cancelled() => return true,
                     completion = next_started_spawn_completion(spawn_tool_calls) => completion,
                 };
                 let Some((index, completion)) = completion else {
@@ -1913,7 +1882,7 @@ async fn await_deferred_completions(
             tokio::pin!(deadline);
             while spawn_tool_calls.iter().any(|call| call.waiter.is_some()) {
                 let completion = tokio::select! {
-                    _ = cancellation_token.cancelled() => return true,
+                    _ = cancel.cancelled() => return true,
                     _ = &mut deadline => break,
                     completion = next_started_spawn_completion(spawn_tool_calls) => completion,
                 };
@@ -2360,7 +2329,6 @@ mod tests {
     use super::{
         PendingReasoningDeltas, decode_completed_tool_output, expand_skill_invocation,
         should_roundtrip_reasoning, skills_context_message, subagent_type_to_prompt_kind,
-        tool_cancel_grace_with_override,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2441,33 +2409,6 @@ mod tests {
         };
         assert!(text.text.contains("# Available skills"));
         assert!(text.text.contains("- deploy: Deploy the app"));
-    }
-
-    #[test]
-    fn tool_cancel_grace_override_is_clamped_under_the_drain_deadline() {
-        use crate::core::CancelReason;
-        use std::time::Duration;
-
-        // No override: the reason's default budget.
-        assert_eq!(
-            tool_cancel_grace_with_override(CancelReason::Shutdown, None),
-            CancelReason::Shutdown.tool_drain_grace()
-        );
-        // A small override (tests shrink the grace) passes through.
-        assert_eq!(
-            tool_cancel_grace_with_override(CancelReason::Shutdown, Some(100)),
-            Duration::from_millis(100)
-        );
-        // An override above the hard-abort deadline is clamped below it —
-        // no configuration may push the batch past the hard abort.
-        assert_eq!(
-            tool_cancel_grace_with_override(CancelReason::Shutdown, Some(60_000)),
-            CancelReason::Shutdown.drain_grace() - Duration::from_secs(1)
-        );
-        assert_eq!(
-            tool_cancel_grace_with_override(CancelReason::UserInterrupt, Some(60_000)),
-            CancelReason::UserInterrupt.drain_grace() - Duration::from_secs(1)
-        );
     }
 
     #[test]

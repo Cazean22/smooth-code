@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Duration;
+
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use cazean_protocol::{
     AgentStatus, AgentStatusChangedEvent, Event, EventMsg, Op, PlanModeChangedEvent,
@@ -58,27 +61,14 @@ impl CancelReason {
 
     /// How long the cancelled task gets to run cooperative cleanup (tool
     /// grace drain, partial-turn persistence) before `drain_aborted_tasks`
-    /// hard-aborts it. Must exceed `tool_drain_grace()` for the same reason
-    /// so the tool-batch outcome and persistence land before the hard abort;
-    /// exit paths use a shorter window so shutdown stays snappy.
-    pub(crate) fn drain_grace(self) -> std::time::Duration {
+    /// hard-aborts it. This is the single base from which [`CancelBudget`]
+    /// derives every nested deadline, so the inner budgets are guaranteed to
+    /// finish before this one elapses; exit paths use a shorter window so
+    /// shutdown stays snappy.
+    pub(crate) fn drain_grace(self) -> Duration {
         match self {
-            Self::UserInterrupt | Self::Replaced => std::time::Duration::from_secs(8),
-            Self::Shutdown | Self::Closed => std::time::Duration::from_secs(3),
-        }
-    }
-
-    /// Budget a cancelled tool batch gets to let in-flight tool futures
-    /// resolve before placeholder interrupted results are synthesized. Kept
-    /// strictly under `drain_grace()` so the batch always finishes —
-    /// placeholders, `ToolCallCompleted` events, partial-turn persistence —
-    /// before the task's hard-abort deadline. `run_command` resolves
-    /// immediately on cancel (its process-group kill is detached), so even
-    /// the short exit-path budget is comfortable.
-    pub(crate) fn tool_drain_grace(self) -> std::time::Duration {
-        match self {
-            Self::UserInterrupt | Self::Replaced => std::time::Duration::from_secs(5),
-            Self::Shutdown | Self::Closed => std::time::Duration::from_millis(1500),
+            Self::UserInterrupt | Self::Replaced => Duration::from_secs(8),
+            Self::Shutdown | Self::Closed => Duration::from_secs(3),
         }
     }
 
@@ -89,6 +79,140 @@ impl CancelReason {
             Self::UserInterrupt | Self::Replaced => AgentStatus::Interrupted,
             Self::Shutdown | Self::Closed => AgentStatus::Shutdown,
         }
+    }
+}
+
+/// Headroom reserved under [`CancelReason::drain_grace`] for synthesizing
+/// placeholder interrupted tool results and persisting the partial turn. The
+/// tool drain — and everything nested under it — must finish before this
+/// headroom begins, or the hard abort would cut persistence short.
+const PERSIST_HEADROOM: Duration = Duration::from_secs(1);
+
+/// Slack added over the provider's own WebSocket cancel-drain deadline
+/// (`cancel_drain_ms`) when sizing how long the turn loop keeps polling a
+/// cancelled stream, so the outer poll always covers the inner drain.
+const STREAM_HEADROOM: Duration = Duration::from_millis(500);
+
+/// Default tool-batch drain per reason, before [`PERSIST_HEADROOM`] clamping.
+/// `run_command` resolves immediately on cancel (its process-group kill is
+/// detached), so even the short exit-path budget is comfortable.
+fn default_tool_grace(reason: CancelReason) -> Duration {
+    match reason {
+        CancelReason::UserInterrupt | CancelReason::Replaced => Duration::from_secs(5),
+        CancelReason::Shutdown | CancelReason::Closed => Duration::from_millis(1500),
+    }
+}
+
+/// Test/ops override for the tool-batch drain (`CAZEAN_TOOL_CANCEL_GRACE_MS`).
+/// Read fresh each call so a runtime/test `set_var` is honored; [`CancelBudget`]
+/// clamps it below the hard-abort deadline so no value can push the batch past
+/// it. This runs once per cancelled batch (a rare, user-initiated event), so
+/// the env lookup cost is irrelevant.
+fn tool_grace_override() -> Option<Duration> {
+    std::env::var("CAZEAN_TOOL_CANCEL_GRACE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+/// The cancellation signal handed to a running turn: a [`CancellationToken`]
+/// plus the [`CancelReason`] it was cancelled with. The reason is set exactly
+/// once, immediately before the token is cancelled, so any task that observes
+/// cancellation can read *why* without a race or a back-reference to shared
+/// session state. Clones share the same underlying token and reason cell.
+#[derive(Clone)]
+pub(crate) struct TurnCancel {
+    token: CancellationToken,
+    reason: Arc<OnceLock<CancelReason>>,
+}
+
+impl TurnCancel {
+    pub(crate) fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            reason: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Record `reason`, then cancel the token. Setting the reason first means
+    /// any waiter woken by `cancelled()` — or any task that next observes
+    /// `is_cancelled()` — sees the reason that caused the cancellation.
+    pub(crate) fn cancel(&self, reason: CancelReason) {
+        let _ = self.reason.set(reason);
+        self.token.cancel();
+    }
+
+    /// Why this turn was cancelled. Defaults to `UserInterrupt` before any
+    /// cancel; in practice it is only read after `cancel` has set it.
+    pub(crate) fn reason(&self) -> CancelReason {
+        self.reason
+            .get()
+            .copied()
+            .unwrap_or(CancelReason::UserInterrupt)
+    }
+
+    pub(crate) fn cancelled(&self) -> WaitForCancellationFuture<'_> {
+        self.token.cancelled()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    /// A clone of the underlying token for code that only needs the signal —
+    /// the provider stream, which cancels on the same token, not a child.
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    /// A child token scoping a single tool call: cancelling the turn cancels
+    /// the call, but the child can never outlive the turn it belongs to.
+    pub(crate) fn child_token(&self) -> CancellationToken {
+        self.token.child_token()
+    }
+}
+
+/// Reason-derived timing for one cancellation. Both budgets descend from the
+/// single [`CancelReason::drain_grace`] base and are clamped under the same
+/// ceiling, so the nesting that keeps cooperative cleanup ahead of the hard
+/// abort is structural rather than a coincidence of independently-chosen
+/// constants:
+///
+/// ```text
+/// tool, stream <= drain_grace - PERSIST_HEADROOM < drain_grace
+/// ```
+///
+/// The tool drain and the stream poll run on mutually-exclusive cancel paths
+/// within a turn (cancelled mid-stream vs. mid-tool-batch), so they are
+/// bounded independently against that ceiling, not ordered relative to each
+/// other.
+pub(crate) struct CancelBudget {
+    /// How long a cancelled tool batch drains before outstanding calls are
+    /// completed with placeholder interrupted results.
+    pub(crate) tool: Duration,
+    /// How long the turn loop keeps polling a cancelled provider stream so the
+    /// provider-side cancel (OpenAI WS `response.cancel`) can make progress.
+    pub(crate) stream: Duration,
+}
+
+impl CancelBudget {
+    /// Derive the budget for `reason`, sizing the stream poll to cover the
+    /// provider's own `ws_cancel_drain` deadline plus [`STREAM_HEADROOM`].
+    pub(crate) fn for_reason(reason: CancelReason, ws_cancel_drain: Duration) -> Self {
+        Self::with_overrides(reason, ws_cancel_drain, tool_grace_override())
+    }
+
+    fn with_overrides(
+        reason: CancelReason,
+        ws_cancel_drain: Duration,
+        tool_override: Option<Duration>,
+    ) -> Self {
+        let ceiling = reason.drain_grace().saturating_sub(PERSIST_HEADROOM);
+        let tool = tool_override
+            .unwrap_or_else(|| default_tool_grace(reason))
+            .min(ceiling);
+        let stream = (ws_cancel_drain + STREAM_HEADROOM).min(ceiling);
+        Self { tool, stream }
     }
 }
 
@@ -163,11 +287,6 @@ pub(crate) struct Session {
     next_internal_sub_id: AtomicU64,
     models: SessionModels,
     plan_mode: AtomicBool,
-    /// The most recent reason `abort_all_tasks` cancelled a turn with. The
-    /// turn task only holds a token, so follow-up cancellations it performs
-    /// itself — e.g. interrupting children whose spawn completed after the
-    /// cascade walk — read this to carry the same reason instead of guessing.
-    last_cancel_reason: std::sync::Mutex<CancelReason>,
     pub(crate) cwd: PathBuf,
     rollout: RolloutRecorder,
 }
@@ -216,7 +335,6 @@ impl Core {
             project_instructions,
             models,
             plan_mode: AtomicBool::new(plan_mode),
-            last_cancel_reason: std::sync::Mutex::new(CancelReason::UserInterrupt),
             cwd,
             rollout,
         });
@@ -356,14 +474,14 @@ impl Session {
             }
             drain_aborted_tasks(aborted, CancelReason::Replaced.drain_grace()).await;
             self.wait_for_finishing_turn().await;
-            let cancellation_token = tokio_util::sync::CancellationToken::new();
+            let cancellation = TurnCancel::new();
             let done = Arc::new(tokio::sync::Notify::new());
             let sess = Arc::clone(self);
             let task_for_runner = Arc::clone(&task);
             let task_name = task_for_runner.span_name();
             let ctx_for_runner = Arc::clone(&turn_context);
             let done_for_runner = Arc::clone(&done);
-            let cancellation_for_runner = cancellation_token.clone();
+            let cancellation_for_runner = cancellation.clone();
             let start_gate = Arc::new(tokio::sync::Notify::new());
             let start_gate_for_runner = Arc::clone(&start_gate);
 
@@ -515,7 +633,7 @@ impl Session {
                 done,
                 kind: task_kind,
                 task,
-                cancellation_token,
+                cancellation,
                 handle: tokio_util::task::AbortOnDropHandle::new(handle),
                 turn_context: Arc::clone(&turn_context),
             };
@@ -555,12 +673,9 @@ impl Session {
         };
 
         if let Some(tasks) = drained {
-            if let Ok(mut last_reason) = self.last_cancel_reason.lock() {
-                *last_reason = reason;
-            }
             *self.current_turn_id.write().await = None;
             for task in &tasks {
-                task.cancellation_token.cancel();
+                task.cancellation.cancel(reason);
                 task.task
                     .abort(Arc::clone(self), Arc::clone(&task.turn_context))
                     .await;
@@ -588,17 +703,6 @@ impl Session {
         let interrupted = !tasks.is_empty();
         drain_aborted_tasks(tasks, reason.drain_grace()).await;
         interrupted
-    }
-
-    /// The reason of the most recent `abort_all_tasks` that drained a task;
-    /// defaults to `UserInterrupt` before any cancellation. Read by the turn
-    /// task, which only holds a token, when it must cancel something itself
-    /// after observing that token.
-    pub(crate) fn last_cancel_reason(&self) -> CancelReason {
-        self.last_cancel_reason
-            .lock()
-            .map(|reason| *reason)
-            .unwrap_or(CancelReason::UserInterrupt)
     }
 
     async fn wait_for_finishing_turn(&self) {
@@ -811,9 +915,11 @@ mod tests {
         tasks::SessionTask,
     };
 
-    use super::{CancelReason, Core, Session, SessionModels, TurnContext};
+    use super::{
+        CancelBudget, CancelReason, Core, PERSIST_HEADROOM, Session, SessionModels, TurnCancel,
+        TurnContext,
+    };
     use cazean_protocol::{AgentStatus, AgentStatusChangedEvent, EventMsg, SessionSource};
-    use tokio_util::sync::CancellationToken;
 
     struct EmptyDriver;
 
@@ -970,10 +1076,10 @@ mod tests {
             _session: Arc<Session>,
             _ctx: Arc<TurnContext>,
             _input: Vec<String>,
-            cancellation_token: CancellationToken,
+            cancel: TurnCancel,
         ) -> Option<String> {
             let _ = self;
-            cancellation_token.cancelled().await;
+            cancel.cancelled().await;
             None
         }
 
@@ -1002,10 +1108,42 @@ mod tests {
             _session: Arc<Session>,
             _ctx: Arc<TurnContext>,
             _input: Vec<String>,
-            _cancellation_token: CancellationToken,
+            _cancel: TurnCancel,
         ) -> Option<String> {
             let _ = self;
             std::future::pending().await
+        }
+    }
+
+    /// Records the reason it observed once its `TurnCancel` is cancelled, so a
+    /// test can assert that a running task sees the reason `abort_all_tasks`
+    /// cancelled it with — the role the old `Session::last_cancel_reason`
+    /// played, now carried on the signal itself.
+    struct ReasonCapturingTask {
+        observed: Arc<std::sync::Mutex<Option<CancelReason>>>,
+    }
+
+    impl SessionTask for ReasonCapturingTask {
+        fn kind(&self) -> TaskKind {
+            TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "test.reason_capturing_task"
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _session: Arc<Session>,
+            _ctx: Arc<TurnContext>,
+            _input: Vec<String>,
+            cancel: TurnCancel,
+        ) -> Option<String> {
+            cancel.cancelled().await;
+            if let Ok(mut slot) = self.observed.lock() {
+                *slot = Some(cancel.reason());
+            }
+            None
         }
     }
 
@@ -1468,19 +1606,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_records_last_cancel_reason() -> Result<()> {
+    async fn abort_makes_reason_visible_to_the_cancelled_task() -> Result<()> {
         let (core, _rx) = test_core().await?;
-        assert_eq!(
-            core.session.last_cancel_reason(),
-            CancelReason::UserInterrupt
-        );
+        let observed = Arc::new(std::sync::Mutex::new(None));
 
         let turn_context = Arc::new(core.session.fresh_turn_context());
         core.session
             .start_task(
                 turn_context,
                 vec!["hello".to_string()],
-                Arc::new(CancellationAwareTask),
+                Arc::new(ReasonCapturingTask {
+                    observed: Arc::clone(&observed),
+                }),
                 TaskKind::Regular,
             )
             .await?;
@@ -1488,8 +1625,81 @@ mod tests {
             .abort_and_drain_all_tasks(CancelReason::Shutdown)
             .await;
 
-        assert_eq!(core.session.last_cancel_reason(), CancelReason::Shutdown);
+        let observed_reason = *observed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("observed mutex poisoned"))?;
+        assert_eq!(observed_reason, Some(CancelReason::Shutdown));
         Ok(())
+    }
+
+    #[test]
+    fn turn_cancel_exposes_reason_set_before_cancel() {
+        let cancel = TurnCancel::new();
+        assert!(!cancel.is_cancelled());
+        cancel.cancel(CancelReason::Shutdown);
+        assert!(cancel.is_cancelled());
+        assert_eq!(cancel.reason(), CancelReason::Shutdown);
+        // A clone observes the same cancellation and reason.
+        assert_eq!(cancel.clone().reason(), CancelReason::Shutdown);
+    }
+
+    #[test]
+    fn turn_cancel_reason_defaults_before_any_cancel() {
+        let cancel = TurnCancel::new();
+        assert_eq!(cancel.reason(), CancelReason::UserInterrupt);
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn turn_cancel_reason_is_visible_after_cancelled_wakes() {
+        let cancel = TurnCancel::new();
+        let waiter = cancel.clone();
+        let handle = tokio::spawn(async move {
+            waiter.cancelled().await;
+            waiter.reason()
+        });
+        cancel.cancel(CancelReason::Replaced);
+        assert_eq!(handle.await.ok(), Some(CancelReason::Replaced));
+    }
+
+    #[test]
+    fn cancel_budget_nests_under_the_hard_abort_deadline() {
+        use std::time::Duration;
+        let ws = Duration::from_millis(1500);
+        for reason in [
+            CancelReason::UserInterrupt,
+            CancelReason::Replaced,
+            CancelReason::Shutdown,
+            CancelReason::Closed,
+        ] {
+            let ceiling = reason.drain_grace() - PERSIST_HEADROOM;
+
+            // Default: the per-reason target, clamped under the ceiling.
+            let default = CancelBudget::with_overrides(reason, ws, None);
+            assert!(default.tool <= ceiling, "{reason:?} tool exceeds ceiling");
+            assert!(
+                default.stream <= ceiling,
+                "{reason:?} stream exceeds ceiling"
+            );
+
+            // A huge override is clamped to the ceiling, never past it.
+            let huge = CancelBudget::with_overrides(reason, ws, Some(Duration::from_secs(60)));
+            assert_eq!(huge.tool, ceiling, "{reason:?} huge override not clamped");
+
+            // A tiny override is respected verbatim.
+            let tiny = CancelBudget::with_overrides(reason, ws, Some(Duration::from_millis(50)));
+            assert_eq!(tiny.tool, Duration::from_millis(50));
+        }
+
+        // Concrete defaults preserved, and the stream poll honors a larger
+        // configured cancel-drain up to the ceiling (the bug the hardcoded 2s
+        // used to hide).
+        let user = CancelBudget::with_overrides(CancelReason::UserInterrupt, ws, None);
+        assert_eq!(user.tool, Duration::from_secs(5));
+        assert_eq!(user.stream, Duration::from_secs(2));
+        let big_ws =
+            CancelBudget::with_overrides(CancelReason::UserInterrupt, Duration::from_secs(5), None);
+        assert_eq!(big_ws.stream, Duration::from_millis(5500));
     }
 
     /// Shutdown awaits its drain inline, and the tool-batch grace for

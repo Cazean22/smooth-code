@@ -2,9 +2,12 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use tokio::sync::{Mutex, Notify};
-use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+use tokio_util::task::AbortOnDropHandle;
 
-use crate::{core::TurnContext, tasks::AnySessionTask};
+use crate::{
+    core::{TurnCancel, TurnContext},
+    tasks::AnySessionTask,
+};
 
 /// Metadata about the currently running turn.
 pub(crate) struct ActiveTurn {
@@ -38,7 +41,7 @@ pub(crate) struct RunningTask {
     #[allow(dead_code)]
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,
-    pub(crate) cancellation_token: CancellationToken,
+    pub(crate) cancellation: TurnCancel,
     pub(crate) handle: AbortOnDropHandle<()>,
     pub(crate) turn_context: Arc<TurnContext>,
 }

@@ -186,6 +186,19 @@ impl SessionModel {
         matches!(self, Self::OpenAi(_))
     }
 
+    /// How long the turn loop should keep polling a cancelled stream so the
+    /// provider's own cancel can finish (it parks the WebSocket from inside the
+    /// stream). For OpenAI this is the configured `cancel_drain_ms`; other
+    /// models use the default. Only consulted when `requires_stream_cancel_drain`
+    /// is true.
+    pub(crate) fn stream_cancel_drain(&self) -> Duration {
+        let ms = match self {
+            Self::OpenAi(openai) => openai.websocket.cancel_drain_ms,
+            _ => cazean_config::WebSocketConfig::default().cancel_drain_ms,
+        };
+        Duration::from_millis(ms)
+    }
+
     /// OpenAI WebSocket pre-output retry budget. For OpenAI this is the
     /// configured value; other models (incl. the test stub) use the default,
     /// because actual retries are gated by the transient-marker check, not the
@@ -1352,8 +1365,10 @@ fn is_openai_websocket_connection_reset(error: &CompletionError) -> bool {
 /// structured code rather than on free-form prose — robust to the proxy's message wording.
 /// `internal_server_error` is the upstream 5xx the proxy reports when the codex backend returns
 /// a server error (often alongside a `": EOF` transport tail; see the markers below).
-const OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES: &[&str] =
-    &["websocket_connection_limit_reached", "internal_server_error"];
+const OPENAI_WEBSOCKET_RETRYABLE_PROXY_CODES: &[&str] = &[
+    "websocket_connection_limit_reached",
+    "internal_server_error",
+];
 
 /// Free-text transport/stream phrases that indicate the connection dropped before the turn
 /// finished. Unlike the codes above, these conditions are only ever surfaced as human-readable

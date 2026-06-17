@@ -362,6 +362,15 @@ impl Core {
                 }
             }
             Op::Shutdown => {
+                // A prior interrupt hands the cancelled turn to a detached
+                // background drain (see `interrupt_turn_cascade`) that performs
+                // the interrupted turn's partial-history persist. That task is no
+                // longer in `active_turn`, so the abort/drain below would not wait
+                // for it — and a process exit right after a quit would kill it
+                // mid-persist, losing the interrupted turn's model context on the
+                // next resume. Wait for any in-flight interrupt cleanup first, the
+                // same gate the next turn uses in `start_regular_turn`.
+                self.session.wait_for_interrupt_cleanup().await;
                 // Own tasks and descendants' tasks drain together under one
                 // shared shutdown window so N stubborn turns cost one grace,
                 // not N — the TUI exit epilogue budgets a single window.
@@ -1584,6 +1593,61 @@ mod tests {
         assert_eq!(user_message_text(&history[0]).as_deref(), Some("continue"));
         assert_eq!(assistant_message_text(&history[1]).as_deref(), Some("done"));
         assert_eq!(continue_turn_id, "1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_interrupt_waits_for_cancel_cleanup() -> Result<()> {
+        // An interrupt hands the cancelled turn to a detached background drain
+        // that persists the interrupted turn's partial model history. If the
+        // user quits right after interrupting, shutdown must wait for that drain
+        // — otherwise the process exits mid-persist and the next resume loses the
+        // interrupted turn's context (only a synthetic user+reasoning stub is
+        // reconstructed). This mirrors the gate `start_user_input` already uses.
+        let (core, _rx) = test_core().await?;
+        let cleanup_started = Arc::new(Notify::new());
+        let cleanup_release = Arc::new(Notify::new());
+        let turn_context = Arc::new(core.session.fresh_turn_context());
+        core.session
+            .start_task(
+                turn_context,
+                vec!["hello".to_string()],
+                Arc::new(DelayedCancelCleanupTask {
+                    cleanup_started: Arc::clone(&cleanup_started),
+                    cleanup_release: Arc::clone(&cleanup_release),
+                }),
+                TaskKind::Regular,
+            )
+            .await?;
+
+        let result = core.submit(cazean_protocol::Op::Interrupt).await?;
+        assert_eq!(result, "interrupted");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cleanup_started.notified(),
+        )
+        .await
+        .context("cancelled task did not enter cleanup")?;
+
+        let core_for_shutdown = Core {
+            session: Arc::clone(&core.session),
+        };
+        let shutdown_handle = tokio::spawn(async move {
+            core_for_shutdown
+                .submit(cazean_protocol::Op::Shutdown)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !shutdown_handle.is_finished(),
+            "shutdown should block until the interrupted turn's cleanup persists"
+        );
+
+        cleanup_release.notify_waiters();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_handle)
+            .await
+            .context("shutdown did not finish after cleanup released")???;
+        assert_eq!(result, "shutdown");
         Ok(())
     }
 

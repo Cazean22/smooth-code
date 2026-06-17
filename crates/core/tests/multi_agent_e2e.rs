@@ -2111,6 +2111,168 @@ async fn resumed_completed_tool_loop_history_includes_tool_results() -> Result<(
     Ok(())
 }
 
+struct PreambleToolLoopDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for PreambleToolLoopDriver {
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(
+                    first_user_text(&prompt),
+                    Some("review the diff".to_string())
+                );
+                assert!(history.is_empty());
+                let tool_call = ToolCall::new(
+                    "tool-1".to_string(),
+                    ToolFunction::new(
+                        "normal_tool".to_string(),
+                        serde_json::json!({ "value": "ok" }),
+                    ),
+                )
+                .with_call_id("call-1".to_string());
+                // Assistant text streamed *before* the tool call, in one response:
+                // the preamble shape that previously survived the live view but
+                // vanished on resume.
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "I'll inspect the diff first.".to_string(),
+                            additional_params: None,
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-call-1".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-tool-phase".to_string()),
+                        response: String::new(),
+                    })),
+                ])))
+            }
+            1 => Ok(Box::pin(stream::iter(vec![
+                Ok(SessionCompletionEvent::AssistantItem(
+                    SessionAssistantContent::Text(Text {
+                        text: "review complete".to_string(),
+                        additional_params: None,
+                    }),
+                )),
+                Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                    assistant_message_id: Some("assistant-final".to_string()),
+                    response: "review complete".to_string(),
+                })),
+            ]))),
+            other => panic!("unexpected completion turn {other}"),
+        }
+    }
+
+    fn call_tool(
+        &self,
+        tool_name: &str,
+        args: &str,
+    ) -> futures_util::future::BoxFuture<'static, Result<String>> {
+        assert_eq!(tool_name, "normal_tool");
+        assert_eq!(args, r#"{"value":"ok"}"#);
+        Box::pin(async { Ok("tool-output".to_string()) })
+    }
+}
+
+struct PreambleToolLoopFactory;
+
+impl SessionModelFactory for PreambleToolLoopFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _ask_user_client: Option<AskUserClient>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        _system_prompt_kind: SystemPromptKind,
+        _agent_control: AgentControl,
+        _plan_mode: bool,
+    ) -> Result<SessionModel> {
+        Ok(SessionModel::Stub(Arc::new(PreambleToolLoopDriver {
+            calls: Mutex::new(0),
+        })))
+    }
+}
+
+/// A preamble (assistant text emitted before a tool call) is shown live via
+/// streaming deltas, but those are not persisted; resume rebuilds the transcript
+/// from persisted events alone. Regression test: the preamble must replay on
+/// resume, in order, ahead of its tool call and the turn's final message.
+#[tokio::test]
+async fn resumed_transcript_includes_preamble_before_tool_call() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
+
+    let manager = ThreadManagerState::new(None, Some(Arc::new(PreambleToolLoopFactory))).await?;
+    let started = manager.start_thread().await?;
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await?;
+
+    let turn = manager
+        .start_user_input(root_id, "review the diff".to_string())
+        .await?;
+    wait_for_turn_completion(&mut root_events, &turn).await;
+    drop(manager);
+
+    let resumed_manager =
+        ThreadManagerState::new(None, Some(Arc::new(PreambleToolLoopFactory))).await?;
+    let resumed = resumed_manager.resume_thread(root_id).await?;
+
+    let preamble_idx = resumed
+        .initial_messages
+        .iter()
+        .position(|event| {
+            matches!(event, EventMsg::AgentMessageCompleted(message)
+                if message.text == "I'll inspect the diff first.")
+        })
+        .expect("preamble assistant text must replay on resume");
+    let tool_started_idx = resumed
+        .initial_messages
+        .iter()
+        .position(|event| matches!(event, EventMsg::ToolCallStarted(_)))
+        .expect("tool call must replay on resume");
+    let final_idx = resumed
+        .initial_messages
+        .iter()
+        .position(|event| {
+            matches!(event, EventMsg::AgentMessageCompleted(message)
+                if message.text == "review complete")
+        })
+        .expect("final assistant message must replay on resume");
+
+    assert!(
+        preamble_idx < tool_started_idx,
+        "preamble must precede its tool call in the resumed transcript"
+    );
+    assert!(
+        tool_started_idx < final_idx,
+        "tool call must precede the final message in the resumed transcript"
+    );
+
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn idless_reasoning_completion_supersedes_pending_deltas_without_duplicating() -> Result<()> {
     let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;

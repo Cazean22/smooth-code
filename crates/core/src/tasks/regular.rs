@@ -399,6 +399,31 @@ impl AttemptState {
                 } => {
                     self.saw_assistant_item_this_attempt = true;
                     self.saw_tool_call_this_attempt = true;
+                    // A tool call ends the current assistant text segment, so any
+                    // text streamed before it is a finished preamble message. Text
+                    // only reaches the UI as (unpersisted) `AgentMessageDelta`s, and
+                    // the turn's lone persisted `AgentMessageCompleted` covers only
+                    // its final post-tool message — so without this, a preamble shows
+                    // live (committed when the tool call starts) but is lost on
+                    // resume, where the transcript is rebuilt from persisted events
+                    // alone. Emit it now, before the tool call's own events, so resume
+                    // replays it in order. Key the id off this call's unique internal
+                    // id so it cannot collide with the turn's other assistant-message
+                    // ids; a collision would make the resume/preview de-dupe
+                    // (`committed_assistant_item_id`) silently drop a message.
+                    if self.pending_tool_calls.is_empty() && !self.accumulated_text.is_empty() {
+                        session
+                            .emit_event(
+                                ctx,
+                                EventMsg::AgentMessageCompleted(AgentMessageCompletedEvent {
+                                    thread_id: session.id.to_string(),
+                                    turn_id: ctx.sub_id.clone(),
+                                    item_id: format!("{internal_call_id}-assistant-text"),
+                                    text: self.accumulated_text.clone(),
+                                }),
+                            )
+                            .await;
+                    }
                     session
                         .emit_event(
                             ctx,

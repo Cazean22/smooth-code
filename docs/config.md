@@ -63,5 +63,9 @@ local-proxy stand-in.
 - `[provider.websocket]` tunes the OpenAI WebSocket retry path used by both the
   provider stream and the manual turn-retry loop. `retry_budget = 0` disables
   pre-output retries. These values only affect the OpenAI provider.
+- `tools.web_search.enabled` (default `true`) declares OpenAI's hosted
+  `web_search` tool, which the backend executes server-side via the Responses
+  API; the model's answer streams back with citations. It applies to the OpenAI
+  provider only (other providers ignore it) and is suppressed while in plan mode.
 - `telemetry.log_file_name` must be a bare file name (no path separators, `.`,
   or `..`); it is written under `<workspace>/.cazean/logs/`.

@@ -23,7 +23,7 @@ pub use error::ConfigError;
 pub use schema::{
     AgentConfig, Config, KNOWN_PROVIDERS, Merge, OpenAiConfig, PartialConfig, ProviderConfig,
     ReasoningEffortConfig, ReasoningSummaryConfig, RunCommandConfig, TelemetryConfig, ToolsConfig,
-    TuiColors, TuiConfig, WebSocketConfig, normalize_provider,
+    TuiColors, TuiConfig, WebSearchConfig, WebSocketConfig, normalize_provider,
 };
 
 /// Relative path of the config file within a config root (XDG or project).
@@ -251,6 +251,36 @@ mod tests {
     #[test]
     fn unknown_field_is_rejected() {
         assert!(parse("[provider]\nmodle = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn web_search_enabled_by_default() -> TestResult {
+        let config = PartialConfig::default().resolve()?;
+        assert!(config.tools.web_search.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn web_search_can_be_disabled() -> TestResult {
+        let file = parse("[tools.web_search]\nenabled = false\n")?;
+        let config = PartialConfig::default().merge(file).resolve()?;
+        assert!(!config.tools.web_search.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn tools_subsections_merge_independently() -> TestResult {
+        // User disables web_search; project tweaks run_command. Neither layer's
+        // [tools.*] subsection should clobber the other.
+        let user = parse("[tools.web_search]\nenabled = false\n")?;
+        let project = parse("[tools.run_command]\ndefault_timeout_secs = 42\n")?;
+        let config = PartialConfig::default()
+            .merge(user)
+            .merge(project)
+            .resolve()?;
+        assert!(!config.tools.web_search.enabled);
+        assert_eq!(config.tools.run_command.default_timeout_secs, 42);
+        Ok(())
     }
 
     #[test]

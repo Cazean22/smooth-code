@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use cazean_config::{Config, ReasoningEffortConfig, ReasoningSummaryConfig};
+use cazean_config::{Config, OpenAiConfig, ReasoningEffortConfig, ReasoningSummaryConfig};
 use futures_util::{SinkExt, StreamExt};
 use rig::{
     OneOrMany,
@@ -23,7 +23,8 @@ use rig::{
             responses_api::{
                 AdditionalParameters, CompletionRequest as OpenAiResponsesCompletionRequest,
                 InputItem as OpenAiResponsesInputItem, Output, Reasoning as OpenAiReasoning,
-                ReasoningEffort, ReasoningSummary, ResponseStatus, ResponsesUsage,
+                ReasoningEffort, ReasoningSummary, ResponseStatus, ResponsesToolDefinition,
+                ResponsesUsage,
                 streaming::{
                     ContentPartChunkPart, ItemChunk, ItemChunkKind, ResponseChunkKind,
                     StreamingCompletionResponse as OpenAiStreamingCompletionResponse,
@@ -260,19 +261,18 @@ impl SessionModel {
                     .api_key(&openai.api_key)
                     .base_url(&openai.base_url);
                 let client = builder.build()?;
-                let additional_params = AdditionalParameters {
-                    reasoning: Some(
-                        OpenAiReasoning::new()
-                            .with_effort(reasoning_effort(openai.reasoning_effort))
-                            .with_summary_level(reasoning_summary(openai.reasoning_summary)),
-                    ),
-                    ..Default::default()
-                };
+                // Hosted `web_search` is OpenAI-only and is suppressed in plan
+                // mode, whose prompt enumerates an allowed-tool contract that an
+                // un-listed hosted tool would contradict.
+                let additional_params_json = openai_additional_params_json(
+                    openai,
+                    config.tools.web_search.enabled && !plan_mode,
+                );
                 let agent = build_agent(
                     client
                         .agent(&model)
                         .preamble(&preamble)
-                        .additional_params(additional_params.to_json()),
+                        .additional_params(additional_params_json),
                     cwd,
                     thread_id,
                     ask_user_client.clone(),
@@ -525,6 +525,45 @@ fn reasoning_summary(
         ReasoningSummaryConfig::Concise => ReasoningSummaryLevel::Concise,
         ReasoningSummaryConfig::Detailed => ReasoningSummaryLevel::Detailed,
     }
+}
+
+/// Wire value for OpenAI's hosted `web_search` tool. `external_web_access: true`
+/// requests live results and mirrors codex's working request shape against the
+/// shared backend; the serialization of this small Rig struct is infallible in
+/// practice, so the fallback is only a defensive equivalent.
+fn openai_web_search_tool_value() -> serde_json::Value {
+    serde_json::to_value(
+        ResponsesToolDefinition::web_search()
+            .with_config("external_web_access", serde_json::Value::Bool(true)),
+    )
+    .unwrap_or_else(|_| serde_json::json!({ "type": "web_search", "external_web_access": true }))
+}
+
+/// Build the OpenAI `additional_params` JSON: reasoning configuration plus, when
+/// `include_web_search`, the hosted `web_search` tool. This is the sole writer of
+/// the `"tools"` key, so there is no pre-existing array to merge with — Rig's
+/// request builder lifts `additional_params["tools"]` out and appends it to the
+/// request's tool list.
+fn openai_additional_params_json(
+    openai: &OpenAiConfig,
+    include_web_search: bool,
+) -> serde_json::Value {
+    let additional_params = AdditionalParameters {
+        reasoning: Some(
+            OpenAiReasoning::new()
+                .with_effort(reasoning_effort(openai.reasoning_effort))
+                .with_summary_level(reasoning_summary(openai.reasoning_summary)),
+        ),
+        ..Default::default()
+    };
+    let mut params = additional_params.to_json();
+    if include_web_search && let Some(object) = params.as_object_mut() {
+        object.insert(
+            "tools".to_string(),
+            serde_json::Value::Array(vec![openai_web_search_tool_value()]),
+        );
+    }
+    params
 }
 
 async fn stream_agent_completion<M>(
@@ -2084,9 +2123,12 @@ mod tests {
     };
     use tokio_tungstenite::{accept_async, tungstenite::Message as TestWebSocketMessage};
 
-    use cazean_config::Config;
+    use cazean_config::{Config, OpenAiConfig};
 
-    use super::{build_agent, compose_session_preamble};
+    use super::{
+        build_agent, compose_session_preamble, openai_additional_params_json,
+        openai_web_search_tool_value,
+    };
     use crate::{
         agent::{
             AgentControl, SystemPromptKind, plan_mode::plan_mode_tool_names, plan_mode_instructions,
@@ -2561,6 +2603,39 @@ mod tests {
             preamble,
             format!("Base prompt.\n\n{}", plan_mode_instructions())
         );
+    }
+
+    #[test]
+    fn web_search_tool_value_has_expected_wire_shape() {
+        let value = openai_web_search_tool_value();
+        assert_eq!(value["type"], "web_search");
+        assert_eq!(value["external_web_access"], true);
+    }
+
+    #[test]
+    fn additional_params_includes_web_search_when_enabled() {
+        let params = openai_additional_params_json(&OpenAiConfig::default(), true);
+        let Some(tools) = params.get("tools").and_then(|tools| tools.as_array()) else {
+            panic!("tools array should be present when web search is enabled: {params}");
+        };
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(|kind| kind.as_str()) == Some("web_search")),
+            "web_search tool should be present: {params}"
+        );
+        // Reasoning config is preserved alongside the injected tool.
+        assert!(params.get("reasoning").is_some());
+    }
+
+    #[test]
+    fn additional_params_omits_web_search_when_disabled() {
+        let params = openai_additional_params_json(&OpenAiConfig::default(), false);
+        assert!(
+            params.get("tools").is_none(),
+            "no tools key when web search is disabled: {params}"
+        );
+        assert!(params.get("reasoning").is_some());
     }
 
     #[tokio::test]

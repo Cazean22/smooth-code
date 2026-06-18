@@ -48,6 +48,12 @@ default_timeout_secs = 300       # used when a command omits timeout_secs
 max_timeout_secs = 3600          # hard cap; must be >= default_timeout_secs
 term_grace_ms = 2000             # SIGTERM-to-SIGKILL grace period
 
+[tools.web_search]
+# Declares OpenAI's hosted web_search tool, executed server-side via the
+# Responses API. OpenAI provider only (ignored by the other providers), and
+# suppressed while in plan mode.
+enabled = true
+
 [tui]
 highlight_theme = "CatppuccinMocha"   # any two-face theme, e.g. Dracula, Nord, GruvboxDark
 max_highlight_bytes = 524288

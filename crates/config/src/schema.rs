@@ -105,6 +105,7 @@ pub struct ToolsConfig {
     pub max_file_change_bytes: usize,
     pub max_todos: usize,
     pub max_skill_bytes: usize,
+    pub web_search: WebSearchConfig,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +113,13 @@ pub struct RunCommandConfig {
     pub default_timeout_secs: u64,
     pub max_timeout_secs: u64,
     pub term_grace_ms: u64,
+}
+
+/// The hosted `web_search` tool. Only the OpenAI provider declares it (it is
+/// executed server-side via the Responses API); other providers ignore it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebSearchConfig {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,6 +204,7 @@ impl Default for ToolsConfig {
             max_file_change_bytes: 512 * 1024,
             max_todos: 50,
             max_skill_bytes: 64 * 1024,
+            web_search: WebSearchConfig::default(),
         }
     }
 }
@@ -207,6 +216,12 @@ impl Default for RunCommandConfig {
             max_timeout_secs: 3600,
             term_grace_ms: 2000,
         }
+    }
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -309,6 +324,7 @@ pub struct PartialTools {
     pub max_file_change_bytes: Option<usize>,
     pub max_todos: Option<usize>,
     pub max_skill_bytes: Option<usize>,
+    pub web_search: Option<PartialWebSearch>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -317,6 +333,12 @@ pub struct PartialRunCommand {
     pub default_timeout_secs: Option<u64>,
     pub max_timeout_secs: Option<u64>,
     pub term_grace_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PartialWebSearch {
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -437,6 +459,7 @@ impl Merge for PartialTools {
             ),
             max_todos: overlay(self.max_todos, higher.max_todos),
             max_skill_bytes: overlay(self.max_skill_bytes, higher.max_skill_bytes),
+            web_search: merge_nested(self.web_search, higher.web_search),
         }
     }
 }
@@ -447,6 +470,14 @@ impl Merge for PartialRunCommand {
             default_timeout_secs: overlay(self.default_timeout_secs, higher.default_timeout_secs),
             max_timeout_secs: overlay(self.max_timeout_secs, higher.max_timeout_secs),
             term_grace_ms: overlay(self.term_grace_ms, higher.term_grace_ms),
+        }
+    }
+}
+
+impl Merge for PartialWebSearch {
+    fn merge(self, higher: Self) -> Self {
+        Self {
+            enabled: overlay(self.enabled, higher.enabled),
         }
     }
 }
@@ -562,6 +593,7 @@ fn resolve_tools(partial: PartialTools, def: ToolsConfig) -> ToolsConfig {
             .unwrap_or(def.max_file_change_bytes),
         max_todos: partial.max_todos.unwrap_or(def.max_todos),
         max_skill_bytes: partial.max_skill_bytes.unwrap_or(def.max_skill_bytes),
+        web_search: resolve_web_search(partial.web_search.unwrap_or_default(), def.web_search),
     }
 }
 
@@ -572,6 +604,12 @@ fn resolve_run_command(partial: PartialRunCommand, def: RunCommandConfig) -> Run
             .unwrap_or(def.default_timeout_secs),
         max_timeout_secs: partial.max_timeout_secs.unwrap_or(def.max_timeout_secs),
         term_grace_ms: partial.term_grace_ms.unwrap_or(def.term_grace_ms),
+    }
+}
+
+fn resolve_web_search(partial: PartialWebSearch, def: WebSearchConfig) -> WebSearchConfig {
+    WebSearchConfig {
+        enabled: partial.enabled.unwrap_or(def.enabled),
     }
 }
 

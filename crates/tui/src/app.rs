@@ -458,9 +458,12 @@ struct UiModel {
     /// Stacked full-screen subagent previews opened from transcript-select mode;
     /// the top view receives keys and is rendered, nesting pushes deeper.
     preview_stack: Vec<SubagentPreviewView>,
-    /// Subagent previews popped with Ctrl-O, newest last. Ctrl-I reopens these
-    /// by issuing fresh preview requests, preserving server watcher refcounts.
-    preview_forward_stack: Vec<ThreadId>,
+    /// Subagent previews parked with Ctrl-O, newest last. The intact views are
+    /// kept here (still subscribed and still fed live events) so Ctrl-I restores
+    /// them instantly with their in-flight stream — no server round-trip, no
+    /// snapshot rebuild. The server watcher is released only when a view is truly
+    /// discarded (stack cleared, or forward history invalidated by a new open).
+    preview_forward_stack: Vec<SubagentPreviewView>,
     /// Timestamp of the last Esc press in Normal mode (or leaving Insert),
     /// armed for double-Esc detection.
     last_esc: Option<Instant>,
@@ -565,25 +568,37 @@ impl UiModel {
                 // A parent's CollabAgentCompleted names a previewed child by
                 // id, not by source thread: patch every matching view first,
                 // before source routing can consume the event (with a nested
-                // stack [A, B], B's completion arrives with source A).
+                // stack [A, B], B's completion arrives with source A). Parked
+                // (Ctrl-O'd) views stay subscribed, so patch them too.
                 if let EventMsg::CollabAgentCompleted(completed) = &event.msg {
-                    for view in &mut self.preview_stack {
+                    for view in self
+                        .preview_stack
+                        .iter_mut()
+                        .chain(self.preview_forward_stack.iter_mut())
+                    {
                         if view.thread_id == completed.child_thread_id {
                             view.complete_from_parent(completed.status.clone());
                         }
                     }
                 }
                 // Events from previewed threads feed their stack views and
-                // never touch the main transcript.
+                // never touch the main transcript. Parked views are still
+                // subscribed, so they stay in sync while backgrounded and
+                // re-entry (Ctrl-I) shows everything that arrived meanwhile.
                 if let Some(source) = source_thread_id
                     && self
                         .preview_stack
                         .iter()
+                        .chain(self.preview_forward_stack.iter())
                         .any(|view| view.thread_id == source)
                 {
                     // Previews render full-screen, so wrap at terminal width.
                     let width = self.terminal_width.max(1);
-                    for view in &mut self.preview_stack {
+                    for view in self
+                        .preview_stack
+                        .iter_mut()
+                        .chain(self.preview_forward_stack.iter_mut())
+                    {
                         if view.thread_id != source {
                             continue;
                         }

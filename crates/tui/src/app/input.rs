@@ -469,12 +469,13 @@ impl UiModel {
             };
             return Vec::new();
         };
-        self.preview_forward_stack.clear();
+        let mut effects = self.discard_forward_previews();
         self.status_line = String::from("Opening subagent…");
-        vec![self.effect(
+        effects.push(self.effect(
             EffectContext::ThreadPreview { thread_id },
             UiEffectKind::ThreadPreview { thread_id },
-        )]
+        ));
+        effects
     }
 
     /// Enter submits only with Ctrl. Cmd/Super is intentionally not accepted:

@@ -147,9 +147,11 @@ impl UiModel {
         }
         // Previewed subagents are interactive too: their questions and plan
         // approvals are accepted (the preview stack is closed by the handler).
+        // Parked (Ctrl-O'd) previews stay subscribed, so accept them as well.
         if self
             .preview_stack
             .iter()
+            .chain(self.preview_forward_stack.iter())
             .any(|view| view.thread_id == requested_thread_id)
         {
             return None;

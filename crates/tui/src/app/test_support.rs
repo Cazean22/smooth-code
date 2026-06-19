@@ -299,6 +299,24 @@ pub(in crate::app) fn preview_targets(effects: &[UiEffect]) -> Vec<ThreadId> {
         .collect()
 }
 
+/// The thread ids of parked (forward-stack) preview views, in stack order.
+pub(in crate::app) fn forward_thread_ids(
+    forward_stack: &[crate::subagent_preview::SubagentPreviewView],
+) -> Vec<ThreadId> {
+    forward_stack.iter().map(|view| view.thread_id).collect()
+}
+
+/// A parked (Ctrl-O'd) preview view for `thread_id`, for seeding the forward
+/// stack in tests that exercise forward-history invalidation.
+pub(in crate::app) fn parked_preview_view(
+    thread_id: ThreadId,
+) -> crate::subagent_preview::SubagentPreviewView {
+    crate::subagent_preview::SubagentPreviewView::from_preview_response(
+        preview_response(thread_id, Vec::new()),
+        80,
+    )
+}
+
 pub(in crate::app) fn child_event(id: &str, msg: EventMsg) -> Event {
     Event {
         id: id.to_owned(),

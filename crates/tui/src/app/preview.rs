@@ -1,31 +1,53 @@
 use super::*;
 
 impl UiModel {
+    /// Status text for the currently-open preview: reflects the top view's
+    /// sub-mode (scroll vs. select) and whether parked views remain for Ctrl-I.
+    /// Centralized because Ctrl-I now restores the exact parked view, including
+    /// its `select_mode`, so the hint must match the live key handling — and
+    /// Ctrl-I forward works in both sub-modes, but only when something is parked.
+    fn preview_status_line(&self) -> String {
+        let forward = if self.preview_forward_stack.is_empty() {
+            ""
+        } else {
+            ", Ctrl-I forward"
+        };
+        match self.preview_stack.last() {
+            Some(view) if view.select_mode => {
+                format!("Subagent select — j/k move, Enter open, Esc scroll, Ctrl-O back{forward}")
+            }
+            Some(view) => format!("{} — Ctrl-O back{forward}", view.header_label()),
+            None => format!("Returned to parent session{forward}"),
+        }
+    }
+
+    /// Park the top preview (Ctrl-O): the intact view — with its in-flight
+    /// stream and live subscription — moves to the forward stack so Ctrl-I can
+    /// restore it instantly. No `ThreadUnwatch`: the watcher is kept until the
+    /// view is truly discarded (`clear_preview_stack` / `discard_forward_previews`).
     pub(in crate::app) fn pop_preview_back(&mut self) -> Vec<UiEffect> {
         let Some(popped) = self.preview_stack.pop() else {
             return Vec::new();
         };
-        let thread_id = popped.thread_id;
-        self.preview_forward_stack.push(thread_id);
-        self.status_line = match self.preview_stack.last() {
-            Some(top) => format!("{} — Ctrl-O back, Ctrl-I forward", top.header_label()),
-            None => String::from("Returned to parent session — Ctrl-I forward"),
-        };
-        vec![self.effect(
-            EffectContext::ThreadUnwatch,
-            UiEffectKind::ThreadUnwatch { thread_id },
-        )]
+        self.preview_forward_stack.push(popped);
+        self.status_line = self.preview_status_line();
+        Vec::new()
     }
 
+    /// Restore the most recently parked preview (Ctrl-I): the view is intact, so
+    /// no server round-trip and no snapshot rebuild — just re-stack it and let
+    /// auto-scroll catch up to anything that streamed while it was parked.
     pub(in crate::app) fn reopen_forward_preview(&mut self) -> Vec<UiEffect> {
-        let Some(thread_id) = self.preview_forward_stack.pop() else {
+        let Some(mut view) = self.preview_forward_stack.pop() else {
             return Vec::new();
         };
-        self.status_line = String::from("Opening subagent…");
-        vec![self.effect(
-            EffectContext::ThreadPreview { thread_id },
-            UiEffectKind::ThreadPreview { thread_id },
-        )]
+        if view.auto_scroll {
+            let width = self.terminal_width.max(1);
+            view.scroll_to_bottom(width, self.viewport_height);
+        }
+        self.preview_stack.push(view);
+        self.status_line = self.preview_status_line();
+        Vec::new()
     }
 
     /// Keys while a subagent preview is open. The top view owns the keyboard
@@ -50,8 +72,9 @@ impl UiModel {
     }
 
     /// A preview's default sub-mode: Normal-like line/page scrolling with no
-    /// selection highlight. `Ctrl-O` pops the preview (one `ThreadUnwatch` per
-    /// pop — the server refcounts watchers); `Esc Esc` enters the select sub-mode.
+    /// selection highlight. `Ctrl-O` parks the preview (keeping its watcher so
+    /// `Ctrl-I` can restore it — see `pop_preview_back`); `Esc Esc` enters the
+    /// select sub-mode.
     pub(in crate::app) fn handle_preview_scroll_key(
         &mut self,
         key_event: KeyEvent,
@@ -78,9 +101,7 @@ impl UiModel {
                     view.selected_tool_entry =
                         view.default_tool_entry_for_selection(view.selected, false);
                     view.ensure_selected_visible(width, viewport);
-                    self.status_line = String::from(
-                        "Subagent select — j/k move, Enter open, Esc scroll, Ctrl-O back",
-                    );
+                    self.status_line = self.preview_status_line();
                 } else {
                     view.pending_esc = Some(now);
                 }
@@ -181,8 +202,7 @@ impl UiModel {
                 view.pending_g = None;
                 view.pending_esc = None;
                 view.pending_args = None;
-                self.status_line =
-                    String::from("Subagent preview — Ctrl-O back, Ctrl-I forward, Esc Esc select");
+                self.status_line = self.preview_status_line();
                 Vec::new()
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -228,12 +248,13 @@ impl UiModel {
                 });
                 match target {
                     Some((_, Some(thread_id))) => {
-                        self.preview_forward_stack.clear();
+                        let mut effects = self.discard_forward_previews();
                         self.status_line = String::from("Opening subagent…");
-                        vec![self.effect(
+                        effects.push(self.effect(
                             EffectContext::ThreadPreview { thread_id },
                             UiEffectKind::ThreadPreview { thread_id },
-                        )]
+                        ));
+                        effects
                     }
                     Some((true, None)) => {
                         self.status_line =
@@ -503,22 +524,16 @@ impl UiModel {
         let width = self.terminal_width.max(1);
         let mut view = SubagentPreviewView::from_preview_response(response, width);
         view.scroll_to_bottom(width, self.viewport_height);
-        self.status_line = if self.preview_forward_stack.is_empty() {
-            format!("{} — Ctrl-O back", view.header_label())
-        } else {
-            format!("{} — Ctrl-O back, Ctrl-I forward", view.header_label())
-        };
         self.preview_stack.push(view);
+        self.status_line = self.preview_status_line();
         Vec::new()
     }
 
-    /// Pop every preview view, emitting one `ThreadUnwatch` per view — the
-    /// server refcounts watchers, so each successful preview needs exactly
-    /// one release, duplicates included.
-    pub(in crate::app) fn clear_preview_stack(&mut self) -> Vec<UiEffect> {
-        self.preview_forward_stack.clear();
-        let views = std::mem::take(&mut self.preview_stack);
-        views
+    /// Discard every parked (forward-stack) preview, emitting one `ThreadUnwatch`
+    /// per view — parked views stay subscribed, so opening a different subagent
+    /// (which invalidates forward history) must release their watchers.
+    pub(in crate::app) fn discard_forward_previews(&mut self) -> Vec<UiEffect> {
+        std::mem::take(&mut self.preview_forward_stack)
             .into_iter()
             .map(|view| {
                 self.effect(
@@ -529,6 +544,23 @@ impl UiModel {
                 )
             })
             .collect()
+    }
+
+    /// Pop every preview view across both stacks, emitting one `ThreadUnwatch`
+    /// per view — the server refcounts watchers, so each successful preview (open
+    /// or parked) needs exactly one release, duplicates included.
+    pub(in crate::app) fn clear_preview_stack(&mut self) -> Vec<UiEffect> {
+        let mut effects = self.discard_forward_previews();
+        let views = std::mem::take(&mut self.preview_stack);
+        effects.extend(views.into_iter().map(|view| {
+            self.effect(
+                EffectContext::ThreadUnwatch,
+                UiEffectKind::ThreadUnwatch {
+                    thread_id: view.thread_id,
+                },
+            )
+        }));
+        effects
     }
 
     /// Full-screen subagent preview: a header naming the agent and its live
@@ -572,11 +604,18 @@ impl UiModel {
         // The status line stays visible inside the preview: in-preview
         // feedback ("Subagent not started yet", failed nested opens) would
         // otherwise be invisible until the user exits.
-        let hint = if select_mode {
-            "j/k move  Enter nested  y copy selected tool  yy args  Esc scroll  Ctrl-O back"
+        let mut hint = if select_mode {
+            String::from(
+                "j/k move  Enter nested  y copy selected tool  yy args  Esc scroll  Ctrl-O back",
+            )
         } else {
-            "j/k scroll  gg/G top/bottom  Esc Esc select  Ctrl-O back  Ctrl-I forward"
+            String::from("j/k scroll  gg/G top/bottom  Esc Esc select  Ctrl-O back")
         };
+        // Ctrl-I forward works in both sub-modes, but only when something is
+        // parked — don't advertise it otherwise.
+        if !self.preview_forward_stack.is_empty() {
+            hint.push_str("  Ctrl-I forward");
+        }
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw(self.status_line.clone()),
@@ -741,7 +780,10 @@ mod tests {
         if let Some(state) = app.model.transcript_select.as_mut() {
             state.selected = tool_row;
         }
-        app.model.preview_forward_stack.push(ThreadId::new());
+        let parked = ThreadId::new();
+        app.model
+            .preview_forward_stack
+            .push(parked_preview_view(parked));
 
         let t = t0 + Duration::from_millis(300);
         let effects = app.model.handle_key_event_at(key(KeyCode::Char('g')), t);
@@ -758,14 +800,12 @@ mod tests {
             .model
             .handle_key_event_at(key(KeyCode::Enter), t + Duration::from_millis(200));
 
-        let preview_targets: Vec<ThreadId> = effects
-            .iter()
-            .filter_map(|effect| match effect.kind {
-                UiEffectKind::ThreadPreview { thread_id } => Some(thread_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(preview_targets, vec![child_thread_id]);
+        assert_eq!(preview_targets(&effects), vec![child_thread_id]);
+        assert_eq!(
+            unwatch_targets(&effects),
+            vec![parked],
+            "opening a different subagent releases parked-view watchers"
+        );
         assert!(app.model.preview_forward_stack.is_empty());
         assert_eq!(app.model.mode, UiMode::TranscriptSelect);
         assert_eq!(
@@ -857,14 +897,12 @@ mod tests {
 
         let t0 = Instant::now();
         enter_select(&mut app.model, t0);
-        let Some(tool_row) = app
+        let tool_row = app
             .model
             .transcript_items
             .iter()
             .position(|item| item.tool_group_cell().is_some())
-        else {
-            panic!("spawn tool row index");
-        };
+            .expect("spawn tool row index");
         if let Some(state) = app.model.transcript_select.as_mut() {
             state.selected = tool_row;
         }
@@ -1040,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_ctrl_o_pops_one_view_and_ctrl_i_reopens_forward() {
+    fn preview_ctrl_o_parks_view_and_ctrl_i_restores_it_without_refetch() {
         let mut model = select_model_with_items(4);
         let t0 = Instant::now();
         enter_select(&mut model, t0);
@@ -1053,48 +1091,51 @@ mod tests {
         open_preview(&mut model, child, Vec::new());
         open_preview(&mut model, child, Vec::new());
 
+        let forward_ids =
+            |model: &UiModel| -> Vec<ThreadId> { forward_thread_ids(&model.preview_forward_stack) };
+
         let t = t0 + Duration::from_millis(300);
         let ctrl_o = modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
         let ctrl_i = modified_key(KeyCode::Char('i'), KeyModifiers::CONTROL);
-        let effects = model.handle_key_event_at(ctrl_o, t);
-        assert_eq!(
-            unwatch_targets(&effects),
-            vec![child],
-            "first back unwatches"
-        );
-        assert_eq!(model.preview_stack.len(), 1);
-        assert_eq!(model.preview_forward_stack, vec![child]);
 
+        // Ctrl-O parks the intact view — no unwatch, the subscription is kept.
+        let effects = model.handle_key_event_at(ctrl_o, t);
+        assert!(
+            unwatch_targets(&effects).is_empty(),
+            "parking keeps the watcher"
+        );
+        assert!(preview_targets(&effects).is_empty(), "no refetch on park");
+        assert_eq!(model.preview_stack.len(), 1);
+        assert_eq!(forward_ids(&model), vec![child]);
+
+        // Ctrl-I restores it with no server round-trip.
         let effects = model.handle_key_event_at(ctrl_i, t + Duration::from_millis(50));
-        assert_eq!(preview_targets(&effects), vec![child]);
+        assert!(
+            preview_targets(&effects).is_empty(),
+            "no refetch on restore"
+        );
+        assert!(unwatch_targets(&effects).is_empty());
         assert!(model.preview_forward_stack.is_empty());
-        open_preview(&mut model, child, Vec::new());
         assert_eq!(model.preview_stack.len(), 2);
 
+        // Park both, draining the stack back to the parent select mode.
         let effects = model.handle_key_event_at(ctrl_o, t + Duration::from_millis(100));
-        assert_eq!(
-            unwatch_targets(&effects),
-            vec![child],
-            "second back unwatches"
-        );
+        assert!(unwatch_targets(&effects).is_empty());
         assert_eq!(model.preview_stack.len(), 1);
 
         let effects = model.handle_key_event_at(ctrl_o, t + Duration::from_millis(150));
-        assert_eq!(
-            unwatch_targets(&effects),
-            vec![child],
-            "third back unwatches again — the server refcount drains to zero"
-        );
+        assert!(unwatch_targets(&effects).is_empty());
         assert!(model.preview_stack.is_empty());
 
         assert_eq!(model.mode, UiMode::TranscriptSelect);
         assert_eq!(model.transcript_select.map(|state| state.selected), Some(2));
         assert_eq!(model.scroll, parent_scroll);
-        assert_eq!(model.preview_forward_stack, vec![child, child]);
+        assert_eq!(forward_ids(&model), vec![child, child]);
 
         let effects = model.handle_key_event_at(ctrl_i, t + Duration::from_millis(200));
-        assert_eq!(preview_targets(&effects), vec![child]);
-        assert_eq!(model.preview_forward_stack, vec![child]);
+        assert!(preview_targets(&effects).is_empty());
+        assert_eq!(model.preview_stack.len(), 1);
+        assert_eq!(forward_ids(&model), vec![child]);
     }
 
     #[test]
@@ -1149,7 +1190,10 @@ mod tests {
         // `Enter` on the spawn row nests a second preview. `Enter` lives in the
         // select sub-mode, reached with `Esc Esc`. A fresh `Enter` branch clears
         // any Ctrl-I forward history left by prior back navigation.
-        model.preview_forward_stack.push(ThreadId::new());
+        let parked = ThreadId::new();
+        model
+            .preview_forward_stack
+            .push(parked_preview_view(parked));
         let t0 = Instant::now();
         let _ = model.handle_key_event_at(key(KeyCode::Esc), t0);
         let _ = model.handle_key_event_at(key(KeyCode::Esc), t0 + Duration::from_millis(50));
@@ -1157,6 +1201,11 @@ mod tests {
             model.handle_key_event_at(key(KeyCode::Enter), t0 + Duration::from_millis(100));
         let targets = preview_targets(&effects);
         assert_eq!(targets, vec![grandchild]);
+        assert_eq!(
+            unwatch_targets(&effects),
+            vec![parked],
+            "nesting a new preview releases parked-view watchers"
+        );
         assert!(model.preview_forward_stack.is_empty());
         open_preview(&mut model, grandchild, Vec::new());
         assert_eq!(model.preview_stack.len(), 2);
@@ -1304,13 +1353,18 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(model.preview_stack.len(), 1);
 
-        // `Ctrl-O` in scroll mode pops the preview with exactly one unwatch.
+        // `Ctrl-O` in scroll mode parks the preview (no unwatch — the view and
+        // its subscription are kept so Ctrl-I can restore it).
         let effects = model.handle_key_event_at(
             modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL),
             t0 + Duration::from_millis(200),
         );
         assert!(model.preview_stack.is_empty());
-        assert_eq!(unwatch_targets(&effects), vec![child]);
+        assert!(unwatch_targets(&effects).is_empty());
+        assert_eq!(
+            forward_thread_ids(&model.preview_forward_stack),
+            vec![child]
+        );
     }
 
     #[test]
@@ -1369,6 +1423,59 @@ mod tests {
         );
     }
 
+    /// A parked (Ctrl-O'd) preview stays subscribed, so its interactive requests
+    /// must be accepted — and accepting closes both stacks, releasing the parked
+    /// watcher.
+    #[test]
+    fn server_request_for_parked_preview_is_accepted_and_clears_both_stacks() {
+        let mut model = workspace_normal_model();
+        let parent = ThreadId::new();
+        let child = ThreadId::new();
+        model.current_thread_id = Some(parent);
+        open_preview(&mut model, child, Vec::new());
+
+        // Ctrl-O parks the view into the (still-subscribed) forward stack.
+        let ctrl_o = modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let _ = model.handle_key_event_at(ctrl_o, Instant::now());
+        assert!(model.preview_stack.is_empty());
+        assert_eq!(
+            forward_thread_ids(&model.preview_forward_stack),
+            vec![child]
+        );
+
+        let request = ServerRequest::AskUserQuestion {
+            request_id: RequestId(11),
+            params: AskUserQuestionParams {
+                thread_id: child.to_string(),
+                turn_id: String::from("0"),
+                questions: vec![AskUserQuestion {
+                    question: String::from("Proceed?"),
+                    header: String::from("Confirm"),
+                    multi_select: false,
+                    options: vec![AskUserQuestionOption {
+                        label: String::from("Yes"),
+                        description: String::from("go"),
+                        preview: None,
+                    }],
+                }],
+            },
+        };
+        let effects = model.update(UiEvent::ServerRequest(request));
+        assert!(
+            model.question_picker.is_some(),
+            "a parked view's question is accepted"
+        );
+        assert!(
+            model.preview_forward_stack.is_empty(),
+            "accepting closes the forward stack too"
+        );
+        assert_eq!(
+            unwatch_targets(&effects),
+            vec![child],
+            "the parked watcher is released exactly once"
+        );
+    }
+
     #[test]
     fn preview_mid_stream_completion_uses_full_text_not_tail() {
         let mut model = workspace_normal_model();
@@ -1414,6 +1521,99 @@ mod tests {
         assert_eq!(
             raw, "the full message including the tail of the message",
             "the completed full text wins over the streamed tail"
+        );
+    }
+
+    /// Regression: parking a mid-stream preview with Ctrl-O and restoring it with
+    /// Ctrl-I must keep the partial assistant text already streamed — the view is
+    /// preserved, not rebuilt from a snapshot that lacks the in-flight deltas.
+    #[test]
+    fn preview_partial_stream_survives_park_and_restore() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(&mut model, child, Vec::new());
+
+        let delta = |text: &str| UiEvent::Protocol {
+            source_thread_id: Some(child),
+            event: Box::new(child_event(
+                "d",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: child.to_string(),
+                    turn_id: String::from("0"),
+                    item_id: String::from("m1"),
+                    delta: String::from(text),
+                }),
+            )),
+            viewport_height: 20,
+        };
+        let visible = |model: &mut UiModel| -> String {
+            model
+                .preview_stack
+                .last_mut()
+                .expect("top preview view")
+                .visible_lines(80, 20)
+                .join("\n")
+        };
+
+        let _ = model.update(delta("partial in-flight text"));
+        assert!(
+            visible(&mut model).contains("partial in-flight text"),
+            "the streamed partial shows before navigation"
+        );
+
+        let t0 = Instant::now();
+        let ctrl_o = modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let ctrl_i = modified_key(KeyCode::Char('i'), KeyModifiers::CONTROL);
+        let _ = model.handle_key_event_at(ctrl_o, t0);
+        let _ = model.handle_key_event_at(ctrl_i, t0 + Duration::from_millis(50));
+
+        assert!(
+            visible(&mut model).contains("partial in-flight text"),
+            "the partial survives the Ctrl-O / Ctrl-I round-trip"
+        );
+    }
+
+    /// Parked previews stay subscribed, so deltas that arrive while a view is
+    /// backgrounded accumulate and are all present on Ctrl-I.
+    #[test]
+    fn preview_keeps_streaming_while_parked() {
+        let mut model = workspace_normal_model();
+        let child = ThreadId::new();
+        open_preview(&mut model, child, Vec::new());
+
+        let delta = |text: &str| UiEvent::Protocol {
+            source_thread_id: Some(child),
+            event: Box::new(child_event(
+                "d",
+                EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                    thread_id: child.to_string(),
+                    turn_id: String::from("0"),
+                    item_id: String::from("m1"),
+                    delta: String::from(text),
+                }),
+            )),
+            viewport_height: 20,
+        };
+
+        let _ = model.update(delta("first chunk "));
+        let t0 = Instant::now();
+        let ctrl_o = modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let ctrl_i = modified_key(KeyCode::Char('i'), KeyModifiers::CONTROL);
+        let _ = model.handle_key_event_at(ctrl_o, t0);
+
+        // While parked: routed to the forward-stack view, which is still live.
+        let _ = model.update(delta("second chunk"));
+        let _ = model.handle_key_event_at(ctrl_i, t0 + Duration::from_millis(50));
+
+        let visible = model
+            .preview_stack
+            .last_mut()
+            .expect("top preview view")
+            .visible_lines(80, 20)
+            .join("\n");
+        assert!(
+            visible.contains("first chunk") && visible.contains("second chunk"),
+            "both pre-park and while-parked deltas render: {visible:?}"
         );
     }
 

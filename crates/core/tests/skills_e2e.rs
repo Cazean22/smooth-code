@@ -134,9 +134,12 @@ impl SessionModelDriver for SkillCallDriver {
         Box::pin(async move {
             assert_eq!(tool_name, "skill");
             let parsed = serde_json::from_str::<tools::SkillArgs>(&args)?;
-            rig::tool::Tool::call(&tools::SkillTool::new(cwd), parsed)
-                .await
-                .map_err(Into::into)
+            rig::tool::Tool::call(
+                &tools::SkillTool::new(vec![tools::project_skills_dir(&cwd)]),
+                parsed,
+            )
+            .await
+            .map_err(Into::into)
         })
     }
 }
@@ -171,7 +174,7 @@ async fn skill_tool_call_returns_skill_instructions_to_the_model() -> Result<()>
     // The session resolves paths against its creation-time cwd, so derive the
     // skills dir the same way (TempDir may be a symlink on macOS).
     let cwd = std::env::current_dir()?;
-    let skill_dir = tools::skills_dir(&cwd).join("deploy");
+    let skill_dir = tools::project_skills_dir(&cwd).join("deploy");
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(
         skill_dir.join("SKILL.md"),
@@ -327,7 +330,7 @@ async fn explore_children_get_no_skills_advertising_or_slash_expansion() -> Resu
     std::env::set_current_dir(workspace.path())?;
 
     let cwd = std::env::current_dir()?;
-    let skill_dir = tools::skills_dir(&cwd).join("deploy");
+    let skill_dir = tools::project_skills_dir(&cwd).join("deploy");
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(
         skill_dir.join("SKILL.md"),

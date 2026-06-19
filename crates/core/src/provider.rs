@@ -471,7 +471,10 @@ where
     // Progress tracking is available everywhere except read-only Explore agents.
     let builder = builder
         .tool(TodoWriteTool::new().with_max_todos(tools.max_todos))
-        .tool(SkillTool::new(cwd.clone()).with_max_skill_bytes(tools.max_skill_bytes));
+        .tool(
+            SkillTool::new(tools::skill_roots(cazean_config::user_skills_dir(), &cwd))
+                .with_max_skill_bytes(tools.max_skill_bytes),
+        );
     // File-mutating tools are only registered outside plan mode;
     // plan-mode-specific tools (`plan_write`, `exit_plan_mode`) are only
     // registered inside plan mode.

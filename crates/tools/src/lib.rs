@@ -38,6 +38,9 @@ pub use plan_write::{PlanWriteArgs, PlanWriteTool, plan_file_path};
 pub use read::{ReadArgs, ReadTool};
 pub use run_command::{RunCommandArgs, RunCommandTool};
 pub use skill::{SkillArgs, SkillTool};
-pub use skills::{Skill, SkillMeta, list_skills, load_skill, render_skill_invocation, skills_dir};
+pub use skills::{
+    Skill, SkillMeta, list_skills, load_skill, project_skills_dir, render_skill_invocation,
+    skill_roots,
+};
 pub use todo_write::{TodoInput, TodoWriteArgs, TodoWriteTool};
 pub use write::{WriteArgs, WriteTool};

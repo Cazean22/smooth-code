@@ -29,7 +29,7 @@
 
 ## Persistence and Events
 
-- Rollout sessions are newline-delimited JSON under `.cazean/sessions/YYYY/MM/DD/*.jsonl`; telemetry logs go to `.cazean/logs/cazean-tui.log`; multi-agent thread metadata lives in `.cazean/state.db`.
+- Rollout sessions are newline-delimited JSON under `.cazean/sessions/YYYY/MM/DD/*.jsonl`; telemetry logs go to `~/.cazean/logs/cazean.log`; multi-agent thread metadata lives in `.cazean/state.db`.
 - `ThreadManagerState::start_thread` creates a root thread, registers `/root` in `AgentControl`, persists root metadata, and emits `SessionConfigured` after app-server subscribes.
 - `ThreadManagerState::resume_thread` reloads rollout history/events and rehydrates open child subtrees from SQLite, emitting `CollabResumeBegin`/`CollabResumeEnd` initial messages for resumed children.
 - Only selected protocol events are persisted to rollout. Check `rollout::persist_event` before assuming a new event will replay on resume.

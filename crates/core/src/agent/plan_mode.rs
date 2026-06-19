@@ -30,7 +30,7 @@ pub(crate) const PLAN_MODE_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "skill",
-        "load a project skill's instructions by name; only invoke skills listed in the \
+        "load a skill's instructions by name; only invoke skills listed in the \
          Available Skills context block.",
     ),
     ("plan_write", "write your plan to the per-thread plan file."),

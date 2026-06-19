@@ -206,7 +206,7 @@ pub(in crate::app) fn skills_fixture()
 -> Result<(tempfile::TempDir, UiModel), Box<dyn std::error::Error>> {
     let temp = tempfile::TempDir::new()?;
     for (name, description) in [("deploy", "Deploy the app"), ("review", "Review a PR")] {
-        let dir = tools::skills_dir(temp.path()).join(name);
+        let dir = tools::project_skills_dir(temp.path()).join(name);
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
             dir.join("SKILL.md"),
@@ -214,7 +214,7 @@ pub(in crate::app) fn skills_fixture()
         )?;
     }
     let mut model = workspace_insert_model();
-    model.skills_root = temp.path().to_path_buf();
+    model.skill_roots = vec![tools::project_skills_dir(temp.path())];
     Ok((temp, model))
 }
 

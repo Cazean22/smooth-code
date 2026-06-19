@@ -612,7 +612,7 @@ impl UiModel {
         };
         if self.skill_popup.is_none() {
             let skills = tools::list_skills(
-                &self.skills_root,
+                &self.skill_roots,
                 crate::config_state::current().tools.max_skill_bytes,
             );
             if skills.is_empty() {
@@ -1002,7 +1002,7 @@ mod tests {
     fn slash_without_skills_does_not_open_popup() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::TempDir::new()?;
         let mut model = workspace_insert_model();
-        model.skills_root = temp.path().to_path_buf();
+        model.skill_roots = vec![tools::project_skills_dir(temp.path())];
 
         let _ = model.handle_key_event(key(KeyCode::Char('/')));
         assert!(model.skill_popup.is_none());

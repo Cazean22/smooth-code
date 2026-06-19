@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Maximum bytes of a SKILL.md file that are read; longer bodies are truncated.
@@ -24,9 +25,23 @@ pub struct Skill {
     pub body: String,
 }
 
-/// Directory that holds project skills: `<cwd>/.cazean/skills`.
-pub fn skills_dir(cwd: &Path) -> PathBuf {
+/// Directory that holds a project's skills: `<cwd>/.cazean/skills`.
+pub fn project_skills_dir(cwd: &Path) -> PathBuf {
     cwd.join(".cazean").join("skills")
+}
+
+/// Assemble the ordered skill roots (ascending precedence) for a session: the
+/// user-global directory (if discoverable) first, then the project directory,
+/// so a project skill overrides a same-named user-global one. The global dir is
+/// passed in (resolved by the caller via `cazean-config`) to keep this crate
+/// free of home/env logic.
+pub fn skill_roots(user_global: Option<PathBuf>, cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(global) = user_global {
+        roots.push(global);
+    }
+    roots.push(project_skills_dir(cwd));
+    roots
 }
 
 fn is_valid_skill_name(name: &str) -> bool {
@@ -37,51 +52,61 @@ fn is_valid_skill_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// List all valid skills under `<cwd>/.cazean/skills`, sorted by name.
+/// List all valid skills discovered across `roots`, sorted by name.
 ///
-/// Entries that are not directories, have invalid names, lack a SKILL.md, or
-/// fail frontmatter validation are skipped with a warning rather than
-/// surfacing an error: a single malformed skill must not break discovery.
-pub fn list_skills(cwd: &Path, max_skill_bytes: usize) -> Vec<SkillMeta> {
-    let dir = skills_dir(cwd);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut skills = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+/// `roots` are searched in ascending precedence: a skill in a later root
+/// overrides a same-named skill in an earlier one (callers pass the user-global
+/// dir first and the project dir last, so project skills win). Entries that are
+/// not directories, have invalid names, lack a SKILL.md, or fail frontmatter
+/// validation are skipped with a warning rather than surfacing an error: a
+/// single malformed skill must not break discovery, and a malformed skill never
+/// shadows a valid same-named one from a lower-precedence root.
+pub fn list_skills(roots: &[PathBuf], max_skill_bytes: usize) -> Vec<SkillMeta> {
+    // Keyed by name so a higher-precedence root overwrites; BTreeMap also yields
+    // the name-sorted output for free.
+    let mut by_name: BTreeMap<String, SkillMeta> = BTreeMap::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
-        if !is_valid_skill_name(name) {
-            tracing::warn!(skill = %name, "skipping skill with invalid name");
-            continue;
-        }
-        match load_skill_at(&path.join("SKILL.md"), name, max_skill_bytes) {
-            Some(skill) => skills.push(skill.meta),
-            None => {
-                tracing::warn!(skill = %name, "skipping skill with missing or invalid SKILL.md");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !is_valid_skill_name(name) {
+                tracing::warn!(skill = %name, "skipping skill with invalid name");
+                continue;
+            }
+            match load_skill_at(&path.join("SKILL.md"), name, max_skill_bytes) {
+                Some(skill) => {
+                    by_name.insert(name.to_string(), skill.meta);
+                }
+                None => {
+                    tracing::warn!(skill = %name, "skipping skill with missing or invalid SKILL.md");
+                }
             }
         }
     }
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
-    skills
+    by_name.into_values().collect()
 }
 
-/// Load a single skill by name. Returns `None` if the name is invalid or the
-/// skill does not exist / fails validation.
-pub fn load_skill(cwd: &Path, name: &str, max_skill_bytes: usize) -> Option<Skill> {
+/// Load a single skill by name, searching `roots` in descending precedence
+/// (last root first, so a project skill is preferred over a user-global one).
+/// Returns `None` if the name is invalid or no root holds a valid skill with
+/// that name; a malformed skill in a higher-precedence root falls through to a
+/// valid one in a lower-precedence root.
+pub fn load_skill(roots: &[PathBuf], name: &str, max_skill_bytes: usize) -> Option<Skill> {
     if !is_valid_skill_name(name) {
         return None;
     }
-    load_skill_at(
-        &skills_dir(cwd).join(name).join("SKILL.md"),
-        name,
-        max_skill_bytes,
-    )
+    roots
+        .iter()
+        .rev()
+        .find_map(|root| load_skill_at(&root.join(name).join("SKILL.md"), name, max_skill_bytes))
 }
 
 fn load_skill_at(path: &Path, dir_name: &str, max_skill_bytes: usize) -> Option<Skill> {
@@ -223,10 +248,15 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn write_skill(root: &Path, name: &str, content: &str) -> TestResult {
-        let dir = skills_dir(root).join(name);
+        let dir = project_skills_dir(root).join(name);
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("SKILL.md"), content)?;
         Ok(())
+    }
+
+    /// Skill roots for a single project root (what most tests exercise).
+    fn roots(root: &Path) -> Vec<PathBuf> {
+        vec![project_skills_dir(root)]
     }
 
     #[test]
@@ -282,7 +312,7 @@ mod tests {
         let Some(temp) = temp else {
             panic!("tempdir creation failed");
         };
-        assert!(list_skills(temp.path(), MAX_SKILL_BYTES).is_empty());
+        assert!(list_skills(&roots(temp.path()), MAX_SKILL_BYTES).is_empty());
     }
 
     #[test]
@@ -303,7 +333,7 @@ mod tests {
         // Invalid: name charset.
         write_skill(temp.path(), "bad name", "---\ndescription: nope\n---\nbody")?;
 
-        let skills = list_skills(temp.path(), MAX_SKILL_BYTES);
+        let skills = list_skills(&roots(temp.path()), MAX_SKILL_BYTES);
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "zeta"]);
         assert_eq!(skills[0].description, "A skill");
@@ -319,7 +349,7 @@ mod tests {
             "---\nname: deploy\ndescription: Deploy the app\n---\nRun make deploy.\n",
         )?;
 
-        let Some(skill) = load_skill(temp.path(), "deploy", MAX_SKILL_BYTES) else {
+        let Some(skill) = load_skill(&roots(temp.path()), "deploy", MAX_SKILL_BYTES) else {
             panic!("expected skill to load");
         };
         assert_eq!(skill.meta.name, "deploy");
@@ -336,7 +366,7 @@ mod tests {
             "deploy",
             "---\nname: other\ndescription: Mismatch\n---\nbody",
         )?;
-        assert!(load_skill(temp.path(), "deploy", MAX_SKILL_BYTES).is_none());
+        assert!(load_skill(&roots(temp.path()), "deploy", MAX_SKILL_BYTES).is_none());
         Ok(())
     }
 
@@ -346,9 +376,9 @@ mod tests {
         let Some(temp) = temp else {
             panic!("tempdir creation failed");
         };
-        assert!(load_skill(temp.path(), "../escape", MAX_SKILL_BYTES).is_none());
-        assert!(load_skill(temp.path(), "", MAX_SKILL_BYTES).is_none());
-        assert!(load_skill(temp.path(), &"x".repeat(65), MAX_SKILL_BYTES).is_none());
+        assert!(load_skill(&roots(temp.path()), "../escape", MAX_SKILL_BYTES).is_none());
+        assert!(load_skill(&roots(temp.path()), "", MAX_SKILL_BYTES).is_none());
+        assert!(load_skill(&roots(temp.path()), &"x".repeat(65), MAX_SKILL_BYTES).is_none());
     }
 
     #[test]
@@ -358,7 +388,7 @@ mod tests {
         let body = "x".repeat(MAX_SKILL_BYTES * 2);
         write_skill(temp.path(), "big", &format!("{header}{body}"))?;
 
-        let Some(skill) = load_skill(temp.path(), "big", MAX_SKILL_BYTES) else {
+        let Some(skill) = load_skill(&roots(temp.path()), "big", MAX_SKILL_BYTES) else {
             panic!("expected oversized skill to load truncated");
         };
         assert!(skill.body.len() <= MAX_SKILL_BYTES);
@@ -379,7 +409,7 @@ mod tests {
         let body = "é".repeat(fill_chars);
         write_skill(temp.path(), "split", &format!("{header}{body}"))?;
 
-        let Some(skill) = load_skill(temp.path(), "split", MAX_SKILL_BYTES) else {
+        let Some(skill) = load_skill(&roots(temp.path()), "split", MAX_SKILL_BYTES) else {
             panic!("expected truncated multibyte skill to load");
         };
         assert!(skill.body.len() < MAX_SKILL_BYTES);
@@ -390,14 +420,14 @@ mod tests {
     #[test]
     fn invalid_utf8_skill_md_is_rejected() -> TestResult {
         let temp = tempfile::TempDir::new()?;
-        let dir = skills_dir(temp.path()).join("binary");
+        let dir = project_skills_dir(temp.path()).join("binary");
         std::fs::create_dir_all(&dir)?;
         let mut bytes = b"---\ndescription: Binary\n---\n".to_vec();
         bytes.extend_from_slice(&[0xff, 0xfe, 0x00]);
         std::fs::write(dir.join("SKILL.md"), bytes)?;
 
-        assert!(load_skill(temp.path(), "binary", MAX_SKILL_BYTES).is_none());
-        assert!(list_skills(temp.path(), MAX_SKILL_BYTES).is_empty());
+        assert!(load_skill(&roots(temp.path()), "binary", MAX_SKILL_BYTES).is_none());
+        assert!(list_skills(&roots(temp.path()), MAX_SKILL_BYTES).is_empty());
         Ok(())
     }
 
@@ -409,7 +439,7 @@ mod tests {
             "deploy",
             "---\ndescription: Deploy the app\n---\nRun make deploy.",
         )?;
-        let Some(skill) = load_skill(temp.path(), "deploy", MAX_SKILL_BYTES) else {
+        let Some(skill) = load_skill(&roots(temp.path()), "deploy", MAX_SKILL_BYTES) else {
             panic!("expected skill to load");
         };
 
@@ -420,6 +450,70 @@ mod tests {
 
         let rendered = render_skill_invocation(&skill, None);
         assert!(rendered.ends_with("(no additional arguments)"));
+        Ok(())
+    }
+
+    #[test]
+    fn project_skill_shadows_global() -> TestResult {
+        let global = tempfile::TempDir::new()?;
+        let project = tempfile::TempDir::new()?;
+        write_skill(
+            global.path(),
+            "deploy",
+            "---\ndescription: Global deploy\n---\nglobal body",
+        )?;
+        write_skill(
+            project.path(),
+            "deploy",
+            "---\ndescription: Project deploy\n---\nproject body",
+        )?;
+        // Ascending precedence: global first, project last (project wins).
+        let roots = vec![
+            project_skills_dir(global.path()),
+            project_skills_dir(project.path()),
+        ];
+
+        let listed = list_skills(&roots, MAX_SKILL_BYTES);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "deploy");
+        assert_eq!(listed[0].description, "Project deploy");
+
+        let Some(skill) = load_skill(&roots, "deploy", MAX_SKILL_BYTES) else {
+            panic!("expected skill to load");
+        };
+        assert_eq!(skill.body, "project body");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_project_skill_does_not_shadow_valid_global() -> TestResult {
+        let global = tempfile::TempDir::new()?;
+        let project = tempfile::TempDir::new()?;
+        write_skill(
+            global.path(),
+            "deploy",
+            "---\ndescription: Global deploy\n---\nglobal body",
+        )?;
+        // Malformed: missing description, so it is skipped during discovery and
+        // loading rather than shadowing the valid global skill.
+        write_skill(
+            project.path(),
+            "deploy",
+            "---\nname: deploy\n---\nproject body",
+        )?;
+        let roots = vec![
+            project_skills_dir(global.path()),
+            project_skills_dir(project.path()),
+        ];
+
+        let listed = list_skills(&roots, MAX_SKILL_BYTES);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].description, "Global deploy");
+
+        let Some(skill) = load_skill(&roots, "deploy", MAX_SKILL_BYTES) else {
+            panic!("expected valid global skill to load");
+        };
+        assert_eq!(skill.body, "global body");
         Ok(())
     }
 }

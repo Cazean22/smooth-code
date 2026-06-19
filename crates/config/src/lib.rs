@@ -3,7 +3,7 @@
 //! Layered configuration for cazean.
 //!
 //! Precedence (low → high): built-in defaults → user config
-//! (`~/.config/cazean/config.toml`) → project config
+//! (`~/.cazean/config.toml`, overridable via `$CAZEAN_HOME`) → project config
 //! (`<workspace>/.cazean/config.toml`) → `CAZEAN_*` env vars.
 //!
 //! Each layer parses into a [`PartialConfig`] (all-optional fields); the layers
@@ -14,9 +14,8 @@ mod color;
 mod error;
 mod schema;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-
-use etcetera::base_strategy::{BaseStrategy, Xdg};
 
 pub use color::{ColorSpec, NamedColor, ParseColorError};
 pub use error::ConfigError;
@@ -26,8 +25,6 @@ pub use schema::{
     TuiColors, TuiConfig, WebSearchConfig, WebSocketConfig, normalize_provider,
 };
 
-/// Relative path of the config file within a config root (XDG or project).
-const CONFIG_RELATIVE_PATH: &str = "cazean/config.toml";
 /// Project config lives under `<workspace>/.cazean/config.toml`.
 const PROJECT_CONFIG_RELATIVE_PATH: &str = ".cazean/config.toml";
 
@@ -42,12 +39,42 @@ pub fn load(workspace_root: &Path) -> Result<Config, ConfigError> {
     load_from(workspace_root, user_config_path(), env_vars)
 }
 
-/// Discover the user-level config path using the XDG base strategy explicitly
-/// (`~/.config/cazean/config.toml`, honoring `$XDG_CONFIG_HOME`). Returns
-/// `None` if the config directory cannot be determined.
-fn user_config_path() -> Option<PathBuf> {
-    let strategy = Xdg::new().ok()?;
-    Some(strategy.config_dir().join(CONFIG_RELATIVE_PATH))
+/// User-global cazean home directory.
+///
+/// `$CAZEAN_HOME` if set to a non-empty value, otherwise `~/.cazean` (the
+/// platform home directory from [`etcetera::home_dir`] joined with `.cazean`,
+/// so the layout is identical across Linux, macOS, and Windows). Returns `None`
+/// only when no override is set and the home directory cannot be determined.
+pub fn cazean_home() -> Option<PathBuf> {
+    cazean_home_from(std::env::var_os("CAZEAN_HOME"), etcetera::home_dir().ok())
+}
+
+/// Pure core of [`cazean_home`], parameterized over the override value and home
+/// directory so tests can drive it without touching the process environment.
+fn cazean_home_from(override_var: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(value) = override_var.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(value));
+    }
+    Some(home?.join(".cazean"))
+}
+
+/// User-level config file (`~/.cazean/config.toml`). `None` if the home
+/// directory cannot be determined, in which case the user layer is skipped.
+pub fn user_config_path() -> Option<PathBuf> {
+    Some(cazean_home()?.join("config.toml"))
+}
+
+/// User-global skills directory (`~/.cazean/skills`). `None` if the home
+/// directory cannot be determined.
+pub fn user_skills_dir() -> Option<PathBuf> {
+    Some(cazean_home()?.join("skills"))
+}
+
+/// Path of a log file under `~/.cazean/logs/`. `file_name` must already be a
+/// validated bare file name (see `telemetry.log_file_name` validation). `None`
+/// if the home directory cannot be determined.
+pub fn log_path(file_name: &str) -> Option<PathBuf> {
+    Some(cazean_home()?.join("logs").join(file_name))
 }
 
 /// Core of [`load`], parameterized over the user path and env vars so tests can
@@ -398,5 +425,31 @@ mod tests {
         let resolved = partial.resolve()?;
         assert_eq!(resolved, Config::default());
         Ok(())
+    }
+
+    #[test]
+    fn cazean_home_prefers_nonempty_override() {
+        let home = cazean_home_from(
+            Some(OsString::from("/custom/cz")),
+            Some(PathBuf::from("/home/user")),
+        );
+        assert_eq!(home, Some(PathBuf::from("/custom/cz")));
+    }
+
+    #[test]
+    fn cazean_home_empty_override_falls_back_to_home_dotdir() {
+        let home = cazean_home_from(Some(OsString::new()), Some(PathBuf::from("/home/user")));
+        assert_eq!(home, Some(PathBuf::from("/home/user/.cazean")));
+    }
+
+    #[test]
+    fn cazean_home_unset_override_uses_home_dotdir() {
+        let home = cazean_home_from(None, Some(PathBuf::from("/home/user")));
+        assert_eq!(home, Some(PathBuf::from("/home/user/.cazean")));
+    }
+
+    #[test]
+    fn cazean_home_none_without_override_or_home() {
+        assert_eq!(cazean_home_from(None, None), None);
     }
 }

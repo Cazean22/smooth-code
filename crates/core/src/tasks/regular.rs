@@ -267,13 +267,16 @@ impl SessionTask for RegularTask {
         // read-only and `build_agent` excludes the tool for them, so steering
         // them toward it would only produce failed tool calls.
         let skills_enabled = !matches!(session.system_prompt_kind, SystemPromptKind::Explore);
+        // Skill roots (user-global + project) resolved once and shared by the
+        // `/name` slash expansion and the available-skills listing below.
+        let skill_roots = tools::skill_roots(cazean_config::user_skills_dir(), &session.cwd);
         // A leading `/skill-name` is expanded to the skill's instructions for
         // the model and the persisted history, while the transcript event
         // keeps the raw text the user typed.
         let model_text = skills_enabled
             .then(|| {
                 expand_skill_invocation(
-                    &session.cwd,
+                    &skill_roots,
                     &prompt_text,
                     session.agent_control.max_skill_bytes(),
                 )
@@ -296,7 +299,7 @@ impl SessionTask for RegularTask {
             })),
         };
         let skills = if skills_enabled {
-            tools::list_skills(&session.cwd, session.agent_control.max_skill_bytes())
+            tools::list_skills(&skill_roots, session.agent_control.max_skill_bytes())
         } else {
             Vec::new()
         };
@@ -2238,7 +2241,7 @@ fn skills_context_message(skills: &[SkillMeta]) -> Option<Message> {
         .collect::<Vec<_>>()
         .join("\n");
     let text = format!(
-        "# Available skills\n\nThe following user-defined skills exist in this project. When a request matches a skill's purpose, invoke the `skill` tool with its name and follow the returned instructions.\n\n{listing}"
+        "# Available skills\n\nThe following user-defined skills are available, drawn from your user-global skills directory and this project (a project skill overrides a same-named global one). When a request matches a skill's purpose, invoke the `skill` tool with its name and follow the returned instructions.\n\n{listing}"
     );
     Some(Message::User {
         content: OneOrMany::one(UserContent::Text(Text {
@@ -2248,12 +2251,13 @@ fn skills_context_message(skills: &[SkillMeta]) -> Option<Message> {
     })
 }
 
-/// If the prompt starts with `/name` where `name` is a skill in
-/// `<cwd>/.cazean/skills`, return the expanded model-facing text (skill
-/// instructions + remaining text as arguments). Any other text — including
-/// unknown `/foo` commands — passes through unchanged.
+/// If the prompt starts with `/name` where `name` is a skill found in
+/// `skill_roots` (the user-global and project skill directories, project last
+/// so it wins), return the expanded model-facing text (skill instructions +
+/// remaining text as arguments). Any other text — including unknown `/foo`
+/// commands — passes through unchanged.
 fn expand_skill_invocation(
-    cwd: &std::path::Path,
+    skill_roots: &[std::path::PathBuf],
     prompt_text: &str,
     max_skill_bytes: usize,
 ) -> Option<String> {
@@ -2263,7 +2267,7 @@ fn expand_skill_invocation(
         .find(char::is_whitespace)
         .unwrap_or(candidate.len());
     let (name, args) = candidate.split_at(name_end);
-    let skill = tools::load_skill(cwd, name, max_skill_bytes)?;
+    let skill = tools::load_skill(skill_roots, name, max_skill_bytes)?;
     Some(tools::render_skill_invocation(&skill, Some(args)))
 }
 
@@ -2386,7 +2390,7 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn write_skill(root: &std::path::Path, name: &str, content: &str) -> TestResult {
-        let dir = tools::skills_dir(root).join(name);
+        let dir = tools::project_skills_dir(root).join(name);
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("SKILL.md"), content)?;
         Ok(())
@@ -2400,8 +2404,9 @@ mod tests {
             "deploy",
             "---\ndescription: Deploy the app\n---\nRun make deploy.",
         )?;
+        let roots = vec![tools::project_skills_dir(temp.path())];
 
-        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy to staging", 64 * 1024)
+        let Some(expanded) = expand_skill_invocation(&roots, "/deploy to staging", 64 * 1024)
         else {
             panic!("expected /deploy to expand");
         };
@@ -2409,7 +2414,7 @@ mod tests {
         assert!(expanded.contains("Run make deploy."));
         assert!(expanded.ends_with("to staging"));
 
-        let Some(expanded) = expand_skill_invocation(temp.path(), "/deploy", 64 * 1024) else {
+        let Some(expanded) = expand_skill_invocation(&roots, "/deploy", 64 * 1024) else {
             panic!("expected bare /deploy to expand");
         };
         assert!(expanded.ends_with("(no additional arguments)"));
@@ -2420,9 +2425,10 @@ mod tests {
     fn expand_skill_invocation_keeps_multiline_args() -> TestResult {
         let temp = tempfile::TempDir::new()?;
         write_skill(temp.path(), "deploy", "---\ndescription: Deploy\n---\nbody")?;
+        let roots = vec![tools::project_skills_dir(temp.path())];
 
         let Some(expanded) =
-            expand_skill_invocation(temp.path(), "/deploy to staging\nwith care", 64 * 1024)
+            expand_skill_invocation(&roots, "/deploy to staging\nwith care", 64 * 1024)
         else {
             panic!("expected /deploy to expand");
         };
@@ -2434,13 +2440,14 @@ mod tests {
     fn expand_skill_invocation_passes_through_non_matches() -> TestResult {
         let temp = tempfile::TempDir::new()?;
         write_skill(temp.path(), "deploy", "---\ndescription: Deploy\n---\nbody")?;
+        let roots = vec![tools::project_skills_dir(temp.path())];
 
         // Unknown skill, plain text, and bare slash all pass through.
-        assert!(expand_skill_invocation(temp.path(), "/unknown args", 64 * 1024).is_none());
-        assert!(expand_skill_invocation(temp.path(), "deploy the app", 64 * 1024).is_none());
-        assert!(expand_skill_invocation(temp.path(), "/", 64 * 1024).is_none());
+        assert!(expand_skill_invocation(&roots, "/unknown args", 64 * 1024).is_none());
+        assert!(expand_skill_invocation(&roots, "deploy the app", 64 * 1024).is_none());
+        assert!(expand_skill_invocation(&roots, "/", 64 * 1024).is_none());
         // A slash later in the text does not trigger expansion.
-        assert!(expand_skill_invocation(temp.path(), "run /deploy", 64 * 1024).is_none());
+        assert!(expand_skill_invocation(&roots, "run /deploy", 64 * 1024).is_none());
         Ok(())
     }
 

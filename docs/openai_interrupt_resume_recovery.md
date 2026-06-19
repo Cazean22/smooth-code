@@ -217,7 +217,7 @@ git diff --check
 
 Useful local files when diagnosing similar failures:
 
-- `.cazean/logs/cazean-tui.log` — runtime log and provider retry/errors;
+- `~/.cazean/logs/cazean.log` — runtime log and provider retry/errors;
 - `.cazean/sessions/YYYY/MM/DD/*.jsonl` — rollout transcript and model-history
   records;
 - `CAZEAN_OPENAI_TURN_REQUEST_JSON=/path/to/request.json` — optional dump of the

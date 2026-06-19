@@ -1,7 +1,7 @@
 # cazean configuration (example)
 #
 # Copy to one of the following (later layers override earlier ones):
-#   1. ~/.config/cazean/config.toml        (user, XDG; honors $XDG_CONFIG_HOME)
+#   1. ~/.cazean/config.toml                (user; override the dir with $CAZEAN_HOME)
 #   2. <workspace>/.cazean/config.toml      (project)
 # CAZEAN_* environment variables override file config (see docs/config.md).
 #
@@ -69,5 +69,5 @@ code = "cyan"
 
 [telemetry]
 log_filter = "info,cazean_tui=debug,app_server=debug,cazean_core=debug"  # overridable by RUST_LOG
-log_file_name = "cazean-tui.log"   # bare file name under <workspace>/.cazean/logs/
+log_file_name = "cazean.log"       # bare file name under ~/.cazean/logs/
 force_stderr = false               # true logs to stderr instead of the file

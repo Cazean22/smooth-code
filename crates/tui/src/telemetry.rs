@@ -1,7 +1,4 @@
-use std::{
-    io::IsTerminal,
-    path::{Path, PathBuf},
-};
+use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
 use cazean_config::Config;
@@ -20,8 +17,14 @@ pub(crate) fn init(config: &Config) -> Result<TelemetryGuard> {
     let interactive_tui = std::io::stdout().is_terminal();
     let force_terminal_logs = config.telemetry.force_stderr;
 
-    let (writer, log_writer_guard) = if interactive_tui && !force_terminal_logs {
-        let log_path = preferred_log_path(&config.telemetry.log_file_name)?;
+    // Log to the user-global `~/.cazean/logs/<file>` when running an interactive
+    // TUI; fall back to stderr when forced, non-interactive, or the home
+    // directory can't be resolved (mirrors config's silently-skip behavior).
+    let log_path = (interactive_tui && !force_terminal_logs)
+        .then(|| cazean_config::log_path(&config.telemetry.log_file_name))
+        .flatten();
+
+    let (writer, log_writer_guard) = if let Some(log_path) = log_path {
         let log_dir = log_path
             .parent()
             .context("telemetry log path is missing a parent directory")?;
@@ -67,14 +70,4 @@ pub(crate) fn init(config: &Config) -> Result<TelemetryGuard> {
     Ok(TelemetryGuard {
         _log_writer_guard: log_writer_guard,
     })
-}
-
-fn preferred_log_path(file_name: &str) -> Result<PathBuf> {
-    let cwd =
-        std::env::current_dir().context("failed to determine current directory for telemetry")?;
-    Ok(log_path_in(&cwd, file_name))
-}
-
-fn log_path_in(root: &Path, file_name: &str) -> PathBuf {
-    root.join(".cazean").join("logs").join(file_name)
 }

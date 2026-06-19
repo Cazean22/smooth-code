@@ -7,9 +7,10 @@ use ratatui::{
 };
 use tools::SkillMeta;
 
-/// Completion popup listing project skills while the composer holds a leading
-/// `/token`. Unlike `QuestionPicker` it is an Insert-mode adornment: it never
-/// takes focus away from the composer, it only intercepts a few keys.
+/// Completion popup listing the available skills (user-global and project)
+/// while the composer holds a leading `/token`. Unlike `QuestionPicker` it is an
+/// Insert-mode adornment: it never takes focus away from the composer, it only
+/// intercepts a few keys.
 pub(crate) struct SkillPopup {
     skills: Vec<SkillMeta>,
     /// Indices into `skills` that match the current query, best match first.

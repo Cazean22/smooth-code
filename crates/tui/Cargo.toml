@@ -1,9 +1,14 @@
 [package]
 name = "cazean-tui"
+autobins = false
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "cz"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true

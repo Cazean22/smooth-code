@@ -9,9 +9,9 @@ use crate::{
     skills::{list_skills, load_skill, render_skill_invocation},
 };
 
-const DESCRIPTION: &str = r#"Load a project skill and follow its instructions.
+const DESCRIPTION: &str = r#"Load a skill and follow its instructions.
 
-Skills are user-defined instruction packages stored in this project. Only invoke skills that appear in the "Available skills" context block; never guess a skill name. The tool returns the skill's instructions — follow them for the current request."#;
+Skills are user-defined instruction packages, drawn from your user-global skills directory and from the current project; on a name clash the project's skill takes precedence. Only invoke skills that appear in the "Available skills" context block; never guess a skill name. The tool returns the skill's instructions — follow them for the current request."#;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -25,14 +25,14 @@ pub struct SkillArgs {
 
 #[derive(Clone)]
 pub struct SkillTool {
-    cwd: PathBuf,
+    skill_roots: Vec<PathBuf>,
     max_skill_bytes: usize,
 }
 
 impl SkillTool {
-    pub fn new(cwd: PathBuf) -> Self {
+    pub fn new(skill_roots: Vec<PathBuf>) -> Self {
         Self {
-            cwd,
+            skill_roots,
             max_skill_bytes: crate::skills::MAX_SKILL_BYTES,
         }
     }
@@ -61,10 +61,10 @@ impl Tool for SkillTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let name = args.skill.trim();
-        match load_skill(&self.cwd, name, self.max_skill_bytes) {
+        match load_skill(&self.skill_roots, name, self.max_skill_bytes) {
             Some(skill) => Ok(render_skill_invocation(&skill, args.args.as_deref())),
             None => {
-                let available = list_skills(&self.cwd, self.max_skill_bytes)
+                let available = list_skills(&self.skill_roots, self.max_skill_bytes)
                     .into_iter()
                     .map(|meta| meta.name)
                     .collect::<Vec<_>>();
@@ -88,7 +88,7 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn write_skill(root: &std::path::Path, name: &str, content: &str) -> TestResult {
-        let dir = crate::skills::skills_dir(root).join(name);
+        let dir = crate::skills::project_skills_dir(root).join(name);
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("SKILL.md"), content)?;
         Ok(())
@@ -103,7 +103,7 @@ mod tests {
             "---\ndescription: Deploy the app\n---\nRun make deploy.",
         )?;
 
-        let tool = SkillTool::new(temp.path().to_path_buf());
+        let tool = SkillTool::new(vec![crate::skills::project_skills_dir(temp.path())]);
         let output = tool
             .call(SkillArgs {
                 skill: "deploy".to_string(),
@@ -122,7 +122,7 @@ mod tests {
         let temp = tempfile::TempDir::new()?;
         write_skill(temp.path(), "deploy", "---\ndescription: Deploy\n---\nbody")?;
 
-        let tool = SkillTool::new(temp.path().to_path_buf());
+        let tool = SkillTool::new(vec![crate::skills::project_skills_dir(temp.path())]);
         let result = tool
             .call(SkillArgs {
                 skill: "missing".to_string(),
@@ -144,7 +144,7 @@ mod tests {
         let Ok(temp) = tempfile::TempDir::new() else {
             panic!("tempdir creation failed");
         };
-        let tool = SkillTool::new(temp.path().to_path_buf());
+        let tool = SkillTool::new(vec![crate::skills::project_skills_dir(temp.path())]);
         let result = tool
             .call(SkillArgs {
                 skill: "missing".to_string(),

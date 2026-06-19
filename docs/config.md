@@ -5,8 +5,8 @@ before it (lowest precedence first):
 
 1. **Built-in defaults** — reproduce the hardcoded defaults. See
    `config.example.toml` at the repo root for the full set with comments.
-2. **User config** — `~/.config/cazean/config.toml` (XDG; honors
-   `$XDG_CONFIG_HOME`, so the path is `~/.config` on macOS too).
+2. **User config** — `~/.cazean/config.toml` (override the directory with
+   `$CAZEAN_HOME`).
 3. **Project config** — `<workspace>/.cazean/config.toml`, where
    `<workspace>` is the current working directory.
 4. **Environment variables** — the `CAZEAN_*` variables below.
@@ -68,4 +68,26 @@ local-proxy stand-in.
   API; the model's answer streams back with citations. It applies to the OpenAI
   provider only (other providers ignore it) and is suppressed while in plan mode.
 - `telemetry.log_file_name` must be a bare file name (no path separators, `.`,
-  or `..`); it is written under `<workspace>/.cazean/logs/`.
+  or `..`); it is written under `~/.cazean/logs/`.
+
+## Storage locations
+
+cazean keeps user-global state in a single home directory and per-project state
+alongside the workspace:
+
+- **User-global home** — `~/.cazean/` (identical layout on Linux, macOS, and
+  Windows, where it resolves to `%USERPROFILE%\.cazean\`). Set `$CAZEAN_HOME` to
+  a non-empty path to relocate it. Holds:
+  - `config.toml` — user config (layer 2 above).
+  - `skills/` — user-global skills.
+  - `logs/cazean.log` — the runtime log (file name from `telemetry.log_file_name`).
+- **Project-local** — `<workspace>/.cazean/`. Holds `config.toml` (project
+  config, layer 3), `skills/` (project skills), `sessions/`, `state.db`, and
+  `plans/`.
+
+Skills are loaded from both `~/.cazean/skills/` and `<workspace>/.cazean/skills`;
+when both define a skill with the same name, the project's wins.
+
+`$CAZEAN_HOME` overrides only the user-global home directory. It is distinct from
+the `CAZEAN_*` config-override variables above, which map to individual config
+fields.

@@ -443,9 +443,11 @@ struct UiModel {
     question_picker: Option<QuestionPicker>,
     plan_approval: Option<PlanApprovalOverlay>,
     skill_popup: Option<SkillPopup>,
-    /// Root directory skills are discovered from when the composer holds a
-    /// leading `/token`; the process cwd outside of tests.
-    skills_root: std::path::PathBuf,
+    /// Skill roots searched when the composer holds a leading `/token`, in
+    /// ascending precedence: the user-global dir (`~/.cazean/skills`) then the
+    /// project dir (`<cwd>/.cazean/skills`), so a project skill overrides a
+    /// same-named user-global one. Project-only in tests.
+    skill_roots: Vec<std::path::PathBuf>,
     effect_counter: u64,
     effect_contexts: HashMap<EffectId, EffectContext>,
     screen: Screen,
@@ -510,7 +512,10 @@ impl UiModel {
             question_picker: None,
             plan_approval: None,
             skill_popup: None,
-            skills_root: std::env::current_dir().unwrap_or_default(),
+            skill_roots: tools::skill_roots(
+                cazean_config::user_skills_dir(),
+                &std::env::current_dir().unwrap_or_default(),
+            ),
             effect_counter: 0,
             effect_contexts: HashMap::new(),
             screen: Screen::Dashboard,

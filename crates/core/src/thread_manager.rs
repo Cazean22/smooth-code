@@ -1148,7 +1148,7 @@ mod tests {
         let original_cwd = std::env::current_dir()?;
         std::env::set_current_dir(workspace.path())?;
 
-        let skill_dir = tools::skills_dir(workspace.path()).join("deploy");
+        let skill_dir = tools::project_skills_dir(workspace.path()).join("deploy");
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(
             skill_dir.join("SKILL.md"),

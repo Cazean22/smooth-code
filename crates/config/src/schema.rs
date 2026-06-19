@@ -251,7 +251,7 @@ impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             log_filter: "info,cazean_tui=debug,app_server=debug,cazean_core=debug".to_string(),
-            log_file_name: "cazean-tui.log".to_string(),
+            log_file_name: "cazean.log".to_string(),
             force_stderr: false,
         }
     }
@@ -727,7 +727,7 @@ fn check_nonzero(key: &str, value: usize) -> Result<(), ConfigError> {
     }
 }
 
-/// `log_file_name` is joined under `.cazean/logs/`; it must be a bare
+/// `log_file_name` is joined under `~/.cazean/logs/`; it must be a bare
 /// file name so a config file can't redirect logs outside that directory.
 fn validate_log_file_name(name: &str) -> Result<(), ConfigError> {
     if name.is_empty() {

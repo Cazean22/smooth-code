@@ -224,6 +224,7 @@ pub(in crate::app) fn plan_approval_params(thread_id: &str) -> RequestPlanApprov
         turn_id: "turn-1".to_string(),
         call_id: "call-1".to_string(),
         plan: "# The plan\n\n1. Refactor the module.".to_string(),
+        reason: None,
     }
 }
 

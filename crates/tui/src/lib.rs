@@ -92,11 +92,12 @@ pub async fn run(config: std::sync::Arc<cazean_config::Config>) -> TuiResult<()>
                 match maybe_event {
                     Some(Ok(event)) => {
                         let viewport_height = app.viewport_height_for(&terminal)?;
-                        if matches!(
-                            app.handle_terminal_event(&mut app_server, event, viewport_height).await?,
-                            crate::app::AppRunControl::Exit
-                        ) {
-                            break;
+                        match app.handle_terminal_event(&mut app_server, event, viewport_height).await? {
+                            crate::app::AppRunControl::Exit => break,
+                            crate::app::AppRunControl::OpenEditor(path) => {
+                                edit_plan_in_editor(&mut terminal, &mut app, &path).await?;
+                            }
+                            crate::app::AppRunControl::Continue => {}
                         }
                         terminal.draw(|frame| app.render(frame))?;
                     }
@@ -179,10 +180,17 @@ fn init() -> TuiResult<Option<AppTerminal>> {
     }
 
     enable_raw_mode()?;
-
     let mut stdout = std::io::stdout();
+    enter_screen(&mut stdout)?;
+    let backend = CrosstermBackend::new(stdout);
+    Ok(Some(Terminal::new(backend)?))
+}
+
+/// Enter the alternate screen and enable the input modes the UI relies on.
+/// Shared by `init` and editor `resume` so the two can never drift.
+fn enter_screen<W: std::io::Write>(out: &mut W) -> TuiResult<()> {
     execute!(
-        stdout,
+        out,
         EnterAlternateScreen,
         EnableBracketedPaste,
         // Alternate scroll mode (DECSET 1007): the terminal turns mouse wheel
@@ -192,9 +200,19 @@ fn init() -> TuiResult<Option<AppTerminal>> {
         Print(concat!('\x1b', "[?1007h")),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
+    Ok(())
+}
 
-    let backend = CrosstermBackend::new(stdout);
-    Ok(Some(Terminal::new(backend)?))
+/// Reverse of [`enter_screen`]. Shared by `restore` and editor `suspend`.
+fn leave_screen<W: std::io::Write>(out: &mut W) -> TuiResult<()> {
+    execute!(
+        out,
+        PopKeyboardEnhancementFlags,
+        Print(concat!('\x1b', "[?1007l")),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
+    Ok(())
 }
 
 fn restore(terminal: Option<&mut AppTerminal>) -> TuiResult<()> {
@@ -203,13 +221,65 @@ fn restore(terminal: Option<&mut AppTerminal>) -> TuiResult<()> {
     };
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        PopKeyboardEnhancementFlags,
-        Print(concat!('\x1b', "[?1007l")),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )?;
+    leave_screen(terminal.backend_mut())?;
     terminal.show_cursor()?;
+    Ok(())
+}
+
+/// Hand the terminal back to a child process: leave the alternate screen and
+/// raw mode (and pop the kitty flags) so an external editor behaves normally.
+fn suspend(terminal: &mut AppTerminal) -> TuiResult<()> {
+    disable_raw_mode()?;
+    leave_screen(terminal.backend_mut())?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+/// Re-take the terminal after a suspended child exits. Re-pushing the kitty
+/// flags is load-bearing (Ctrl-chords break otherwise), and `clear` invalidates
+/// ratatui's cached buffer so the next draw repaints over the editor's output.
+fn resume(terminal: &mut AppTerminal) -> TuiResult<()> {
+    enable_raw_mode()?;
+    enter_screen(terminal.backend_mut())?;
+    terminal.clear()?;
+    Ok(())
+}
+
+/// Run the user's editor (`$VISUAL`, then `$EDITOR`, then `vi`) on `path`,
+/// waiting for it to exit. `$VISUAL`/`$EDITOR` may carry arguments.
+async fn run_editor(path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".to_string());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let args: Vec<&str> = parts.collect();
+    tokio::process::Command::new(program)
+        .args(args)
+        .arg(path)
+        .status()
+        .await
+}
+
+/// Suspend the TUI, edit `path` in `$EDITOR`, restore the terminal, and refresh
+/// the approval overlay with whatever was saved.
+async fn edit_plan_in_editor(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    path: &std::path::Path,
+) -> TuiResult<()> {
+    suspend(terminal)?;
+    let result = run_editor(path).await;
+    resume(terminal)?;
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "failed to launch editor for plan");
+    }
+    app.reload_plan_after_edit();
     Ok(())
 }

@@ -258,6 +258,17 @@ impl UiModel {
             Screen::Workspace if !self.preview_stack.is_empty() => {
                 self.render_preview(frame, frame.area());
             }
+            // An active plan-approval overlay owns the whole screen.
+            Screen::Workspace
+                if self
+                    .plan_approval
+                    .as_ref()
+                    .is_some_and(PlanApprovalOverlay::is_active) =>
+            {
+                if let Some(overlay) = self.plan_approval.as_ref() {
+                    overlay.render(frame, frame.area());
+                }
+            }
             Screen::Workspace => self.render_workspace(frame, frame.area()),
         }
     }
@@ -348,11 +359,6 @@ impl UiModel {
             .as_ref()
             .map(|picker| picker.desired_height(area.width).min(20))
             .unwrap_or(0);
-        let approval_height = self
-            .plan_approval
-            .as_ref()
-            .map(|overlay| overlay.desired_height(area.width).min(30))
-            .unwrap_or(0);
         let command_height = if self.mode == UiMode::Command { 1 } else { 0 };
         let composer_height = self.composer_height();
         let skill_popup_height = self
@@ -365,9 +371,6 @@ impl UiModel {
         constraints.push(Constraint::Min(5));
         if picker_height > 0 {
             constraints.push(Constraint::Length(picker_height));
-        }
-        if approval_height > 0 {
-            constraints.push(Constraint::Length(approval_height));
         }
         if skill_popup_height > 0 {
             constraints.push(Constraint::Length(skill_popup_height));
@@ -391,12 +394,6 @@ impl UiModel {
         if picker_height > 0 {
             if let Some(picker) = &self.question_picker {
                 picker.render(frame, chunks[idx]);
-            }
-            idx += 1;
-        }
-        if approval_height > 0 {
-            if let Some(overlay) = &self.plan_approval {
-                overlay.render(frame, chunks[idx]);
             }
             idx += 1;
         }
@@ -486,9 +483,15 @@ impl UiModel {
         ));
         lines.extend(wrap::wrap_line_hanging(
             Line::from(vec![
-                Span::styled("Mode ", Style::default().fg(Color::Yellow).bold()),
+                Span::styled("Editor ", Style::default().fg(Color::Yellow).bold()),
                 Span::raw(format!("{:?}", self.mode)),
-                Span::raw("  "),
+            ]),
+            wrap_width,
+            wrap::display_width("Editor "),
+        ));
+        lines.extend(wrap::wrap_line_hanging(
+            Line::from(vec![
+                Span::styled("Agent ", Style::default().fg(Color::Yellow).bold()),
                 Span::styled(
                     if self.plan_mode { "PLAN" } else { "FULL" },
                     if self.plan_mode {
@@ -497,9 +500,10 @@ impl UiModel {
                         Style::default().dim()
                     },
                 ),
+                Span::styled("  Shift+Tab", Style::default().dim()),
             ]),
             wrap_width,
-            wrap::display_width("Mode "),
+            wrap::display_width("Agent "),
         ));
         if let Some(thread_id) = self.current_thread_id {
             lines.extend(wrap::wrap_line_hanging(
@@ -594,6 +598,13 @@ impl UiModel {
             spans.push(Span::styled(
                 "⏸ PLAN MODE",
                 Style::default().fg(Color::Magenta).bold(),
+            ));
+        }
+        if matches!(self.mode, UiMode::Normal | UiMode::Insert) {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                "Shift+Tab plan/full",
+                Style::default().fg(Color::DarkGray),
             ));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);

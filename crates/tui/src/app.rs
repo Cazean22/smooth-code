@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use app_server_protocol::{
@@ -48,6 +49,9 @@ mod test_support;
 pub(crate) enum AppRunControl {
     Continue,
     Exit,
+    /// Suspend the TUI and open this file in the user's `$EDITOR`; the run loop
+    /// (which owns the terminal) handles suspend/resume.
+    OpenEditor(PathBuf),
 }
 
 /// Window within which a second Esc press enters transcript-select mode.
@@ -137,6 +141,9 @@ impl App {
             let effect_id = effect.effect_id;
             let result = match effect.kind {
                 UiEffectKind::Exit => return Ok(AppRunControl::Exit),
+                UiEffectKind::OpenEditor { path } => {
+                    return Ok(AppRunControl::OpenEditor(path));
+                }
                 UiEffectKind::ThreadStart => app_server
                     .start_thread()
                     .await
@@ -231,6 +238,12 @@ impl App {
             .transcript_viewport_height(size.width, size.height))
     }
 
+    /// After the external editor closes, refresh the approval overlay so it
+    /// shows whatever the user saved.
+    pub(crate) fn reload_plan_after_edit(&mut self) {
+        self.model.reload_plan_after_edit();
+    }
+
     #[cfg(test)]
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         self.model.transcript_lines_uncached(width)
@@ -297,6 +310,9 @@ enum UiEffectKind {
     CopyToClipboard {
         content: String,
     },
+    OpenEditor {
+        path: PathBuf,
+    },
     Exit,
 }
 
@@ -326,6 +342,7 @@ enum EffectContext {
     SetPlanMode { previous: bool, desired: bool },
     ServerRequest,
     Clipboard,
+    OpenEditor,
     Exit,
 }
 
@@ -448,6 +465,10 @@ struct UiModel {
     /// project dir (`<cwd>/.cazean/skills`), so a project skill overrides a
     /// same-named user-global one. Project-only in tests.
     skill_roots: Vec<std::path::PathBuf>,
+    /// Workspace root (process cwd at startup), used to locate the plan file for
+    /// `Ctrl+G` editing. The in-process core resolves the same path from its
+    /// own creation-time cwd, so the two always agree.
+    workspace_root: PathBuf,
     effect_counter: u64,
     effect_contexts: HashMap<EffectId, EffectContext>,
     screen: Screen,
@@ -519,6 +540,7 @@ impl UiModel {
                 cazean_config::user_skills_dir(),
                 &std::env::current_dir().unwrap_or_default(),
             ),
+            workspace_root: std::env::current_dir().unwrap_or_default(),
             effect_counter: 0,
             effect_contexts: HashMap::new(),
             screen: Screen::Dashboard,
@@ -660,6 +682,26 @@ impl UiModel {
         let effect_id = EffectId(self.effect_counter);
         self.effect_contexts.insert(effect_id, context);
         UiEffect { effect_id, kind }
+    }
+
+    /// Re-read the plan file into the active approval overlay after the user
+    /// edits it in `$EDITOR`. No-op if there is no active overlay, the thread id
+    /// didn't parse, or the file can't be read.
+    fn reload_plan_after_edit(&mut self) {
+        let Some(thread_id) = self
+            .plan_approval
+            .as_ref()
+            .filter(|overlay| overlay.is_active())
+            .and_then(PlanApprovalOverlay::thread_id)
+        else {
+            return;
+        };
+        let path = tools::plan_file_path(&self.workspace_root, thread_id);
+        if let Ok(plan) = std::fs::read_to_string(&path)
+            && let Some(overlay) = self.plan_approval.as_mut()
+        {
+            overlay.set_plan(plan);
+        }
     }
 
     fn next_item_id(&mut self) -> TranscriptItemId {

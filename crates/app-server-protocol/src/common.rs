@@ -187,6 +187,10 @@ pub struct RequestPlanApprovalParams {
     pub call_id: String,
     /// Full markdown of the plan being submitted for approval.
     pub plan: String,
+    /// Optional short note from the model about why it is exiting plan mode
+    /// (the `exit_plan_mode` `reason` arg), shown above the plan for context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
@@ -581,6 +585,7 @@ mod tests {
             turn_id: "3".to_string(),
             call_id: "call-9".to_string(),
             plan: "# Plan\n\n1. Do the thing.".to_string(),
+            reason: None,
         })
         .request_with_id(RequestId(11));
 
@@ -604,6 +609,32 @@ mod tests {
 
         let schema = serde_json::to_value(schemars::schema_for!(ServerRequest))?;
         assert!(schema.to_string().contains("item/request_plan_approval"));
+        Ok(())
+    }
+
+    #[test]
+    fn request_plan_approval_round_trips_with_reason() -> TestResult {
+        let params = RequestPlanApprovalParams {
+            thread_id: "t".to_string(),
+            turn_id: "u".to_string(),
+            call_id: "c".to_string(),
+            plan: "# Plan".to_string(),
+            reason: Some("plan ready".to_string()),
+        };
+
+        let value = serde_json::to_value(&params)?;
+        assert_eq!(
+            value,
+            json!({
+                "threadId": "t",
+                "turnId": "u",
+                "callId": "c",
+                "plan": "# Plan",
+                "reason": "plan ready",
+            })
+        );
+        let decoded: RequestPlanApprovalParams = serde_json::from_value(value)?;
+        assert_eq!(decoded, params);
         Ok(())
     }
 

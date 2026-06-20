@@ -147,7 +147,7 @@ impl UiModel {
                 self.push_error(format!("could not copy to clipboard: {error}"));
                 Vec::new()
             }
-            Some(EffectContext::Exit) | None => Vec::new(),
+            Some(EffectContext::Exit) | Some(EffectContext::OpenEditor) | None => Vec::new(),
         }
     }
 

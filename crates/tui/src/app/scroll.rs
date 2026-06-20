@@ -25,15 +25,11 @@ impl UiModel {
             .as_ref()
             .map(|picker| picker.desired_height(width).min(20))
             .unwrap_or(0);
-        let approval_height = self
-            .plan_approval
-            .as_ref()
-            .map(|overlay| overlay.desired_height(width).min(30))
-            .unwrap_or(0);
+        // The plan-approval overlay renders full-screen (its own branch in
+        // `render`), so it no longer subtracts from the transcript viewport.
         let command_height = if self.mode == UiMode::Command { 1 } else { 0 };
         height
             .saturating_sub(picker_height)
-            .saturating_sub(approval_height)
             .saturating_sub(1)
             .saturating_sub(1)
             .saturating_sub(command_height)
@@ -48,17 +44,6 @@ impl UiModel {
             FocusTarget::Transcript if self.inspector_visible => FocusTarget::Inspector,
             FocusTarget::Transcript => FocusTarget::Composer,
             FocusTarget::Inspector => FocusTarget::Composer,
-            FocusTarget::Composer => FocusTarget::Transcript,
-            FocusTarget::Overlay => FocusTarget::Transcript,
-        };
-    }
-
-    pub(in crate::app) fn focus_prev(&mut self) {
-        self.focus = match self.focus {
-            FocusTarget::Dashboard => FocusTarget::Composer,
-            FocusTarget::Transcript => FocusTarget::Composer,
-            FocusTarget::Inspector => FocusTarget::Transcript,
-            FocusTarget::Composer if self.inspector_visible => FocusTarget::Inspector,
             FocusTarget::Composer => FocusTarget::Transcript,
             FocusTarget::Overlay => FocusTarget::Transcript,
         };
@@ -259,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_inspector_is_skipped_by_tab_and_backtab() {
+    fn hidden_inspector_is_skipped_by_tab() {
         let mut model = workspace_normal_model();
         model.inspector_visible = false;
 
@@ -267,12 +252,6 @@ mod tests {
         assert_eq!(model.focus, FocusTarget::Composer);
 
         let _ = model.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(model.focus, FocusTarget::Transcript);
-
-        let _ = model.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(model.focus, FocusTarget::Composer);
-
-        let _ = model.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(model.focus, FocusTarget::Transcript);
     }
 

@@ -65,6 +65,15 @@ impl UiModel {
             self.push_info("no active thread; start a session before toggling plan mode");
             return Vec::new();
         };
+        // The core refuses to flip plan mode mid-turn (the tool set is chosen at
+        // turn start), so reject here with a clear message instead of letting the
+        // optimistic flip bounce back as an error.
+        if self.is_turn_running {
+            self.push_info(
+                "Can't switch mode while the agent is running — press Ctrl+C to stop first",
+            );
+            return Vec::new();
+        }
         let previous = self.plan_mode;
         let desired = !self.plan_mode;
         self.plan_mode = desired;
@@ -709,7 +718,7 @@ mod tests {
         for ch in "no tests".chars() {
             let _ = model.handle_key_event(key(KeyCode::Char(ch)));
         }
-        let effects = model.handle_key_event(key(KeyCode::Enter));
+        let effects = model.handle_key_event(modified_key(KeyCode::Enter, KeyModifiers::CONTROL));
 
         assert!(model.plan_approval.is_none());
         assert!(matches!(

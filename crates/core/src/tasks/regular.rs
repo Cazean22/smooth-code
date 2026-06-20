@@ -1462,8 +1462,17 @@ async fn execute_exit_plan_mode_call(
         internal_call_id,
     } = pending;
 
+    // The model may attach a short `reason` to `exit_plan_mode`; surface it to
+    // the user alongside the plan (it never reaches them otherwise).
+    let reason = tool_call
+        .function
+        .arguments
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
     let (tool_output, success, error) =
-        exit_plan_mode_outcome(&session, &ctx, internal_call_id.clone(), cancel).await?;
+        exit_plan_mode_outcome(&session, &ctx, internal_call_id.clone(), reason, cancel).await?;
 
     Some(
         complete_tool_call(
@@ -1488,6 +1497,7 @@ async fn exit_plan_mode_outcome(
     session: &Arc<Session>,
     ctx: &Arc<TurnContext>,
     internal_call_id: String,
+    reason: Option<String>,
     cancel: &TurnCancel,
 ) -> Option<(String, bool, Option<String>)> {
     let failure = |message: String| Some((message.clone(), false, Some(message)));
@@ -1518,7 +1528,9 @@ async fn exit_plan_mode_outcome(
         thread_id: session.id.to_string(),
         turn_id: ctx.sub_id.clone(),
         call_id: internal_call_id,
-        plan,
+        // Keep `plan` owned for the approval fallback below.
+        plan: plan.clone(),
+        reason,
     };
     let decision = tokio::select! {
         _ = cancel.cancelled() => return None,
@@ -1529,13 +1541,25 @@ async fn exit_plan_mode_outcome(
         Ok(response) => match response.decision {
             PlanApprovalDecision::Approved => {
                 match session.apply_plan_mode_unchecked(false).await {
-                    Ok(_) => Some((
-                        "Plan approved by the user. Plan mode is off — implement the plan now \
-                         with the full tool set."
-                            .to_string(),
-                        true,
-                        None,
-                    )),
+                    Ok(_) => {
+                        // Re-read the plan file so any edits the user made while
+                        // reviewing (Ctrl+G → $EDITOR in the approval overlay)
+                        // are what the model implements. Fall back to the plan
+                        // as originally submitted if the re-read is empty/fails.
+                        let approved_plan = tokio::fs::read_to_string(&plan_path)
+                            .await
+                            .ok()
+                            .filter(|reread| !reread.trim().is_empty())
+                            .unwrap_or(plan);
+                        Some((
+                            format!(
+                                "Plan approved by the user. Plan mode is off — implement the \
+                                 plan now with the full tool set.\n\nApproved plan:\n{approved_plan}"
+                            ),
+                            true,
+                            None,
+                        ))
+                    }
                     Err(err) => failure(err.to_string()),
                 }
             }

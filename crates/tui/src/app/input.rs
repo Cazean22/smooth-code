@@ -20,6 +20,12 @@ impl UiModel {
         if self.screen == Screen::Workspace {
             if let Some(picker) = self.question_picker.as_mut() {
                 picker.handle_paste(&text);
+            } else if let Some(overlay) = self
+                .plan_approval
+                .as_mut()
+                .filter(|overlay| overlay.is_active())
+            {
+                overlay.handle_paste(&text);
             } else if self.mode == UiMode::Insert {
                 self.composer.insert_paste(&text);
                 self.sync_skill_popup();
@@ -37,6 +43,14 @@ impl UiModel {
             && key_event.modifiers.contains(KeyModifiers::CONTROL)
     }
 
+    /// Shift+Tab as delivered by both the legacy encoding (`BackTab`) and the
+    /// kitty keyboard protocol (`Tab` + SHIFT). Used to toggle plan mode.
+    pub(in crate::app) fn is_shift_tab(key_event: KeyEvent) -> bool {
+        matches!(key_event.code, KeyCode::BackTab)
+            || (matches!(key_event.code, KeyCode::Tab)
+                && key_event.modifiers.contains(KeyModifiers::SHIFT))
+    }
+
     pub(in crate::app) fn is_disambiguated_ctrl_i(key_event: KeyEvent) -> bool {
         matches!(key_event.code, KeyCode::Char('i') | KeyCode::Char('I'))
             && key_event.modifiers.contains(KeyModifiers::CONTROL)
@@ -52,7 +66,10 @@ impl UiModel {
     pub(in crate::app) fn preview_forward_allowed_in_current_context(&self) -> bool {
         self.screen == Screen::Workspace
             && self.question_picker.is_none()
-            && self.plan_approval.is_none()
+            && !self
+                .plan_approval
+                .as_ref()
+                .is_some_and(PlanApprovalOverlay::is_active)
             && !matches!(
                 self.mode,
                 UiMode::Command | UiMode::Insert | UiMode::Overlay
@@ -99,12 +116,27 @@ impl UiModel {
             return self.dispatch_picker_key(key_event);
         }
 
-        if self.screen == Screen::Workspace && self.plan_approval.is_some() {
+        if self.screen == Screen::Workspace
+            && self
+                .plan_approval
+                .as_ref()
+                .is_some_and(PlanApprovalOverlay::is_active)
+        {
             return self.dispatch_plan_approval_key(key_event);
         }
 
         if self.mode == UiMode::Command {
             return self.handle_command_key(key_event);
+        }
+
+        // Shift+Tab toggles plan mode (Claude Code style) from Normal or while
+        // composing in Insert. Placed after the overlay/command guards so they
+        // consume their own keys first.
+        if self.screen == Screen::Workspace
+            && matches!(self.mode, UiMode::Normal | UiMode::Insert)
+            && Self::is_shift_tab(key_event)
+        {
+            return self.request_plan_toggle();
         }
 
         match self.screen {
@@ -217,6 +249,14 @@ impl UiModel {
                 self.toggle_inspector_visible();
                 Vec::new()
             }
+            KeyCode::Char('R')
+                if self
+                    .plan_approval
+                    .as_ref()
+                    .is_some_and(|overlay| !overlay.is_active()) =>
+            {
+                self.resume_plan_review()
+            }
             KeyCode::Char(':') => {
                 self.mode = UiMode::Command;
                 self.command.clear();
@@ -227,10 +267,6 @@ impl UiModel {
             }
             KeyCode::Tab => {
                 self.focus_next();
-                Vec::new()
-            }
-            KeyCode::BackTab => {
-                self.focus_prev();
                 Vec::new()
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -662,7 +698,11 @@ impl UiModel {
             KeyCode::Esc => {
                 self.command.clear();
                 self.mode = if self.screen == Screen::Workspace
-                    && (self.question_picker.is_some() || self.plan_approval.is_some())
+                    && (self.question_picker.is_some()
+                        || self
+                            .plan_approval
+                            .as_ref()
+                            .is_some_and(PlanApprovalOverlay::is_active))
                 {
                     UiMode::Overlay
                 } else {
@@ -696,6 +736,7 @@ impl UiModel {
             "send" => self.request_turn_start(),
             "cancel" => self.request_turn_cancel(),
             "plan" => self.request_plan_toggle(),
+            "review" => self.resume_plan_review(),
             "quit" | "q" => vec![self.effect(EffectContext::Exit, UiEffectKind::Exit)],
             "clear" => {
                 self.clear_transcript();
@@ -733,7 +774,7 @@ impl UiModel {
                 Vec::new()
             }
             "help" => {
-                self.push_info(":send  :cancel  :plan  :quit  :clear  :focus transcript|inspector|composer|dashboard  :inspector toggle|show|hide  I toggle inspector  :help");
+                self.push_info(":send  :cancel  :plan (Shift+Tab)  :review  :quit  :clear  :focus transcript|inspector|composer|dashboard  :inspector toggle|show|hide  I toggle inspector  :help");
                 Vec::new()
             }
             other => {
@@ -790,6 +831,29 @@ impl UiModel {
         }
     }
 
+    /// Bring back a deferred plan-approval overlay (R / :review). Surfaces an
+    /// info note when nothing is deferred.
+    pub(in crate::app) fn resume_plan_review(&mut self) -> Vec<UiEffect> {
+        if self
+            .plan_approval
+            .as_ref()
+            .is_some_and(|overlay| !overlay.is_active())
+        {
+            // Drop any subagent preview so the resumed overlay isn't hidden
+            // behind it, and release the preview's server watchers.
+            let effects = self.clear_preview_stack();
+            if let Some(overlay) = self.plan_approval.as_mut() {
+                overlay.resume();
+            }
+            self.mode = UiMode::Overlay;
+            self.focus = FocusTarget::Overlay;
+            effects
+        } else {
+            self.push_info("No deferred plan review to resume");
+            Vec::new()
+        }
+    }
+
     pub(in crate::app) fn dispatch_plan_approval_key(
         &mut self,
         key_event: KeyEvent,
@@ -814,6 +878,27 @@ impl UiModel {
                         response,
                     },
                 )]
+            }
+            PlanApprovalOutcome::Defer => {
+                if let Some(overlay) = self.plan_approval.as_mut() {
+                    overlay.defer();
+                }
+                self.mode = UiMode::Normal;
+                self.focus = FocusTarget::Transcript;
+                self.push_info("Plan review deferred — press R to resume, Ctrl+C to cancel");
+                Vec::new()
+            }
+            PlanApprovalOutcome::OpenEditor => {
+                let Some(path) = self
+                    .plan_approval
+                    .as_ref()
+                    .and_then(PlanApprovalOverlay::thread_id)
+                    .map(|thread_id| tools::plan_file_path(&self.workspace_root, thread_id))
+                else {
+                    self.push_error("Cannot open plan in editor: unknown plan file path");
+                    return Vec::new();
+                };
+                vec![self.effect(EffectContext::OpenEditor, UiEffectKind::OpenEditor { path })]
             }
         }
     }
@@ -1688,5 +1773,105 @@ mod tests {
         let (kept, truncated) = clip_for_clipboard(String::from("short"));
         assert!(!truncated);
         assert_eq!(kept, "short");
+    }
+
+    #[test]
+    fn shift_tab_toggles_plan_mode_in_normal_and_insert() {
+        let mut model = workspace_normal_model();
+        model.current_thread_id = Some(ThreadId::new());
+
+        // Normal mode: BackTab (Shift+Tab) requests enabling plan mode.
+        let effects = model.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0].kind,
+            UiEffectKind::SetPlanMode { enabled: true, .. }
+        ));
+
+        // Insert mode: kitty-style Tab+Shift toggles it back off.
+        model.mode = UiMode::Insert;
+        let effects = model.handle_key_event(modified_key(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0].kind,
+            UiEffectKind::SetPlanMode { enabled: false, .. }
+        ));
+    }
+
+    #[test]
+    fn shift_tab_blocked_while_turn_running() {
+        let mut model = workspace_normal_model();
+        model.current_thread_id = Some(ThreadId::new());
+        model.is_turn_running = true;
+
+        let effects = model.handle_key_event(key(KeyCode::BackTab));
+        assert!(effects.is_empty(), "must not toggle mode mid-turn");
+        assert!(!model.plan_mode);
+    }
+
+    #[test]
+    fn esc_in_active_overlay_defers_without_responding() {
+        let mut model = workspace_normal_model();
+        model.current_thread_id = Some(ThreadId::new());
+        model.plan_approval = Some(PlanApprovalOverlay::new(
+            RequestId(1),
+            plan_approval_params("thread"),
+        ));
+        model.mode = UiMode::Overlay;
+        model.focus = FocusTarget::Overlay;
+
+        let effects = model.handle_key_event(key(KeyCode::Esc));
+        assert!(effects.is_empty(), "defer must not send a response");
+        assert_eq!(model.mode, UiMode::Normal);
+        assert!(
+            model
+                .plan_approval
+                .as_ref()
+                .is_some_and(|overlay| !overlay.is_active()),
+            "overlay should be deferred but still pending"
+        );
+    }
+
+    #[test]
+    fn deferred_overlay_does_not_swallow_keys_and_r_resumes() {
+        let mut model = workspace_normal_model();
+        model.current_thread_id = Some(ThreadId::new());
+        model.plan_approval = Some(PlanApprovalOverlay::new(
+            RequestId(1),
+            plan_approval_params("thread"),
+        ));
+        if let Some(overlay) = model.plan_approval.as_mut() {
+            overlay.defer();
+        }
+        model.mode = UiMode::Normal;
+        model.focus = FocusTarget::Transcript;
+
+        // R resumes the deferred overlay.
+        let _ = model.handle_key_event(key(KeyCode::Char('R')));
+        assert_eq!(model.mode, UiMode::Overlay);
+        assert!(
+            model
+                .plan_approval
+                .as_ref()
+                .is_some_and(|overlay| overlay.is_active())
+        );
+    }
+
+    #[test]
+    fn ctrl_g_in_overlay_emits_open_editor_effect() {
+        let mut model = workspace_normal_model();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        model.plan_approval = Some(PlanApprovalOverlay::new(
+            RequestId(1),
+            plan_approval_params(&thread_id.to_string()),
+        ));
+        model.mode = UiMode::Overlay;
+        model.focus = FocusTarget::Overlay;
+
+        let effects =
+            model.handle_key_event(modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0].kind, UiEffectKind::OpenEditor { .. }));
     }
 }

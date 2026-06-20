@@ -167,12 +167,14 @@ impl SessionModelFactory for ExitPlanFactory {
 
 struct ApprovalProbe {
     plans: Mutex<Vec<String>>,
+    reasons: Mutex<Vec<Option<String>>>,
     calls: Mutex<usize>,
 }
 
 fn approval_client(
     decision: PlanApprovalDecision,
     feedback: Option<&'static str>,
+    edit_to: Option<&'static str>,
     probe: Arc<ApprovalProbe>,
 ) -> AskUserClient {
     AskUserClient::new(
@@ -186,6 +188,19 @@ fn approval_client(
     .with_plan_approval(move |params| {
         let probe = Arc::clone(&probe);
         async move {
+            // Simulate the user editing the plan in $EDITOR (Ctrl+G) before
+            // approving: overwrite the on-disk plan file the session re-reads.
+            if let Some(edited) = edit_to
+                && let (Ok(cwd), Ok(thread_id)) = (
+                    std::env::current_dir(),
+                    params.thread_id.parse::<ThreadId>(),
+                )
+            {
+                let _ = std::fs::write(tools::plan_file_path(&cwd, thread_id), edited);
+            }
+            if let Ok(mut reasons) = probe.reasons.lock() {
+                reasons.push(params.reason.clone());
+            }
             if let Ok(mut plans) = probe.plans.lock() {
                 plans.push(params.plan);
             }
@@ -231,6 +246,7 @@ async fn run_exit_plan_turn(
     decision: PlanApprovalDecision,
     feedback: Option<&'static str>,
     plan_content: Option<&str>,
+    edit_on_approval: Option<&'static str>,
     expected_result_snippets: &'static [&'static str],
 ) -> Result<PlanModeRun> {
     let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
@@ -240,10 +256,16 @@ async fn run_exit_plan_turn(
 
     let probe = Arc::new(ApprovalProbe {
         plans: Mutex::new(Vec::new()),
+        reasons: Mutex::new(Vec::new()),
         calls: Mutex::new(0),
     });
     let manager = ThreadManagerState::new(
-        Some(approval_client(decision, feedback, Arc::clone(&probe))),
+        Some(approval_client(
+            decision,
+            feedback,
+            edit_on_approval,
+            Arc::clone(&probe),
+        )),
         Some(Arc::new(ExitPlanFactory {
             expected_result_snippets,
         })),
@@ -295,6 +317,7 @@ async fn approved_plan_unlocks_plan_mode_mid_turn() -> Result<()> {
         PlanApprovalDecision::Approved,
         None,
         Some("# The grand plan\n\n1. Refactor."),
+        None,
         &["Plan approved by the user", "implement the plan now"],
     )
     .await?;
@@ -319,6 +342,16 @@ async fn approved_plan_unlocks_plan_mode_mid_turn() -> Result<()> {
         ["# The grand plan\n\n1. Refactor."],
         "the approval request must carry the plan_write content"
     );
+    let reasons = run
+        .probe
+        .reasons
+        .lock()
+        .map_err(|_| anyhow::anyhow!("reasons mutex"))?;
+    assert_eq!(
+        reasons.as_slice(),
+        [Some("plan ready".to_string())],
+        "the model's exit_plan_mode reason must reach the approval request"
+    );
     Ok(())
 }
 
@@ -328,6 +361,7 @@ async fn rejected_plan_stays_in_plan_mode_and_surfaces_feedback() -> Result<()> 
         PlanApprovalDecision::Rejected,
         Some("use sqlite instead"),
         Some("# The grand plan"),
+        None,
         &[
             "rejected the plan",
             "still in plan mode",
@@ -352,6 +386,7 @@ async fn exit_without_plan_file_fails_and_never_asks_for_approval() -> Result<()
         PlanApprovalDecision::Approved,
         None,
         None,
+        None,
         &["no plan found", "plan_write"],
     )
     .await?;
@@ -368,6 +403,40 @@ async fn exit_without_plan_file_fails_and_never_asks_for_approval() -> Result<()
         .lock()
         .map_err(|_| anyhow::anyhow!("calls mutex"))?;
     assert_eq!(*calls, 0, "approval must not be requested without a plan");
+    Ok(())
+}
+
+#[tokio::test]
+async fn approved_plan_applies_user_edits_from_disk() -> Result<()> {
+    // The user opens the plan in $EDITOR (Ctrl+G) and edits it before approving;
+    // on approval the re-read plan — not the originally submitted one — is what
+    // the model is told to implement.
+    let run = run_exit_plan_turn(
+        PlanApprovalDecision::Approved,
+        None,
+        Some("# Original plan\n\n1. Old step."),
+        Some("# Edited plan\n\n1. New step from the editor."),
+        &["Plan approved by the user", "New step from the editor"],
+    )
+    .await?;
+
+    assert_eq!(
+        run.plan_mode_changes,
+        vec![true, false],
+        "approval should flip plan mode off mid-turn"
+    );
+    assert_eq!(
+        run.last_assistant_message.as_deref(),
+        Some("implementing plan")
+    );
+    // The approval *request* still carried the originally submitted plan; the
+    // edited version only reaches the model via the post-approval re-read.
+    let plans = run
+        .probe
+        .plans
+        .lock()
+        .map_err(|_| anyhow::anyhow!("plans mutex"))?;
+    assert_eq!(plans.as_slice(), ["# Original plan\n\n1. Old step."]);
     Ok(())
 }
 

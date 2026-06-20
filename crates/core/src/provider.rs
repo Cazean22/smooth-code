@@ -2032,6 +2032,19 @@ fn push_reasoning_choices(
     summary: Vec<ReasoningSummary>,
     encrypted_content: Option<String>,
 ) {
+    if summary.is_empty() && encrypted_content.is_none() {
+        // OpenAI can emit a reasoning output item that carries only its provider
+        // id. That id still has to be roundtripped because later output items
+        // (including function calls) may reference it. Rig's full Reasoning raw
+        // choice requires one content block, so use an empty delta as the local
+        // transport; the manual turn loop converts provider-id empty deltas back
+        // into an id-only MessageReasoning without emitting visible UI text.
+        choices.push(RawStreamingChoice::ReasoningDelta {
+            id: Some(id),
+            reasoning: String::new(),
+        });
+        return;
+    }
     for summary in summary {
         let ReasoningSummary::SummaryText { text } = summary;
         choices.push(RawStreamingChoice::Reasoning {
@@ -3067,6 +3080,70 @@ mod tests {
 
         assert!(summary_index < message_index);
         assert!(encrypted_index < message_index);
+        Ok(())
+    }
+
+    #[test]
+    fn openai_websocket_completed_response_output_preserves_id_only_reasoning_before_tool_call()
+    -> Result<()> {
+        let mut accumulator = super::OpenAiWebSocketAccumulator::new();
+        let payload = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_empty",
+                        "summary": []
+                    },
+                    {
+                        "type": "function_call",
+                        "id": "fc_empty",
+                        "call_id": "call_empty",
+                        "name": "read",
+                        "arguments": "{\"file_path\":\"Cargo.toml\"}",
+                        "status": "completed"
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "output_tokens_details": {"reasoning_tokens": 1},
+                    "total_tokens": 3
+                }
+            }
+        })
+        .to_string();
+
+        let outcome = super::parse_openai_websocket_payload(&payload, &mut accumulator)?;
+
+        assert!(outcome.choices.is_empty());
+        assert!(outcome.terminal);
+        let finished = accumulator.finish();
+        let reasoning_index = finished
+            .iter()
+            .position(|choice| {
+                matches!(
+                    choice,
+                    RawStreamingChoice::ReasoningDelta { id, reasoning }
+                        if id.as_deref() == Some("rs_empty") && reasoning.is_empty()
+                )
+            })
+            .context("terminal response id-only reasoning should be emitted")?;
+        let tool_index = finished
+            .iter()
+            .position(|choice| {
+                matches!(
+                    choice,
+                    RawStreamingChoice::ToolCall(tool_call)
+                        if tool_call.id == "fc_empty" && tool_call.call_id.as_deref() == Some("call_empty")
+                )
+            })
+            .context("terminal response tool call should be emitted")?;
+
+        assert!(reasoning_index < tool_index);
         Ok(())
     }
 

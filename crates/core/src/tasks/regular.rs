@@ -53,6 +53,12 @@ fn reasoning_text(reasoning: &MessageReasoning) -> String {
         .collect::<String>()
 }
 
+fn id_only_reasoning(id: String) -> MessageReasoning {
+    let mut reasoning = MessageReasoning::new("");
+    reasoning.content.clear();
+    reasoning.with_id(id)
+}
+
 /// Mark the current turn as failed: log, emit a protocol `Error` event so the
 /// rollout / inbox carries the underlying provider/stream error, and publish
 /// `AgentStatus::Errored` so any parent waiting on this thread (inline waiter,
@@ -217,6 +223,9 @@ impl PendingReasoningDeltas {
     fn finalize_into(self, accumulated: &mut Vec<MessageReasoning>) {
         for (id, text) in self.deltas {
             if text.is_empty() {
+                if let Some(id) = id {
+                    accumulated.push(id_only_reasoning(id));
+                }
                 continue;
             }
             let mut reasoning = MessageReasoning::new(&text);
@@ -452,28 +461,28 @@ impl AttemptState {
                         .clone()
                         .unwrap_or_else(|| format!("{attempt_assistant_item_id}-reasoning"));
                     self.pending_reasoning_deltas.push_delta(id, &reasoning);
-                    session
-                        .emit_event(
-                            ctx,
-                            EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
-                                thread_id: session.id.to_string(),
-                                turn_id: ctx.sub_id.clone(),
-                                item_id,
-                                delta: reasoning,
-                            }),
-                        )
-                        .await;
+                    if !reasoning.is_empty() {
+                        session
+                            .emit_event(
+                                ctx,
+                                EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
+                                    thread_id: session.id.to_string(),
+                                    turn_id: ctx.sub_id.clone(),
+                                    item_id,
+                                    delta: reasoning,
+                                }),
+                            )
+                            .await;
+                    }
                 }
                 SessionAssistantContent::Reasoning(reasoning) => {
                     self.saw_assistant_item_this_attempt = true;
-                    // Skip only truly empty completions. A block carrying
-                    // `Encrypted` or `Redacted` content has empty
-                    // human-readable text but still must be roundtripped
-                    // to the provider on the next turn — for OpenAI's
-                    // o-series, the encrypted chain-of-thought is what
-                    // preserves reasoning continuity, and dropping it
-                    // can produce refusals or degraded responses.
-                    if reasoning.content.is_empty() {
+                    // Skip only completions that carry neither content nor a
+                    // provider id. OpenAI can emit an id-only reasoning item that
+                    // must be roundtripped because later function/message output
+                    // may depend on the `rs_*` id, even though there is no visible
+                    // reasoning text for the transcript.
+                    if reasoning.content.is_empty() && reasoning.id.is_none() {
                         return;
                     }
                     self.pending_reasoning_deltas.on_completion(&reasoning.id);
@@ -2690,6 +2699,19 @@ mod tests {
         assert_eq!(reasoning_text_content(&accumulated[0]), "with id");
         assert!(accumulated[1].id.is_none());
         assert_eq!(reasoning_text_content(&accumulated[1]), "no id");
+    }
+
+    #[test]
+    fn empty_idd_delta_finalizes_as_id_only_reasoning() {
+        let mut pending = PendingReasoningDeltas::default();
+        pending.push_delta(Some("rs_empty".to_string()), "");
+
+        let mut accumulated = Vec::new();
+        pending.finalize_into(&mut accumulated);
+
+        assert_eq!(accumulated.len(), 1);
+        assert_eq!(accumulated[0].id.as_deref(), Some("rs_empty"));
+        assert!(accumulated[0].content.is_empty());
     }
 
     #[test]

@@ -1577,6 +1577,148 @@ impl SessionModelDriver for ReasoningToolLoopDriver {
     }
 }
 
+struct IdOnlyReasoningToolLoopDriver {
+    calls: Mutex<usize>,
+}
+
+impl SessionModelDriver for IdOnlyReasoningToolLoopDriver {
+    fn stream_completion_turn(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+    ) -> Result<SessionCompletionStream> {
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calls mutex"))?;
+        let call_idx = *calls;
+        *calls += 1;
+        drop(calls);
+
+        match call_idx {
+            0 => {
+                assert_eq!(
+                    first_user_text(&prompt),
+                    Some("id-only reasoning tool loop".to_string())
+                );
+                assert!(
+                    history.iter().all(|message| {
+                        !matches!(
+                            message,
+                            Message::Assistant { content, .. }
+                                if content.iter().any(|item| matches!(item, AssistantContent::ToolCall(_)))
+                        )
+                    }),
+                    "first provider call should not include a prior assistant tool call"
+                );
+                let mut reasoning = Reasoning::new("");
+                reasoning.id = Some("rs_empty".to_string());
+                reasoning.content.clear();
+                let tool_call = ToolCall::new(
+                    "fc_empty".to_string(),
+                    ToolFunction::new(
+                        "normal_tool".to_string(),
+                        serde_json::json!({ "value": "ok" }),
+                    ),
+                )
+                .with_call_id("call_empty".to_string());
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Reasoning(reasoning),
+                    )),
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id: "internal-call-empty".to_string(),
+                        },
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-id-only-reasoning".to_string()),
+                        response: String::new(),
+                    })),
+                ])))
+            }
+            1 => {
+                assert_eq!(
+                    tool_result_texts(&prompt),
+                    vec!["tool-output"],
+                    "tool result should be the continuation prompt"
+                );
+                assert!(
+                    history.iter().any(|message| {
+                        first_user_text(message) == Some("id-only reasoning tool loop".to_string())
+                    }),
+                    "history should include the initial user prompt"
+                );
+                let Some(assistant_message) = history.iter().find(|message| {
+                    matches!(
+                        message,
+                        Message::Assistant { content, .. }
+                            if content.iter().any(|item| matches!(
+                                item,
+                                AssistantContent::ToolCall(tool_call)
+                                    if tool_call.function.name == "normal_tool"
+                            ))
+                    )
+                }) else {
+                    panic!("history should include the assistant tool-call message");
+                };
+                let (_, reasonings) = assistant_text_and_reasonings(assistant_message);
+                assert_eq!(reasonings.len(), 1);
+                assert_eq!(reasonings[0].id.as_deref(), Some("rs_empty"));
+                assert!(
+                    reasonings[0].content.is_empty(),
+                    "id-only OpenAI reasoning must be preserved without inventing visible content"
+                );
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(SessionCompletionEvent::AssistantItem(
+                        SessionAssistantContent::Text(Text {
+                            text: "done".to_string(),
+                            additional_params: None,
+                        }),
+                    )),
+                    Ok(SessionCompletionEvent::Completed(SessionTurnSummary {
+                        assistant_message_id: Some("assistant-final".to_string()),
+                        response: "done".to_string(),
+                    })),
+                ])))
+            }
+            other => panic!("unexpected completion turn {other}"),
+        }
+    }
+
+    fn call_tool(
+        &self,
+        tool_name: &str,
+        args: &str,
+    ) -> futures_util::future::BoxFuture<'static, Result<String>> {
+        assert_eq!(tool_name, "normal_tool");
+        assert_eq!(args, r#"{"value":"ok"}"#);
+        Box::pin(async { Ok("tool-output".to_string()) })
+    }
+}
+
+struct IdOnlyReasoningToolLoopFactory;
+
+impl SessionModelFactory for IdOnlyReasoningToolLoopFactory {
+    fn build(
+        &self,
+        _cwd: PathBuf,
+        _thread_id: ThreadId,
+        _ask_user_client: Option<AskUserClient>,
+        _current_turn_id: Arc<RwLock<Option<String>>>,
+        _system_prompt_kind: SystemPromptKind,
+        _agent_control: AgentControl,
+        _plan_mode: bool,
+    ) -> Result<SessionModel> {
+        Ok(SessionModel::Stub(Arc::new(
+            IdOnlyReasoningToolLoopDriver {
+                calls: Mutex::new(0),
+            },
+        )))
+    }
+}
+
 struct ReasoningStreamFactory;
 
 impl SessionModelFactory for ReasoningStreamFactory {
@@ -2023,6 +2165,28 @@ async fn wait_for_turn_completion(
         }
     }
     panic!("turn {turn_id} did not complete in time");
+}
+
+#[tokio::test]
+async fn id_only_reasoning_survives_tool_call_continuation_history() -> Result<()> {
+    let _cwd_guard = CWD_LOCK.lock().map_err(|_| anyhow::anyhow!("cwd lock"))?;
+    let workspace = TempDir::new()?;
+    let original_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(workspace.path())?;
+
+    let manager =
+        ThreadManagerState::new(None, Some(Arc::new(IdOnlyReasoningToolLoopFactory))).await?;
+    let started = manager.start_thread().await?;
+    let root_id = started.thread_id;
+    let mut root_events = manager.subscribe(root_id).await?;
+
+    let first_turn = manager
+        .start_user_input(root_id, "id-only reasoning tool loop".to_string())
+        .await?;
+    wait_for_turn_completion(&mut root_events, &first_turn).await;
+
+    std::env::set_current_dir(original_cwd)?;
+    Ok(())
 }
 
 #[tokio::test]

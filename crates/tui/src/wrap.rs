@@ -277,360 +277,217 @@ pub(crate) fn wrap_line_hanging(
     let indent = indent.min(width.saturating_sub(1));
     let line_style = line.style;
 
-    let mut rows: Vec<Vec<StyledSlice<'_>>> = Vec::new();
-    let mut current: Vec<StyledSlice<'_>> = Vec::new();
-    let mut current_width = 0usize;
-    let mut word = PendingWord::default();
+    let mut state = HangingWrapState::new(width, indent);
     let mut saw_content = false;
 
     for span in &line.spans {
         let style = span.style;
-        for part in chunk_parts(span.content.as_ref()) {
-            saw_content = true;
-            match part {
-                ChunkPart::Word(part) => {
-                    word.push_part(part, style);
+        let text = span.content.as_ref();
+        let mut run_start = 0usize;
+        let mut run_width = 0usize;
+        let mut run_is_space = None;
+
+        for (idx, ch) in text.char_indices() {
+            let is_space = ch == ' ';
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            match run_is_space {
+                None => {
+                    run_is_space = Some(is_space);
+                    run_start = idx;
+                    run_width = ch_width;
                 }
-                ChunkPart::Spaces(part) => {
-                    place_word_hanging_slices(
-                        &mut rows,
-                        &mut current,
-                        &mut current_width,
-                        &mut word,
-                        width,
-                        indent,
-                    );
-                    place_spaces_hanging(
-                        &mut rows,
-                        &mut current,
-                        &mut current_width,
-                        part.text,
-                        style,
-                        width,
-                        indent,
-                    );
+                Some(current_is_space) if current_is_space == is_space => {
+                    run_width += ch_width;
+                }
+                Some(current_is_space) => {
+                    saw_content = true;
+                    state.place_span_run(current_is_space, &text[run_start..idx], run_width, style);
+                    run_is_space = Some(is_space);
+                    run_start = idx;
+                    run_width = ch_width;
                 }
             }
+        }
+
+        if let Some(is_space) = run_is_space {
+            saw_content = true;
+            state.place_span_run(is_space, &text[run_start..], run_width, style);
         }
     }
     if !saw_content {
         return vec![Line::default().style(line_style)];
     }
-    place_word_hanging_slices(
-        &mut rows,
-        &mut current,
-        &mut current_width,
-        &mut word,
-        width,
-        indent,
-    );
-    if !current.is_empty() || rows.is_empty() {
-        rows.push(current);
-    }
 
-    build_hanging_slice_lines(rows, line_style, indent)
+    state.finish(line_style)
 }
 
-#[derive(Clone, Copy)]
-struct WordPart<'a> {
-    text: &'a str,
+type BorrowedSpanRun<'a> = (&'a str, Style, usize);
+
+struct HangingWrapState<'a> {
+    rows: Vec<Vec<Span<'static>>>,
+    current: Vec<Span<'static>>,
+    current_width: usize,
+    pending_word: Vec<BorrowedSpanRun<'a>>,
+    pending_word_width: usize,
     width: usize,
+    indent: usize,
 }
 
-impl<'a> WordPart<'a> {
-    fn new(text: &'a str, width: usize) -> Self {
-        Self { text, width }
-    }
-}
-
-enum ChunkPart<'a> {
-    Word(WordPart<'a>),
-    Spaces(WordPart<'a>),
-}
-
-struct StyledSlice<'a> {
-    parts: Vec<WordPart<'a>>,
-    style: Style,
-    width: usize,
-}
-
-impl<'a> StyledSlice<'a> {
-    fn new(part: WordPart<'a>, style: Style) -> Self {
+impl<'a> HangingWrapState<'a> {
+    fn new(width: usize, indent: usize) -> Self {
         Self {
-            parts: vec![part],
-            style,
-            width: part.width,
+            rows: Vec::new(),
+            current: Vec::new(),
+            current_width: 0,
+            pending_word: Vec::new(),
+            pending_word_width: 0,
+            width,
+            indent,
         }
     }
 
-    fn append_part(&mut self, part: WordPart<'a>) {
-        self.width += part.width;
-        self.parts.push(part);
+    fn place_span_run(&mut self, is_space: bool, text: &'a str, text_width: usize, style: Style) {
+        if text.is_empty() {
+            return;
+        }
+
+        if is_space {
+            self.place_pending_word();
+            self.place_spaces(text, style);
+        } else {
+            self.pending_word.push((text, style, text_width));
+            self.pending_word_width += text_width;
+        }
     }
 
-    fn append_slice(&mut self, slice: StyledSlice<'a>) {
-        self.width += slice.width;
-        self.parts.extend(slice.parts);
-    }
-}
+    fn place_spaces(&mut self, spaces: &str, style: Style) {
+        let mut segment_start = None;
+        let mut segment_width = 0usize;
 
-#[derive(Default)]
-struct PendingWord<'a> {
-    slices: Vec<StyledSlice<'a>>,
-    width: usize,
-}
-
-impl<'a> PendingWord<'a> {
-    fn push_part(&mut self, part: WordPart<'a>, style: Style) {
-        self.width += part.width;
-        push_styled_part(&mut self.slices, part, style);
-    }
-}
-
-fn push_styled_part<'a>(slices: &mut Vec<StyledSlice<'a>>, part: WordPart<'a>, style: Style) {
-    if part.text.is_empty() {
-        return;
-    }
-
-    if let Some(last) = slices.last_mut()
-        && last.style == style
-    {
-        last.append_part(part);
-    } else {
-        slices.push(StyledSlice::new(part, style));
-    }
-}
-
-fn push_styled_slice<'a>(slices: &mut Vec<StyledSlice<'a>>, slice: StyledSlice<'a>) {
-    if slice.parts.is_empty() {
-        return;
-    }
-
-    if let Some(last) = slices.last_mut()
-        && last.style == slice.style
-    {
-        last.append_slice(slice);
-    } else {
-        slices.push(slice);
-    }
-}
-
-fn push_styled_slices<'a>(target: &mut Vec<StyledSlice<'a>>, slices: Vec<StyledSlice<'a>>) {
-    for slice in slices {
-        push_styled_slice(target, slice);
-    }
-}
-
-fn chunk_parts(text: &str) -> Vec<ChunkPart<'_>> {
-    let mut parts = Vec::new();
-    let mut run_start = 0usize;
-    let mut run_width = 0usize;
-    let mut run_is_space = None;
-
-    for (idx, ch) in text.char_indices() {
-        let is_space = ch == ' ';
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        match run_is_space {
-            None => {
-                run_is_space = Some(is_space);
-                run_start = idx;
-                run_width = ch_width;
+        for (idx, ch) in spaces.char_indices() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let logical_width = self.current_width.saturating_add(segment_width);
+            let budget = row_budget(self.rows.len(), self.width, self.indent);
+            if logical_width.saturating_add(ch_width) > budget {
+                if let Some(start) = segment_start.take() {
+                    push_span_text(&mut self.current, &spaces[start..idx], style);
+                    self.current_width += segment_width;
+                    segment_width = 0;
+                }
+                self.rows.push(std::mem::take(&mut self.current));
+                self.current_width = 0;
+                continue;
             }
-            Some(current_is_space) if current_is_space == is_space => {
-                run_width += ch_width;
+
+            let dropping_leading = logical_width == 0 && !self.rows.is_empty();
+            if dropping_leading {
+                continue;
             }
-            Some(current_is_space) => {
-                push_chunk_part(
-                    &mut parts,
-                    current_is_space,
-                    &text[run_start..idx],
-                    run_width,
-                );
-                run_is_space = Some(is_space);
-                run_start = idx;
-                run_width = ch_width;
+
+            if segment_start.is_none() {
+                segment_start = Some(idx);
             }
+            segment_width += ch_width;
+        }
+
+        if let Some(start) = segment_start {
+            push_span_text(&mut self.current, &spaces[start..], style);
+            self.current_width += segment_width;
         }
     }
 
-    if let Some(is_space) = run_is_space {
-        push_chunk_part(&mut parts, is_space, &text[run_start..], run_width);
+    /// Place the accumulated word onto the current row, accounting for the
+    /// hanging indent budget of continuation rows. A word wider than a
+    /// continuation row is hard-broken so it still renders.
+    fn place_pending_word(&mut self) {
+        if self.pending_word.is_empty() {
+            return;
+        }
+        let word = std::mem::take(&mut self.pending_word);
+        let word_width = std::mem::replace(&mut self.pending_word_width, 0);
+
+        let cur_budget = row_budget(self.rows.len(), self.width, self.indent);
+        let next_budget = row_budget(self.rows.len() + 1, self.width, self.indent);
+        // Move a whole word to a fresh row only when it actually fits there. A word
+        // too wide even for the next row is hard-broken starting in the current
+        // row's remaining space, so a prefix never lands alone on its own row.
+        if self.current_width > 0
+            && self.current_width + word_width > cur_budget
+            && word_width <= next_budget
+        {
+            self.rows.push(std::mem::take(&mut self.current));
+            self.current_width = 0;
+        }
+
+        let budget = row_budget(self.rows.len(), self.width, self.indent);
+        if self.current_width + word_width <= budget {
+            self.push_word_fragments(word);
+            self.current_width += word_width;
+            return;
+        }
+
+        self.hard_break_word_fragments(word);
     }
 
-    parts
-}
-
-fn push_chunk_part<'a>(
-    parts: &mut Vec<ChunkPart<'a>>,
-    is_space: bool,
-    text: &'a str,
-    width: usize,
-) {
-    let part = WordPart::new(text, width);
-    if is_space {
-        parts.push(ChunkPart::Spaces(part));
-    } else {
-        parts.push(ChunkPart::Word(part));
+    fn push_word_fragments(&mut self, word: Vec<BorrowedSpanRun<'a>>) {
+        for (text, style, _) in word {
+            push_span_text(&mut self.current, text, style);
+        }
     }
-}
 
-fn place_spaces_hanging<'a>(
-    rows: &mut Vec<Vec<StyledSlice<'a>>>,
-    current: &mut Vec<StyledSlice<'a>>,
-    current_width: &mut usize,
-    spaces: &'a str,
-    style: Style,
-    width: usize,
-    indent: usize,
-) {
-    let mut segment_start = None;
-    let mut segment_width = 0usize;
-
-    for (idx, ch) in spaces.char_indices() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        let logical_width = (*current_width).saturating_add(segment_width);
-        let budget = row_budget(rows.len(), width, indent);
-        if logical_width.saturating_add(ch_width) > budget {
-            if let Some(start) = segment_start.take() {
-                push_styled_part(
-                    current,
-                    WordPart::new(&spaces[start..idx], segment_width),
-                    style,
-                );
-                *current_width += segment_width;
-                segment_width = 0;
+    fn hard_break_word_fragments(&mut self, word: Vec<BorrowedSpanRun<'a>>) {
+        for (text, style, text_width) in word {
+            let budget = row_budget(self.rows.len(), self.width, self.indent);
+            if self.current_width.saturating_add(text_width) <= budget {
+                push_span_text(&mut self.current, text, style);
+                self.current_width += text_width;
+                continue;
             }
-            rows.push(std::mem::take(current));
-            *current_width = 0;
-            continue;
+
+            self.hard_break_text_fragment(text, style);
         }
-
-        let dropping_leading = logical_width == 0 && !rows.is_empty();
-        if dropping_leading {
-            continue;
-        }
-
-        if segment_start.is_none() {
-            segment_start = Some(idx);
-        }
-        segment_width += ch_width;
     }
 
-    if let Some(start) = segment_start {
-        push_styled_part(
-            current,
-            WordPart::new(&spaces[start..], segment_width),
-            style,
-        );
-        *current_width += segment_width;
-    }
-}
-
-/// Place the accumulated `word` onto the current row, accounting for the hanging
-/// indent budget of continuation rows. A word wider than a continuation row is
-/// hard-broken so it still renders.
-fn place_word_hanging_slices<'a>(
-    rows: &mut Vec<Vec<StyledSlice<'a>>>,
-    current: &mut Vec<StyledSlice<'a>>,
-    current_width: &mut usize,
-    word: &mut PendingWord<'a>,
-    width: usize,
-    indent: usize,
-) {
-    if word.slices.is_empty() {
-        return;
-    }
-    let slices = std::mem::take(&mut word.slices);
-    let word_width = std::mem::replace(&mut word.width, 0);
-
-    let cur_budget = row_budget(rows.len(), width, indent);
-    let next_budget = row_budget(rows.len() + 1, width, indent);
-    // Move a whole word to a fresh row only when it actually fits there. A word
-    // too wide even for the next row is hard-broken starting in the current
-    // row's remaining space, so a prefix never lands alone on its own row.
-    if *current_width > 0 && *current_width + word_width > cur_budget && word_width <= next_budget {
-        rows.push(std::mem::take(current));
-        *current_width = 0;
-    }
-
-    let budget = row_budget(rows.len(), width, indent);
-    if *current_width + word_width <= budget {
-        push_styled_slices(current, slices);
-        *current_width += word_width;
-        return;
-    }
-
-    hard_break_word_slices(rows, current, current_width, slices, width, indent);
-}
-
-fn hard_break_word_slices<'a>(
-    rows: &mut Vec<Vec<StyledSlice<'a>>>,
-    current: &mut Vec<StyledSlice<'a>>,
-    current_width: &mut usize,
-    slices: Vec<StyledSlice<'a>>,
-    width: usize,
-    indent: usize,
-) {
-    for slice in slices {
-        let budget = row_budget(rows.len(), width, indent);
-        let slice_width = slice.width;
-        if (*current_width).saturating_add(slice_width) <= budget {
-            push_styled_slice(current, slice);
-            *current_width += slice_width;
-            continue;
-        }
-
-        hard_break_slice(rows, current, current_width, slice, width, indent);
-    }
-}
-
-fn hard_break_slice<'a>(
-    rows: &mut Vec<Vec<StyledSlice<'a>>>,
-    current: &mut Vec<StyledSlice<'a>>,
-    current_width: &mut usize,
-    slice: StyledSlice<'a>,
-    width: usize,
-    indent: usize,
-) {
-    let style = slice.style;
-    for part in slice.parts {
+    fn hard_break_text_fragment(&mut self, text: &str, style: Style) {
         let mut segment_start = 0usize;
         let mut segment_width = 0usize;
 
-        for (idx, ch) in part.text.char_indices() {
+        for (idx, ch) in text.char_indices() {
             let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            let budget = row_budget(rows.len(), width, indent);
-            let used_width = (*current_width).saturating_add(segment_width);
+            let budget = row_budget(self.rows.len(), self.width, self.indent);
+            let used_width = self.current_width.saturating_add(segment_width);
             if used_width > 0 && used_width.saturating_add(ch_width) > budget {
                 if segment_start < idx {
-                    push_styled_part(
-                        current,
-                        WordPart::new(&part.text[segment_start..idx], segment_width),
-                        style,
-                    );
-                    *current_width += segment_width;
+                    push_span_text(&mut self.current, &text[segment_start..idx], style);
+                    self.current_width += segment_width;
                 }
-                rows.push(std::mem::take(current));
-                *current_width = 0;
+                self.rows.push(std::mem::take(&mut self.current));
+                self.current_width = 0;
                 segment_start = idx;
                 segment_width = 0;
             }
             segment_width += ch_width;
         }
 
-        if segment_start < part.text.len() {
-            push_styled_part(
-                current,
-                WordPart::new(&part.text[segment_start..], segment_width),
-                style,
-            );
-            *current_width += segment_width;
+        if segment_start < text.len() {
+            push_span_text(&mut self.current, &text[segment_start..], style);
+            self.current_width += segment_width;
         }
+    }
+
+    fn finish(mut self, line_style: Style) -> Vec<Line<'static>> {
+        self.place_pending_word();
+        let current = std::mem::take(&mut self.current);
+        if !current.is_empty() || self.rows.is_empty() {
+            self.rows.push(current);
+        }
+
+        build_hanging_span_lines(self.rows, line_style, self.indent)
     }
 }
 
-fn build_hanging_slice_lines(
-    rows: Vec<Vec<StyledSlice<'_>>>,
+fn build_hanging_span_lines(
+    rows: Vec<Vec<Span<'static>>>,
     line_style: Style,
     indent: usize,
 ) -> Vec<Line<'static>> {
@@ -641,14 +498,25 @@ fn build_hanging_slice_lines(
             if idx > 0 && indent > 0 {
                 spans.push(Span::raw(" ".repeat(indent)));
             }
-            for slice in row {
-                for part in slice.parts {
-                    push_span_text(&mut spans, part.text, slice.style);
-                }
+            for span in row {
+                push_owned_span(&mut spans, span);
             }
             Line::from(spans).style(line_style)
         })
         .collect()
+}
+
+fn push_owned_span(spans: &mut Vec<Span<'static>>, span: Span<'static>) {
+    if span.content.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut()
+        && last.style == span.style
+    {
+        last.content.to_mut().push_str(span.content.as_ref());
+    } else {
+        spans.push(span);
+    }
 }
 
 fn push_span_text(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
@@ -705,43 +573,26 @@ mod tests {
             .collect()
     }
 
-    fn styled_slice_text(slice: &StyledSlice<'_>) -> String {
-        slice.parts.iter().map(|part| part.text).collect()
-    }
-
     #[test]
-    fn styled_slice_coalesces_adjacent_same_style_parts() {
+    fn wrap_line_hanging_coalesces_adjacent_same_style_output_spans() {
         let green = Style::default().fg(Color::Green);
         let red = Style::default().fg(Color::Red);
-        let mut slices = Vec::new();
+        let line = Line::from(vec![
+            Span::styled("alpha", green),
+            Span::styled(" ", green),
+            Span::styled("beta", green),
+            Span::styled("!", red),
+        ]);
 
-        push_styled_part(&mut slices, WordPart::new("alpha", 5), green);
-        push_styled_part(&mut slices, WordPart::new(" ", 1), green);
-        push_styled_part(&mut slices, WordPart::new("beta", 4), green);
-        push_styled_part(&mut slices, WordPart::new("!", 1), red);
+        let wrapped = wrap_line_hanging(line, 20, 2);
 
-        assert_eq!(slices.len(), 2);
-        assert_eq!(styled_slice_text(&slices[0]), "alpha beta");
-        assert_eq!(slices[0].width, 10);
-        assert_eq!(styled_slice_text(&slices[1]), "!");
-        assert_eq!(slices[1].width, 1);
-    }
-
-    #[test]
-    fn pending_word_coalesces_same_style_span_fragments() {
-        let green = Style::default().fg(Color::Green);
-        let red = Style::default().fg(Color::Red);
-        let mut word = PendingWord::default();
-
-        word.push_part(WordPart::new("abc", 3), green);
-        word.push_part(WordPart::new("def", 3), green);
-        word.push_part(WordPart::new("ghi", 3), red);
-
-        assert_eq!(word.slices.len(), 2);
-        assert_eq!(word.width, 9);
-        assert_eq!(styled_slice_text(&word.slices[0]), "abcdef");
-        assert_eq!(word.slices[0].width, 6);
-        assert_eq!(styled_slice_text(&word.slices[1]), "ghi");
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(line_text(&wrapped[0]), "alpha beta!");
+        assert_eq!(wrapped[0].spans.len(), 2);
+        assert_eq!(wrapped[0].spans[0].content.as_ref(), "alpha beta");
+        assert_eq!(wrapped[0].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(wrapped[0].spans[1].content.as_ref(), "!");
+        assert_eq!(wrapped[0].spans[1].style.fg, Some(Color::Red));
     }
 
     #[test]

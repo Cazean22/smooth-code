@@ -22,9 +22,9 @@ use rig::{
             self,
             responses_api::{
                 AdditionalParameters, CompletionRequest as OpenAiResponsesCompletionRequest,
-                InputItem as OpenAiResponsesInputItem, Output, Reasoning as OpenAiReasoning,
-                ReasoningEffort, ReasoningSummary, ResponseStatus, ResponsesToolDefinition,
-                ResponsesUsage,
+                InputItem as OpenAiResponsesInputItem, Message as OpenAiResponsesMessage, Output,
+                Reasoning as OpenAiReasoning, ReasoningEffort, ReasoningSummary, ResponseStatus,
+                ResponsesToolDefinition, ResponsesUsage,
                 streaming::{
                     ContentPartChunkPart, ItemChunk, ItemChunkKind, ResponseChunkKind,
                     StreamingCompletionResponse as OpenAiStreamingCompletionResponse,
@@ -1084,6 +1084,7 @@ fn normalize_openai_websocket_response_request(
     request: &mut OpenAiResponsesCompletionRequest,
 ) -> std::result::Result<(), CompletionError> {
     let mut saw_system_input = false;
+    let mut sanitized_assistant_input = false;
     let mut system_instructions = Vec::new();
     let mut input = Vec::new();
 
@@ -1096,11 +1097,15 @@ fn normalize_openai_websocket_response_request(
                     system_instructions.push(instructions.to_string());
                 }
             }
-            None => input.push(item),
+            None => {
+                let (item, sanitized) = openai_websocket_sanitize_assistant_input_item(item)?;
+                sanitized_assistant_input |= sanitized;
+                input.push(item);
+            }
         }
     }
 
-    if !saw_system_input {
+    if !saw_system_input && !sanitized_assistant_input {
         return Ok(());
     }
 
@@ -1118,6 +1123,53 @@ fn normalize_openai_websocket_response_request(
     }
 
     Ok(())
+}
+
+fn openai_websocket_sanitize_assistant_input_item(
+    item: OpenAiResponsesInputItem,
+) -> std::result::Result<(OpenAiResponsesInputItem, bool), CompletionError> {
+    let mut value = serde_json::to_value(&item)?;
+    if !value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|role| role == "assistant")
+    {
+        return Ok((item, false));
+    }
+
+    let Some(content) = value
+        .get_mut("content")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok((item, false));
+    };
+
+    let mut sanitized = false;
+    for part in content {
+        let is_input_text = part
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|part_type| part_type == "input_text");
+        if is_input_text && let Some(object) = part.as_object_mut() {
+            object.insert(
+                "type".to_string(),
+                serde_json::Value::String("output_text".to_string()),
+            );
+            sanitized = true;
+        }
+    }
+
+    if !sanitized {
+        return Ok((item, false));
+    }
+
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("id")
+            .or_insert_with(|| serde_json::Value::String(String::new()));
+    }
+    let message: OpenAiResponsesMessage = serde_json::from_value(value)?;
+    Ok((OpenAiResponsesInputItem::from(message), true))
 }
 
 fn openai_websocket_system_input_text(
@@ -2795,6 +2847,7 @@ mod tests {
             preamble: Some("Use concise answers.".to_string()),
             chat_history: OneOrMany::many(vec![
                 Message::system("Follow repo instructions."),
+                Message::assistant("Previous assistant answer."),
                 Message::user("Inspect the workspace."),
             ])
             .context("chat history")?,
@@ -2831,7 +2884,105 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|role| role == "user")
         }));
+        let assistant = input
+            .iter()
+            .find(|item| {
+                item.get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|role| role == "assistant")
+            })
+            .context("assistant input item")?;
+        let assistant_content = assistant
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .context("assistant content array")?;
+        assert!(assistant_content.iter().any(|part| {
+            part.get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|part_type| part_type == "output_text")
+        }));
+        assert!(assistant_content.iter().all(|part| {
+            !part
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|part_type| part_type == "input_text")
+        }));
         assert!(!payload.contains("System instructions:"));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_websocket_payload_keeps_user_content_as_input_text() -> Result<()> {
+        let request = CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::many(vec![
+                Message::assistant("Prior assistant answer."),
+                Message::user("Continue from there."),
+            ])
+            .context("chat history")?,
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        };
+
+        let payload = super::openai_websocket_create_payload("gpt-test", request)?;
+        let value: serde_json::Value = serde_json::from_str(&payload)?;
+        let input = value
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .context("input array")?;
+        let assistant = input
+            .iter()
+            .find(|item| {
+                item.get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|role| role == "assistant")
+            })
+            .context("assistant input item")?;
+        let assistant_content = assistant
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .context("assistant content array")?;
+        assert!(assistant_content.iter().any(|part| {
+            part.get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|part_type| part_type == "output_text")
+        }));
+        assert!(assistant_content.iter().all(|part| {
+            !part
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|part_type| part_type == "input_text")
+        }));
+
+        let user = input
+            .iter()
+            .find(|item| {
+                item.get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|role| role == "user")
+            })
+            .context("user input item")?;
+        let user_content = user
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .context("user content array")?;
+        assert!(user_content.iter().any(|part| {
+            part.get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|part_type| part_type == "input_text")
+        }));
+        assert!(user_content.iter().all(|part| {
+            !part
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|part_type| part_type == "output_text")
+        }));
         Ok(())
     }
 

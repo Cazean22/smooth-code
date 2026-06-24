@@ -165,10 +165,14 @@ impl ThreadManagerState {
     #[tracing::instrument(name = "core.thread_manager.resume_thread", skip(self), fields(thread_id = %thread_id))]
     pub async fn resume_thread(&self, thread_id: ThreadId) -> CoreResult<ResumedThread> {
         if let Some(thread) = self.threads.read().await.get(&thread_id).cloned() {
+            let rollout_path = thread.rollout_path().clone();
+            let resume_state = load_state(&rollout_path, RecoveryMode::PreviewLive)
+                .await
+                .map_err(CoreError::rollout)?;
             return Ok(ResumedThread {
                 thread_id,
-                rollout_path: thread.rollout_path().clone(),
-                initial_messages: Vec::new(),
+                rollout_path,
+                initial_messages: resume_state.initial_messages,
             });
         }
 
@@ -1275,6 +1279,47 @@ mod tests {
                 .filter_map(user_message_text)
                 .any(|text| text.contains("Original metadata instructions"))
         );
+
+        std::env::set_current_dir(original_cwd)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_loaded_thread_returns_rollout_snapshot() -> Result<()> {
+        let _cwd_guard = cwd_test_lock().lock().await;
+        let workspace = TempDir::new()?;
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(workspace.path())?;
+
+        let manager = ThreadManagerState::new(
+            None,
+            Some(Arc::new(StubFactory {
+                model: SessionModel::Stub(Arc::new(StubDriver {
+                    text: "done".to_string(),
+                })),
+            })),
+        )
+        .await?;
+        let started = manager.start_thread().await?;
+        manager
+            .start_user_input(started.thread_id, "hello again".to_string())
+            .await?;
+        let _ = wait_for_final_status(&manager.agent_control(), started.thread_id).await?;
+
+        let resumed = manager.resume_thread(started.thread_id).await?;
+
+        assert!(resumed.initial_messages.iter().any(|event| {
+            matches!(event, EventMsg::UserMessage { text } if text == "hello again")
+        }));
+        assert!(resumed.initial_messages.iter().any(|event| {
+            matches!(
+                event,
+                EventMsg::AgentMessageCompleted(message) if message.text == "done"
+            )
+        }));
+        assert!(resumed.initial_messages.iter().any(|event| {
+            matches!(event, EventMsg::TurnCompleted(turn) if turn.last_assistant_message.as_deref() == Some("done"))
+        }));
 
         std::env::set_current_dir(original_cwd)?;
         Ok(())

@@ -6,154 +6,12 @@ pub(crate) fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-#[allow(dead_code)]
-pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut current_width: usize = 0;
-    for ch in text.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width > 0 && current_width.saturating_add(ch_width) > width {
-            chunks.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-        current.push(ch);
-        current_width = current_width.saturating_add(ch_width);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-}
-
 pub(crate) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let line_style = line.style;
-
-    // Flatten to per-character (char, style) pairs so word boundaries can be
-    // found across span boundaries while each character keeps its own style.
-    let chars: Vec<(char, Style)> = line
-        .spans
-        .iter()
-        .flat_map(|span| {
-            let style = span.style;
-            span.content.chars().map(move |ch| (ch, style))
-        })
-        .collect();
-    if chars.is_empty() {
-        return vec![Line::default().style(line_style)];
-    }
-
-    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
-    let mut current: Vec<(char, Style)> = Vec::new();
-    let mut current_width = 0usize;
-    let mut word: Vec<(char, Style)> = Vec::new();
-    let mut word_width = 0usize;
-
-    for (ch, style) in chars {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if ch == ' ' {
-            // A space ends the pending word; commit it before placing the space.
-            place_word(
-                &mut rows,
-                &mut current,
-                &mut current_width,
-                &mut word,
-                &mut word_width,
-                width,
-            );
-            // Dropping a leading space on a continuation row keeps wrapped text
-            // flush-left; a leading space on the first row is genuine indent.
-            let dropping_leading = current_width == 0 && !rows.is_empty();
-            if current_width.saturating_add(ch_width) > width {
-                rows.push(std::mem::take(&mut current));
-                current_width = 0;
-            } else if !dropping_leading {
-                current.push((ch, style));
-                current_width += ch_width;
-            }
-        } else {
-            word.push((ch, style));
-            word_width += ch_width;
-        }
-    }
-    place_word(
-        &mut rows,
-        &mut current,
-        &mut current_width,
-        &mut word,
-        &mut word_width,
-        width,
-    );
-    if !current.is_empty() || rows.is_empty() {
-        rows.push(current);
-    }
-
-    rows.into_iter()
-        .map(|row| build_line(row, line_style))
-        .collect()
-}
-
-/// Place the accumulated `word` onto the current row, wrapping to a fresh row
-/// when it does not fit. A word wider than a full line is hard-broken so it
-/// still renders (e.g. a long URL), but a word that fits on its own line is
-/// never split mid-word.
-fn place_word(
-    rows: &mut Vec<Vec<(char, Style)>>,
-    current: &mut Vec<(char, Style)>,
-    current_width: &mut usize,
-    word: &mut Vec<(char, Style)>,
-    word_width: &mut usize,
-    width: usize,
-) {
-    if word.is_empty() {
-        return;
-    }
-    let word = std::mem::take(word);
-    let ww = std::mem::replace(word_width, 0);
-
-    if *current_width > 0 && *current_width + ww > width && ww <= width {
-        rows.push(std::mem::take(current));
-        *current_width = 0;
-    }
-
-    if ww <= width {
-        current.extend(word);
-        *current_width += ww;
-        return;
-    }
-
-    for (ch, style) in word {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if *current_width > 0 && *current_width + ch_width > width {
-            rows.push(std::mem::take(current));
-            *current_width = 0;
-        }
-        current.push((ch, style));
-        *current_width += ch_width;
-    }
-}
-
-fn build_line(row: Vec<(char, Style)>, line_style: Style) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (ch, style) in row {
-        if let Some(last) = spans.last_mut()
-            && last.style == style
-        {
-            last.content.to_mut().push(ch);
-        } else {
-            spans.push(Span::styled(ch.to_string(), style));
-        }
-    }
-    Line::from(spans).style(line_style)
+    wrap_line_hanging(line, width, 0)
 }
 
 pub(crate) fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
     lines
         .into_iter()
         .flat_map(|line| wrap_line(line, width))
@@ -164,33 +22,7 @@ pub(crate) fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'s
 /// at word boundaries, and never drops leading whitespace. Used for code blocks
 /// and tool rows where column alignment and indentation must be preserved.
 pub(crate) fn wrap_line_char(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let line_style = line.style;
-    let mut out: Vec<Line<'static>> = vec![Line::default()];
-    let mut current_width: usize = 0;
-
-    for span in line.spans {
-        let style = span.style;
-        for ch in span.content.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if current_width > 0 && current_width.saturating_add(ch_width) > width {
-                out.push(Line::default());
-                current_width = 0;
-            }
-            if let Some(current) = out.last_mut() {
-                if let Some(last) = current.spans.last_mut()
-                    && last.style == style
-                {
-                    last.content.to_mut().push(ch);
-                } else {
-                    current.spans.push(Span::styled(ch.to_string(), style));
-                }
-            }
-            current_width = current_width.saturating_add(ch_width);
-        }
-    }
-
-    out.into_iter().map(|line| line.style(line_style)).collect()
+    wrap_line_char_hanging(line, width, 0)
 }
 
 /// Number of usable content columns for a row: the first row gets the full
@@ -201,34 +33,6 @@ fn row_budget(completed_rows: usize, width: usize, indent: usize) -> usize {
     } else {
         width.saturating_sub(indent).max(1)
     }
-}
-
-/// Build wrapped rows into lines, prefixing every continuation row with `indent`
-/// spaces so wrapped content hangs under the first row's content.
-fn build_hanging_lines(
-    rows: Vec<Vec<(char, Style)>>,
-    line_style: Style,
-    indent: usize,
-) -> Vec<Line<'static>> {
-    rows.into_iter()
-        .enumerate()
-        .map(|(idx, row)| {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            if idx > 0 && indent > 0 {
-                spans.push(Span::raw(" ".repeat(indent)));
-            }
-            for (ch, style) in row {
-                if let Some(last) = spans.last_mut()
-                    && last.style == style
-                {
-                    last.content.to_mut().push(ch);
-                } else {
-                    spans.push(Span::styled(ch.to_string(), style));
-                }
-            }
-            Line::from(spans).style(line_style)
-        })
-        .collect()
 }
 
 /// Character/column-faithful wrapping with a hanging indent. Like
@@ -244,25 +48,70 @@ pub(crate) fn wrap_line_char_hanging(
     let indent = indent.min(width.saturating_sub(1));
     let line_style = line.style;
 
-    let mut rows: Vec<Vec<(char, Style)>> = vec![Vec::new()];
-    let mut current_width: usize = 0;
-    for span in line.spans {
-        let style = span.style;
-        for ch in span.content.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            let budget = row_budget(rows.len() - 1, width, indent);
-            if current_width > 0 && current_width.saturating_add(ch_width) > budget {
-                rows.push(Vec::new());
-                current_width = 0;
-            }
-            if let Some(row) = rows.last_mut() {
-                row.push((ch, style));
-            }
-            current_width = current_width.saturating_add(ch_width);
+    let mut state = CharWrapState::new(width, indent);
+    for span in &line.spans {
+        state.push_span_text(span.content.as_ref(), span.style);
+    }
+    state.finish(line_style)
+}
+
+struct CharWrapState {
+    rows: Vec<Vec<Span<'static>>>,
+    current: Vec<Span<'static>>,
+    current_width: usize,
+    width: usize,
+    indent: usize,
+}
+
+impl CharWrapState {
+    fn new(width: usize, indent: usize) -> Self {
+        Self {
+            rows: Vec::new(),
+            current: Vec::new(),
+            current_width: 0,
+            width,
+            indent,
         }
     }
 
-    build_hanging_lines(rows, line_style, indent)
+    fn push_span_text(&mut self, text: &str, style: Style) {
+        if text.is_empty() {
+            return;
+        }
+
+        let mut segment_start = 0usize;
+        let mut segment_width = 0usize;
+        for (idx, ch) in text.char_indices() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let budget = row_budget(self.rows.len(), self.width, self.indent);
+            let used_width = self.current_width.saturating_add(segment_width);
+            if used_width > 0 && used_width.saturating_add(ch_width) > budget {
+                if segment_start < idx {
+                    push_span_text(&mut self.current, &text[segment_start..idx], style);
+                    self.current_width += segment_width;
+                }
+                self.rows.push(std::mem::take(&mut self.current));
+                self.current_width = 0;
+                segment_start = idx;
+                segment_width = 0;
+            }
+            segment_width += ch_width;
+        }
+
+        if segment_start < text.len() {
+            push_span_text(&mut self.current, &text[segment_start..], style);
+            self.current_width += segment_width;
+        }
+    }
+
+    fn finish(mut self, line_style: Style) -> Vec<Line<'static>> {
+        let current = std::mem::take(&mut self.current);
+        if !current.is_empty() || self.rows.is_empty() {
+            self.rows.push(current);
+        }
+
+        build_hanging_span_lines(self.rows, line_style, self.indent)
+    }
 }
 
 /// Word-aware wrapping with a hanging indent: like `wrap_line`, but continuation
@@ -573,6 +422,21 @@ mod tests {
             .collect()
     }
 
+    fn lines_signature(lines: &[Line<'static>]) -> Vec<(Style, Vec<(String, Style)>)> {
+        lines
+            .iter()
+            .map(|line| {
+                (
+                    line.style,
+                    line.spans
+                        .iter()
+                        .map(|span| (span.content.to_string(), span.style))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn wrap_line_hanging_coalesces_adjacent_same_style_output_spans() {
         let green = Style::default().fg(Color::Green);
@@ -597,16 +461,20 @@ mod tests {
 
     #[test]
     fn cjk_width_is_counted_as_two_columns() {
-        let wrapped = wrap_text("你好ab", 4);
-        assert_eq!(wrapped, vec!["你好".to_string(), "ab".to_string()]);
-        assert_eq!(display_width(&wrapped[0]), 4);
+        let wrapped = wrap_line_char(Line::from("你好ab"), 4);
+        let texts: Vec<String> = wrapped.iter().map(line_text).collect();
+
+        assert_eq!(texts, vec!["你好".to_string(), "ab".to_string()]);
+        assert_eq!(display_width(&texts[0]), 4);
     }
 
     #[test]
     fn combining_mark_stays_with_base_width() {
-        let wrapped = wrap_text("e\u{301}xy", 2);
-        assert_eq!(display_width(&wrapped[0]), 2);
-        assert_eq!(wrapped[0], "e\u{301}x");
+        let wrapped = wrap_line_char(Line::from("e\u{301}xy"), 2);
+        let texts: Vec<String> = wrapped.iter().map(line_text).collect();
+
+        assert_eq!(display_width(&texts[0]), 2);
+        assert_eq!(texts[0], "e\u{301}x");
     }
 
     #[test]
@@ -695,6 +563,75 @@ mod tests {
         for line in &wrapped {
             assert!(display_width(&line_text(line)) <= 5);
         }
+    }
+
+    #[test]
+    fn wrap_line_char_hanging_coalesces_adjacent_same_style_output_spans() {
+        let green = Style::default().fg(Color::Green);
+        let red = Style::default().fg(Color::Red);
+        let line = Line::from(vec![
+            Span::styled("ab", green),
+            Span::styled("cd", green),
+            Span::styled("ef", red),
+        ]);
+
+        let wrapped = wrap_line_char_hanging(line, 10, 2);
+
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(line_text(&wrapped[0]), "abcdef");
+        assert_eq!(wrapped[0].spans.len(), 2);
+        assert_eq!(wrapped[0].spans[0].content.as_ref(), "abcd");
+        assert_eq!(wrapped[0].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(wrapped[0].spans[1].content.as_ref(), "ef");
+        assert_eq!(wrapped[0].spans[1].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn wrap_line_char_hanging_preserves_styles_and_wide_chars() {
+        let green = Style::default().fg(Color::Green);
+        let red = Style::default().fg(Color::Red);
+        let line = Line::from(vec![Span::styled("你好", green), Span::styled("ab", red)]);
+
+        let wrapped = wrap_line_char_hanging(line, 5, 2);
+        let texts: Vec<String> = wrapped.iter().map(line_text).collect();
+
+        assert_eq!(texts, vec!["你好a".to_string(), "  b".to_string()]);
+        for line in &wrapped {
+            assert!(display_width(&line_text(line)) <= 5);
+        }
+        assert_eq!(wrapped[0].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(wrapped[0].spans[1].style.fg, Some(Color::Red));
+        assert_eq!(wrapped[1].spans[1].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn wrap_line_char_matches_hanging_with_zero_indent() {
+        let line = Line::from(vec![
+            Span::styled("ab", Style::default().fg(Color::Green)),
+            Span::styled(" cd", Style::default().fg(Color::Red)),
+            Span::styled("你好", Style::default().fg(Color::Blue)),
+        ])
+        .style(Style::default().bg(Color::DarkGray));
+
+        let direct = wrap_line_char(line.clone(), 5);
+        let hanging = wrap_line_char_hanging(line, 5, 0);
+
+        assert_eq!(lines_signature(&direct), lines_signature(&hanging));
+    }
+
+    #[test]
+    fn wrap_line_matches_hanging_with_zero_indent() {
+        let line = Line::from(vec![
+            Span::raw("  alpha "),
+            Span::styled("betagamma", Style::default().fg(Color::Green)),
+            Span::styled(" delta", Style::default().fg(Color::Red)),
+        ])
+        .style(Style::default().bg(Color::DarkGray));
+
+        let direct = wrap_line(line.clone(), 9);
+        let hanging = wrap_line_hanging(line, 9, 0);
+
+        assert_eq!(lines_signature(&direct), lines_signature(&hanging));
     }
 
     #[test]

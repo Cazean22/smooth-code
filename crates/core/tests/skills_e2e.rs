@@ -66,7 +66,7 @@ impl SessionModelDriver for SkillCallDriver {
     fn stream_completion_turn(
         &self,
         prompt: Message,
-        _history: Vec<Message>,
+        history: Vec<Message>,
     ) -> Result<SessionCompletionStream> {
         let mut calls = self
             .calls
@@ -78,6 +78,7 @@ impl SessionModelDriver for SkillCallDriver {
 
         match call_idx {
             0 => {
+                assert_available_skill_context(&history, "deploy");
                 let tool_call = ToolCall::new(
                     "skill-1".to_string(),
                     ToolFunction::new(
@@ -100,6 +101,7 @@ impl SessionModelDriver for SkillCallDriver {
                 ])))
             }
             1 => {
+                assert_loaded_skill_context(&history, "deploy");
                 let texts = tool_result_texts(&prompt);
                 assert_eq!(texts.len(), 1, "expected one skill tool result");
                 assert!(
@@ -118,6 +120,20 @@ impl SessionModelDriver for SkillCallDriver {
                     texts[0]
                 );
                 Ok(final_text_stream("skill followed"))
+            }
+            2 => {
+                assert_loaded_skill_context(&history, "deploy");
+                assert!(
+                    history
+                        .iter()
+                        .any(|message| message_contains_skill_invocation(message, "deploy")),
+                    "follow-up history should retain prior deploy skill invocation: {history:?}"
+                );
+                assert_eq!(
+                    first_user_text(&prompt).as_deref(),
+                    Some("deploy follow-up")
+                );
+                Ok(final_text_stream("follow-up followed"))
             }
             other => panic!("unexpected completion turn {other}"),
         }
@@ -200,6 +216,22 @@ async fn skill_tool_call_returns_skill_instructions_to_the_model() -> Result<()>
     // turn finished on the post-tool response.
     assert_eq!(last_assistant_message.as_deref(), Some("skill followed"));
 
+    manager
+        .start_user_input(started.thread_id, "deploy follow-up".to_string())
+        .await?;
+
+    let follow_up_last_assistant_message = loop {
+        let event =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await??;
+        if let cazean_protocol::EventMsg::TurnCompleted(turn) = event.msg {
+            break turn.last_assistant_message;
+        }
+    };
+    assert_eq!(
+        follow_up_last_assistant_message.as_deref(),
+        Some("follow-up followed")
+    );
+
     std::env::set_current_dir(original_cwd)?;
     Ok(())
 }
@@ -212,6 +244,62 @@ fn first_user_text(message: &Message) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+fn skills_context_text(history: &[Message]) -> Option<String> {
+    history
+        .iter()
+        .filter_map(first_user_text)
+        .find(|text| text.contains("# Loaded skills") || text.contains("# Available skills"))
+}
+
+fn assert_available_skill_context(history: &[Message], skill: &str) {
+    let context = skills_context_text(history)
+        .unwrap_or_else(|| panic!("missing skills context in history: {history:?}"));
+    assert!(
+        context.contains("# Available skills"),
+        "skills context should advertise unloaded skills: {context}"
+    );
+    assert!(
+        context.contains(&format!("- {skill}:")),
+        "skills context should list {skill} as available: {context}"
+    );
+}
+
+fn assert_loaded_skill_context(history: &[Message], skill: &str) {
+    let context = skills_context_text(history)
+        .unwrap_or_else(|| panic!("missing skills context in history: {history:?}"));
+    assert!(
+        context.contains("# Loaded skills"),
+        "skills context should identify loaded skills: {context}"
+    );
+    assert!(
+        context.contains(&format!("- {skill}:")),
+        "skills context should list {skill} as loaded: {context}"
+    );
+    if let Some((_, available_section)) = context.split_once("# Available skills") {
+        assert!(
+            !available_section.contains(&format!("- {skill}:")),
+            "loaded skill {skill} must not remain available for re-invocation: {context}"
+        );
+    }
+}
+
+fn message_contains_skill_invocation(message: &Message, skill: &str) -> bool {
+    let needle = format!("<skill-invocation skill=\"{skill}\">");
+    let Message::User { content } = message else {
+        return false;
+    };
+    content.iter().any(|item| match item {
+        UserContent::Text(text) => text.text.contains(&needle),
+        UserContent::ToolResult(tool_result) => {
+            tool_result.content.iter().any(|content| match content {
+                rig::message::ToolResultContent::Text(text) => text.text.contains(&needle),
+                _ => false,
+            })
+        }
+        _ => false,
+    })
 }
 
 /// Root-side driver: confirms the root itself IS advertised the skills, then

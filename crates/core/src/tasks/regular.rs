@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use app_server_protocol::{PlanApprovalDecision, RequestPlanApprovalParams};
 use cazean_protocol::{
@@ -2274,11 +2278,13 @@ fn build_request_parts(
     new_messages: &[Message],
 ) -> Option<(Message, Vec<Message>)> {
     let (pending_prompt, new_history) = new_messages.split_last()?;
+    let loaded_skill_names =
+        loaded_skill_names_from_messages(history_before_turn.iter().chain(new_messages.iter()));
     let mut request_history = Vec::new();
     if let Some(message) = project_instructions_message(project_instructions) {
         request_history.push(message);
     }
-    if let Some(message) = skills_context_message(skills) {
+    if let Some(message) = skills_context_message(skills, &loaded_skill_names) {
         request_history.push(message);
     }
     request_history.extend_from_slice(history_before_turn);
@@ -2286,22 +2292,77 @@ fn build_request_parts(
     Some((pending_prompt.clone(), request_history))
 }
 
+fn loaded_skill_names_from_messages<'a>(
+    messages: impl IntoIterator<Item = &'a Message>,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for message in messages {
+        let Message::User { content } = message else {
+            continue;
+        };
+        for item in content.iter() {
+            match item {
+                UserContent::Text(text) => {
+                    names.extend(tools::loaded_skill_names_in_text(&text.text));
+                }
+                UserContent::ToolResult(tool_result) => {
+                    for content in tool_result.content.iter() {
+                        if let ToolResultContent::Text(text) = content {
+                            names.extend(tools::loaded_skill_names_in_text(&text.text));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    names
+}
+
 /// Synthetic request-only user message advertising the project's skills, like
 /// `project_instructions_message` it is rebuilt per request and never
-/// persisted to history, so the list self-refreshes every turn.
-fn skills_context_message(skills: &[SkillMeta]) -> Option<Message> {
-    if skills.is_empty() {
+/// persisted to history, so the list self-refreshes every turn while loaded
+/// skills are derived from the existing model-facing context.
+fn skills_context_message(
+    skills: &[SkillMeta],
+    loaded_skill_names: &BTreeSet<String>,
+) -> Option<Message> {
+    if skills.is_empty() && loaded_skill_names.is_empty() {
         return None;
     }
-    let listing = skills
+
+    let mut sections = Vec::new();
+    if !loaded_skill_names.is_empty() {
+        let listing = loaded_skill_names
+            .iter()
+            .map(|name| {
+                skills
+                    .iter()
+                    .find(|skill| skill.name == *name)
+                    .map(|skill| format!("- {}: {}", skill.name, skill.description))
+                    .unwrap_or_else(|| format!("- {name}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!(
+            "# Loaded skills\n\nThe following skills already have `<skill-invocation skill=\"...\">` instructions present somewhere in conversation context/history. Do not invoke the `skill` tool again for these names; follow the existing loaded instructions directly for related requests.\n\n{listing}"
+        ));
+    }
+
+    let available = skills
         .iter()
+        .filter(|skill| !loaded_skill_names.contains(&skill.name))
         .map(|skill| format!("- {}: {}", skill.name, skill.description))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let text = format!(
-        "# Available skills\n\nThe following user-defined skills are available, drawn from your user-global skills directory and this project (a project skill overrides a same-named global one). When a request matches a skill's purpose, invoke the `skill` tool with its name and follow the returned instructions.\n\n{listing}"
-    );
-    Some(Message::User {
+        .collect::<Vec<_>>();
+    if !available.is_empty() {
+        let listing = available.join("\n");
+        sections.push(format!(
+            "# Available skills\n\nThe following user-defined skills are available, drawn from your user-global skills directory and from this project (a project skill overrides a same-named global one). When a request matches one of these not-yet-loaded skills, invoke the `skill` tool with its name and follow the returned instructions. If a `<skill-invocation skill=\"...\">` block for a skill is already present anywhere in conversation context/history, follow those loaded instructions directly without invoking the tool again.\n\n{listing}"
+        ));
+    }
+
+    let text = sections.join("\n\n");
+    (!text.is_empty()).then_some(Message::User {
         content: OneOrMany::one(UserContent::Text(Text {
             text,
             additional_params: None,
@@ -2434,6 +2495,8 @@ fn tool_result(id: String, call_id: Option<String>, tool_result: String) -> Tool
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use cazean_protocol::{FileChange, FileChangeOutput, ToolCallResultKind};
     use rig::message::Reasoning as MessageReasoning;
     use tools::{SubagentArgs, encode_tool_output};
@@ -2442,7 +2505,8 @@ mod tests {
 
     use super::{
         PendingReasoningDeltas, decode_completed_tool_output, expand_skill_invocation,
-        should_roundtrip_reasoning, skills_context_message, subagent_type_to_prompt_kind,
+        loaded_skill_names_from_messages, should_roundtrip_reasoning, skills_context_message,
+        subagent_type_to_prompt_kind,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2511,14 +2575,17 @@ mod tests {
 
     #[test]
     fn skills_context_message_lists_skills_and_omits_when_empty() {
-        assert!(skills_context_message(&[]).is_none());
+        let loaded = BTreeSet::new();
+        assert!(skills_context_message(&[], &loaded).is_none());
 
         let skills = vec![tools::SkillMeta {
             name: "deploy".to_string(),
             description: "Deploy the app".to_string(),
             path: std::path::PathBuf::from("SKILL.md"),
         }];
-        let Some(rig::message::Message::User { content }) = skills_context_message(&skills) else {
+        let Some(rig::message::Message::User { content }) =
+            skills_context_message(&skills, &loaded)
+        else {
             panic!("expected a user message");
         };
         let rig::message::UserContent::Text(text) = content.first() else {
@@ -2526,6 +2593,95 @@ mod tests {
         };
         assert!(text.text.contains("# Available skills"));
         assert!(text.text.contains("- deploy: Deploy the app"));
+        assert!(text.text.contains("without invoking the tool again"));
+    }
+
+    #[test]
+    fn skills_context_message_moves_loaded_skills_out_of_available_list() {
+        let skills = vec![
+            tools::SkillMeta {
+                name: "commit".to_string(),
+                description: "Commit changes".to_string(),
+                path: std::path::PathBuf::from("commit/SKILL.md"),
+            },
+            tools::SkillMeta {
+                name: "review".to_string(),
+                description: "Review code".to_string(),
+                path: std::path::PathBuf::from("review/SKILL.md"),
+            },
+        ];
+        let loaded = BTreeSet::from(["commit".to_string()]);
+
+        let Some(rig::message::Message::User { content }) =
+            skills_context_message(&skills, &loaded)
+        else {
+            panic!("expected a user message");
+        };
+        let rig::message::UserContent::Text(text) = content.first() else {
+            panic!("expected text content");
+        };
+
+        assert!(text.text.contains("# Loaded skills"));
+        assert!(text.text.contains("- commit: Commit changes"));
+        assert!(text.text.contains("Do not invoke the `skill` tool again"));
+        assert!(text.text.contains("# Available skills"));
+        assert!(text.text.contains("- review: Review code"));
+        let available_section = text
+            .text
+            .split("# Available skills")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(!available_section.contains("- commit:"));
+    }
+
+    #[test]
+    fn skills_context_message_omits_available_section_when_all_skills_loaded() {
+        let skills = vec![tools::SkillMeta {
+            name: "commit".to_string(),
+            description: "Commit changes".to_string(),
+            path: std::path::PathBuf::from("commit/SKILL.md"),
+        }];
+        let loaded = BTreeSet::from(["commit".to_string()]);
+
+        let Some(rig::message::Message::User { content }) =
+            skills_context_message(&skills, &loaded)
+        else {
+            panic!("expected a user message");
+        };
+        let rig::message::UserContent::Text(text) = content.first() else {
+            panic!("expected text content");
+        };
+
+        assert!(text.text.contains("# Loaded skills"));
+        assert!(!text.text.contains("# Available skills"));
+    }
+
+    #[test]
+    fn loaded_skill_names_from_messages_reads_text_and_tool_results() {
+        let direct = rig::message::Message::User {
+            content: rig::OneOrMany::one(rig::message::UserContent::Text(rig::message::Text {
+                text: "<skill-invocation skill=\"deploy\">body</skill-invocation>".to_string(),
+                additional_params: None,
+            })),
+        };
+        let tool_result = rig::message::Message::User {
+            content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(
+                rig::message::ToolResult {
+                    id: "tool-result".to_string(),
+                    call_id: None,
+                    content: rig::message::ToolResultContent::from_tool_output(
+                        "<skill-invocation skill=\"commit\">body</skill-invocation>".to_string(),
+                    ),
+                },
+            )),
+        };
+
+        let names = loaded_skill_names_from_messages([&direct, &tool_result]);
+
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["commit", "deploy"]
+        );
     }
 
     #[test]

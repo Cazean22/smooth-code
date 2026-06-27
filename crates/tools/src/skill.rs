@@ -11,7 +11,7 @@ use crate::{
 
 const DESCRIPTION: &str = r#"Load a skill and follow its instructions.
 
-Skills are user-defined instruction packages, drawn from your user-global skills directory and from the current project; on a name clash the project's skill takes precedence. Only invoke skills that appear in the "Available skills" context block; never guess a skill name. The tool returns the skill's instructions — follow them for the current request."#;
+Skills are user-defined instruction packages, drawn from your user-global skills directory and from the current project; on a name clash the project's skill takes precedence. Only invoke skills that appear in the current "Available skills" context block; never guess a skill name. Do not reload a skill that is already loaded: if a `<skill-invocation skill="...">` block for the skill is already present anywhere in conversation context/history, its instructions are already in context — follow them directly for the new request instead of calling this tool again. The tool returns the skill's instructions — follow them for the current request."#;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -91,6 +91,27 @@ mod tests {
         let dir = crate::skills::project_skills_dir(root).join(name);
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("SKILL.md"), content)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn definition_describes_loaded_skill_carve_out() -> TestResult {
+        let temp = tempfile::TempDir::new()?;
+        let tool = SkillTool::new(vec![crate::skills::project_skills_dir(temp.path())]);
+
+        let definition = tool.definition(String::new()).await;
+
+        assert!(definition.description.contains("already loaded"));
+        assert!(
+            definition
+                .description
+                .contains("conversation context/history")
+        );
+        assert!(
+            definition
+                .description
+                .contains("instead of calling this tool again")
+        );
         Ok(())
     }
 

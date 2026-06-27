@@ -39,8 +39,8 @@ pub use read::{ReadArgs, ReadTool};
 pub use run_command::{RunCommandArgs, RunCommandTool};
 pub use skill::{SkillArgs, SkillTool};
 pub use skills::{
-    Skill, SkillMeta, list_skills, load_skill, project_skills_dir, render_skill_invocation,
-    skill_roots,
+    Skill, SkillMeta, list_skills, load_skill, loaded_skill_names_in_text, project_skills_dir,
+    render_skill_invocation, skill_roots,
 };
 pub use todo_write::{TodoInput, TodoWriteArgs, TodoWriteTool};
 pub use write::{WriteArgs, WriteTool};

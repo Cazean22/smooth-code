@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Maximum bytes of a SKILL.md file that are read; longer bodies are truncated.
@@ -179,6 +179,35 @@ pub fn render_skill_invocation(skill: &Skill, args: Option<&str>) -> String {
     format!(
         "<skill-invocation skill=\"{name}\">\nThe user invoked the \"/{name}\" skill. Follow the instructions below for this request.\n\n{body}\n</skill-invocation>\n\n{args}"
     )
+}
+
+/// Return skill names whose rendered invocation markers already appear in
+/// model-facing text. This intentionally parses only the wrapper emitted by
+/// [`render_skill_invocation`], so unrelated text cannot mark a skill loaded.
+pub fn loaded_skill_names_in_text(text: &str) -> BTreeSet<String> {
+    const PREFIX: &str = "<skill-invocation skill=\"";
+    const SUFFIX: &str = "\">";
+
+    let mut names = BTreeSet::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find(PREFIX) {
+        let after_prefix = &remaining[start + PREFIX.len()..];
+        let Some(end) = after_prefix.find('"') else {
+            break;
+        };
+        let name = &after_prefix[..end];
+        let after_name = &after_prefix[end..];
+        if after_name.starts_with(SUFFIX) && is_valid_skill_name(name) {
+            names.insert(name.to_string());
+            remaining = &after_name[SUFFIX.len()..];
+        } else {
+            // The candidate was malformed; advance only past this marker's first
+            // character so a later valid marker in the malformed text can still
+            // be discovered.
+            remaining = &after_prefix[1..];
+        }
+    }
+    names
 }
 
 /// Parse a SKILL.md: a `---`-delimited frontmatter block of single-line
@@ -451,6 +480,55 @@ mod tests {
         let rendered = render_skill_invocation(&skill, None);
         assert!(rendered.ends_with("(no additional arguments)"));
         Ok(())
+    }
+
+    #[test]
+    fn loaded_skill_names_in_text_extracts_rendered_markers() -> TestResult {
+        let temp = tempfile::TempDir::new()?;
+        write_skill(
+            temp.path(),
+            "deploy",
+            "---\ndescription: Deploy the app\n---\nRun make deploy.",
+        )?;
+        let Some(skill) = load_skill(&roots(temp.path()), "deploy", MAX_SKILL_BYTES) else {
+            panic!("expected skill to load");
+        };
+
+        let rendered = render_skill_invocation(&skill, Some("to staging"));
+        let names = loaded_skill_names_in_text(&rendered);
+
+        assert_eq!(names.into_iter().collect::<Vec<_>>(), vec!["deploy"]);
+        Ok(())
+    }
+
+    #[test]
+    fn loaded_skill_names_in_text_extracts_multiple_markers() {
+        let text = concat!(
+            "<skill-invocation skill=\"deploy\">body</skill-invocation>",
+            "\nnoise\n",
+            "<skill-invocation skill=\"commit\">body</skill-invocation>"
+        );
+
+        let names = loaded_skill_names_in_text(text);
+
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["commit", "deploy"]
+        );
+    }
+
+    #[test]
+    fn loaded_skill_names_in_text_ignores_malformed_or_invalid_markers() {
+        let text = concat!(
+            "<skill-invocation skill=\"bad name\">body</skill-invocation>",
+            "\n<skill-invocation skill=\"../escape\">body</skill-invocation>",
+            "\n<skill-invocation skill=\"missing-close body",
+            "\n<skill-invocation skill=\"good_name\">body</skill-invocation>"
+        );
+
+        let names = loaded_skill_names_in_text(text);
+
+        assert_eq!(names.into_iter().collect::<Vec<_>>(), vec!["good_name"]);
     }
 
     #[test]

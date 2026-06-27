@@ -731,6 +731,34 @@ mod tests {
     }
 
     #[test]
+    fn continuing_plan_chat_with_message_emits_respond_effect() {
+        let mut model = UiModel::new();
+        let thread_id = ThreadId::new();
+        model.current_thread_id = Some(thread_id);
+        let _ = model.update(UiEvent::ServerRequest(ServerRequest::RequestPlanApproval {
+            request_id: RequestId(56),
+            params: plan_approval_params(&thread_id.to_string()),
+        }));
+
+        let _ = model.handle_key_event(key(KeyCode::Char('c')));
+        for ch in "can we discuss alternatives?".chars() {
+            let _ = model.handle_key_event(key(KeyCode::Char(ch)));
+        }
+        let effects = model.handle_key_event(modified_key(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        assert!(model.plan_approval.is_none());
+        assert_eq!(model.mode, UiMode::Normal);
+        assert_eq!(model.focus, FocusTarget::Transcript);
+        assert!(matches!(
+            &effects[0].kind,
+            UiEffectKind::RespondPlanApproval { request_id, response }
+                if *request_id == RequestId(56)
+                    && response.decision == PlanApprovalDecision::ContinueChat
+                    && response.feedback.as_deref() == Some("can we discuss alternatives?")
+        ));
+    }
+
+    #[test]
     fn turn_interrupted_closes_plan_approval_overlay() {
         let mut model = UiModel::new();
         let thread_id = ThreadId::new();

@@ -381,6 +381,54 @@ async fn rejected_plan_stays_in_plan_mode_and_surfaces_feedback() -> Result<()> 
 }
 
 #[tokio::test]
+async fn continue_chat_keeps_plan_mode_and_continues_on_plan_model() -> Result<()> {
+    let run = run_exit_plan_turn(
+        PlanApprovalDecision::ContinueChat,
+        Some("can we compare approaches first?"),
+        Some("# The grand plan"),
+        None,
+        &[
+            "continue chatting in plan mode",
+            "Do not call `plan_write` or `exit_plan_mode` again",
+            "can we compare approaches first?",
+        ],
+    )
+    .await?;
+
+    assert_eq!(
+        run.plan_mode_changes,
+        vec![true],
+        "continue chat must not leave plan mode"
+    );
+    assert_eq!(run.last_assistant_message.as_deref(), Some("revising plan"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn continue_chat_without_message_tells_model_to_wait() -> Result<()> {
+    let run = run_exit_plan_turn(
+        PlanApprovalDecision::ContinueChat,
+        None,
+        Some("# The grand plan"),
+        None,
+        &[
+            "continue chatting in plan mode",
+            "did not provide an additional message",
+            "Respond briefly and wait for the user",
+        ],
+    )
+    .await?;
+
+    assert_eq!(
+        run.plan_mode_changes,
+        vec![true],
+        "continue chat without a message must not leave plan mode"
+    );
+    assert_eq!(run.last_assistant_message.as_deref(), Some("revising plan"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn exit_without_plan_file_fails_and_never_asks_for_approval() -> Result<()> {
     let run = run_exit_plan_turn(
         PlanApprovalDecision::Approved,

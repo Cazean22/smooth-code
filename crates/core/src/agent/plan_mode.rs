@@ -37,7 +37,7 @@ pub(crate) const PLAN_MODE_TOOLS: &[(&str, &str)] = &[
     ("plan_write", "write your plan to the per-thread plan file."),
     (
         "exit_plan_mode",
-        "submit the plan you wrote with `plan_write` for user approval.",
+        "submit the plan you wrote with `plan_write` for user approval or continued discussion.",
     ),
 ];
 
@@ -66,7 +66,7 @@ Proceed in four phases. During EXPLORE, prefer progress updates and read-only to
 1. EXPLORE — read the relevant code and gather context for the user's request.
 2. DESIGN — decide on the approach, considering trade-offs and conventions you observed.
 3. WRITE — call `plan_write` with a markdown plan covering: goal, files to change, step-by-step strategy, risks, and any decisions needing user confirmation.
-4. SUBMIT — call `exit_plan_mode` to present the plan to the user for approval. If they approve, plan mode turns off and you implement the plan with the full tool set. If they reject, you stay in plan mode: revise the plan per their feedback with `plan_write`, then submit it again.
+4. SUBMIT — call `exit_plan_mode` to present the plan to the user for approval. If they approve, plan mode turns off and you implement the plan with the full tool set. If they reject, you stay in plan mode: revise the plan per their feedback with `plan_write`, then submit it again. If they choose to continue chatting, stay in plan mode, answer their message, and yield back to the user; do not call `plan_write` or `exit_plan_mode` again unless the user asks or provides new direction.
 "
         )
     });

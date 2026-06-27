@@ -10,6 +10,7 @@ Usage:
 - Call this tool from inside plan mode after writing your plan with `plan_write`; the latest plan file content is presented to the user for review.
 - If the user approves, plan mode turns off and you implement the plan with the full tool set.
 - If the user rejects, you stay in plan mode; revise the plan per their feedback with `plan_write`, then call this tool again.
+- If the user chooses to continue chatting, you stay in plan mode; answer their message and yield back to the user. Do not revise/resubmit the plan on your own unless they ask or provide new direction.
 - Optionally pass a short `reason` describing why you are exiting (e.g., "plan ready"); this is for the transcript only."#;
 
 #[derive(Clone, Default)]

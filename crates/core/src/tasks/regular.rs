@@ -1590,6 +1590,31 @@ async fn exit_plan_mode_outcome(
                     None,
                 ))
             }
+            // Continue-chat is distinct from rejection: the user is not asking
+            // for automatic revision/resubmission, only more conversation in
+            // plan mode.
+            PlanApprovalDecision::ContinueChat => {
+                let user_message = response
+                    .feedback
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|message| !message.is_empty());
+                let continuation = match user_message {
+                    Some(message) => format!("User message: {message}"),
+                    None => "The user did not provide an additional message. Respond briefly and wait for the user.".to_string(),
+                };
+                Some((
+                    format!(
+                        "The user chose to continue chatting in plan mode instead of approving \
+                         or rejecting the plan. You are still in plan mode. Answer the user's \
+                         message if present, then yield back to the user. Do not call `plan_write` \
+                         or `exit_plan_mode` again unless the user asks or provides new direction.\n\
+                         {continuation}"
+                    ),
+                    true,
+                    None,
+                ))
+            }
         },
         Err(err) => failure(format!("exit_plan_mode failed: {}", err.message)),
     }

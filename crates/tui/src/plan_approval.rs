@@ -30,6 +30,7 @@ pub(crate) enum PlanApprovalOutcome {
 enum Stage {
     Reviewing,
     EditingFeedback,
+    EditingChat,
 }
 
 /// Whether the overlay currently owns the screen (`Active`) or has been parked
@@ -104,9 +105,9 @@ impl PlanApprovalOverlay {
         self.scroll = 0;
     }
 
-    /// Insert pasted text into the feedback editor (only while editing).
+    /// Insert pasted text into the rejection/continue-chat editor (only while editing).
     pub(crate) fn handle_paste(&mut self, text: &str) {
-        if matches!(self.stage, Stage::EditingFeedback) {
+        if matches!(self.stage, Stage::EditingFeedback | Stage::EditingChat) {
             self.feedback.insert_paste(text);
         }
     }
@@ -118,7 +119,7 @@ impl PlanApprovalOverlay {
 
         match self.stage {
             Stage::Reviewing => self.handle_review_key(key),
-            Stage::EditingFeedback => self.handle_feedback_key(key),
+            Stage::EditingFeedback | Stage::EditingChat => self.handle_feedback_key(key),
         }
     }
 
@@ -140,6 +141,10 @@ impl PlanApprovalOverlay {
             }
             KeyCode::Char('r') if key.modifiers.is_empty() => {
                 self.stage = Stage::EditingFeedback;
+                PlanApprovalOutcome::None
+            }
+            KeyCode::Char('c') if key.modifiers.is_empty() => {
+                self.stage = Stage::EditingChat;
                 PlanApprovalOutcome::None
             }
             KeyCode::Esc => PlanApprovalOutcome::Defer,
@@ -172,12 +177,17 @@ impl PlanApprovalOverlay {
     }
 
     fn handle_feedback_key(&mut self, key: KeyEvent) -> PlanApprovalOutcome {
-        // Ctrl+Enter submits the rejection (so bare Enter can add newlines),
-        // mirroring the main composer's submit chord.
+        // Ctrl+Enter submits the active text editor (so bare Enter can add
+        // newlines), mirroring the main composer's submit chord.
         if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
             let feedback = self.feedback.as_str().trim();
+            let decision = match self.stage {
+                Stage::EditingFeedback => PlanApprovalDecision::Rejected,
+                Stage::EditingChat => PlanApprovalDecision::ContinueChat,
+                Stage::Reviewing => return PlanApprovalOutcome::None,
+            };
             return PlanApprovalOutcome::Respond(RequestPlanApprovalResponse {
-                decision: PlanApprovalDecision::Rejected,
+                decision,
                 feedback: (!feedback.is_empty()).then(|| feedback.to_string()),
             });
         }
@@ -214,19 +224,22 @@ impl PlanApprovalOverlay {
         match self.stage {
             Stage::Reviewing => footer.extend(wrap::wrap_line_hanging(
                 Line::from(Span::styled(
-                    "a approve   r reject (feedback)   Ctrl+G edit in $EDITOR   \
-                     Esc defer (R resume)   ↑/↓ PgUp/PgDn Home/End scroll",
+                    "a approve   r reject (feedback)   c continue chat (message)   \
+                     Ctrl+G edit in $EDITOR   Esc defer (R resume)   \
+                     ↑/↓ PgUp/PgDn Home/End scroll",
                     Style::default().fg(Color::DarkGray),
                 )),
                 wrap_width,
                 0,
             )),
-            Stage::EditingFeedback => footer.extend(self.feedback_editor_lines()),
+            Stage::EditingFeedback | Stage::EditingChat => {
+                footer.extend(self.feedback_editor_lines())
+            }
         }
         footer
     }
 
-    /// Render the feedback editor as styled lines with a reversed cursor cell,
+    /// Render the shared text editor as styled lines with a reversed cursor cell,
     /// so the multi-line `ComposerState` shows the caret without a hardware
     /// cursor (the overlay is one `Paragraph`).
     fn feedback_editor_lines(&self) -> Vec<Line<'static>> {
@@ -235,8 +248,17 @@ impl PlanApprovalOverlay {
         let normal = Style::default();
         let cursor_style = normal.add_modifier(Modifier::REVERSED);
 
+        let header = match self.stage {
+            Stage::EditingFeedback => {
+                "Feedback (type · Ctrl+Enter submit rejection · Esc back to review):"
+            }
+            Stage::EditingChat => {
+                "Continue chat message (optional · Ctrl+Enter continue chat · Esc back to review):"
+            }
+            Stage::Reviewing => "Message:",
+        };
         let mut out = vec![Line::from(Span::styled(
-            "Feedback (type · Ctrl+Enter submit rejection · Esc back to review):",
+            header,
             Style::default().fg(Color::Yellow),
         ))];
         let mut spans: Vec<Span<'static>> = Vec::new();
@@ -432,6 +454,41 @@ mod tests {
     }
 
     #[test]
+    fn c_collects_message_then_ctrl_enter_continues_chat() {
+        let mut overlay = PlanApprovalOverlay::new(RequestId(1), sample_params());
+        assert!(matches!(
+            overlay.handle_key(key(KeyCode::Char('c'))),
+            PlanApprovalOutcome::None
+        ));
+        for ch in "can we compare approaches?".chars() {
+            overlay.handle_key(key(KeyCode::Char(ch)));
+        }
+        match overlay.handle_key(ctrl(KeyCode::Enter)) {
+            PlanApprovalOutcome::Respond(response) => {
+                assert_eq!(response.decision, PlanApprovalDecision::ContinueChat);
+                assert_eq!(
+                    response.feedback.as_deref(),
+                    Some("can we compare approaches?")
+                );
+            }
+            _ => panic!("expected continue-chat response with message"),
+        }
+    }
+
+    #[test]
+    fn c_then_ctrl_enter_without_message_continues_chat() {
+        let mut overlay = PlanApprovalOverlay::new(RequestId(1), sample_params());
+        overlay.handle_key(key(KeyCode::Char('c')));
+        match overlay.handle_key(ctrl(KeyCode::Enter)) {
+            PlanApprovalOutcome::Respond(response) => {
+                assert_eq!(response.decision, PlanApprovalDecision::ContinueChat);
+                assert_eq!(response.feedback, None);
+            }
+            _ => panic!("expected continue-chat response without message"),
+        }
+    }
+
+    #[test]
     fn bare_enter_in_feedback_adds_newline_not_submit() {
         let mut overlay = PlanApprovalOverlay::new(RequestId(1), sample_params());
         overlay.handle_key(key(KeyCode::Char('r')));
@@ -482,6 +539,20 @@ mod tests {
                 assert_eq!(response.feedback.as_deref(), Some("pasted\nfeedback"));
             }
             _ => panic!("expected rejection with pasted feedback"),
+        }
+    }
+
+    #[test]
+    fn paste_into_continue_chat_appends_text() {
+        let mut overlay = PlanApprovalOverlay::new(RequestId(1), sample_params());
+        overlay.handle_key(key(KeyCode::Char('c')));
+        overlay.handle_paste("pasted\nmessage");
+        match overlay.handle_key(ctrl(KeyCode::Enter)) {
+            PlanApprovalOutcome::Respond(response) => {
+                assert_eq!(response.decision, PlanApprovalDecision::ContinueChat);
+                assert_eq!(response.feedback.as_deref(), Some("pasted\nmessage"));
+            }
+            _ => panic!("expected continue-chat response with pasted message"),
         }
     }
 
@@ -554,7 +625,11 @@ mod tests {
         );
         assert!(
             rows.iter().any(|row| row.contains("a approve")),
-            "footer missing: {rows:?}"
+            "footer missing approval hint: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("c continue chat")),
+            "footer missing continue-chat hint: {rows:?}"
         );
         Ok(())
     }

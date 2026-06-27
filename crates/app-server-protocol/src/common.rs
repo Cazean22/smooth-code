@@ -198,13 +198,14 @@ pub struct RequestPlanApprovalParams {
 pub enum PlanApprovalDecision {
     Approved,
     Rejected,
+    ContinueChat,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestPlanApprovalResponse {
     pub decision: PlanApprovalDecision,
-    /// Optional user feedback explaining a rejection.
+    /// Optional user text associated with a rejection or continue-chat decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
 }
@@ -660,6 +661,21 @@ mod tests {
         );
         let decoded: RequestPlanApprovalResponse = serde_json::from_value(value)?;
         assert_eq!(decoded, rejected);
+
+        let continue_chat = RequestPlanApprovalResponse {
+            decision: PlanApprovalDecision::ContinueChat,
+            feedback: Some("can we compare approaches first?".to_string()),
+        };
+        let value = serde_json::to_value(&continue_chat)?;
+        assert_eq!(
+            value,
+            json!({
+                "decision": "continueChat",
+                "feedback": "can we compare approaches first?",
+            })
+        );
+        let decoded: RequestPlanApprovalResponse = serde_json::from_value(value)?;
+        assert_eq!(decoded, continue_chat);
         Ok(())
     }
 }

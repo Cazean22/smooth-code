@@ -254,9 +254,9 @@ impl UiModel {
     pub(in crate::app) fn render(&mut self, frame: &mut Frame<'_>) {
         self.terminal_width = frame.area().width;
         match self.screen {
-            Screen::Dashboard => self.render_dashboard(frame, frame.area()),
+            Screen::Dashboard => self.render_dashboard(frame),
             Screen::Workspace if !self.preview_stack.is_empty() => {
-                self.render_preview(frame, frame.area());
+                self.render_preview(frame);
             }
             // An active plan-approval overlay owns the whole screen.
             Screen::Workspace
@@ -269,11 +269,12 @@ impl UiModel {
                     overlay.render(frame, frame.area());
                 }
             }
-            Screen::Workspace => self.render_workspace(frame, frame.area()),
+            Screen::Workspace => self.render_workspace(frame),
         }
     }
 
-    pub(in crate::app) fn render_dashboard(&self, frame: &mut Frame<'_>, area: Rect) {
+    pub(in crate::app) fn render_dashboard(&self, frame: &mut Frame<'_>) {
+        let area = frame.area();
         self.render_dashboard_body(frame, area);
     }
 
@@ -353,7 +354,8 @@ impl UiModel {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
-    pub(in crate::app) fn render_workspace(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    pub(in crate::app) fn render_workspace(&mut self, frame: &mut Frame<'_>) {
+        let area = frame.area();
         let picker_height = self
             .question_picker
             .as_ref()

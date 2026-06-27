@@ -565,7 +565,8 @@ impl UiModel {
 
     /// Full-screen subagent preview: a header naming the agent and its live
     /// status, the read-only transcript, and a key-hint footer.
-    pub(in crate::app) fn render_preview(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    pub(in crate::app) fn render_preview(&mut self, frame: &mut Frame<'_>) {
+        let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([

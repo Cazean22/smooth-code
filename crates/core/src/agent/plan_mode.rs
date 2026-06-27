@@ -16,9 +16,9 @@ pub(crate) const PLAN_MODE_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "spawn_agent",
-        "spawn sub-agents for parallel read-only exploration. While in plan mode every child \
-         runs as an Explore agent regardless of the `subagent_type` you pass; none of them can \
-         modify files.",
+        "spawn sub-agents for parallel read-only exploration. For broad planning work, fan out 2-4 \
+         focused research prompts across independent areas. While in plan mode every child runs as \
+         an Explore agent regardless of the `subagent_type` you pass; none of them can modify files.",
     ),
     (
         "ask_user_question",
@@ -62,8 +62,8 @@ While in plan mode you may only use these tools:
 You MUST NOT edit files or write to arbitrary paths while in plan mode. Use `run_command` only for read-only inspection or validation commands; do not run shell commands that modify files or system state. \
 Delete, edit, and write tools are unavailable. Never claim to have changed code while in plan mode.
 
-Proceed in four phases. During EXPLORE, prefer progress updates and read-only tools; use `todo_write` only after the planning work is concrete enough that the checklist communicates useful status:
-1. EXPLORE — read the relevant code and gather context for the user's request.
+Proceed in four phases. During EXPLORE, prefer progress updates and read-only tools; for broad or unfamiliar codebase planning, consider spawning 2-4 focused `Explore` agents in parallel before writing the plan. Use `todo_write` only after the planning work is concrete enough that the checklist communicates useful status:
+1. EXPLORE — read the relevant code, use parallel `spawn_agent` calls for independent research areas when useful, and gather context for the user's request.
 2. DESIGN — decide on the approach, considering trade-offs and conventions you observed.
 3. WRITE — call `plan_write` with a markdown plan covering: goal, files to change, step-by-step strategy, risks, and any decisions needing user confirmation.
 4. SUBMIT — call `exit_plan_mode` to present the plan to the user for approval. If they approve, plan mode turns off and you implement the plan with the full tool set. If they reject, you stay in plan mode: revise the plan per their feedback with `plan_write`, then submit it again. If they choose to continue chatting, stay in plan mode, answer their message, and yield back to the user; do not call `plan_write` or `exit_plan_mode` again unless the user asks or provides new direction.
@@ -86,5 +86,8 @@ mod tests {
                 "plan-mode instructions should list `{name}`"
             );
         }
+        assert!(instructions.contains("2-4 focused research prompts"));
+        assert!(instructions.contains("use parallel `spawn_agent` calls"));
+        assert!(instructions.contains("every child runs as an Explore agent"));
     }
 }

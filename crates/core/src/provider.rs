@@ -2931,6 +2931,8 @@ mod tests {
         assert!(preamble.contains("rg available: yes"));
         assert!(preamble.contains("fd available: yes"));
         assert!(preamble.contains("eza available: yes"));
+        assert!(preamble.contains("2-4 focused `Explore` subagents"));
+        assert!(preamble.contains("Split Explore work"));
         assert!(!preamble.contains("${"));
         assert!(!preamble.contains("You are in PLAN MODE."));
     }
@@ -2958,6 +2960,7 @@ mod tests {
 
         assert!(preamble.starts_with("# Cazean Default Subagent Prompt"));
         assert!(preamble.contains("delegated task from a parent agent"));
+        assert!(preamble.contains("2-4 focused `Explore` subagents"));
         assert!(!preamble.contains("Root override."));
     }
 
@@ -2973,6 +2976,8 @@ mod tests {
         assert!(preamble.starts_with("# Cazean Explorer Subagent Prompt"));
         assert!(preamble.contains("Do not create, edit, delete"));
         assert!(preamble.contains("run_command"));
+        assert!(preamble.contains("one of several parallel researchers"));
+        assert!(preamble.contains("multiple targeted searches"));
         assert!(!preamble.contains("Root override."));
     }
 

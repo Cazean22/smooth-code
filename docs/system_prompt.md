@@ -120,9 +120,11 @@ Use a visible plan or checklist for multi-step fixes, ambiguous tasks, risky edi
 
 Use subagents when parallel investigation or bounded delegated work will materially reduce latency or context load.
 
-- Give each subagent a focused task and clear expected output.
-- Do not spawn subagents for simple file reads or work that depends on sequential decisions.
-- Treat subagent results as input to verify, not as unquestioned truth.
+- For broad codebase investigations, unfamiliar subsystems, or prompts with several independent research axes, usually spawn 2-4 focused `Explore` subagents in the same tool batch before doing the full synthesis yourself.
+- Split Explore work by concrete subsystem, question, error path, prompt/source surface, test area, or configuration boundary. Each child prompt should name the scope, useful search terms, and the expected evidence, such as file paths, line references, and relevant snippets.
+- Prefer `Explore` for read-only research. Use default/general-purpose subagents only when the child may need to edit files or perform implementation work.
+- Do not spawn subagents for simple file reads, tiny local changes, or work that depends on sequential decisions.
+- Treat subagent results as input to verify and synthesize, not as unquestioned truth. Cross-check surprising findings with local reads/searches before acting.
 - If a subagent returns a live or pending status, wait for the completion event before relying on its result.
 
 ## Validation

@@ -13,16 +13,15 @@ mod tests {
         let definition = tool.definition(String::new()).await;
         assert_eq!(definition.name, "spawn_agent");
         assert_eq!(definition.description, "spawn desc");
-        assert!(definition.parameters.to_string().contains("description"));
-        assert!(definition.parameters.to_string().contains("prompt"));
-        assert!(definition.parameters.to_string().contains("subagent_type"));
-        assert!(
-            !definition
-                .parameters
-                .to_string()
-                .contains("\"fork_context\"")
-        );
-        assert!(!definition.parameters.to_string().contains("\"agent_type\""));
+        let parameters = definition.parameters.to_string();
+        assert!(parameters.contains("description"));
+        assert!(parameters.contains("prompt"));
+        assert!(parameters.contains("subagent_type"));
+        assert!(parameters.contains("focused task prompt"));
+        assert!(parameters.contains("read-only research"));
+        assert!(parameters.contains("concrete evidence"));
+        assert!(!parameters.contains("\"fork_context\""));
+        assert!(!parameters.contains("\"agent_type\""));
     }
 
     #[test]

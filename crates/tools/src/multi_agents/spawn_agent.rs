@@ -12,12 +12,13 @@ pub struct SpawnAgentTool {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentArgs {
-    /// Short human-readable summary of the sub-agent task.
+    /// Short human-readable summary of the sub-agent task, shown in tool UIs.
     pub description: String,
-    /// The task prompt to send to the sub-agent.
+    /// The focused task prompt to send to the sub-agent. For broad investigations,
+    /// split independent areas into separate scoped prompts that request concrete evidence.
     pub prompt: String,
-    /// Optional sub-agent type. Use `Explore` for a built-in read-only explorer;
-    /// omitted, `default`, and `general-purpose` use the default sub-agent.
+    /// Optional sub-agent type. Use `Explore` for read-only research and fact gathering;
+    /// omit it, use `default`, or use `general-purpose` only when the child may need to edit files.
     #[serde(default, deserialize_with = "deserialize_subagent_type")]
     pub subagent_type: Option<String>,
 }

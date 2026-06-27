@@ -40,7 +40,7 @@ You are a Cazean subagent working on a delegated task from a parent agent. Focus
 
 You may inspect and modify files when the task requires implementation. Keep changes scoped to the delegated instruction and follow the same repository rules as the root agent.
 
-When your work is investigative, cite concrete files, symbols, commands, and test results. When your work changes code, verify the relevant behavior and summarize the files changed.
+When your work is investigative, cite concrete files, symbols, commands, and test results. For broad read-only investigation with independent areas, you may spawn 2-4 focused `Explore` subagents in one batch, then verify and synthesize their findings. When your work changes code, verify the relevant behavior and summarize the files changed.
 "#;
 
 pub(crate) const EXPLORE_SUBAGENT_SYSTEM_PROMPT: &str =
@@ -58,12 +58,15 @@ pub(crate) fn render_spawn_agent_tool_description() -> String {
     "Spawn a built-in Cazean sub-agent. Supported `subagent_type` values: omit it, \
 `default`, or `general-purpose` for the implementation-capable default subagent; use `Explore` \
 or `explore` for a read-only investigation subagent that can inspect files and run read-only \
-commands but cannot edit files, ask the user, or spawn nested agents. Use `Explore` when you need \
-parallel codebase research, repo inspection, or fact gathering. Use the default/general-purpose \
-subagent when the child may need to implement changes. Spawned children run concurrently. In mixed \
-tool batches, `spawn_agent` may return a live JSON result with `event=\"agent_status\"` and a \
-pending/running status; this means the child is still working, so do not produce a final answer or \
-guess from that status. No wait tool is needed: wait for a later user message with \
+commands but cannot edit files, ask the user, or spawn nested agents. Prefer `Explore` for \
+read-only codebase research, repo inspection, prompt/source tracing, or fact gathering. For \
+broad codebase investigations with independent areas, usually spawn 2-4 focused `Explore` \
+subagents in the same tool batch; split prompts by subsystem, question, error path, test area, \
+or configuration boundary and ask for file/line evidence. Use the default/general-purpose \
+subagent only when the child may need to implement changes. Spawned children run concurrently. \
+In mixed tool batches, `spawn_agent` may return a live JSON result with `event=\"agent_status\"` \
+and a pending/running status; this means the child is still working, so do not produce a final \
+answer or guess from that status. No wait tool is needed: wait for a later user message with \
 `event=\"agent_completed\"` and the same `thread_id`, then use that result. Pure `spawn_agent` \
 batches wait for final child results before continuing."
         .to_string()
@@ -72,7 +75,8 @@ batches wait for final child results before continuing."
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPLORE_SUBAGENT_SYSTEM_PROMPT, SystemPromptKind, render_spawn_agent_tool_description,
+        DEFAULT_SUBAGENT_SYSTEM_PROMPT, EXPLORE_SUBAGENT_SYSTEM_PROMPT, ROOT_SYSTEM_PROMPT,
+        SystemPromptKind, render_spawn_agent_tool_description,
     };
 
     #[test]
@@ -98,6 +102,15 @@ mod tests {
     }
 
     #[test]
+    fn root_and_default_prompts_encourage_parallel_explore_research() {
+        assert!(ROOT_SYSTEM_PROMPT.contains("2-4 focused `Explore` subagents"));
+        assert!(ROOT_SYSTEM_PROMPT.contains("Split Explore work"));
+        assert!(ROOT_SYSTEM_PROMPT.contains("file paths, line references"));
+        assert!(DEFAULT_SUBAGENT_SYSTEM_PROMPT.contains("2-4 focused `Explore` subagents"));
+        assert!(DEFAULT_SUBAGENT_SYSTEM_PROMPT.contains("verify and synthesize"));
+    }
+
+    #[test]
     fn explorer_prompt_is_documented_and_read_only() {
         assert!(EXPLORE_SUBAGENT_SYSTEM_PROMPT.contains("read-only shell inspection"));
         assert!(EXPLORE_SUBAGENT_SYSTEM_PROMPT.contains("Do not create, edit, delete"));
@@ -105,6 +118,9 @@ mod tests {
             EXPLORE_SUBAGENT_SYSTEM_PROMPT
                 .contains("Return findings in your final assistant message")
         );
+        assert!(EXPLORE_SUBAGENT_SYSTEM_PROMPT.contains("one of several parallel researchers"));
+        assert!(EXPLORE_SUBAGENT_SYSTEM_PROMPT.contains("multiple targeted searches"));
+        assert!(EXPLORE_SUBAGENT_SYSTEM_PROMPT.contains("file paths and line references"));
     }
 
     #[test]
@@ -113,6 +129,9 @@ mod tests {
         assert!(spawn.contains("Supported `subagent_type` values"));
         assert!(spawn.contains("Explore"));
         assert!(spawn.contains("read-only"));
+        assert!(spawn.contains("2-4 focused `Explore`"));
+        assert!(spawn.contains("same tool batch"));
+        assert!(spawn.contains("file/line evidence"));
         assert!(spawn.contains("run concurrently"));
         assert!(spawn.contains("No wait tool is needed"));
         assert!(spawn.contains("event=\"agent_completed\""));

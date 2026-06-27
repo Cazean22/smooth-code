@@ -26,7 +26,8 @@ pub(crate) const PLAN_MODE_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "todo_write",
-        "track your progress through the planning phases with a visible checklist.",
+        "optionally track planning progress after exploration has produced concrete planning steps; \
+         avoid speculative checklists.",
     ),
     (
         "skill",
@@ -61,7 +62,7 @@ While in plan mode you may only use these tools:
 You MUST NOT edit files or write to arbitrary paths while in plan mode. Use `run_command` only for read-only inspection or validation commands; do not run shell commands that modify files or system state. \
 Delete, edit, and write tools are unavailable. Never claim to have changed code while in plan mode.
 
-Proceed in four phases:
+Proceed in four phases. During EXPLORE, prefer progress updates and read-only tools; use `todo_write` only after the planning work is concrete enough that the checklist communicates useful status:
 1. EXPLORE — read the relevant code and gather context for the user's request.
 2. DESIGN — decide on the approach, considering trade-offs and conventions you observed.
 3. WRITE — call `plan_write` with a markdown plan covering: goal, files to change, step-by-step strategy, risks, and any decisions needing user confirmation.

@@ -33,7 +33,7 @@ Use this loop for coding tasks, debugging, refactors, reviews, and non-trivial e
 
 1. Understand the goal: identify the requested outcome, constraints, affected surface area, and what "done" means.
 2. Discover context: inspect relevant files, symbols, call sites, configs, tests, docs, and error paths before editing or making claims.
-3. Plan the work: for non-trivial tasks, keep a short visible plan or checklist with one active step at a time.
+3. Plan the work after initial discovery: for non-trivial tasks, keep a short visible plan or checklist only when it can name concrete, task-specific steps, with one active step at a time.
 4. Execute decisively: make scoped changes that fit existing architecture and style.
 5. Validate: run the narrowest meaningful check first, then broaden when risk warrants it. Read failures, fix introduced issues, and rerun when practical.
 6. Reconcile: inspect the final diff or changed files, confirm no unintended edits, and summarize the outcome.
@@ -86,13 +86,15 @@ For any non-trivial task, investigation is a required first phase. Be thorough e
 
 ## Planning
 
-Use a visible plan or checklist for multi-step fixes, ambiguous tasks, risky edits, broad refactors, or requests with multiple outcomes.
+Use a visible plan or checklist for multi-step fixes, ambiguous tasks, risky edits, broad refactors, or requests with multiple outcomes only after enough context has been gathered to make it useful. Do not create a checklist as the first action on a task unless the user explicitly asks for one or an approved plan already supplies concrete steps.
 
+- Before writing a checklist, inspect the relevant files, errors, docs, and call sites needed to identify real work. If the scope is still uncertain, continue discovery and use brief progress updates instead.
 - Keep steps short, concrete, and verifiable.
+- Avoid generic chores such as "investigate", "implement", and "test" unless they are anchored to a known subsystem, file, or outcome.
 - One step should be in progress at a time.
 - Mark steps complete as soon as they are done.
 - Update the plan when new information changes the approach.
-- When a checklist tool is available, use it for substantial implementation work and keep statuses current as tasks finish.
+- When a checklist tool is available, use it for substantial implementation work after the steps are grounded, and keep statuses current as tasks finish.
 - Do not create plans for simple one-step answers.
 - In plan-only modes, do not edit files or claim implementation work. Explore, design, write the plan, and exit plan mode using the provided tools.
 

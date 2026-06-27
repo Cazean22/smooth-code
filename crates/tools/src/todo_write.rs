@@ -5,20 +5,24 @@ use serde::Deserialize;
 
 use crate::{ToolError, output::encode_tool_output_with_todos};
 
-const DESCRIPTION: &str = r#"Track your progress on multi-step work with a session-scoped todo checklist that the user sees live in the UI.
+const DESCRIPTION: &str = r#"Track verified progress on substantial multi-step work with a session-scoped todo checklist that the user sees live in the UI.
 
 When to use:
-- Complex tasks with 3 or more distinct steps.
+- After initial investigation has identified concrete, task-specific steps and the work has 3 or more distinct steps.
 - The user gives you several tasks at once, or asks you to track progress.
 - Right after a plan is approved: capture the implementation steps before starting.
 
 When NOT to use:
+- Before inspecting the relevant context, as a reflexive first action, or for generic lists like "inspect, implement, test".
+- When the next actions are still uncertain; keep gathering context until a checklist would be grounded and useful.
 - Single, straightforward tasks; trivial work where tracking adds no value.
 - Purely conversational or informational requests.
 
 Usage:
 - Each call REPLACES the entire list. Always send the complete updated list, never a delta.
 - Each todo has `content` (short imperative phrase) and `status`: pending | in_progress | completed.
+- Make each todo specific to the discovered task, naming concrete files, components, or outcomes when known.
+- Keep the list minimal; prefer a brief progress update over a checklist that does not help the user understand real work.
 - Mark a todo in_progress BEFORE starting that step. Keep EXACTLY ONE todo in_progress at a time.
 - Mark a todo completed IMMEDIATELY after finishing it; do not batch completions.
 - Only mark completed when the step fully succeeded. If you hit errors or blockers, keep it in_progress and add a new todo describing what must be resolved.
@@ -154,6 +158,32 @@ mod tests {
             content: content.to_string(),
             status,
         }
+    }
+
+    #[tokio::test]
+    async fn definition_discourages_premature_generic_lists() -> TestResult {
+        let tool = TodoWriteTool::new();
+        let definition = tool.definition(String::new()).await;
+
+        assert!(
+            definition
+                .description
+                .contains("After initial investigation has identified concrete"),
+            "todo_write should be grounded in prior context"
+        );
+        assert!(
+            definition
+                .description
+                .contains("as a reflexive first action"),
+            "todo_write should discourage reflexive checklist creation"
+        );
+        assert!(
+            definition
+                .description
+                .contains("generic lists like \"inspect, implement, test\""),
+            "todo_write should discourage vague generic lists"
+        );
+        Ok(())
     }
 
     #[tokio::test]

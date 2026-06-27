@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
 use cazean_config::{Config, OpenAiConfig, ReasoningEffortConfig, ReasoningSummaryConfig};
 use futures_util::{SinkExt, StreamExt};
 use rig::{
@@ -15,6 +16,7 @@ use rig::{
     agent::Agent,
     client::CompletionClient,
     completion::{Completion, CompletionError, CompletionRequest},
+    http_client::{self, HttpClientExt, MultipartForm},
     message::{Message, Reasoning as MessageReasoning, ReasoningContent, Text, ToolCall},
     providers::{
         anthropic, gemini,
@@ -37,6 +39,7 @@ use rig::{
         RawStreamingChoice, RawStreamingToolCall, StreamedAssistantContent,
         StreamingCompletionResponse as RigStreamingCompletionResponse, ToolCallDeltaContent,
     },
+    wasm_compat::WasmCompatSend,
 };
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
@@ -157,10 +160,12 @@ pub enum SessionAssistantContent {
 pub type SessionCompletionStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<SessionCompletionEvent>> + Send>>;
 
+pub type OpenRouterCompletionModel = openrouter::CompletionModel<OpenRouterSseDoneHttpClient>;
+
 #[derive(Clone)]
 pub enum SessionModel {
     OpenAi(Arc<OpenAiSessionModel>),
-    OpenRouter(Arc<Agent<openrouter::CompletionModel>>),
+    OpenRouter(Arc<Agent<OpenRouterCompletionModel>>),
     Anthropic(Arc<Agent<anthropic::completion::CompletionModel>>),
     Gemini(Arc<Agent<gemini::completion::CompletionModel>>),
     Stub(Arc<dyn SessionModelDriver>),
@@ -172,6 +177,116 @@ pub struct OpenAiSessionModel {
     model: String,
     websocket: cazean_config::WebSocketConfig,
     session_ws: Mutex<Option<OpenAiParkedWebSocket>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OpenRouterSseDoneHttpClient {
+    inner: http_client::ReqwestClient,
+}
+
+impl HttpClientExt for OpenRouterSseDoneHttpClient {
+    fn send<T, U>(
+        &self,
+        req: http_client::Request<T>,
+    ) -> impl Future<Output = http_client::Result<http_client::Response<http_client::LazyBody<U>>>>
+    + WasmCompatSend
+    + 'static
+    where
+        T: Into<Bytes> + WasmCompatSend,
+        U: From<Bytes> + WasmCompatSend + 'static,
+    {
+        self.inner.send(req)
+    }
+
+    fn send_multipart<U>(
+        &self,
+        req: http_client::Request<MultipartForm>,
+    ) -> impl Future<Output = http_client::Result<http_client::Response<http_client::LazyBody<U>>>>
+    + WasmCompatSend
+    + 'static
+    where
+        U: From<Bytes> + WasmCompatSend + 'static,
+    {
+        self.inner.send_multipart(req)
+    }
+
+    fn send_streaming<T>(
+        &self,
+        req: http_client::Request<T>,
+    ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + WasmCompatSend
+    where
+        T: Into<Bytes> + WasmCompatSend,
+    {
+        let inner = self.inner.clone();
+        async move {
+            let response = inner.send_streaming(req).await?;
+            Ok(openrouter_done_terminated_streaming_response(response))
+        }
+    }
+}
+
+fn openrouter_done_terminated_streaming_response(
+    response: http_client::StreamingResponse,
+) -> http_client::StreamingResponse {
+    let (parts, body) = response.into_parts();
+    http_client::Response::from_parts(parts, openrouter_done_terminated_body(body))
+}
+
+fn openrouter_done_terminated_body(
+    mut body: http_client::sse::BoxedStream,
+) -> http_client::sse::BoxedStream {
+    Box::pin(async_stream::try_stream! {
+        let mut tail = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            let data = chunk.as_ref();
+            let mut combined = Vec::with_capacity(tail.len() + data.len());
+            combined.extend_from_slice(&tail);
+            combined.extend_from_slice(data);
+
+            if let Some(done_end) = openrouter_sse_done_event_end(&combined) {
+                let current_chunk_len = done_end.saturating_sub(tail.len()).min(data.len());
+                if current_chunk_len > 0 {
+                    yield Bytes::copy_from_slice(&data[..current_chunk_len]);
+                }
+                break;
+            }
+
+            yield chunk;
+            tail = openrouter_sse_done_detection_tail(&combined);
+        }
+    })
+}
+
+const OPENROUTER_SSE_DONE_DETECTION_TAIL_BYTES: usize = 32;
+const OPENROUTER_SSE_DONE_PATTERNS: &[&[u8]] = &[
+    b"data: [DONE]\n\n",
+    b"data:[DONE]\n\n",
+    b"data: [DONE]\r\n\r\n",
+    b"data:[DONE]\r\n\r\n",
+];
+
+fn openrouter_sse_done_detection_tail(bytes: &[u8]) -> Vec<u8> {
+    let start = bytes
+        .len()
+        .saturating_sub(OPENROUTER_SSE_DONE_DETECTION_TAIL_BYTES);
+    bytes[start..].to_vec()
+}
+
+fn openrouter_sse_done_event_end(bytes: &[u8]) -> Option<usize> {
+    OPENROUTER_SSE_DONE_PATTERNS
+        .iter()
+        .filter_map(|pattern| find_bytes(bytes, pattern).map(|start| start + pattern.len()))
+        .min()
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 impl SessionModel {
@@ -291,7 +406,10 @@ impl SessionModel {
                 })))
             }
             "openrouter" => {
-                let client = openrouter::Client::new(&env::var("OPENROUTER_API_KEY")?)?;
+                let client = openrouter::Client::builder()
+                    .api_key(&env::var("OPENROUTER_API_KEY")?)
+                    .http_client(OpenRouterSseDoneHttpClient::default())
+                    .build()?;
                 Ok(Self::OpenRouter(Arc::new(build_agent(
                     client.agent(&model).preamble(&preamble),
                     cwd,
@@ -578,14 +696,38 @@ where
     M: rig::completion::CompletionModel + 'static,
     M::StreamingResponse: Clone + Unpin + rig::completion::GetTokenUsage + Send,
 {
-    let mut stream = agent
+    let stream = agent
         .completion(prompt, history.iter().cloned())
         .await?
         .stream()
         .await?;
-    Ok(Box::pin(async_stream::try_stream! {
+    Ok(session_completion_stream_from_rig_stream(stream))
+}
+
+fn session_completion_stream_from_rig_stream<R>(
+    mut stream: RigStreamingCompletionResponse<R>,
+) -> SessionCompletionStream
+where
+    R: Clone + Unpin + rig::completion::GetTokenUsage + Send + 'static,
+{
+    Box::pin(async_stream::try_stream! {
+        let mut saw_final_response = false;
         while let Some(item) = stream.next().await {
-            let assistant_item = session_assistant_content_from_streamed(item?);
+            let item = match item {
+                Ok(item) => item,
+                Err(error) if saw_final_response && is_rustls_missing_close_notify_eof(&error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "Ignoring rustls close_notify EOF after provider stream final response"
+                    );
+                    continue;
+                }
+                Err(error) => Err(error)?,
+            };
+            if matches!(item, StreamedAssistantContent::Final(_)) {
+                saw_final_response = true;
+            }
+            let assistant_item = session_assistant_content_from_streamed(item);
             yield SessionCompletionEvent::AssistantItem(assistant_item);
         }
 
@@ -601,7 +743,7 @@ where
             assistant_message_id: stream.message_id.clone(),
             response,
         });
-    }))
+    })
 }
 
 fn session_assistant_content_from_streamed<R>(
@@ -909,11 +1051,11 @@ fn openai_websocket_stream(
                 Some(Err(error)) => {
                     let error = openai_websocket_provider_error(error);
                     if accumulator.can_finish_after_disconnect()
-                        && is_openai_websocket_connection_reset(&error)
+                        && is_openai_websocket_finished_output_disconnect(&error)
                     {
                         tracing::debug!(
                             error = %error,
-                            "OpenAI WebSocket reset after a complete output item; finishing turn"
+                            "OpenAI WebSocket transport closed after a complete output item; finishing turn"
                         );
                     } else {
                         terminal_error = Some(error);
@@ -1545,15 +1687,27 @@ pub(crate) fn strip_ws_transient_tag(message: &str) -> String {
     message.replace(&format!("{WS_TRANSIENT_TAG} "), "")
 }
 
+const RUSTLS_MISSING_CLOSE_NOTIFY_MARKER: &str =
+    "peer closed connection without sending tls close_notify";
+const RUSTLS_UNEXPECTED_EOF_MARKER: &str = "unexpected-eof";
+
+fn is_rustls_missing_close_notify_eof(error: &CompletionError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains(RUSTLS_MISSING_CLOSE_NOTIFY_MARKER)
+        && message.contains(RUSTLS_UNEXPECTED_EOF_MARKER)
+}
+
 fn openai_websocket_provider_error(
     error: tokio_tungstenite::tungstenite::Error,
 ) -> CompletionError {
     // Classify from the typed tungstenite variant (robust to Display wording),
-    // falling back to the shared prose markers, and tag once here: the
+    // falling back to rustls/proxy prose markers, and tag once here: the
     // connect-retry path classifies this error directly without passing through
     // the stream chokepoint, so the tag has to be set at this source.
     let candidate = CompletionError::ProviderError(error.to_string());
-    let transient = tungstenite_error_is_transient(&error) || legacy_prose_is_transient(&candidate);
+    let transient = tungstenite_error_is_transient(&error)
+        || is_rustls_missing_close_notify_eof(&candidate)
+        || legacy_prose_is_transient(&candidate);
     provider_error_with_optional_tag(error.to_string(), transient)
 }
 
@@ -1598,6 +1752,10 @@ fn is_openai_websocket_connection_reset(error: &CompletionError) -> bool {
     message.contains("connection reset without closing handshake")
         || message.contains("connection reset by peer")
         || message.contains("openai websocket connection reset before response.completed")
+}
+
+fn is_openai_websocket_finished_output_disconnect(error: &CompletionError) -> bool {
+    is_openai_websocket_connection_reset(error) || is_rustls_missing_close_notify_eof(error)
 }
 
 /// Structured proxy error codes/types (`error.code` / `error.type` / top-level `code`) that
@@ -2166,6 +2324,7 @@ mod tests {
     };
 
     use anyhow::{Context, Result};
+    use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
     use rig::{
         OneOrMany,
@@ -2174,6 +2333,7 @@ mod tests {
         completion::{
             CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
         },
+        http_client,
         message::Message,
         providers::openai::responses_api::{
             Output, OutputFunctionCall, ToolStatus,
@@ -2598,6 +2758,164 @@ mod tests {
             };
             item?;
         }
+        Ok(())
+    }
+
+    async fn collect_session_completion_stream(
+        mut stream: super::SessionCompletionStream,
+    ) -> Result<Vec<super::SessionCompletionEvent>> {
+        let mut events = Vec::new();
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .context("timed out waiting for session completion stream item")?;
+            let Some(item) = item else {
+                break;
+            };
+            events.push(item?);
+        }
+        Ok(events)
+    }
+
+    fn rustls_missing_close_notify_message() -> &'static str {
+        "IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
+    }
+
+    fn rustls_missing_close_notify_error() -> CompletionError {
+        CompletionError::ProviderError(rustls_missing_close_notify_message().to_string())
+    }
+
+    fn rustls_missing_close_notify_http_error() -> http_client::Error {
+        http_client::Error::Instance(Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            rustls_missing_close_notify_message(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn generic_stream_ignores_rustls_close_notify_eof_after_final_response() -> Result<()> {
+        let raw_stream =
+            StreamingCompletionResponse::stream(Box::pin(futures_util::stream::iter(vec![
+                Ok(RawStreamingChoice::Message("hello".to_string())),
+                Ok(RawStreamingChoice::FinalResponse(DummyStreamingResponse)),
+                Err(rustls_missing_close_notify_error()),
+            ])));
+        let stream = super::session_completion_stream_from_rig_stream(raw_stream);
+
+        let events = collect_session_completion_stream(stream).await?;
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                super::SessionCompletionEvent::AssistantItem(
+                    super::SessionAssistantContent::Text(text),
+                ) if text.text == "hello"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                super::SessionCompletionEvent::AssistantItem(super::SessionAssistantContent::Final)
+            )
+        }));
+        let Some(summary) = events.iter().find_map(|event| match event {
+            super::SessionCompletionEvent::Completed(summary) => Some(summary),
+            _ => None,
+        }) else {
+            panic!("session stream should yield a completed summary");
+        };
+        assert_eq!(summary.response, "hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openrouter_done_terminated_body_stops_before_post_done_transport_eof() -> Result<()> {
+        let body = Box::pin(futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: {\"choices\":[]}\n\n")),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            Err(rustls_missing_close_notify_http_error()),
+        ]));
+        let mut body = super::openrouter_done_terminated_body(body);
+        let mut collected = Vec::new();
+
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk?);
+        }
+
+        assert_eq!(
+            collected,
+            b"data: {\"choices\":[]}\n\ndata: [DONE]\n\n".to_vec()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openrouter_done_terminated_body_detects_split_done_frame() -> Result<()> {
+        let body = Box::pin(futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: {\"choices\":[]}\n\ndata: [DO")),
+            Ok(Bytes::from_static(b"NE]\n\n")),
+            Err(rustls_missing_close_notify_http_error()),
+        ]));
+        let mut body = super::openrouter_done_terminated_body(body);
+        let mut collected = Vec::new();
+
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk?);
+        }
+
+        assert_eq!(
+            collected,
+            b"data: {\"choices\":[]}\n\ndata: [DONE]\n\n".to_vec()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openrouter_done_terminated_body_surfaces_pre_done_transport_eof() -> Result<()> {
+        let body = Box::pin(futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: {\"choices\":[]}\n\n")),
+            Err(rustls_missing_close_notify_http_error()),
+        ]));
+        let mut body = super::openrouter_done_terminated_body(body);
+        let first = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .context("timed out waiting for first body chunk")?;
+        let Some(first) = first else {
+            panic!("body should yield first chunk");
+        };
+        assert_eq!(first?, Bytes::from_static(b"data: {\"choices\":[]}\n\n"));
+
+        let second = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .context("timed out waiting for transport error")?;
+        let Some(second) = second else {
+            panic!("body should surface pre-DONE transport error");
+        };
+        let Err(error) = second else {
+            panic!("body should not suppress pre-DONE transport error");
+        };
+        assert!(error.to_string().contains("close_notify"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generic_stream_surfaces_rustls_close_notify_eof_before_final_response() -> Result<()> {
+        let raw_stream =
+            StreamingCompletionResponse::stream(Box::pin(futures_util::stream::iter(vec![
+                Ok(RawStreamingChoice::<DummyStreamingResponse>::Message(
+                    "partial".to_string(),
+                )),
+                Err(rustls_missing_close_notify_error()),
+            ])));
+        let stream = super::session_completion_stream_from_rig_stream(raw_stream);
+
+        let Err(error) = drain_session_completion_stream(stream).await else {
+            panic!("session stream should fail before provider final response");
+        };
+        let Some(error) = error.downcast_ref::<CompletionError>() else {
+            panic!("session stream error should carry CompletionError");
+        };
+        assert!(super::is_rustls_missing_close_notify_eof(error));
         Ok(())
     }
 
@@ -3332,6 +3650,9 @@ mod tests {
                 .is_empty()
         );
         assert!(accumulator.can_finish_after_disconnect());
+        assert!(super::is_openai_websocket_finished_output_disconnect(
+            &rustls_missing_close_notify_error()
+        ));
 
         let finished = accumulator.finish();
         assert!(finished.iter().any(|choice| {
@@ -3427,6 +3748,19 @@ mod tests {
                 "ProviderError: OpenAI WebSocket connection reset before response.completed"
             );
         }
+    }
+
+    #[test]
+    fn openai_websocket_rustls_close_notify_eof_is_tagged_transient_by_source() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        let error = super::openai_websocket_provider_error(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            rustls_missing_close_notify_message(),
+        )));
+
+        assert!(super::is_openai_websocket_transient_start_error(&error));
+        assert!(super::strip_ws_transient_tag(&error.to_string()).contains("close_notify"));
     }
 
     #[test]

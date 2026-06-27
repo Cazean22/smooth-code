@@ -10,6 +10,7 @@ anyhow.workspace = true
 app-server-protocol = { path = "../app-server-protocol" }
 async-stream.workspace = true
 async-channel.workspace = true
+bytes.workspace = true
 futures-util.workspace = true
 indexmap.workspace = true
 rig.workspace = true

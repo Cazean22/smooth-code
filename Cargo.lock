@@ -327,6 +327,7 @@ dependencies = [
  "app-server-protocol",
  "async-channel",
  "async-stream",
+ "bytes",
  "cazean-config",
  "cazean-protocol",
  "cazean-state-db",

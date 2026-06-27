@@ -39,6 +39,10 @@ Use this file to capture concise, durable insights when a task produces knowledg
 - `AgentPath` parsing/join/resolve errors are typed and serde validation still uses the same string representation; path-bearing protocol structs should rely on `AgentPath` serde rather than accepting unchecked strings.
 - App-server JSON-RPC conversion is centralized through `AppServerError::to_json_rpc_error`; core errors preserve their `cazean-core` source and typed kind when surfaced to clients. Tool errors expose stable `kind()` values while preserving readable `Display` text for model/UI output.
 
+## Provider Streaming
+
+- Rustls can report `peer closed connection without sending TLS close_notify` after a provider stream has already reached protocol completion. For generic Rig HTTP/SSE streams, treat that EOF as benign only after `StreamedAssistantContent::Final`; before the final marker it remains a real stream error. Rig 0.38.2's OpenRouter-compatible SSE loop skips `[DONE]` and only emits `FinalResponse` after the body ends, so cazean wraps OpenRouter's streaming HTTP body to end locally as soon as a complete SSE `data: [DONE]` frame is read, avoiding another TLS poll after the terminal marker without suppressing pre-terminal EOFs. For the OpenAI WebSocket path, classify the same rustls EOF as retryable only at the WebSocket source before output, and as graceful only after the accumulator can already finish after disconnect.
+
 ## OpenAI Provider
 
 - The OpenAI provider uses Rig's Responses WebSocket session for the manual tool loop; keep OpenAI turn streaming on `stream_completion_turn` and do not route OpenAI through the generic `CompletionModel::stream()` SSE path.
